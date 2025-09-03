@@ -17,6 +17,7 @@ use fs::{Fs, RealFs};
 use futures::{StreamExt, channel::oneshot, future};
 use git::GitHostingProviderRegistry;
 use gpui::{App, AppContext, Application, AsyncApp, Focusable as _, UpdateGlobal as _};
+use external_websocket_sync;
 
 use gpui_tokio::Tokio;
 use http_client::{Url, read_proxy_from_env};
@@ -583,6 +584,21 @@ pub fn main() {
             cx,
         );
         assistant_tools::init(app_state.client.http_client(), cx);
+        external_websocket_sync::init(cx);
+        
+        // Initialize external WebSocket sync with session and prompt builder
+        // Note: Full initialization with project will happen when workspaces are opened
+        cx.spawn({
+            let app_session = app_state.session.clone();
+            let prompt_builder = prompt_builder.clone();
+            async move |cx| {
+                // Store the session and prompt builder for later project-based initialization
+                if let Err(e) = external_websocket_sync::init_with_session(app_session, prompt_builder, cx) {
+                    log::error!("Failed to initialize external WebSocket sync with session: {}", e);
+                }
+            }
+        }).detach();
+        
         repl::init(app_state.fs.clone(), cx);
         extension_host::init(
             extension_host_proxy,

@@ -1,0 +1,52 @@
+[package]
+name = "external_websocket_sync"
+version = "0.1.0"
+edition.workspace = true
+publish.workspace = true
+license = "GPL-3.0-or-later"
+
+[lints]
+workspace = true
+
+[lib]
+path = "src/external_websocket_sync.rs"
+doctest = false
+
+[features]
+default = ["server"]
+server = ["axum", "tower", "tower-http"]
+test-support = []
+
+[dependencies]
+anyhow.workspace = true
+assistant_context.workspace = true
+axum = { version = "0.7", optional = true }
+chrono.workspace = true
+collections.workspace = true
+context_server.workspace = true
+futures.workspace = true
+gpui.workspace = true
+http.workspace = true
+language_model.workspace = true
+log.workspace = true
+parking_lot.workspace = true
+project.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+session.workspace = true
+settings.workspace = true
+schemars.workspace = true
+smol.workspace = true
+telemetry_events.workspace = true
+tokio = { version = "1.0", features = ["full"] }
+tower = { version = "0.4", optional = true }
+tower-http = { version = "0.5", features = ["fs", "trace", "cors"], optional = true }
+ui.workspace = true
+util.workspace = true
+uuid.workspace = true
+workspace.workspace = true
+workspace-hack.workspace = true
+
+[dev-dependencies]
+fs.workspace = true
+tempfile.workspace = true
