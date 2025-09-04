@@ -12,7 +12,7 @@ use axum::extract::ws::{Message, WebSocket};
 use axum::response::Response;
 use collections::HashMap;
 use futures::{SinkExt, StreamExt};
-use gpui::{AppContext, WeakModel};
+use gpui::{AppContext, WeakEntity};
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 use serde_json::json;

@@ -80,7 +80,6 @@ use serde::Deserialize;
 use session::AppSession;
 use settings::{Settings, update_settings_file};
 use shared_screen::SharedScreen;
-use external_websocket_sync;
 use sqlez::{
     bindable::{Bind, Column, StaticColumnCount},
     statement::Statement,
@@ -1427,7 +1426,7 @@ impl Workspace {
             this.update_window_title(window, cx);
             this.show_initial_notifications(cx);
         });
-        Workspace {
+        let workspace = Workspace {
             weak_self: weak_handle.clone(),
             zoomed: None,
             zoomed_position: None,
@@ -1481,9 +1480,7 @@ impl Workspace {
         };
 
         // Initialize external WebSocket thread sync if available
-        if let Err(e) = external_websocket_sync::init_with_project_when_available(project.clone(), cx) {
-            log::error!("Failed to initialize external WebSocket thread sync: {}", e);
-        }
+        // Note: external_websocket_sync temporarily disabled due to circular dependency
 
         workspace
     }

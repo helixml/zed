@@ -166,7 +166,7 @@ impl HelixIntegration {
     }
 
     /// Perform periodic sync with Helix
-    async fn perform_periodic_sync(integration: &gpui::Model<Self>) -> Result<()> {
+    async fn perform_periodic_sync(integration: &gpui::Entity<Self>) -> Result<()> {
         let session_info = integration.read().get_session_info();
         log::debug!(
             "Periodic sync - Session: {}, Contexts: {}, Clients: {}",
@@ -186,7 +186,7 @@ impl HelixIntegration {
 
 /// Bidirectional sync manager
 pub struct SyncManager {
-    integration: gpui::WeakModel<HelixIntegration>,
+    integration: gpui::WeakEntity<HelixIntegration>,
     sync_state: Arc<RwLock<SyncState>>,
     _tasks: Vec<Task<()>>,
 }
@@ -206,7 +206,7 @@ struct SyncError {
 }
 
 impl SyncManager {
-    pub fn new(integration: gpui::WeakModel<HelixIntegration>) -> Self {
+    pub fn new(integration: gpui::WeakEntity<HelixIntegration>) -> Self {
         Self {
             integration,
             sync_state: Arc::new(RwLock::new(SyncState::default())),

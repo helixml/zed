@@ -6,10 +6,10 @@
 
 use anyhow::{Context, Result};
 use assistant_context::{AssistantContext, ContextId, ContextStore, Message, MessageId};
-use assistant_slash_command::SlashCommandWorkingSet;
+// use assistant_slash_command::SlashCommandWorkingSet;
 use collections::HashMap;
 use futures::{SinkExt, StreamExt};
-use gpui::{App, AppContext, AsyncApp, Context as _, Entity, EventEmitter, Model, SharedString, Subscription, Task, WeakModel};
+use gpui::{App, AppContext, AsyncApp, Context as _, Entity, EventEmitter, SharedString, Subscription, Task, WeakEntity};
 use language::LanguageRegistry;
 use language_model;
 use parking_lot::RwLock;
@@ -35,7 +35,13 @@ pub use mcp::*;
 mod settings;
 pub use settings::*;
 
+mod server;
+pub use server::*;
+
 pub use websocket_sync::*;
+
+/// Type alias for compatibility with existing code
+pub type HelixIntegration = ExternalWebSocketSync;
 
 /// Main external WebSocket thread sync service
 pub struct ExternalWebSocketSync {
@@ -111,11 +117,11 @@ impl ExternalWebSocketSync {
 
         let project = self.project.clone();
         let prompt_builder = self.prompt_builder.clone();
-        let slash_commands = Arc::new(SlashCommandWorkingSet::default());
+        // let slash_commands = Arc::new(SlashCommandWorkingSet::default());
 
         log::info!("Initializing context store for Helix integration");
         
-        match ContextStore::new(project, prompt_builder, slash_commands, cx).await {
+        match ContextStore::new(project, prompt_builder, None, cx).await {
             Ok(context_store) => {
                 self.context_store = Some(context_store);
                 log::info!("Context store initialized successfully");
@@ -267,15 +273,15 @@ impl ExternalWebSocketSync {
         if let Some(_context_store) = &self.context_store {
             let languages = self.project.read(cx).languages().clone();
             let telemetry = self.project.read(cx).client().telemetry().clone();
-            let slash_commands = Arc::new(SlashCommandWorkingSet::default());
+            // let slash_commands = Arc::new(SlashCommandWorkingSet::default());
             
-            let context = cx.new_model(|cx| {
+            let context = cx.new_entity(|cx| {
                 AssistantContext::local(
                     languages,
                     Some(self.project.clone()),
                     Some(telemetry),
                     self.prompt_builder.clone(),
-                    slash_commands,
+                    None,
                     cx,
                 )
             });
@@ -297,15 +303,15 @@ impl ExternalWebSocketSync {
             
             let languages = self.project.read(cx).languages().clone();
             let telemetry = self.project.read(cx).client().telemetry().clone();
-            let slash_commands = Arc::new(SlashCommandWorkingSet::default());
+            // let slash_commands = Arc::new(SlashCommandWorkingSet::default());
             
-            let context = cx.new_model(|cx| {
+            let context = cx.new_entity(|cx| {
                 AssistantContext::local(
                     languages,
                     Some(self.project.clone()),
                     Some(telemetry),
                     self.prompt_builder.clone(),
-                    slash_commands,
+                    None,
                     cx,
                 )
             });

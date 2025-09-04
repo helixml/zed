@@ -20,31 +20,39 @@ test-support = []
 [dependencies]
 anyhow.workspace = true
 assistant_context.workspace = true
-axum = { version = "0.7", optional = true }
+axum = { version = "0.7", optional = true, features = ["ws"] }
 chrono.workspace = true
+clock.workspace = true
 collections.workspace = true
 context_server.workspace = true
 futures.workspace = true
 gpui.workspace = true
 http.workspace = true
+language.workspace = true
 language_model.workspace = true
 log.workspace = true
 parking_lot.workspace = true
 project.workspace = true
+prompt_store.workspace = true
+reqwest.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 session.workspace = true
 settings.workspace = true
 schemars.workspace = true
+settings_ui_macros.workspace = true
 smol.workspace = true
 telemetry_events.workspace = true
 tokio = { version = "1.0", features = ["full"] }
+tokio-tungstenite = "0.26"
 tower = { version = "0.4", optional = true }
 tower-http = { version = "0.5", features = ["fs", "trace", "cors"], optional = true }
+tungstenite = "0.26"
 ui.workspace = true
+url.workspace = true
 util.workspace = true
 uuid.workspace = true
-workspace.workspace = true
+
 workspace-hack.workspace = true
 
 [dev-dependencies]

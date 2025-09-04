@@ -1,11 +1,12 @@
 //! Settings for External WebSocket Thread Sync
 
-use gpui::AppContext;
+use gpui::{App, AppContext};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
-use settings::{Setting, SettingsStore};
+use settings::{Settings, SettingsStore, SettingsSources};
+use settings_ui_macros::SettingsUi;
 
-#[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
+#[derive(Clone, Debug, Serialize, Deserialize, JsonSchema, SettingsUi)]
 pub struct ExternalSyncSettings {
     /// Whether external WebSocket thread sync is enabled
     #[serde(default)]
@@ -201,14 +202,16 @@ impl Default for ServerSettings {
     }
 }
 
-impl Setting for ExternalSyncSettings {
+impl Settings for ExternalSyncSettings {
     const KEY: Option<&'static str> = Some("external_websocket_sync");
 
     type FileContent = Self;
 
-    fn load(sources: SettingsStore, _: &mut AppContext) -> anyhow::Result<Self> {
-        sources.load()
+    fn load(sources: settings::SettingsSources<Self::FileContent>, _: &mut App) -> anyhow::Result<Self> {
+        sources.json_merge()
     }
+
+    fn import_from_vscode(_vscode: &settings::VsCodeSettings, _current: &mut Self::FileContent) {}
 }
 
 impl ExternalSyncSettings {
@@ -302,7 +305,7 @@ impl McpServerSettings {
 }
 
 /// Initialize external sync settings
-pub fn init(cx: &mut AppContext) {
+pub fn init(cx: &mut App) {
     ExternalSyncSettings::register(cx);
 }
 
