@@ -103,6 +103,10 @@ impl WebSocketSync {
 
         log::info!("Starting WebSocket connection task for: {}", url);
 
+        // Clone necessary data before async move
+        let auth_token = config.auth_token.clone();
+        let event_sender = self.event_sender.clone();
+
         tokio::spawn(async move {
             let url = match Url::parse(&url) {
                 Ok(url) => url,
@@ -113,7 +117,7 @@ impl WebSocketSync {
             };
 
             // Try to connect with retries
-            let websocket = match Self::connect_with_auth(&url, &config.auth_token).await {
+            let websocket = match connect_with_auth(&url, &auth_token).await {
                 Ok(ws) => ws,
                 Err(e) => {
                     log::error!("Failed to connect to WebSocket: {}", e);
@@ -165,7 +169,7 @@ impl WebSocketSync {
             // Handle incoming messages
             let incoming_task = {
                 let command_sender = command_sender.clone();
-                let event_sender = self.event_sender.clone();
+                let event_sender = event_sender.clone();
                 tokio::spawn(async move {
                     while let Some(message) = stream.next().await {
                         match message {
@@ -208,8 +212,10 @@ impl WebSocketSync {
         Ok(())
     }
 
-    /// Connect with authentication
-    async fn connect_with_auth(url: &Url, auth_token: &str) -> Result<WebSocketStream<MaybeTlsStream<TcpStream>>> {
+}
+
+/// Connect with authentication
+async fn connect_with_auth(url: &Url, auth_token: &str) -> Result<WebSocketStream<MaybeTlsStream<TcpStream>>> {
         let request = if !auth_token.is_empty() {
             tungstenite::http::Request::builder()
                 .uri(url.as_str())
@@ -228,8 +234,9 @@ impl WebSocketSync {
             .context("Failed to connect to WebSocket")?;
 
         Ok(websocket)
-    }
+}
 
+impl WebSocketSync {
     /// Disconnect from WebSocket
     pub async fn disconnect(&mut self) -> Result<()> {
         if let Some(shutdown_tx) = self.shutdown_tx.take() {
