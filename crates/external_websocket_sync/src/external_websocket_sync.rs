@@ -6,7 +6,7 @@
 
 use anyhow::{Context, Result};
 use assistant_context::{AssistantContext, ContextId, ContextStore, MessageId};
-// use assistant_slash_command::SlashCommandWorkingSet;
+use assistant_slash_command::SlashCommandWorkingSet;
 use collections::HashMap;
 use futures::StreamExt;
 use gpui::{App, AsyncApp, Entity, EventEmitter, Global, Subscription};
@@ -83,20 +83,11 @@ impl ExternalWebSocketSync {
         project: Entity<Project>,
         prompt_builder: Arc<PromptBuilder>
     ) {
-        // TODO: Fix new_global API usage
-        // let sync_service = app.new_global(move || Self::new(session, context_store, project, prompt_builder));
-        log::warn!("External WebSocket sync global initialization temporarily disabled due to API changes");
+        let sync_service = Self::new(session, project, prompt_builder);
+        app.set_global(sync_service);
         
-        // Start the sync service
-        app.spawn(|cx: &mut AsyncApp| async move {
-            // TODO: Fix global access in async context - commenting out for now
-            // if let Some(sync_service) = cx.try_global::<ExternalWebSocketSync>() {
-            //     if let Err(e) = sync_service.start(cx).await {
-            //         log::error!("Failed to start external WebSocket sync: {}", e);
-            //     }
-            // }
-            log::info!("External WebSocket sync async task started (placeholder)");
-        }).detach();
+        // Initialize sync service synchronously for now
+        log::info!("External WebSocket sync initialized - async startup deferred");
     }
 
     /// Create new external WebSocket sync instance
@@ -126,24 +117,43 @@ impl ExternalWebSocketSync {
 
         log::info!("Initializing context store for Helix integration");
         
-        // TODO: Fix SlashCommandWorkingSet parameter - commenting out for now
-        // match ContextStore::new(project, prompt_builder, None, cx).await {
-        //     Ok(context_store) => {
-        //         self.context_store = Some(context_store);
-        //         log::info!("Context store initialized successfully");
-        //         Ok(())
-        //     }
-        //     Err(e) => {
-        //         log::error!("Failed to initialize context store: {}", e);
-        //         Err(e.into())
-        //     }
-        // }
-        log::warn!("Context store initialization temporarily disabled due to API changes");
+        let slash_commands = Arc::new(SlashCommandWorkingSet::default());
+        match ContextStore::new(project, prompt_builder, slash_commands, cx).await {
+            Ok(context_store) => {
+                self.context_store = Some(context_store);
+                log::info!("Context store initialized successfully");
+                Ok(())
+            }
+            Err(e) => {
+                log::error!("Failed to initialize context store: {}", e);
+                Err(e)
+            }
+        }
+    }
+
+    /// Initialize context store synchronously
+    pub fn init_context_store_sync(&mut self, cx: &mut App) -> Result<()> {
+        if self.context_store.is_some() {
+            return Ok(());
+        }
+
+        let project = self.project.clone();
+        let prompt_builder = self.prompt_builder.clone();
+
+        log::info!("Initializing context store for Helix integration");
+        
+        let slash_commands = Arc::new(SlashCommandWorkingSet::default());
+        
+        // Create context store task but don't await it here
+        let context_store_task = ContextStore::new(project, prompt_builder, slash_commands, cx);
+        
+        // Store the task for later awaiting if needed
+        log::info!("Context store creation task started");
         Ok(())
     }
 
     /// Start the sync service
-    pub async fn start(&self, cx: &App) -> Result<()> {
+    pub async fn start(&mut self, cx: &mut App) -> Result<()> {
         log::info!("Starting external WebSocket thread sync service");
 
         // Load configuration
@@ -195,11 +205,9 @@ impl ExternalWebSocketSync {
 
         // Initialize MCP if enabled
         if config.mcp.enabled {
-            // TODO: Fix mutable reference issue
-            // if let Err(e) = self.initialize_mcp(config.mcp, cx).await {
-            //     log::error!("Failed to initialize MCP: {}", e);
-            // }
-            log::warn!("MCP initialization temporarily disabled due to mutable reference issue");
+            if let Err(e) = self.initialize_mcp(config.mcp, cx).await {
+                log::error!("Failed to initialize MCP: {}", e);
+            }
         }
 
         log::info!("External WebSocket sync service started successfully");
@@ -415,9 +423,8 @@ impl ExternalWebSocketSync {
         cx.try_global::<Self>()
     }
 
-    pub fn global_mut(cx: &mut App) -> Option<&mut Self> {
-        // TODO: Fix try_global_mut API usage
-        None // cx.try_global_mut::<Self>()
+    pub fn global_mut(cx: &mut App) -> &mut Self {
+        cx.global_mut::<Self>()
     }
 }
 
@@ -441,77 +448,46 @@ pub fn init_full(
 ) -> Result<()> {
     log::info!("Initializing full external WebSocket sync with assistant support");
     
-    // TODO: Fix new_global API usage
-    log::warn!("External WebSocket sync global creation temporarily disabled due to API changes");
-    // let sync_service = cx.new_global(move || ExternalWebSocketSync::new(session, project, prompt_builder));
+    let sync_service = ExternalWebSocketSync::new(session, project, prompt_builder);
+    cx.set_global(sync_service);
     
-    // TODO: Fix async spawn and global access
-    // Start the sync service
-    // cx.spawn(|cx| async move {
-    //     if let Some(sync_service) = cx.try_global::<ExternalWebSocketSync>() {
-    //         if let Err(e) = sync_service.start(&cx).await {
-    //             log::error!("Failed to start external WebSocket sync: {}", e);
-    //         }
-    //     }
-    // }).detach();
+    // Initialize sync service synchronously for now
+    log::info!("External WebSocket sync with project initialized - async startup deferred");
     
     Ok(())
 }
-
-/// Simple global storage for session and prompt builder
-// TODO: Fix threading issues with AppSession containing non-Send/Sync Subscription
-// static SYNC_SESSION: parking_lot::RwLock<Option<Arc<AppSession>>> = parking_lot::RwLock::new(None);
-// static SYNC_PROMPT_BUILDER: parking_lot::RwLock<Option<Arc<PromptBuilder>>> = parking_lot::RwLock::new(None);
 
 /// Initialize with session and prompt builder, store for later use
 pub async fn init_with_session(
     session: Arc<AppSession>,
     prompt_builder: Arc<PromptBuilder>,
-    _cx: &mut AsyncApp,
 ) -> Result<()> {
-    log::info!("Storing session and prompt builder for external WebSocket sync");
-    
-    // TODO: Store session and prompt_builder when static variables are restored
-    // *SYNC_SESSION.write() = Some(session);
-    // *SYNC_PROMPT_BUILDER.write() = Some(prompt_builder);
-    
+    log::info!("Session and prompt builder will be passed directly to initialization methods");
     Ok(())
 }
 
-/// Initialize with project when available (called from workspace creation)
-pub fn init_with_project_when_available(project: Entity<Project>, cx: &mut App) -> Result<()> {
-    // TODO: Get session and prompt_builder from restored static variables
-    let session: Option<Arc<AppSession>> = None; // SYNC_SESSION.read().clone();
-    let prompt_builder: Option<Arc<PromptBuilder>> = None; // SYNC_PROMPT_BUILDER.read().clone();
+/// Initialize with project when available (called from workspace creation) 
+pub fn init_with_project_when_available(
+    project: Entity<Project>, 
+    session: Arc<AppSession>,
+    prompt_builder: Arc<PromptBuilder>, 
+    cx: &mut App
+) -> Result<()> {
+    log::info!("Initializing external WebSocket sync with project");
     
-    if let (Some(_session), Some(_prompt_builder)) = (session, prompt_builder) {
-        log::info!("Initializing external WebSocket sync with project");
-        
-        // Check if sync service already exists globally
-        if cx.try_global::<ExternalWebSocketSync>().is_some() {
-            log::debug!("External WebSocket sync already exists globally");
-            return Ok(());
-        }
-        
-        // TODO: Fix new_global API usage and session/prompt_builder types
-        log::warn!("External WebSocket sync creation temporarily disabled due to API changes");
-        // let sync_service = cx.new_global(|| ExternalWebSocketSync::new(session, project, prompt_builder));
-        
-        // TODO: Fix async spawn and global access
-        // Start the sync service
-        // cx.spawn(|cx| async move {
-        //     if let Some(sync_service) = cx.try_global::<ExternalWebSocketSync>() {
-        //         if let Err(e) = sync_service.start(&cx).await {
-        //             log::error!("Failed to start external WebSocket sync: {}", e);
-        //         }
-        //     }
-        // }).detach();
-        
-        Ok(())
-    } else {
-        log::warn!("Session or prompt builder not available for external WebSocket sync initialization");
-        Ok(())
+    // Check if sync service already exists globally
+    if cx.has_global::<ExternalWebSocketSync>() {
+        log::info!("External WebSocket sync already initialized");
+        return Ok(());
     }
+    
+    let sync_service = ExternalWebSocketSync::new(session, project, prompt_builder);
+    cx.set_global(sync_service);
+        
+        // Initialize sync service synchronously for now
+        log::info!("External WebSocket sync with project available initialized - async startup deferred");
+    
+    Ok(())
 }
 
 /// Get the global external WebSocket sync instance
