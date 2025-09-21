@@ -266,7 +266,7 @@ impl WebSocketSync {
     }
 
     /// Handle incoming message from Helix
-    async fn handle_incoming_message(
+    pub async fn handle_incoming_message(
         session_id: &str, 
         text: String, 
         command_sender: &mpsc::UnboundedSender<HelixCommand>,
@@ -421,7 +421,7 @@ impl WebSocketSync {
     }
 
     /// Convert SyncEvent to event type string
-    fn event_type_string(event: &SyncEvent) -> String {
+    pub fn event_type_string(event: &SyncEvent) -> String {
         match event {
             SyncEvent::ContextCreated { .. } => "context_created".to_string(),
             SyncEvent::ContextDeleted { .. } => "context_deleted".to_string(),
@@ -437,7 +437,7 @@ impl WebSocketSync {
     }
 
     /// Convert SyncEvent to data HashMap
-    fn event_to_data(event: SyncEvent) -> HashMap<String, serde_json::Value> {
+    pub fn event_to_data(event: SyncEvent) -> HashMap<String, serde_json::Value> {
         let mut data = HashMap::new();
 
         match event {
