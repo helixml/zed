@@ -70,7 +70,7 @@ impl WebSocketSync {
         let is_connected = Arc::new(RwLock::new(false));
         let (shutdown_tx, shutdown_rx) = oneshot::channel();
 
-        let sync = Self {
+        let mut sync = Self {
             config: config.clone(),
             event_sender,
             command_receiver: Arc::new(RwLock::new(Some(command_receiver))),
@@ -126,10 +126,6 @@ impl WebSocketSync {
 
             let (mut sink, mut stream) = websocket.split();
 
-            // Clone session_id for use in both closures
-            let session_id_for_outgoing = config.session_id.clone();
-            let session_id_for_incoming = config.session_id.clone();
-
             // Handle outgoing events
             let event_task = {
                 let is_connected = is_connected.clone();
@@ -140,7 +136,7 @@ impl WebSocketSync {
                         }
 
                         let sync_message = SyncMessage {
-                            session_id: session_id_for_outgoing.clone(),
+                            session_id: config.session_id.clone(),
                             event_type: Self::event_type_string(&event),
                             data: Self::event_to_data(event),
                             timestamp: chrono::Utc::now(),
@@ -154,7 +150,7 @@ impl WebSocketSync {
                             }
                         };
 
-                        if let Err(e) = sink.send(Message::Text(message_text.into())).await {
+                        if let Err(e) = sink.send(Message::Text(message_text)).await {
                             log::error!("Failed to send WebSocket message: {}", e);
                             break;
                         }
@@ -165,12 +161,12 @@ impl WebSocketSync {
             // Handle incoming messages
             let incoming_task = {
                 let command_sender = command_sender.clone();
-                let event_sender = self.event_sender.clone();
+                let session_id = config.session_id.clone();
                 tokio::spawn(async move {
                     while let Some(message) = stream.next().await {
                         match message {
                             Ok(Message::Text(text)) => {
-                                if let Err(e) = Self::handle_incoming_message(&session_id_for_incoming, text.to_string(), &command_sender, &event_sender).await {
+                                if let Err(e) = Self::handle_incoming_message(&session_id, text, &command_sender).await {
                                     log::error!("Failed to handle incoming message: {}", e);
                                 }
                             }
@@ -262,8 +258,7 @@ impl WebSocketSync {
     async fn handle_incoming_message(
         session_id: &str, 
         text: String, 
-        command_sender: &mpsc::UnboundedSender<HelixCommand>,
-        event_sender: &mpsc::UnboundedSender<SyncEvent>
+        command_sender: &mpsc::UnboundedSender<HelixCommand>
     ) -> Result<()> {
         let command: HelixCommand = serde_json::from_str(&text)
             .context("Failed to parse command from Helix")?;
@@ -287,9 +282,6 @@ impl WebSocketSync {
             }
             "update_context" => {
                 Self::handle_update_context_command(session_id, command.data).await?;
-            }
-            "chat_message" => {
-                Self::handle_chat_message_command(session_id, command.data, event_sender).await?;
             }
             _ => {
                 log::warn!("Unknown command type: {}", command.command_type);
@@ -324,7 +316,7 @@ impl WebSocketSync {
         );
 
         // TODO: Actually add the message to the Zed assistant context
-        // This would require access to the ExternalWebSocketSync instance
+        // This would require access to the HelixIntegration instance
         // and the assistant context store
 
         Ok(())
@@ -351,59 +343,6 @@ impl WebSocketSync {
     }
 
     /// Handle update_context command from Helix
-    /// Handle chat_message command from Helix - this includes a request_id and expects a response
-    async fn handle_chat_message_command(
-        session_id: &str,
-        data: HashMap<String, serde_json::Value>,
-        event_sender: &mpsc::UnboundedSender<SyncEvent>,
-    ) -> Result<()> {
-        let request_id = data.get("request_id")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| anyhow::anyhow!("Missing request_id in chat_message command"))?;
-
-        let message = data.get("message")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| anyhow::anyhow!("Missing message in chat_message command"))?;
-
-        let role = data.get("role")
-            .and_then(|v| v.as_str())
-            .unwrap_or("user");
-
-        log::info!(
-            "Received chat message from Helix session {}: {} (role: {}, request_id: {})",
-            session_id,
-            message,
-            role,
-            request_id
-        );
-
-        // TODO: Actually process the chat message through Zed agent
-        // This would require:
-        // 1. Finding or creating a context/thread for this session
-        // 2. Adding the message to the context
-        // 3. Triggering the AI agent to generate a response
-        // 4. Sending the response back to Helix via WebSocket
-
-        // For now, send a placeholder response
-        // In a real implementation, this would be the AI agent response
-        let response_content = format!("Echo from Zed: {}", message);
-        
-        // Send response back to Helix
-        let chat_response = SyncEvent::ChatResponse {
-            request_id: request_id.to_string(),
-            content: response_content.clone(),
-        };
-        
-        if let Err(e) = event_sender.send(chat_response) {
-            log::error!("Failed to send chat response: {}", e);
-            return Err(anyhow::anyhow!("Failed to send chat response: {}", e));
-        }
-        
-        log::info!("Sent response to request {} with: {}", request_id, response_content);
-
-        Ok(())
-    }
-
     async fn handle_update_context_command(
         _session_id: &str,
         data: HashMap<String, serde_json::Value>,
@@ -422,10 +361,6 @@ impl WebSocketSync {
             SyncEvent::MessageUpdated { .. } => "message_updated".to_string(),
             SyncEvent::MessageDeleted { .. } => "message_deleted".to_string(),
             SyncEvent::ContextTitleChanged { .. } => "context_title_changed".to_string(),
-            SyncEvent::ChatResponse { .. } => "chat_response".to_string(),
-            SyncEvent::ChatResponseChunk { .. } => "chat_response_chunk".to_string(),
-            SyncEvent::ChatResponseDone { .. } => "chat_response_done".to_string(),
-            SyncEvent::ChatResponseError { .. } => "chat_response_error".to_string(),
         }
     }
 
@@ -455,21 +390,6 @@ impl WebSocketSync {
             SyncEvent::ContextTitleChanged { context_id, new_title } => {
                 data.insert("context_id".to_string(), serde_json::Value::String(context_id));
                 data.insert("new_title".to_string(), serde_json::Value::String(new_title));
-            }
-            SyncEvent::ChatResponse { request_id, content } => {
-                data.insert("request_id".to_string(), serde_json::Value::String(request_id));
-                data.insert("content".to_string(), serde_json::Value::String(content));
-            }
-            SyncEvent::ChatResponseChunk { request_id, chunk } => {
-                data.insert("request_id".to_string(), serde_json::Value::String(request_id));
-                data.insert("chunk".to_string(), serde_json::Value::String(chunk));
-            }
-            SyncEvent::ChatResponseDone { request_id } => {
-                data.insert("request_id".to_string(), serde_json::Value::String(request_id));
-            }
-            SyncEvent::ChatResponseError { request_id, error } => {
-                data.insert("request_id".to_string(), serde_json::Value::String(request_id));
-                data.insert("error".to_string(), serde_json::Value::String(error));
             }
         }
 

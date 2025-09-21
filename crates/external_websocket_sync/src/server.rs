@@ -2,17 +2,17 @@
 
 use anyhow::{Context, Result};
 use axum::{
-    extract::{Path, Query, State, WebSocketUpgrade},
+    extract::{Path, State, WebSocketUpgrade},
     http::StatusCode,
-    response::{IntoResponse, Json},
-    routing::{delete, get, post, put},
+    response::Json,
+    routing::{delete, get, post},
     Router,
 };
 use axum::extract::ws::{Message, WebSocket};
 use axum::response::Response;
 use collections::HashMap;
 use futures::{SinkExt, StreamExt};
-use gpui::{AppContext, WeakEntity};
+use gpui::App;
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -27,11 +27,7 @@ use uuid::Uuid;
 
 use crate::{
     types::*,
-    sync::SyncClient,
-    HelixIntegration,
-    HelixSettings,
-    get_global_integration,
-    with_integration,
+    ExternalWebSocketSync,
 };
 
 /// Server configuration
@@ -82,11 +78,11 @@ struct WebSocketClient {
     sender: tokio::sync::mpsc::UnboundedSender<Message>,
 }
 
-impl HelixIntegration {
+impl ExternalWebSocketSync {
     /// Start the HTTP server
     pub async fn start_server(
         config: ServerConfig,
-        cx: &AppContext,
+        cx: &App,
     ) -> Result<ServerHandle> {
         let addr: SocketAddr = format!("{}:{}", config.host, config.port)
             .parse()

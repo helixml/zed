@@ -137,6 +137,21 @@ pub enum SyncEvent {
         context_id: String,
         new_title: String,
     },
+    ChatResponse {
+        request_id: String,
+        content: String,
+    },
+    ChatResponseChunk {
+        request_id: String,
+        chunk: String,
+    },
+    ChatResponseDone {
+        request_id: String,
+    },
+    ChatResponseError {
+        request_id: String,
+        error: String,
+    },
 }
 
 /// Sync event with timestamp

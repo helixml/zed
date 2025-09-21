@@ -3,7 +3,7 @@
 use anyhow::{Context, Result};
 use collections::HashMap;
 use futures::{SinkExt, StreamExt};
-use gpui::{AppContext, Task};
+use gpui::{App, Task};
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 use std::{process::Stdio, sync::Arc};
@@ -13,7 +13,7 @@ use uuid::Uuid;
 
 use crate::{
     types::*,
-    HelixIntegration,
+    ExternalWebSocketSync,
 };
 
 /// MCP server manager
@@ -84,7 +84,7 @@ impl McpManager {
     }
 
     /// Initialize MCP servers based on configuration
-    pub async fn initialize(&mut self, config: McpConfig, cx: &mut AppContext) -> Result<()> {
+    pub async fn initialize(&mut self, config: McpConfig, cx: &mut App) -> Result<()> {
         if !config.enabled {
             log::info!("MCP integration is disabled");
             return Ok(());
@@ -100,7 +100,7 @@ impl McpManager {
     }
 
     /// Start an MCP server
-    async fn start_server(&mut self, config: McpServerConfig, cx: &mut AppContext) -> Result<()> {
+    async fn start_server(&mut self, config: McpServerConfig, cx: &mut App) -> Result<()> {
         log::info!("Starting MCP server: {}", config.name);
 
         let server_name = config.name.clone();
@@ -405,9 +405,9 @@ impl McpManager {
     }
 }
 
-impl HelixIntegration {
+impl ExternalWebSocketSync {
     /// Initialize MCP integration
-    pub async fn initialize_mcp(&mut self, config: McpConfig, cx: &mut AppContext) -> Result<()> {
+    pub async fn initialize_mcp(&mut self, config: McpConfig, cx: &mut App) -> Result<()> {
         if !config.enabled {
             return Ok(());
         }

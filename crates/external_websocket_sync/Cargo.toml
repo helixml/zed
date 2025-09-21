@@ -40,7 +40,7 @@ serde_json.workspace = true
 session.workspace = true
 settings.workspace = true
 schemars.workspace = true
-settings_ui_macros.workspace = true
+ui.workspace = true
 smol.workspace = true
 telemetry_events.workspace = true
 tokio = { version = "1.0", features = ["full"] }
@@ -48,7 +48,6 @@ tokio-tungstenite = "0.26"
 tower = { version = "0.4", optional = true }
 tower-http = { version = "0.5", features = ["fs", "trace", "cors"], optional = true }
 tungstenite = "0.26"
-ui.workspace = true
 url.workspace = true
 util.workspace = true
 uuid.workspace = true

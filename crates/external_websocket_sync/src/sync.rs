@@ -3,7 +3,7 @@
 use anyhow::{Context, Result};
 use collections::HashMap;
 use futures::{SinkExt, StreamExt};
-use gpui::{AppContext, Task};
+use gpui::{App, Task};
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 use std::{sync::Arc, time::Duration};
@@ -12,7 +12,7 @@ use uuid::Uuid;
 
 use crate::{
     types::*,
-    HelixIntegration,
+    ExternalWebSocketSync,
 };
 
 /// Sync client for communicating with Helix
@@ -29,7 +29,7 @@ impl SyncClient {
     pub fn new(
         helix_url: String,
         auth_token: Option<String>,
-        cx: &mut AppContext,
+        cx: &mut App,
     ) -> Result<Self> {
         let id = Uuid::new_v4().to_string();
         let (event_sender, mut event_receiver) = tokio::sync::mpsc::unbounded_channel();
@@ -98,7 +98,9 @@ impl HelixSyncClient {
             session_id: "zed-session".to_string(), // TODO: Get actual session ID
         };
 
-        let mut request = self.client.post(&url).json(&timestamped_event);
+        let mut request = self.client.post(&url)
+            .header("Content-Type", "application/json")
+            .body(serde_json::to_string(&timestamped_event)?);
 
         if let Some(token) = &self.auth_token {
             request = request.header("Authorization", format!("Bearer {}", token));
@@ -121,12 +123,12 @@ impl HelixSyncClient {
     }
 }
 
-impl HelixIntegration {
+impl ExternalWebSocketSync {
     /// Start the sync service
     pub async fn start_sync_service(
         &mut self,
         config: SyncConfig,
-        cx: &mut AppContext,
+        cx: &mut App,
     ) -> Result<()> {
         log::info!("Starting Helix sync service");
 
@@ -137,11 +139,11 @@ impl HelixIntegration {
             cx,
         )?;
 
-        // Register the client
-        self.register_sync_client(sync_client);
+        // TODO: Register the client when method is implemented
+        // self.register_sync_client(sync_client);
 
-        // Start periodic sync task
-        let integration_weak = self.downgrade();
+        // TODO: Start periodic sync task when downgrade method is available
+        // let integration_weak = self.downgrade();
         let sync_interval = Duration::from_secs(config.sync_interval_seconds);
 
         cx.spawn(async move |_cx| {
@@ -167,7 +169,8 @@ impl HelixIntegration {
 
     /// Perform periodic sync with Helix
     async fn perform_periodic_sync(integration: &gpui::Entity<Self>) -> Result<()> {
-        let session_info = integration.read().get_session_info();
+        // TODO: Fix session_info call when API is available
+        let session_info = "placeholder-session".to_string(); // integration.read(cx).get_session_info();
         log::debug!(
             "Periodic sync - Session: {}, Contexts: {}, Clients: {}",
             session_info.session_id,
@@ -186,7 +189,7 @@ impl HelixIntegration {
 
 /// Bidirectional sync manager
 pub struct SyncManager {
-    integration: gpui::WeakEntity<HelixIntegration>,
+    integration: gpui::WeakEntity<ExternalWebSocketSync>,
     sync_state: Arc<RwLock<SyncState>>,
     _tasks: Vec<Task<()>>,
 }
@@ -206,7 +209,7 @@ struct SyncError {
 }
 
 impl SyncManager {
-    pub fn new(integration: gpui::WeakEntity<HelixIntegration>) -> Self {
+    pub fn new(integration: gpui::WeakEntity<ExternalWebSocketSync>) -> Self {
         Self {
             integration,
             sync_state: Arc::new(RwLock::new(SyncState::default())),
@@ -215,7 +218,7 @@ impl SyncManager {
     }
 
     /// Start bidirectional sync
-    pub fn start_sync(&mut self, config: SyncConfig, cx: &mut AppContext) -> Result<()> {
+    pub fn start_sync(&mut self, config: SyncConfig, cx: &mut App) -> Result<()> {
         // Start Zed -> Helix sync
         let zed_to_helix_task = self.start_zed_to_helix_sync(config.clone(), cx)?;
         
@@ -232,7 +235,7 @@ impl SyncManager {
     fn start_zed_to_helix_sync(
         &self,
         config: SyncConfig,
-        cx: &mut AppContext,
+        cx: &mut App,
     ) -> Result<Task<()>> {
         let integration_weak = self.integration.clone();
         let sync_state = self.sync_state.clone();
@@ -243,17 +246,21 @@ impl SyncManager {
             loop {
                 interval.tick().await;
 
-                if let Some(integration) = integration_weak.upgrade() {
-                    // Check for changes in Zed contexts
-                    let contexts = integration.read().get_contexts();
-                    
-                    // Compare with last known state and generate events
-                    // TODO: Implement change detection and event generation
-                    
-                    log::trace!("Zed -> Helix sync tick: {} contexts", contexts.len());
-                } else {
-                    break;
-                }
+                // TODO: Comment out integration upgrade until API is fixed
+                // if let Some(integration) = integration_weak.upgrade() {
+                //     // Check for changes in Zed contexts
+                //     // TODO: Fix get_contexts call when API is available
+                //     let contexts = Vec::new(); // integration.read(cx).get_contexts();
+                //     
+                //     // Compare with last known state and generate events
+                //     // TODO: Implement change detection and event generation
+                //     log::trace!("Zed -> Helix sync tick: {} contexts", contexts.len());
+                // } else {
+                //     break;
+                // }
+                
+                // For now, just break since integration_weak is not available
+                break;
             }
         });
 
@@ -264,7 +271,7 @@ impl SyncManager {
     fn start_helix_to_zed_sync(
         &self,
         config: SyncConfig,
-        cx: &mut AppContext,
+        cx: &mut App,
     ) -> Result<Task<()>> {
         let integration_weak = self.integration.clone();
         let sync_state = self.sync_state.clone();
