@@ -203,9 +203,38 @@ impl Default for ServerSettings {
 
 impl Settings for ExternalSyncSettings {
     fn from_settings(_content: &settings::SettingsContent, _cx: &mut App) -> Self {
-        // For now, return default values since external_websocket_sync
-        // isn't yet added to SettingsContent schema
-        Self::default()
+        // Load settings from environment variables for containerized deployments
+        let enabled = std::env::var("ZED_EXTERNAL_SYNC_ENABLED")
+            .map(|v| v.parse().unwrap_or(false))
+            .unwrap_or(false);
+            
+        let websocket_enabled = std::env::var("ZED_WEBSOCKET_SYNC_ENABLED")
+            .map(|v| v.parse().unwrap_or(false))
+            .unwrap_or(enabled); // Default to same as external sync
+            
+        let external_url = std::env::var("ZED_HELIX_URL")
+            .unwrap_or_else(|_| "localhost:8080".to_string());
+            
+        let auth_token = std::env::var("ZED_HELIX_TOKEN").ok();
+        
+        let use_tls = std::env::var("ZED_HELIX_TLS")
+            .map(|v| v.parse().unwrap_or(false))
+            .unwrap_or(false);
+
+        Self {
+            enabled,
+            websocket_sync: WebSocketSyncSettings {
+                enabled: websocket_enabled,
+                external_url,
+                auth_token,
+                use_tls,
+                auto_reconnect: true,
+                reconnect_delay_seconds: 5,
+                max_reconnect_attempts: 10,
+            },
+            mcp: McpSettings::default(),
+            server: ServerSettings::default(),
+        }
     }
 }
 

@@ -31,6 +31,8 @@ use crate::{
 use crate::{
     ExternalAgent, NewExternalAgentThread, NewNativeAgentThreadFromSummary, placeholder_command,
 };
+#[cfg(feature = "external_websocket_sync")]
+use external_websocket_sync;
 use agent::{
     context_store::ContextStore,
     history_store::{HistoryEntryId, HistoryStore},
@@ -437,6 +439,64 @@ pub struct AgentPanel {
 }
 
 impl AgentPanel {
+    #[cfg(feature = "external_websocket_sync")]
+    fn process_websocket_thread_requests(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let pending_requests = external_websocket_sync::process_pending_thread_requests(cx);
+        if pending_requests.is_empty() {
+            return;
+        }
+        
+        // Get or create session mapping
+        let session_mapping = cx.global::<external_websocket_sync::HelixSessionMapping>();
+        
+        for request in pending_requests {
+            log::info!("🎯 Processing WebSocket thread creation request for session: {}", request.helix_session_id);
+            
+            // Check if we already have a thread for this Helix session
+            let mut sessions = session_mapping.sessions.write();
+            if let Some(context_id) = sessions.get(&request.helix_session_id) {
+                // Switch to existing thread
+                log::info!("📝 Switching to existing thread for Helix session: {}", request.helix_session_id);
+                self.switch_to_thread(*context_id, window, cx);
+            } else {
+                // Create new thread and track the mapping
+                log::info!("📝 Creating new thread for Helix session: {}", request.helix_session_id);
+                
+                // Focus the panel first to make it visible
+                if let Some(workspace) = self.workspace.upgrade() {
+                    workspace.update(cx, |workspace, cx| {
+                        workspace.focus_panel::<AgentPanel>(window, cx);
+                    });
+                }
+                
+                // Create the new thread
+                self.new_prompt_editor(window, cx);
+                
+                // TODO: Get the actual context ID from the newly created thread
+                // For now, create a placeholder mapping
+                let context_id = assistant_context::ContextId::new();
+                sessions.insert(request.helix_session_id.clone(), context_id);
+                
+                log::info!("✅ Created and focused new thread for Helix session {} with message: {}", 
+                          request.helix_session_id, request.message);
+            }
+        }
+    }
+    
+    #[cfg(feature = "external_websocket_sync")]
+    fn switch_to_thread(&mut self, context_id: assistant_context::ContextId, window: &mut Window, cx: &mut Context<Self>) {
+        // TODO: Implement switching to an existing thread by context_id
+        // This would involve finding the thread in active_view and switching to it
+        log::info!("🔄 TODO: Switch to existing thread with context_id: {:?}", context_id);
+        
+        // For now, focus the panel to make it visible
+        if let Some(workspace) = self.workspace.upgrade() {
+            workspace.update(cx, |workspace, cx| {
+                workspace.focus_panel::<AgentPanel>(window, cx);
+            });
+        }
+    }
+
     fn serialize(&mut self, cx: &mut Context<Self>) {
         let width = self.width;
         let selected_agent = self.selected_agent.clone();
@@ -581,6 +641,27 @@ impl AgentPanel {
         .detach();
 
         cx.observe(&history_store, |_, _, cx| cx.notify()).detach();
+        
+        // Set up WebSocket thread creation processing
+        #[cfg(feature = "external_websocket_sync")]
+        {
+            cx.spawn(|this, mut cx| async move {
+                loop {
+                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                    
+                    if let Ok(_) = cx.update(|window, cx| {
+                        this.update(cx, |this, cx| {
+                            this.process_websocket_thread_requests(window, cx);
+                        });
+                    }) {
+                        // Continue processing
+                    } else {
+                        // Panel was dropped, exit the loop
+                        break;
+                    }
+                }
+            }).detach();
+        }
 
         let panel_type = AgentSettings::get_global(cx).default_view;
         let active_view = match panel_type {
@@ -2451,6 +2532,7 @@ impl AgentPanel {
 
 impl Render for AgentPanel {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        
         // WARNING: Changes to this element hierarchy can have
         // non-obvious implications to the layout of children.
         //

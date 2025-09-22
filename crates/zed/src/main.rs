@@ -569,19 +569,8 @@ pub fn main() {
         #[cfg(feature = "external_websocket_sync")]
         external_websocket_sync::init(cx);
         
-        // Initialize external WebSocket sync with session and prompt builder
+        // TODO: Initialize external WebSocket sync with session and prompt builder when needed
         // Note: Full initialization with project will happen when workspaces are opened
-        cx.spawn({
-            let app_session = app_state.session.clone();
-            let prompt_builder = prompt_builder.clone();
-            async move |cx| {
-                // Store the session and prompt builder for later project-based initialization
-                #[cfg(feature = "external_websocket_sync")]
-                if let Err(e) = external_websocket_sync::init_with_session(app_session, prompt_builder, cx) {
-                    log::error!("Failed to initialize external WebSocket sync with session: {}", e);
-                }
-            }
-        }).detach();
         
         repl::init(app_state.fs.clone(), cx);
         extension_host::init(

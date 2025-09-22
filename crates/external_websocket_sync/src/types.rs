@@ -152,6 +152,12 @@ pub enum SyncEvent {
         request_id: String,
         error: String,
     },
+    /// Request to create a new assistant thread from a Helix session
+    CreateThreadFromHelixSession {
+        helix_session_id: String,
+        message: String,
+        request_id: String,
+    },
 }
 
 /// Sync event with timestamp

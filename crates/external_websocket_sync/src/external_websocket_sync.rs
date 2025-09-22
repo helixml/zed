@@ -5,11 +5,13 @@
 //! and integration with AI platforms and other external tools.
 
 use anyhow::{Context, Result};
+use util::ResultExt;
 use assistant_context::{AssistantContext, ContextId, ContextStore, MessageId};
 use assistant_slash_command::SlashCommandWorkingSet;
 use collections::HashMap;
 use futures::StreamExt;
 use gpui::{App, AsyncApp, Entity, EventEmitter, Global, Subscription};
+use tokio::sync::mpsc;
 
 use language_model;
 use parking_lot::RwLock;
@@ -39,6 +41,52 @@ mod server;
 pub use server::*;
 
 pub use websocket_sync::*;
+
+/// Request to create a thread from Helix session
+#[derive(Clone, Debug)]
+pub struct CreateThreadRequest {
+    pub helix_session_id: String,
+    pub message: String,
+    pub request_id: String,
+}
+
+/// Global mapping of Helix session IDs to Zed context IDs
+#[derive(Clone, Default)]
+pub struct HelixSessionMapping {
+    pub sessions: Arc<RwLock<std::collections::HashMap<String, assistant_context::ContextId>>>,
+}
+
+impl Global for HelixSessionMapping {}
+
+/// Global channel for thread creation requests from WebSocket to UI
+#[derive(Clone)]
+pub struct ThreadCreationChannel {
+    pub sender: mpsc::UnboundedSender<CreateThreadRequest>,
+}
+
+impl Global for ThreadCreationChannel {}
+
+/// Global queue for pending thread creation requests that the UI can poll
+#[derive(Clone, Default)]
+pub struct PendingThreadRequests {
+    pub requests: Arc<RwLock<Vec<CreateThreadRequest>>>,
+}
+
+impl Global for PendingThreadRequests {}
+
+/// Process pending thread creation requests from the global queue
+pub fn process_pending_thread_requests(cx: &mut App) -> Vec<CreateThreadRequest> {
+    if let Some(pending) = cx.try_global::<PendingThreadRequests>() {
+        let mut requests = pending.requests.write();
+        let processed: Vec<CreateThreadRequest> = requests.drain(..).collect();
+        if !processed.is_empty() {
+            log::info!("🎯 Processing {} pending thread creation requests", processed.len());
+        }
+        processed
+    } else {
+        Vec::new()
+    }
+}
 
 /// Type alias for compatibility with existing code
 pub type HelixIntegration = ExternalWebSocketSync;
@@ -192,7 +240,7 @@ impl ExternalWebSocketSync {
 
         // Start WebSocket sync if enabled
         if config.websocket_sync.enabled {
-            match WebSocketSync::new(config.websocket_sync.clone()).await {
+            match WebSocketSync::new(config.websocket_sync.clone(), None).await {
                 Ok(_websocket_sync) => {
                     log::info!("WebSocket sync initialized successfully");
                     // TODO: Store websocket_sync in a thread-safe way
@@ -432,12 +480,121 @@ impl ExternalWebSocketSync {
 pub fn init(cx: &mut App) {
     log::info!("Initializing external WebSocket sync module");
     
-    // Initialize settings
-    settings::init(cx);
+    // Initialize our settings (don't call settings::init again as it's already called in main)
+    sync_settings::init(cx);
     
-    // Log that the module is ready
-    log::info!("External WebSocket sync module ready, waiting for assistant context initialization");
+    // Create global channel for thread creation requests
+    let (thread_creation_sender, mut thread_creation_receiver) = mpsc::unbounded_channel();
+    cx.set_global(ThreadCreationChannel {
+        sender: thread_creation_sender.clone(),
+    });
+    
+    // Create global queue for pending thread creation requests
+    let pending_requests = PendingThreadRequests::default();
+    let pending_requests_clone = pending_requests.clone();
+    cx.set_global(pending_requests);
+    
+    // Create global session mapping
+    cx.set_global(HelixSessionMapping::default());
+    
+    // Spawn background task to listen for thread creation requests
+    std::thread::spawn(move || {
+        let rt = tokio::runtime::Runtime::new().expect("Failed to create tokio runtime");
+        rt.block_on(async move {
+            while let Some(request) = thread_creation_receiver.recv().await {
+                log::info!("🎯 Received thread creation request from WebSocket: {:?}", request);
+                
+                // Add request to global pending queue for UI to process
+                {
+                    let mut requests = pending_requests_clone.requests.write();
+                    requests.push(request.clone());
+                    log::info!("✅ Added thread creation request to global queue for session {}", request.helix_session_id);
+                }
+            }
+        });
+    });
+    
+    // Check if WebSocket sync is enabled via environment variables
+    let enabled = std::env::var("ZED_EXTERNAL_SYNC_ENABLED")
+        .map(|v| v.parse().unwrap_or(false))
+        .unwrap_or(false);
+        
+    let websocket_enabled = std::env::var("ZED_WEBSOCKET_SYNC_ENABLED")
+        .map(|v| v.parse().unwrap_or(false))
+        .unwrap_or(enabled);
+        
+    if enabled && websocket_enabled {
+        log::info!("External WebSocket sync is enabled - attempting to start WebSocket connection");
+        
+        // Start WebSocket sync in a background task
+        let helix_url = std::env::var("ZED_HELIX_URL")
+            .unwrap_or_else(|_| "localhost:8080".to_string());
+        let auth_token = std::env::var("ZED_HELIX_TOKEN")
+            .unwrap_or_else(|_| "".to_string());
+        let use_tls = std::env::var("ZED_HELIX_TLS")
+            .map(|v| v.parse().unwrap_or(false))
+            .unwrap_or(false);
+            
+        log::info!("Starting WebSocket sync with: {}://{}", 
+                  if use_tls { "wss" } else { "ws" }, helix_url);
+        
+                // Try to start WebSocket connection using tokio runtime
+                let helix_url_clone = helix_url.clone();
+                let auth_token_clone = auth_token.clone();
+                
+                // Use std::thread to avoid async context issues
+                std::thread::spawn(move || {
+                    // Create a new tokio runtime for this thread
+                    let rt = tokio::runtime::Runtime::new().expect("Failed to create tokio runtime");
+                    
+                    // Keep the runtime alive and handle the WebSocket connection
+                    rt.block_on(async move {
+                        // Connect as a general external agent (not tied to specific sessions)
+                        let agent_id = format!("zed-agent-{}", chrono::Utc::now().timestamp());
+                        
+                        // Create WebSocket sync config - Zed connects as a general agent
+                        let websocket_config = WebSocketSyncConfig {
+                            enabled: true,
+                            helix_url: helix_url_clone,
+                            session_id: agent_id.clone(), // This identifies this Zed instance
+                            auth_token: auth_token_clone,
+                            use_tls,
+                        };
+                        
+                        log::info!("Connecting Zed as external agent: {}", agent_id);
+                        log::info!("WebSocket config: url={}, agent_id={}, use_tls={}", 
+                                  websocket_config.helix_url, agent_id, use_tls);
+                        
+                        // Start WebSocket connection - this will listen for session messages from Helix
+                        match WebSocketSync::new(websocket_config, Some(thread_creation_sender.clone())).await {
+                            Ok(websocket_sync) => {
+                                log::info!("Zed WebSocket sync connected successfully - ready to receive session messages");
+                                
+                                // Keep the WebSocket connection alive by running indefinitely
+                                // This prevents the thread and runtime from shutting down
+                                loop {
+                                    tokio::time::sleep(tokio::time::Duration::from_secs(30)).await;
+                                    log::debug!("WebSocket sync thread still running...");
+                                }
+                            }
+                            Err(e) => {
+                                log::error!("Failed to connect Zed WebSocket sync: {}", e);
+                                // Retry after a delay
+                                tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
+                                log::info!("Retrying WebSocket connection...");
+                            }
+                        }
+                    });
+                });
+        
+        log::info!("WebSocket sync startup task launched");
+    } else {
+        log::info!("External WebSocket sync is disabled or not configured");
+    }
+    
+    log::info!("External WebSocket sync module initialization completed");
 }
+
 
 /// Initialize the external WebSocket sync with full assistant support
 pub fn init_full(
