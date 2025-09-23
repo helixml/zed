@@ -747,3 +747,4 @@ pub fn subscribe_to_context_changes_global(context: Entity<assistant_context::As
     eprintln!("✅ [SYNC_GLOBAL] Context subscription created for session: {}", external_session_id);
 }
 
+

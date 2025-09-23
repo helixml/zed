@@ -284,6 +284,7 @@ pub fn main() {
 
     let failed_single_instance_check = if *zed_env_vars::ZED_STATELESS
         || *release_channel::RELEASE_CHANNEL == ReleaseChannel::Dev
+        || args.allow_multiple_instances
     {
         false
     } else {
@@ -1232,6 +1233,10 @@ struct Args {
     /// Output current environment variables as JSON to stdout
     #[arg(long, hide = true)]
     printenv: bool,
+
+    /// Disable single instance check, allowing multiple Zed instances to run simultaneously
+    #[arg(long)]
+    allow_multiple_instances: bool,
 }
 
 #[derive(Clone, Debug)]
