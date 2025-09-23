@@ -1061,8 +1061,8 @@ impl AgentPanel {
             editor
         });
 
-        if self.selected_agent != AgentType::TextThread {
-            self.selected_agent = AgentType::TextThread;
+        if self.selected_agent != AgentType::Zed {
+            self.selected_agent = AgentType::Zed;
             self.serialize(cx);
         }
 
