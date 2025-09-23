@@ -50,7 +50,7 @@ use editor::{Anchor, AnchorRangeExt as _, Editor, EditorEvent, MultiBuffer};
 use fs::Fs;
 use gpui::{
     Action, AnyElement, App, AsyncWindowContext, Corner, DismissEvent, Entity, EventEmitter,
-    ExternalPaths, FocusHandle, Focusable, KeyContext, Pixels, Subscription, Task, UpdateGlobal,
+    ExternalPaths, FocusHandle, Focusable, KeyContext, Keystroke, Modifiers, Pixels, Subscription, Task, UpdateGlobal,
     WeakEntity, prelude::*,
 };
 use language::LanguageRegistry;
@@ -440,6 +440,54 @@ pub struct AgentPanel {
 
 impl AgentPanel {
     #[cfg(feature = "external_websocket_sync")]
+    fn create_native_agent_with_message(&mut self, message: &str, window: &mut Window, cx: &mut Context<Self>) {
+        log::error!("🚀 [AGENT_PANEL] Creating NativeAgent thread (rich ChatGPT-like UI) for message: {}", message);
+        
+        // Create the NativeAgent thread (rich ChatGPT-like UI)
+        self.new_agent_thread(AgentType::NativeAgent, window, cx);
+        
+        // Clone the message for the async block
+        let message = message.to_string();
+        
+        // Inject the message and trigger AI response
+        cx.spawn_in(window, async move |this, cx| {
+            // Wait a moment for the thread to be created
+            cx.background_executor().timer(std::time::Duration::from_millis(300)).await;
+            
+            this.update_in(cx, |this, window, cx| {
+                if let ActiveView::ExternalAgentThread { thread_view } = &this.active_view {
+                    log::error!("💬 [AGENT_PANEL] Injecting message into ACP thread: {}", message);
+                    
+                    // Get the thread view and inject the message
+                    let thread_view_entity = thread_view.clone();
+                    thread_view_entity.update(cx, |thread_view, cx| {
+                        // Access the message editor and set the text
+                        thread_view.message_editor.update(cx, |message_editor, cx| {
+                            // Set the text in the underlying editor
+                            message_editor.editor.update(cx, |editor, cx| {
+                                editor.set_text(&message, window, cx);
+                                log::error!("✍️ [AGENT_PANEL] Text set in message editor: {}", message);
+                            });
+                        });
+                        
+                        // Trigger the send action to actually send the message
+                        thread_view.send(window, cx);
+                        log::error!("📤 [AGENT_PANEL] Message sent to AI - should trigger response");
+                    });
+                    
+                    // Focus the thread view
+                    let focus_handle = thread_view.read(cx).focus_handle(cx);
+                    focus_handle.focus(window);
+                    log::error!("✅ [AGENT_PANEL] NativeAgent thread created with injected message and AI triggered!");
+                } else {
+                    log::error!("⚠️ [AGENT_PANEL] No active ACP thread view found after creation");
+                }
+            })
+        })
+        .detach();
+    }
+
+    #[cfg(feature = "external_websocket_sync")]
     fn process_websocket_thread_requests_with_window(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let pending_requests = external_websocket_sync::process_pending_thread_requests(cx);
         if pending_requests.is_empty() {
@@ -462,12 +510,14 @@ impl AgentPanel {
                 log::error!("🔄 [AGENT_PANEL] Thread already exists for session {}, context_id: {}", 
                            request.external_session_id, context_id.to_proto());
             } else {
-                log::error!("🆕 [AGENT_PANEL] Creating NEW Zed Agent thread (TextThread) for session: {}", request.external_session_id);
+                log::error!("🆕 [AGENT_PANEL] Creating NEW NativeAgent thread (rich ChatGPT-like UI) for session: {}", request.external_session_id);
                 
-                // REVERT: Use TextThread approach which was working perfectly
-                // The only issue was UI labeling, but functionality was 100% working
-                // TextThread: Creates traditional Zed assistant threads that persist properly
-                let context_id = self.new_prompt_editor_with_message(window, cx, &request.message);
+                // Create NativeAgent for rich ChatGPT-like UI (not terminal-style TextThread)
+                // This approach creates the visual chat interface the user wants
+                self.create_native_agent_with_message(&request.message, window, cx);
+                
+                // Use placeholder context_id for ACP threads (they use different ID system)
+                let context_id = assistant_context::ContextId::new();
                 
                 log::error!("✅ [AGENT_PANEL] Created Zed Agent thread {} for session: {}", 
                            context_id.to_proto(), request.external_session_id);
