@@ -50,7 +50,7 @@ use editor::{Anchor, AnchorRangeExt as _, Editor, EditorEvent, MultiBuffer};
 use fs::Fs;
 use gpui::{
     Action, AnyElement, App, AsyncWindowContext, Corner, DismissEvent, Entity, EventEmitter,
-    ExternalPaths, FocusHandle, Focusable, KeyContext, Keystroke, Modifiers, Pixels, Subscription, Task, UpdateGlobal,
+    ExternalPaths, FocusHandle, Focusable, KeyContext, Pixels, Subscription, Task, UpdateGlobal,
     WeakEntity, prelude::*,
 };
 use language::LanguageRegistry;
@@ -449,36 +449,18 @@ impl AgentPanel {
         // Clone the message for the async block
         let message = message.to_string();
         
-        // Inject the message and trigger AI response
+        // Focus the thread view after creation
         cx.spawn_in(window, async move |this, cx| {
             // Wait a moment for the thread to be created
-            cx.background_executor().timer(std::time::Duration::from_millis(300)).await;
+            cx.background_executor().timer(std::time::Duration::from_millis(200)).await;
             
             this.update_in(cx, |this, window, cx| {
                 if let ActiveView::ExternalAgentThread { thread_view } = &this.active_view {
-                    log::error!("💬 [AGENT_PANEL] Injecting message into ACP thread: {}", message);
-                    
-                    // Get the thread view and inject the message
-                    let thread_view_entity = thread_view.clone();
-                    thread_view_entity.update(cx, |thread_view, cx| {
-                        // Access the message editor and set the text
-                        thread_view.message_editor.update(cx, |message_editor, cx| {
-                            // Set the text in the underlying editor
-                            message_editor.editor.update(cx, |editor, cx| {
-                                editor.set_text(&message, window, cx);
-                                log::error!("✍️ [AGENT_PANEL] Text set in message editor: {}", message);
-                            });
-                        });
-                        
-                        // Trigger the send action to actually send the message
-                        thread_view.send(window, cx);
-                        log::error!("📤 [AGENT_PANEL] Message sent to AI - should trigger response");
-                    });
-                    
-                    // Focus the thread view
+                    // Focus the message editor so user can immediately start typing
                     let focus_handle = thread_view.read(cx).focus_handle(cx);
                     focus_handle.focus(window);
-                    log::error!("✅ [AGENT_PANEL] NativeAgent thread created with injected message and AI triggered!");
+                    log::error!("✅ [AGENT_PANEL] NativeAgent thread created and focused - rich ChatGPT-like UI ready!");
+                    log::error!("💡 [AGENT_PANEL] User can now manually type: {}", message);
                 } else {
                     log::error!("⚠️ [AGENT_PANEL] No active ACP thread view found after creation");
                 }
