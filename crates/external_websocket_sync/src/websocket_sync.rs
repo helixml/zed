@@ -455,54 +455,22 @@ impl WebSocketSync {
                     .unwrap_or(session_id)
                     .to_string();
                 
-                // Handle the chat_message command and get response data
-                let (_context_id, _) = Self::handle_chat_message_with_response(session_id, command.data, event_sender).await?;
+                // Handle the chat_message command - this will trigger AI processing in Zed
+                let (context_id, _) = Self::handle_chat_message_with_response(session_id, command.data.clone(), event_sender).await?;
                 
-                // Create and send the chat_response back to Helix using the HELIX session ID
-                let ai_response = SyncMessage {
-                    session_id: helix_session_id.to_string(),
-                    event_type: "chat_response".to_string(),
-                    data: {
-                        let mut data = std::collections::HashMap::new();
-                        data.insert("request_id".to_string(), serde_json::Value::String(request_id.clone()));
-                        data.insert("content".to_string(), serde_json::Value::String("Hello from Zed! I received your message and I'm processing it with AI. This is a test response.".to_string()));
-                        data
-                    },
-                    timestamp: chrono::Utc::now(),
-                };
+                eprintln!("✅ [HANDLE_MESSAGE_WITH_RESPONSE] Chat message sent to Zed context system");
+                eprintln!("🔄 [HANDLE_MESSAGE_WITH_RESPONSE] Context ID: {}, Helix Session ID: {}", context_id, helix_session_id);
+                eprintln!("📋 [HANDLE_MESSAGE_WITH_RESPONSE] Request ID: {}", request_id);
+                eprintln!("🚫 [HANDLE_MESSAGE_WITH_RESPONSE] REMOVED HARDCODED RESPONSES!");
+                eprintln!("🤖 [HANDLE_MESSAGE_WITH_RESPONSE] Real AI responses will be sent via context event system");
+                eprintln!("⏳ [HANDLE_MESSAGE_WITH_RESPONSE] Waiting for async AI completion...");
                 
-                let response_text = serde_json::to_string(&ai_response)?;
-                eprintln!("📤 [HANDLE_MESSAGE_WITH_RESPONSE] ========================================");
-                eprintln!("📤 [HANDLE_MESSAGE_WITH_RESPONSE] SENDING CHAT_RESPONSE TO HELIX");
-                eprintln!("📤 [HANDLE_MESSAGE_WITH_RESPONSE] Request ID: {}", request_id);
-                eprintln!("📤 [HANDLE_MESSAGE_WITH_RESPONSE] Response: {}", response_text);
-                eprintln!("📤 [HANDLE_MESSAGE_WITH_RESPONSE] ========================================");
-                
-                websocket_sender.send(Message::Text(response_text.into()))?;
-                eprintln!("✅ [HANDLE_MESSAGE_WITH_RESPONSE] Chat response sent to WebSocket channel");
-                
-                // Send chat_response_done signal using the same Helix session ID
-                let done_response = SyncMessage {
-                    session_id: helix_session_id.to_string(),
-                    event_type: "chat_response_done".to_string(),
-                    data: {
-                        let mut data = std::collections::HashMap::new();
-                        data.insert("request_id".to_string(), serde_json::Value::String(request_id.clone()));
-                        data
-                    },
-                    timestamp: chrono::Utc::now(),
-                };
-                
-                let done_text = serde_json::to_string(&done_response)?;
-                eprintln!("📤 [HANDLE_MESSAGE_WITH_RESPONSE] ========================================");
-                eprintln!("📤 [HANDLE_MESSAGE_WITH_RESPONSE] SENDING CHAT_RESPONSE_DONE TO HELIX");
-                eprintln!("📤 [HANDLE_MESSAGE_WITH_RESPONSE] Request ID: {}", request_id);
-                eprintln!("📤 [HANDLE_MESSAGE_WITH_RESPONSE] Done signal: {}", done_text);
-                eprintln!("📤 [HANDLE_MESSAGE_WITH_RESPONSE] ========================================");
-                
-                websocket_sender.send(Message::Text(done_text.into()))?;
-                eprintln!("✅ [HANDLE_MESSAGE_WITH_RESPONSE] Chat response done sent to WebSocket channel");
-                eprintln!("🎉 [HANDLE_MESSAGE_WITH_RESPONSE] COMPLETE - Both response and done sent!");
+                // TODO: The real AI responses will be sent back to Helix when the context system
+                // generates them. This happens asynchronously via context events.
+                // We need to implement a proper context event listener that:
+                // 1. Listens for AI completion events from the context
+                // 2. Maps the context_id back to helix_session_id using ExternalSessionMapping  
+                // 3. Sends chat_response and chat_response_done back to Helix via WebSocket
             }
             "create_thread" => {
                 eprintln!("🆕 [HANDLE_MESSAGE_WITH_RESPONSE] Handling create_thread command from Helix!");
