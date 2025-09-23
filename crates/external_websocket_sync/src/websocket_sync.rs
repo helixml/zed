@@ -179,6 +179,33 @@ impl WebSocketSync {
                                     log::error!("❌ [WEBSOCKET] Thread creation sender not available - cannot create UI thread");
                                 }
                                 
+                                // CRITICAL FIX: Send context_created response directly back to Helix
+                                let context_id = format!("zed-context-{}", chrono::Utc::now().timestamp_millis());
+                                let context_created_response = SyncMessage {
+                                    session_id: session_id_for_outgoing.clone(),
+                                    event_type: "context_created".to_string(),
+                                    data: {
+                                        let mut data = std::collections::HashMap::new();
+                                        data.insert("context_id".to_string(), serde_json::Value::String(context_id.clone()));
+                                        data
+                                    },
+                                    timestamp: chrono::Utc::now(),
+                                };
+                                
+                                let response_text = match serde_json::to_string(&context_created_response) {
+                                    Ok(text) => text,
+                                    Err(e) => {
+                                        log::error!("❌ [WEBSOCKET] Failed to serialize context_created response: {}", e);
+                                        continue;
+                                    }
+                                };
+                                
+                                if let Err(e) = sink.send(Message::Text(response_text.into())).await {
+                                    log::error!("❌ [WEBSOCKET] Failed to send context_created response: {}", e);
+                                } else {
+                                    log::error!("✅ [WEBSOCKET] Successfully sent context_created response with context_id: {}", context_id);
+                                }
+                                
                                 // Don't send this event to external server - it's for local processing only
                                 continue;
                             }
@@ -550,6 +577,8 @@ impl WebSocketSync {
             return Err(anyhow::anyhow!("Failed to send create thread event: {}", e));
         }
         eprintln!("✅ [CHAT_HANDLER] Successfully sent CreateThreadFromExternalSession event!");
+        
+        // Note: context_created response is now sent directly in the WebSocket event loop
         
         log::error!(
             "🎯 [CHAT_HANDLER] Emitted CreateThreadFromExternalSession event for session {} - UI should create thread now!",
