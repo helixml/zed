@@ -440,6 +440,48 @@ pub struct AgentPanel {
 
 impl AgentPanel {
     #[cfg(feature = "external_websocket_sync")]
+    fn process_websocket_thread_requests_with_window(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let pending_requests = external_websocket_sync::process_pending_thread_requests(cx);
+        if pending_requests.is_empty() {
+            return;
+        }
+        
+        log::error!("🎯 [AGENT_PANEL] Found {} pending WebSocket thread requests with window access!", pending_requests.len());
+        
+        for request in pending_requests {
+            log::error!("🎯 [AGENT_PANEL] Processing WebSocket thread creation request for session: {}", request.external_session_id);
+            
+            // Check if we already have a thread for this external session
+            let existing_context_id = {
+                let session_mapping = cx.global::<external_websocket_sync::ExternalSessionMapping>();
+                let sessions = session_mapping.sessions.read();
+                sessions.get(&request.external_session_id).cloned()
+            };
+            
+            if let Some(context_id) = existing_context_id {
+                log::error!("🔄 [AGENT_PANEL] Thread already exists for session {}, context_id: {}", 
+                           request.external_session_id, context_id.to_proto());
+            } else {
+                log::error!("🆕 [AGENT_PANEL] Creating NEW Zed Agent thread for session: {}", request.external_session_id);
+                
+                // Create a proper Zed Agent thread (TextThread), not an ACP thread!
+                // This uses the same pattern as new_prompt_editor_with_message()
+                let context_id = self.new_prompt_editor_with_message(window, cx, &request.message);
+                
+                log::error!("✅ [AGENT_PANEL] Created Zed Agent thread {} for session: {}", 
+                           context_id.to_proto(), request.external_session_id);
+                
+                // Store the mapping between Helix session and Zed context
+                {
+                    let session_mapping = cx.global::<external_websocket_sync::ExternalSessionMapping>();
+                    let mut sessions = session_mapping.sessions.write();
+                    sessions.insert(request.external_session_id.clone(), context_id);
+                }
+            }
+        }
+    }
+    
+    #[cfg(feature = "external_websocket_sync")]
     fn process_websocket_thread_requests_deferred(&mut self, cx: &mut Context<Self>) {
         let pending_requests = external_websocket_sync::process_pending_thread_requests(cx);
         if pending_requests.is_empty() {
@@ -655,71 +697,7 @@ impl AgentPanel {
                 panel
     })?;
 
-            // Start WebSocket polling task now that panel is fully created
-            #[cfg(feature = "external_websocket_sync")]
-            {
-                eprintln!("🔄 [AGENT_PANEL] Starting WebSocket polling task after panel creation...");
-                let panel_entity = panel.clone();
-                cx.spawn(async move |cx| {
-                    eprintln!("🔄 [AGENT_PANEL] WebSocket polling task started, entering loop...");
-                    loop {
-                        cx.background_executor().timer(std::time::Duration::from_millis(100)).await;
-                        
-                        if let Ok(_) = panel_entity.update(cx, |this, cx| {
-                            // Check if there are pending requests and process them directly
-                            let pending_requests = external_websocket_sync::process_pending_thread_requests(cx);
-                            if !pending_requests.is_empty() {
-                                eprintln!("🎯 [AGENT_PANEL] Found {} pending WebSocket thread requests, processing directly!", pending_requests.len());
-                                
-                                // Process each request by creating threads
-                                for request in pending_requests {
-                                    eprintln!("🎯 [AGENT_PANEL] Creating thread for session: {}", request.external_session_id);
-                                    
-                                    // Create a new thread with the message content
-                                    let context = this.context_store.update(cx, |context_store, cx| context_store.create(cx));
-                                    let context_id = context.read(cx).id().clone();
-                                    
-                                    eprintln!("✅ [AGENT_PANEL] Created thread with context_id: {:?} for message: {}", context_id, request.message);
-                                    
-                                    // Add the user's message to the thread and submit for AI response
-                                    context.update(cx, |context, cx| {
-                                        eprintln!("📝 [AGENT_PANEL] Adding user message to thread: {}", request.message);
-                                        
-                                        // Add the user's message to the buffer
-                                        context.buffer().update(cx, |buffer, cx| {
-                                            let end_offset = buffer.len();
-                                            buffer.edit([(end_offset..end_offset, format!("{}\n", request.message))], None, cx);
-                                        });
-                                        
-                                        // Now call assist to get AI response
-                                        context.assist(cx);
-                                    });
-                                    
-                                    // Store the session mapping
-                                    {
-                                        let session_mapping = cx.global::<external_websocket_sync::ExternalSessionMapping>();
-                                        let mut sessions = session_mapping.sessions.write();
-                                        sessions.insert(request.external_session_id.clone(), context_id.clone());
-                                    }
-                                    
-                                    // Subscribe to context changes to sync back to Helix
-                                    eprintln!("🔔 [AGENT_PANEL] Setting up context change subscription for session: {}", request.external_session_id);
-                                    external_websocket_sync::subscribe_to_context_changes_global(context.clone(), request.external_session_id.clone(), cx);
-                                    
-                                    // Focus the panel to make the new thread visible
-                                    cx.notify();
-                                }
-                            }
-                        }) {
-                            // Continue processing
-                        } else {
-                            // Panel was dropped, exit the loop
-                            eprintln!("🔄 [AGENT_PANEL] WebSocket polling task exiting - panel was dropped");
-                            break;
-                        }
-                    }
-                }).detach();
-            }
+            // WebSocket thread creation is now handled in the render method
 
             Ok(panel)
         })
@@ -776,9 +754,9 @@ impl AgentPanel {
         #[cfg(feature = "external_websocket_sync")]
         {
             cx.observe_global::<external_websocket_sync::PendingThreadRequests>(|this, cx| {
-                eprintln!("🎯 [AGENT_PANEL] WebSocket thread requests changed - processing directly!");
-                // Process WebSocket thread requests immediately without window access
-                this.process_websocket_thread_requests_deferred(cx);
+                eprintln!("🎯 [AGENT_PANEL] WebSocket thread requests changed - scheduling thread creation!");
+                // Schedule thread creation to happen with window access
+                cx.notify(); // This will trigger a re-render where we can check for pending requests
             }).detach();
         }
         
@@ -2727,6 +2705,11 @@ impl AgentPanel {
 
 impl Render for AgentPanel {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // Process any pending WebSocket thread requests now that we have window access
+        #[cfg(feature = "external_websocket_sync")]
+        {
+            self.process_websocket_thread_requests_with_window(window, cx);
+        }
         
         // WARNING: Changes to this element hierarchy can have
         // non-obvious implications to the layout of children.
