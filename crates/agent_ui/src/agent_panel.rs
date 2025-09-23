@@ -462,15 +462,12 @@ impl AgentPanel {
                 log::error!("🔄 [AGENT_PANEL] Thread already exists for session {}, context_id: {}", 
                            request.external_session_id, context_id.to_proto());
             } else {
-                log::error!("🆕 [AGENT_PANEL] Creating NEW built-in Zed Agent thread (NativeAgent) for session: {}", request.external_session_id);
+                log::error!("🆕 [AGENT_PANEL] Creating NEW Zed Agent thread (TextThread) for session: {}", request.external_session_id);
                 
-                // Use the built-in Zed Agent (NativeAgent) - same as "New Thread" UI button
-                // This creates the terminal-like interface, not the text editor interface
-                self.new_agent_thread(AgentType::NativeAgent, window, cx);
-                
-                // TODO: We need to inject the initial message into the created ACP thread
-                // For now, use a placeholder context_id since ACP threads don't return AssistantContext IDs
-                let context_id = assistant_context::ContextId::new(); // Placeholder for ACP thread
+                // REVERT: Use TextThread approach which was working perfectly
+                // The only issue was UI labeling, but functionality was 100% working
+                // TextThread: Creates traditional Zed assistant threads that persist properly
+                let context_id = self.new_prompt_editor_with_message(window, cx, &request.message);
                 
                 log::error!("✅ [AGENT_PANEL] Created Zed Agent thread {} for session: {}", 
                            context_id.to_proto(), request.external_session_id);
