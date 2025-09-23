@@ -462,11 +462,15 @@ impl AgentPanel {
                 log::error!("🔄 [AGENT_PANEL] Thread already exists for session {}, context_id: {}", 
                            request.external_session_id, context_id.to_proto());
             } else {
-                log::error!("🆕 [AGENT_PANEL] Creating NEW Zed Agent thread for session: {}", request.external_session_id);
+                log::error!("🆕 [AGENT_PANEL] Creating NEW built-in Zed Agent thread (NativeAgent) for session: {}", request.external_session_id);
                 
-                // Create a proper Zed Agent thread (TextThread), not an ACP thread!
-                // This uses the same pattern as new_prompt_editor_with_message()
-                let context_id = self.new_prompt_editor_with_message(window, cx, &request.message);
+                // Use the built-in Zed Agent (NativeAgent) - same as "New Thread" UI button
+                // This creates the terminal-like interface, not the text editor interface
+                self.new_agent_thread(AgentType::NativeAgent, window, cx);
+                
+                // TODO: We need to inject the initial message into the created ACP thread
+                // For now, use a placeholder context_id since ACP threads don't return AssistantContext IDs
+                let context_id = assistant_context::ContextId::new(); // Placeholder for ACP thread
                 
                 log::error!("✅ [AGENT_PANEL] Created Zed Agent thread {} for session: {}", 
                            context_id.to_proto(), request.external_session_id);
@@ -1061,8 +1065,8 @@ impl AgentPanel {
             editor
         });
 
-        if self.selected_agent != AgentType::Zed {
-            self.selected_agent = AgentType::Zed;
+        if self.selected_agent != AgentType::NativeAgent {
+            self.selected_agent = AgentType::NativeAgent;
             self.serialize(cx);
         }
 
