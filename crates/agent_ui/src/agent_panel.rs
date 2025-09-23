@@ -43,6 +43,7 @@ use ai_onboarding::AgentPanelOnboarding;
 use anyhow::{Result, anyhow};
 use assistant_context::{AssistantContext, ContextEvent, ContextSummary};
 use assistant_slash_command::SlashCommandWorkingSet;
+use language_model::Role;
 use assistant_tool::ToolWorkingSet;
 use client::{UserStore, zed_urls};
 use cloud_llm_client::{Plan, PlanV1, PlanV2, UsageLimit};
@@ -503,19 +504,19 @@ impl AgentPanel {
             log::error!("🔔 [AGENT_PANEL] Found context, subscribing to events...");
             
             // Subscribe to context events
-            cx.subscribe_in(&context, window, move |_panel, _context, event, _window, cx| {
+            cx.subscribe_in(&context.clone(), window, move |_panel, _context, event, _window, cx| {
                 log::error!("🎯 [CONTEXT_EVENT] Received context event: {:?}", event);
                 
                 match event {
                     assistant_context::ContextEvent::StreamedCompletion => {
                         log::error!("🤖 [CONTEXT_EVENT] AI completion finished! Forwarding to Helix...");
                         
-                        // Get the latest AI response from the context
-                        // TODO: Extract the actual AI response content
-                        let ai_response = "AI response content here"; // Placeholder
+                        // Extract the latest AI response from the context
+                        let ai_response = Self::extract_latest_ai_response(_context, cx);
+                        log::error!("🤖 [CONTEXT_EVENT] Extracted AI response: {}", ai_response);
                         
                         // Forward the response back to Helix via WebSocket
-                        Self::forward_ai_response_to_helix(&helix_session_id, ai_response, cx);
+                        Self::forward_ai_response_to_helix(&helix_session_id, &ai_response, cx);
                     }
                     assistant_context::ContextEvent::MessagesEdited => {
                         log::error!("📝 [CONTEXT_EVENT] Messages edited - potential AI response");
@@ -534,14 +535,91 @@ impl AgentPanel {
     }
     
     #[cfg(feature = "external_websocket_sync")]
+    fn extract_latest_ai_response(context: &Entity<assistant_context::AssistantContext>, cx: &App) -> String {
+        log::error!("🔍 [EXTRACT_AI] Extracting latest AI response from context");
+        
+        // Get all messages from the context
+        let messages: Vec<_> = context.read(cx).messages(cx).collect();
+        log::error!("🔍 [EXTRACT_AI] Found {} total messages", messages.len());
+        
+        // Find the last assistant message (AI response)
+        if let Some(last_ai_message) = messages.iter().rev().find(|msg| {
+            msg.role == Role::Assistant
+        }) {
+            log::error!("🔍 [EXTRACT_AI] Found last AI message at offset range: {:?}", last_ai_message.offset_range);
+            
+            // Extract the text content from the buffer
+            let mut ai_text = String::new();
+            let buffer = context.read(cx).buffer();
+            for chunk in buffer.read(cx).text_for_range(last_ai_message.offset_range.clone()) {
+                ai_text.push_str(chunk);
+            }
+            
+            log::error!("🔍 [EXTRACT_AI] Extracted AI text: {}", ai_text.trim());
+            ai_text.trim().to_string()
+        } else {
+            log::error!("⚠️ [EXTRACT_AI] No AI message found in context");
+            String::new()
+        }
+    }
+    
+    #[cfg(feature = "external_websocket_sync")]
     fn forward_ai_response_to_helix(helix_session_id: &str, ai_response: &str, cx: &mut Context<AgentPanel>) {
         log::error!("📤 [FORWARD_AI] Forwarding AI response to Helix session: {}", helix_session_id);
         log::error!("📤 [FORWARD_AI] Response content: {}", ai_response);
         
-        // TODO: Implement WebSocket sending via the existing WebSocket sync system
-        // For now, just log that we received the AI response
-        log::error!("🚧 [FORWARD_AI] WebSocket sending not implemented yet - AI response captured successfully");
-        log::error!("🚧 [FORWARD_AI] This confirms the context event subscription is working!");
+        // Get the global WebSocket sender
+        if let Some(sender) = external_websocket_sync::get_global_websocket_sender() {
+            log::error!("📤 [FORWARD_AI] WebSocket sender available, sending AI response...");
+            
+            // Create the sync message for chat response
+            let sync_message = external_websocket_sync::SyncMessage {
+                event_type: "chat_response".to_string(),
+                session_id: helix_session_id.to_string(),
+                data: {
+                    let mut data = std::collections::HashMap::new();
+                    data.insert("content".to_string(), serde_json::Value::String(ai_response.to_string()));
+                    data.insert("request_id".to_string(), serde_json::Value::String("ai_response".to_string()));
+                    data
+                },
+                timestamp: chrono::Utc::now(),
+            };
+            
+            // Serialize and send the message
+            if let Ok(json_message) = serde_json::to_string(&sync_message) {
+                let websocket_message = external_websocket_sync::tungstenite::Message::Text(json_message.into());
+                if let Err(e) = sender.send(websocket_message) {
+                    log::error!("❌ [FORWARD_AI] Failed to send WebSocket message: {}", e);
+                } else {
+                    log::error!("✅ [FORWARD_AI] AI response sent to Helix successfully!");
+                    
+                    // Send completion signal
+                    let completion_message = external_websocket_sync::SyncMessage {
+                        event_type: "chat_response_done".to_string(),
+                        session_id: helix_session_id.to_string(),
+                        data: {
+                            let mut data = std::collections::HashMap::new();
+                            data.insert("request_id".to_string(), serde_json::Value::String("ai_response".to_string()));
+                            data
+                        },
+                        timestamp: chrono::Utc::now(),
+                    };
+                    
+                    if let Ok(completion_json) = serde_json::to_string(&completion_message) {
+                        let completion_websocket_message = external_websocket_sync::tungstenite::Message::Text(completion_json.into());
+                        if let Err(e) = sender.send(completion_websocket_message) {
+                            log::error!("❌ [FORWARD_AI] Failed to send completion signal: {}", e);
+                        } else {
+                            log::error!("✅ [FORWARD_AI] Completion signal sent to Helix!");
+                        }
+                    }
+                }
+            } else {
+                log::error!("❌ [FORWARD_AI] Failed to serialize sync message");
+            }
+        } else {
+            log::error!("⚠️ [FORWARD_AI] WebSocket sender not available - no connection to Helix");
+        }
     }
     
     #[cfg(feature = "external_websocket_sync")]

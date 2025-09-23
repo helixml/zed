@@ -41,6 +41,7 @@ mod server;
 pub use server::*;
 
 pub use websocket_sync::*;
+pub use tungstenite;
 
 /// Request to create a thread from external session
 #[derive(Clone, Debug)]

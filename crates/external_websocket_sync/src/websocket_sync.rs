@@ -11,11 +11,20 @@ use tokio::sync::{mpsc, oneshot};
 use url::Url;
 use parking_lot::RwLock;
 use std::sync::Arc;
+use std::sync::OnceLock;
 
 use assistant_context::{AssistantContext, ContextId, ContextStore, MessageId};
 use gpui::Entity;
 
 use crate::types::*;
+
+/// Global WebSocket sender for sending messages to Helix
+static GLOBAL_WEBSOCKET_SENDER: OnceLock<mpsc::UnboundedSender<Message>> = OnceLock::new();
+
+/// Get the global WebSocket sender
+pub fn get_global_websocket_sender() -> Option<&'static mpsc::UnboundedSender<Message>> {
+    GLOBAL_WEBSOCKET_SENDER.get()
+}
 
 /// WebSocket sync configuration
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -145,6 +154,13 @@ impl WebSocketSync {
 
             // Create a channel for sending WebSocket messages
             let (websocket_sender, mut websocket_receiver) = mpsc::unbounded_channel::<Message>();
+
+            // Store the websocket sender in global state for use by the agent panel
+            if let Err(_) = GLOBAL_WEBSOCKET_SENDER.set(websocket_sender.clone()) {
+                log::error!("⚠️ [WEBSOCKET_SYNC] Global WebSocket sender already set - this shouldn't happen");
+            } else {
+                log::error!("✅ [WEBSOCKET_SYNC] WebSocket sender stored in global state - agent panel can now send messages");
+            }
 
             // Clone session_id for use in both closures
             let session_id_for_outgoing = config.session_id.clone();
