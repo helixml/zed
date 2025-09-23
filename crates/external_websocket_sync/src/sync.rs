@@ -1,4 +1,4 @@
-//! Sync module for real-time synchronization with Helix
+//! Sync module for real-time synchronization with external servers
 
 use anyhow::{Context, Result};
 use collections::HashMap;
@@ -15,7 +15,7 @@ use crate::{
     ExternalWebSocketSync,
 };
 
-/// Sync client for communicating with Helix
+/// Sync client for communicating with external servers
 pub struct SyncClient {
     id: String,
     helix_url: String,
@@ -40,7 +40,7 @@ impl SyncClient {
 
         // Start background task for sending events to Helix
         let task = cx.spawn(async move |_cx| {
-            let mut client = HelixSyncClient::new(client_url, client_token);
+            let mut client = ExternalSyncClient::new(client_url, client_token);
             
             while let Some(event) = event_receiver.recv().await {
                 if let Err(e) = client.send_event(event).await {
@@ -72,14 +72,14 @@ impl SyncClient {
     }
 }
 
-/// Internal HTTP client for communicating with Helix
-struct HelixSyncClient {
+/// Internal HTTP client for communicating with external servers
+struct ExternalSyncClient {
     client: reqwest::Client,
     base_url: String,
     auth_token: Option<String>,
 }
 
-impl HelixSyncClient {
+impl ExternalSyncClient {
     fn new(base_url: String, auth_token: Option<String>) -> Self {
         let client = reqwest::Client::new();
         Self {

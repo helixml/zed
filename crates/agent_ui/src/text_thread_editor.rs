@@ -365,6 +365,17 @@ impl TextThreadEditor {
         );
     }
 
+    #[cfg(feature = "external_websocket_sync")]
+    pub fn insert_message_from_helix(&mut self, message: &str, window: &mut Window, cx: &mut Context<Self>) {
+        // Insert the message from Helix as user input
+        self.editor.update(cx, |editor, cx| {
+            editor.insert(&format!("{}\n\n", message), window, cx)
+        });
+        
+        // Send the message to the model to generate a response
+        self.send_to_model(window, cx);
+    }
+
     fn assist(&mut self, _: &Assist, window: &mut Window, cx: &mut Context<Self>) {
         if self.sending_disabled(cx) {
             return;

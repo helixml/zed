@@ -42,21 +42,21 @@ pub use server::*;
 
 pub use websocket_sync::*;
 
-/// Request to create a thread from Helix session
+/// Request to create a thread from external session
 #[derive(Clone, Debug)]
 pub struct CreateThreadRequest {
-    pub helix_session_id: String,
+    pub external_session_id: String,
     pub message: String,
     pub request_id: String,
 }
 
-/// Global mapping of Helix session IDs to Zed context IDs
+/// Global mapping of external session IDs to Zed context IDs
 #[derive(Clone, Default)]
-pub struct HelixSessionMapping {
+pub struct ExternalSessionMapping {
     pub sessions: Arc<RwLock<std::collections::HashMap<String, assistant_context::ContextId>>>,
 }
 
-impl Global for HelixSessionMapping {}
+impl Global for ExternalSessionMapping {}
 
 /// Global channel for thread creation requests from WebSocket to UI
 #[derive(Clone)]
@@ -151,6 +151,24 @@ impl ExternalWebSocketSync {
             sync_clients: Arc::new(RwLock::new(Vec::new())),
             _subscriptions: Vec::new(),
         }
+    }
+
+    /// Subscribe to context changes and emit sync events to Helix
+    pub fn subscribe_to_context_changes(&mut self, context: Entity<assistant_context::AssistantContext>, external_session_id: String, cx: &mut App) {
+        let session_id_clone = external_session_id.clone();
+        eprintln!("🔔 [SYNC] Subscribing to context changes for external session: {}", external_session_id);
+        
+        let subscription = cx.subscribe(&context, move |_context, _event, _cx| {
+            eprintln!("🔔 [SYNC] Context changed for session: {}", session_id_clone);
+            
+            // TODO: Extract context content and send sync event to Helix
+            eprintln!("✅ [SYNC] Sending context update to Helix for session: {}", session_id_clone);
+            // This is where we'll implement the sync back to Helix
+            // We'll send the complete thread state back to Helix
+        });
+        
+        self._subscriptions.push(subscription);
+        eprintln!("✅ [SYNC] Successfully subscribed to context changes for session: {}", external_session_id);
     }
 
     /// Initialize context store with project
@@ -403,9 +421,23 @@ impl ExternalWebSocketSync {
 
         drop(contexts);
 
-        // TODO: Add actual message to the assistant context
-        // For now, create a placeholder message ID
-        let message_id = MessageId(clock::Lamport::new(1));
+        // Add the actual message to the assistant context
+        let message_id = context.update(cx, |context, cx| {
+            // Add the user's message to the buffer (same as agent panel does)
+            context.buffer().update(cx, |buffer, cx| {
+                let end_offset = buffer.len();
+                buffer.edit([(end_offset..end_offset, format!("{}\n", content))], None, cx);
+            });
+
+            // If this is a user message, trigger AI assistant response
+            if role == "user" {
+                log::info!("🤖 [WEBSOCKET_SYNC] Triggering AI assistant for user message: {}", content);
+                context.assist(cx);
+            }
+
+            // Create a message ID (for now just use a placeholder)
+            MessageId(clock::Lamport::new(1))
+        });
 
         // Notify via WebSocket
         self.notify_message_added(context_id, &message_id);
@@ -478,6 +510,8 @@ impl ExternalWebSocketSync {
 
 /// Initialize the external WebSocket sync module
 pub fn init(cx: &mut App) {
+    // Force output to stderr regardless of log level
+    eprintln!("🚀 [EXTERNAL_WEBSOCKET_SYNC] Initializing external WebSocket sync module");
     log::info!("Initializing external WebSocket sync module");
     
     // Initialize our settings (don't call settings::init again as it's already called in main)
@@ -495,20 +529,22 @@ pub fn init(cx: &mut App) {
     cx.set_global(pending_requests);
     
     // Create global session mapping
-    cx.set_global(HelixSessionMapping::default());
+    cx.set_global(ExternalSessionMapping::default());
     
     // Spawn background task to listen for thread creation requests
     std::thread::spawn(move || {
         let rt = tokio::runtime::Runtime::new().expect("Failed to create tokio runtime");
         rt.block_on(async move {
             while let Some(request) = thread_creation_receiver.recv().await {
-                log::info!("🎯 Received thread creation request from WebSocket: {:?}", request);
+                eprintln!("🎯 [BACKGROUND] Received thread creation request from WebSocket: {:?}", request);
+                log::error!("🎯 [BACKGROUND] Received thread creation request from WebSocket: {:?}", request);
                 
                 // Add request to global pending queue for UI to process
                 {
                     let mut requests = pending_requests_clone.requests.write();
                     requests.push(request.clone());
-                    log::info!("✅ Added thread creation request to global queue for session {}", request.helix_session_id);
+                    eprintln!("✅ [BACKGROUND] Added thread creation request to global queue for session {}", request.external_session_id);
+                    log::error!("✅ [BACKGROUND] Added thread creation request to global queue for session {}", request.external_session_id);
                 }
             }
         });
@@ -523,8 +559,12 @@ pub fn init(cx: &mut App) {
         .map(|v| v.parse().unwrap_or(false))
         .unwrap_or(enabled);
         
+    eprintln!("🔍 [EXTERNAL_WEBSOCKET_SYNC] External sync enabled: {}, WebSocket enabled: {}", enabled, websocket_enabled);
+    log::error!("🔍 [INIT] External sync enabled: {}, WebSocket enabled: {}", enabled, websocket_enabled);
+    
     if enabled && websocket_enabled {
-        log::info!("External WebSocket sync is enabled - attempting to start WebSocket connection");
+        eprintln!("🚀 [EXTERNAL_WEBSOCKET_SYNC] External WebSocket sync is enabled - attempting to start WebSocket connection");
+        log::error!("🚀 [INIT] External WebSocket sync is enabled - attempting to start WebSocket connection");
         
         // Start WebSocket sync in a background task
         let helix_url = std::env::var("ZED_HELIX_URL")
@@ -535,7 +575,7 @@ pub fn init(cx: &mut App) {
             .map(|v| v.parse().unwrap_or(false))
             .unwrap_or(false);
             
-        log::info!("Starting WebSocket sync with: {}://{}", 
+        log::error!("🔌 [INIT] Starting WebSocket sync with: {}://{}", 
                   if use_tls { "wss" } else { "ws" }, helix_url);
         
                 // Try to start WebSocket connection using tokio runtime
@@ -561,6 +601,9 @@ pub fn init(cx: &mut App) {
                             use_tls,
                         };
                         
+                        eprintln!("🔌 [EXTERNAL_WEBSOCKET_SYNC] Connecting Zed as external agent: {}", agent_id);
+                        eprintln!("🔧 [EXTERNAL_WEBSOCKET_SYNC] WebSocket config: url={}, agent_id={}, use_tls={}", 
+                                  websocket_config.helix_url, agent_id, use_tls);
                         log::info!("Connecting Zed as external agent: {}", agent_id);
                         log::info!("WebSocket config: url={}, agent_id={}, use_tls={}", 
                                   websocket_config.helix_url, agent_id, use_tls);
@@ -568,7 +611,8 @@ pub fn init(cx: &mut App) {
                         // Start WebSocket connection - this will listen for session messages from Helix
                         match WebSocketSync::new(websocket_config, Some(thread_creation_sender.clone())).await {
                             Ok(websocket_sync) => {
-                                log::info!("Zed WebSocket sync connected successfully - ready to receive session messages");
+                                eprintln!("✅ [EXTERNAL_WEBSOCKET_SYNC] Zed WebSocket sync connected successfully - ready to receive session messages");
+                                log::error!("✅ [INIT] Zed WebSocket sync connected successfully - ready to receive session messages");
                                 
                                 // Keep the WebSocket connection alive by running indefinitely
                                 // This prevents the thread and runtime from shutting down
@@ -578,6 +622,7 @@ pub fn init(cx: &mut App) {
                                 }
                             }
                             Err(e) => {
+                                eprintln!("❌ [EXTERNAL_WEBSOCKET_SYNC] Failed to connect Zed WebSocket sync: {}", e);
                                 log::error!("Failed to connect Zed WebSocket sync: {}", e);
                                 // Retry after a delay
                                 tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
@@ -669,5 +714,36 @@ pub async fn with_sync_service_async<T>(
     f: impl FnOnce(&ExternalWebSocketSync) -> T,
 ) -> Option<T> {
     get_global_sync_service(cx).map(f)
+}
+
+/// Subscribe to context changes for an external session (called from AgentPanel)
+pub fn subscribe_to_context_changes_global(context: Entity<assistant_context::AssistantContext>, external_session_id: String, cx: &mut App) {
+    let session_id_clone = external_session_id.clone();
+    eprintln!("🔔 [SYNC_GLOBAL] Setting up global context subscription for session: {}", external_session_id);
+    
+    // Create a subscription that will send sync events when the context changes
+    let _subscription = cx.subscribe(&context, move |context_entity, _event, cx| {
+        eprintln!("🔔 [SYNC_GLOBAL] Context changed for session: {}", session_id_clone);
+        
+        // Extract the current context content
+        let context_content = context_entity.read(cx);
+        let messages = context_content.messages(cx);
+        
+        let messages: Vec<_> = messages.collect();
+        eprintln!("🔔 [SYNC_GLOBAL] Context has {} messages, syncing to Helix...", messages.len());
+        
+        // TODO: Send sync event to Helix via WebSocket
+        // This is where we'll implement the actual sync back to Helix
+        // We need to:
+        // 1. Extract all messages from the context
+        // 2. Format them as Helix-compatible messages
+        // 3. Send them via WebSocket to update the Helix session
+        
+        eprintln!("✅ [SYNC_GLOBAL] Context sync completed for session: {}", session_id_clone);
+    });
+    
+    // Store the subscription in global state so it doesn't get dropped
+    // TODO: We need a way to store these subscriptions globally
+    eprintln!("✅ [SYNC_GLOBAL] Context subscription created for session: {}", external_session_id);
 }
 

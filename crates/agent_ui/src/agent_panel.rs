@@ -32,7 +32,7 @@ use crate::{
     ExternalAgent, NewExternalAgentThread, NewNativeAgentThreadFromSummary, placeholder_command,
 };
 #[cfg(feature = "external_websocket_sync")]
-use external_websocket_sync;
+use external_websocket_sync_dep as external_websocket_sync;
 use agent::{
     context_store::ContextStore,
     history_store::{HistoryEntryId, HistoryStore},
@@ -441,26 +441,38 @@ pub struct AgentPanel {
 impl AgentPanel {
     #[cfg(feature = "external_websocket_sync")]
     fn process_websocket_thread_requests(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        // TODO: Implement WebSocket thread request processing
         let pending_requests = external_websocket_sync::process_pending_thread_requests(cx);
         if pending_requests.is_empty() {
+            // Log every 100 polls to show we're actually polling
+            use std::sync::atomic::{AtomicU64, Ordering};
+            static POLL_COUNT: AtomicU64 = AtomicU64::new(0);
+            let count = POLL_COUNT.fetch_add(1, Ordering::Relaxed);
+            if count % 100 == 0 {
+                log::error!("🔄 [AGENT_PANEL] Polled for WebSocket requests {} times, no pending requests", count);
+            }
             return;
         }
         
-        // Get or create session mapping
-        let session_mapping = cx.global::<external_websocket_sync::HelixSessionMapping>();
+        log::error!("🎯 [AGENT_PANEL] Found {} pending WebSocket thread requests!", pending_requests.len());
         
         for request in pending_requests {
-            log::info!("🎯 Processing WebSocket thread creation request for session: {}", request.helix_session_id);
+            log::error!("🎯 [AGENT_PANEL] Processing WebSocket thread creation request for session: {}", request.external_session_id);
             
-            // Check if we already have a thread for this Helix session
-            let mut sessions = session_mapping.sessions.write();
-            if let Some(context_id) = sessions.get(&request.helix_session_id) {
+            // Check if we already have a thread for this external session
+            let existing_context_id = {
+                let session_mapping = cx.global::<external_websocket_sync::ExternalSessionMapping>();
+                let sessions = session_mapping.sessions.read();
+                sessions.get(&request.external_session_id).cloned()
+            };
+            
+            if let Some(context_id) = existing_context_id {
                 // Switch to existing thread
-                log::info!("📝 Switching to existing thread for Helix session: {}", request.helix_session_id);
-                self.switch_to_thread(*context_id, window, cx);
+                log::info!("📝 Switching to existing thread for external session: {}", request.external_session_id);
+                self.switch_to_thread(context_id, window, cx);
             } else {
                 // Create new thread and track the mapping
-                log::info!("📝 Creating new thread for Helix session: {}", request.helix_session_id);
+                log::info!("📝 Creating new thread for external session: {}", request.external_session_id);
                 
                 // Focus the panel first to make it visible
                 if let Some(workspace) = self.workspace.upgrade() {
@@ -469,27 +481,77 @@ impl AgentPanel {
                     });
                 }
                 
-                // Create the new thread
-                self.new_prompt_editor(window, cx);
+                // Create the new thread and get the actual context ID
+                let context_id = self.new_prompt_editor_with_message(window, cx, &request.message);
                 
-                // TODO: Get the actual context ID from the newly created thread
-                // For now, create a placeholder mapping
-                let context_id = assistant_context::ContextId::new();
-                sessions.insert(request.helix_session_id.clone(), context_id);
+                // Store the mapping
+                {
+                    let session_mapping = cx.global::<external_websocket_sync::ExternalSessionMapping>();
+                    let mut sessions = session_mapping.sessions.write();
+                    sessions.insert(request.external_session_id.clone(), context_id.clone());
+                }
                 
-                log::info!("✅ Created and focused new thread for Helix session {} with message: {}", 
-                          request.helix_session_id, request.message);
+                log::info!("✅ Created and focused new thread for external session {} with message: {}", 
+                          request.external_session_id, request.message);
             }
         }
     }
     
     #[cfg(feature = "external_websocket_sync")]
     fn switch_to_thread(&mut self, context_id: assistant_context::ContextId, window: &mut Window, cx: &mut Context<Self>) {
-        // TODO: Implement switching to an existing thread by context_id
-        // This would involve finding the thread in active_view and switching to it
-        log::info!("🔄 TODO: Switch to existing thread with context_id: {:?}", context_id);
+        // TODO: Implement thread switching
+        log::info!("🔄 Switching to existing thread with context_id: {:?}", context_id);
         
-        // For now, focus the panel to make it visible
+        // Try to find an existing thread with this context ID
+        if let Some(context) = self.context_store.read(cx).loaded_context_for_id(&context_id, &cx) {
+            let lsp_adapter_delegate = make_lsp_adapter_delegate(&self.project, cx)
+                .log_err()
+                .flatten();
+
+            let context_editor = cx.new(|cx| {
+                TextThreadEditor::for_context(
+                    context.clone(),
+                    self.fs.clone(),
+                    self.workspace.clone(),
+                    self.project.clone(),
+                    lsp_adapter_delegate,
+                    window,
+                    cx,
+                )
+            });
+
+            // Create title editor
+            let title_editor = cx.new(|cx| {
+                let mut editor = Editor::single_line(window, cx);
+                let summary = context.read(cx).summary().or_default();
+                editor.set_text(summary, window, cx);
+                editor
+            });
+
+            // Create buffer search bar
+            let buffer_search_bar = cx.new(|cx| BufferSearchBar::new(Some(self.language_registry.clone()), window, cx));
+            buffer_search_bar.update(cx, |buffer_search_bar, cx| {
+                buffer_search_bar.set_active_pane_item(Some(&context_editor), window, cx)
+            });
+
+            self.set_active_view(
+                ActiveView::TextThread {
+                    context_editor: context_editor.clone(),
+                    title_editor: title_editor.clone(),
+                    buffer_search_bar: buffer_search_bar.clone(),
+                    _subscriptions: vec![],
+                },
+                window,
+                cx,
+            );
+            context_editor.focus_handle(cx).focus(window);
+            
+            log::info!("✅ Switched to existing thread");
+        } else {
+            log::warn!("⚠️ Context not found for ID: {:?}", context_id);
+        }
+        
+        // Focus the panel to make it visible
         if let Some(workspace) = self.workspace.upgrade() {
             workspace.update(cx, |workspace, cx| {
                 workspace.focus_panel::<AgentPanel>(window, cx);
@@ -590,8 +652,75 @@ impl AgentPanel {
                     });
                 }
                 panel.as_mut(cx).loading = false;
+
                 panel
-            })?;
+    })?;
+
+            // Start WebSocket polling task now that panel is fully created
+            #[cfg(feature = "external_websocket_sync")]
+            {
+                eprintln!("🔄 [AGENT_PANEL] Starting WebSocket polling task after panel creation...");
+                let panel_entity = panel.clone();
+                cx.spawn(async move |cx| {
+                    eprintln!("🔄 [AGENT_PANEL] WebSocket polling task started, entering loop...");
+                    loop {
+                        cx.background_executor().timer(std::time::Duration::from_millis(100)).await;
+                        
+                        if let Ok(_) = panel_entity.update(cx, |this, cx| {
+                            // Check if there are pending requests and process them directly
+                            let pending_requests = external_websocket_sync::process_pending_thread_requests(cx);
+                            if !pending_requests.is_empty() {
+                                eprintln!("🎯 [AGENT_PANEL] Found {} pending WebSocket thread requests, processing directly!", pending_requests.len());
+                                
+                                // Process each request by creating threads
+                                for request in pending_requests {
+                                    eprintln!("🎯 [AGENT_PANEL] Creating thread for session: {}", request.external_session_id);
+                                    
+                                    // Create a new thread with the message content
+                                    let context = this.context_store.update(cx, |context_store, cx| context_store.create(cx));
+                                    let context_id = context.read(cx).id().clone();
+                                    
+                                    eprintln!("✅ [AGENT_PANEL] Created thread with context_id: {:?} for message: {}", context_id, request.message);
+                                    
+                                    // Add the user's message to the thread and submit for AI response
+                                    context.update(cx, |context, cx| {
+                                        eprintln!("📝 [AGENT_PANEL] Adding user message to thread: {}", request.message);
+                                        
+                                        // Add the user's message to the buffer
+                                        context.buffer().update(cx, |buffer, cx| {
+                                            let end_offset = buffer.len();
+                                            buffer.edit([(end_offset..end_offset, format!("{}\n", request.message))], None, cx);
+                                        });
+                                        
+                                        // Now call assist to get AI response
+                                        context.assist(cx);
+                                    });
+                                    
+                                    // Store the session mapping
+                                    {
+                                        let session_mapping = cx.global::<external_websocket_sync::ExternalSessionMapping>();
+                                        let mut sessions = session_mapping.sessions.write();
+                                        sessions.insert(request.external_session_id.clone(), context_id.clone());
+                                    }
+                                    
+                                    // Subscribe to context changes to sync back to Helix
+                                    eprintln!("🔔 [AGENT_PANEL] Setting up context change subscription for session: {}", request.external_session_id);
+                                    external_websocket_sync::subscribe_to_context_changes_global(context.clone(), request.external_session_id.clone(), cx);
+                                    
+                                    // Focus the panel to make the new thread visible
+                                    cx.notify();
+                                }
+                            }
+                        }) {
+                            // Continue processing
+                        } else {
+                            // Panel was dropped, exit the loop
+                            eprintln!("🔄 [AGENT_PANEL] WebSocket polling task exiting - panel was dropped");
+                            break;
+                        }
+                    }
+                }).detach();
+            }
 
             Ok(panel)
         })
@@ -605,6 +734,8 @@ impl AgentPanel {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
+        eprintln!("🔧 [AGENT_PANEL] AgentPanel::new() called - creating new AgentPanel instance...");
+        eprintln!("🔧 [AGENT_PANEL] About to check external_websocket_sync feature flag...");
         let fs = workspace.app_state().fs.clone();
         let user_store = workspace.app_state().user_store.clone();
         let project = workspace.project();
@@ -641,26 +772,22 @@ impl AgentPanel {
         .detach();
 
         cx.observe(&history_store, |_, _, cx| cx.notify()).detach();
-        
-        // Set up WebSocket thread creation processing
+
+        // Set up WebSocket thread request processing observer
         #[cfg(feature = "external_websocket_sync")]
         {
-            cx.spawn(|this, mut cx| async move {
-                loop {
-                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-                    
-                    if let Ok(_) = cx.update(|window, cx| {
-                        this.update(cx, |this, cx| {
-                            this.process_websocket_thread_requests(window, cx);
-                        });
-                    }) {
-                        // Continue processing
-                    } else {
-                        // Panel was dropped, exit the loop
-                        break;
-                    }
-                }
+            cx.observe_global::<external_websocket_sync::PendingThreadRequests>(|this, cx| {
+                eprintln!("🎯 [AGENT_PANEL] WebSocket thread requests changed - processing directly!");
+                // Just trigger a notification - the actual processing will happen in the background polling
+                cx.notify();
             }).detach();
+        }
+        
+        // Set up WebSocket thread creation processing - defer to avoid update conflict
+        #[cfg(feature = "external_websocket_sync")]
+        {
+            eprintln!("🎉 [AGENT_PANEL] FEATURE FLAG ACTIVE! external_websocket_sync is compiled!");
+            eprintln!("🔄 [AGENT_PANEL] Will start WebSocket polling task after panel creation...");
         }
 
         let panel_type = AgentSettings::get_global(cx).default_view;
@@ -920,6 +1047,75 @@ impl AgentPanel {
             cx,
         );
         context_editor.focus_handle(cx).focus(window);
+    }
+
+    #[cfg(feature = "external_websocket_sync")]
+    fn new_prompt_editor_with_message(&mut self, window: &mut Window, cx: &mut Context<Self>, initial_message: &str) -> assistant_context::ContextId {
+        telemetry::event!("Agent Thread Started", agent = "zed-text");
+
+        let context = self
+            .context_store
+            .update(cx, |context_store, cx| context_store.create(cx));
+        
+        let context_id = context.read(cx).id().clone();
+        
+        let lsp_adapter_delegate = make_lsp_adapter_delegate(&self.project, cx)
+            .log_err()
+            .flatten();
+
+        let context_editor = cx.new(|cx| {
+            let mut editor = TextThreadEditor::for_context(
+                context.clone(),
+                self.fs.clone(),
+                self.workspace.clone(),
+                self.project.clone(),
+                lsp_adapter_delegate,
+                window,
+                cx,
+            );
+            
+            // Insert the initial message from Helix instead of default prompt
+            if !initial_message.is_empty() {
+                editor.insert_message_from_helix(initial_message, window, cx);
+            } else {
+                editor.insert_default_prompt(window, cx);
+            }
+            
+            editor
+        });
+
+        if self.selected_agent != AgentType::TextThread {
+            self.selected_agent = AgentType::TextThread;
+            self.serialize(cx);
+        }
+
+        // Create title editor
+        let title_editor = cx.new(|cx| {
+            let mut editor = Editor::single_line(window, cx);
+            let summary = context.read(cx).summary().or_default();
+            editor.set_text(summary, window, cx);
+            editor
+        });
+
+        // Create buffer search bar
+        let buffer_search_bar = cx.new(|cx| BufferSearchBar::new(Some(self.language_registry.clone()), window, cx));
+        buffer_search_bar.update(cx, |buffer_search_bar, cx| {
+            buffer_search_bar.set_active_pane_item(Some(&context_editor), window, cx)
+        });
+
+        self.set_active_view(
+            ActiveView::TextThread {
+                context_editor: context_editor.clone(),
+                title_editor: title_editor.clone(),
+                buffer_search_bar: buffer_search_bar.clone(),
+                _subscriptions: vec![],
+            },
+            window,
+            cx,
+        );
+        context_editor.focus_handle(cx).focus(window);
+        
+        context_id
     }
 
     fn external_thread(

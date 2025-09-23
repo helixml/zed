@@ -1,4 +1,4 @@
-//! WebSocket sync client for connecting Zed to Helix
+//! WebSocket sync client for connecting Zed to external WebSocket servers
 
 use anyhow::{Context, Result};
 use futures::{SinkExt, StreamExt};
@@ -39,26 +39,26 @@ impl Default for WebSocketSyncConfig {
     }
 }
 
-/// WebSocket sync client for real-time communication with Helix
+/// WebSocket sync client for real-time communication with external WebSocket servers
 pub struct WebSocketSync {
     config: WebSocketSyncConfig,
     event_sender: mpsc::UnboundedSender<SyncEvent>,
-    command_receiver: Arc<RwLock<Option<mpsc::UnboundedReceiver<HelixCommand>>>>,
+    command_receiver: Arc<RwLock<Option<mpsc::UnboundedReceiver<ExternalWebSocketCommand>>>>,
     is_connected: Arc<RwLock<bool>>,
     shutdown_tx: Option<oneshot::Sender<()>>,
     // Assistant context management for creating UI threads
-    active_contexts: Arc<RwLock<HashMap<String, ContextId>>>, // Helix session ID -> Zed context ID mapping
+    active_contexts: Arc<RwLock<HashMap<String, ContextId>>>, // External session ID -> Zed context ID mapping
 }
 
-/// Commands received from Helix
+/// Commands received from external WebSocket server
 #[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct HelixCommand {
+pub struct ExternalWebSocketCommand {
     #[serde(rename = "type")]
     pub command_type: String,
     pub data: HashMap<String, serde_json::Value>,
 }
 
-/// Sync message sent to Helix
+/// Sync message sent to external WebSocket server
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct SyncMessage {
     pub session_id: String,
@@ -99,7 +99,7 @@ impl WebSocketSync {
         &self,
         config: WebSocketSyncConfig,
         mut event_receiver: mpsc::UnboundedReceiver<SyncEvent>,
-        command_sender: mpsc::UnboundedSender<HelixCommand>,
+        command_sender: mpsc::UnboundedSender<ExternalWebSocketCommand>,
         is_connected: Arc<RwLock<bool>>,
         shutdown_rx: oneshot::Receiver<()>,
         thread_creation_sender: Option<mpsc::UnboundedSender<crate::CreateThreadRequest>>,
@@ -137,7 +137,7 @@ impl WebSocketSync {
             };
 
             *is_connected.write() = true;
-            log::info!("Connected to Helix WebSocket");
+            log::info!("Connected to external WebSocket server");
 
             let (mut sink, mut stream) = websocket.split();
 
@@ -156,34 +156,34 @@ impl WebSocketSync {
 
                         // Handle local events that should create UI threads
                         match &event {
-                            SyncEvent::CreateThreadFromHelixSession { helix_session_id, message, request_id } => {
-                                log::info!(
-                                    "🎯 Processing CreateThreadFromHelixSession event: session={}, message={}, request={}",
-                                    helix_session_id, message, request_id
+                            SyncEvent::CreateThreadFromExternalSession { external_session_id, message, request_id } => {
+                                log::error!(
+                                    "🎯 [WEBSOCKET] Processing CreateThreadFromExternalSession event: session={}, message={}, request={}",
+                                    external_session_id, message, request_id
                                 );
                                 
                                 // Send thread creation request to UI via channel
                                 if let Some(ref sender) = thread_creation_sender {
                                     let request = crate::CreateThreadRequest {
-                                        helix_session_id: helix_session_id.clone(),
+                                        external_session_id: external_session_id.clone(),
                                         message: message.clone(),
                                         request_id: request_id.clone(),
                                     };
                                     
                                     if let Err(e) = sender.send(request) {
-                                        log::error!("Failed to send thread creation request: {}", e);
+                                        log::error!("❌ [WEBSOCKET] Failed to send thread creation request: {}", e);
                                     } else {
-                                        log::info!("✅ Sent thread creation request to UI for session {}", helix_session_id);
+                                        log::error!("✅ [WEBSOCKET] Sent thread creation request to UI for session {}", external_session_id);
                                     }
                                 } else {
-                                    log::warn!("Thread creation sender not available - cannot create UI thread");
+                                    log::error!("❌ [WEBSOCKET] Thread creation sender not available - cannot create UI thread");
                                 }
                                 
-                                // Don't send this event to Helix - it's for local processing only
+                                // Don't send this event to external server - it's for local processing only
                                 continue;
                             }
                             _ => {
-                                // Handle other events normally by sending to Helix
+                                // Handle other events normally by sending to external server
                             }
                         }
 
@@ -218,6 +218,9 @@ impl WebSocketSync {
                     while let Some(message) = stream.next().await {
                         match message {
                             Ok(Message::Text(text)) => {
+                                eprintln!("🔔 [WEBSOCKET] Received WebSocket message: {}", text);
+                                log::info!("Received WebSocket message: {}", text);
+                                eprintln!("🔄 [WEBSOCKET] Processing message with session_id: {}", session_id_for_incoming);
                                 if let Err(e) = Self::handle_incoming_message(&session_id_for_incoming, text.to_string(), &command_sender, &event_sender).await {
                                     log::error!("Failed to handle incoming message: {}", e);
                                 }
@@ -295,7 +298,7 @@ async fn connect_with_auth(url: &Url, auth_token: &str) -> Result<WebSocketStrea
             match connect_async(url.as_str()).await {
                 Ok((websocket, response)) => {
                     log::info!("WebSocket connection successful! Status: {}", response.status());
-                    Ok(websocket)
+        Ok(websocket)
                 }
                 Err(e) => {
                     log::error!("WebSocket connection failed with detailed error: {:?}", e);
@@ -312,7 +315,7 @@ impl WebSocketSync {
             let _ = shutdown_tx.send(());
         }
         *self.is_connected.write() = false;
-        log::info!("Disconnected from Helix WebSocket");
+        log::info!("Disconnected from external WebSocket server");
         Ok(())
     }
 
@@ -321,7 +324,7 @@ impl WebSocketSync {
         *self.is_connected.read()
     }
 
-    /// Send a sync event to Helix
+    /// Send a sync event to external WebSocket server
     pub fn send_event(&self, event: SyncEvent) -> Result<()> {
         if !self.is_connected() {
             return Err(anyhow::anyhow!("WebSocket not connected"));
@@ -334,37 +337,55 @@ impl WebSocketSync {
         Ok(())
     }
 
-    /// Handle incoming message from Helix
+    /// Handle incoming message from external WebSocket server
     pub async fn handle_incoming_message(
         session_id: &str, 
         text: String, 
-        command_sender: &mpsc::UnboundedSender<HelixCommand>,
+        command_sender: &mpsc::UnboundedSender<ExternalWebSocketCommand>,
         event_sender: &mpsc::UnboundedSender<SyncEvent>
     ) -> Result<()> {
-        let command: HelixCommand = serde_json::from_str(&text)
-            .context("Failed to parse command from Helix")?;
+        eprintln!("🔍 [HANDLE_MESSAGE] Processing incoming message for session: {}", session_id);
+        eprintln!("🔍 [HANDLE_MESSAGE] Message text: {}", text);
+        
+        let command: ExternalWebSocketCommand = match serde_json::from_str(&text) {
+            Ok(cmd) => {
+                eprintln!("✅ [HANDLE_MESSAGE] Successfully parsed command: {:?}", cmd);
+                cmd
+            }
+            Err(e) => {
+                eprintln!("❌ [HANDLE_MESSAGE] Failed to parse command: {}", e);
+                return Err(anyhow::anyhow!("Failed to parse command from external server: {}", e));
+            }
+        };
 
-        log::debug!("Received command from Helix: {:?}", command);
+        log::debug!("Received command from external server: {:?}", command);
 
         // Forward the command for processing
         if let Err(_) = command_sender.send(command.clone()) {
             log::warn!("Failed to forward command to handler");
         }
 
+        eprintln!("🔀 [HANDLE_MESSAGE] Processing command type: {}", command.command_type);
+
         match command.command_type.as_str() {
             "add_message" => {
+                eprintln!("📝 [HANDLE_MESSAGE] Handling add_message command");
                 Self::handle_add_message_command(session_id, command.data).await?;
             }
             "update_message" => {
+                eprintln!("✏️ [HANDLE_MESSAGE] Handling update_message command");
                 Self::handle_update_message_command(session_id, command.data).await?;
             }
             "delete_message" => {
+                eprintln!("🗑️ [HANDLE_MESSAGE] Handling delete_message command");
                 Self::handle_delete_message_command(session_id, command.data).await?;
             }
             "update_context" => {
+                eprintln!("🔄 [HANDLE_MESSAGE] Handling update_context command");
                 Self::handle_update_context_command(session_id, command.data).await?;
             }
             "chat_message" => {
+                eprintln!("💬 [HANDLE_MESSAGE] Handling chat_message command - THIS SHOULD CREATE THREAD!");
                 // TODO: Need to pass self reference to handle_chat_message_command
                 // For now, keep the static version working
                 Self::handle_chat_message_command(session_id, command.data, event_sender, None).await?;
@@ -377,7 +398,7 @@ impl WebSocketSync {
         Ok(())
     }
 
-    /// Handle add_message command from Helix
+    /// Handle add_message command from external server
     async fn handle_add_message_command(
         session_id: &str,
         data: HashMap<String, serde_json::Value>,
@@ -412,7 +433,7 @@ impl WebSocketSync {
         Ok(())
     }
 
-    /// Handle update_message command from Helix
+    /// Handle update_message command from external server
     async fn handle_update_message_command(
         _session_id: &str,
         data: HashMap<String, serde_json::Value>,
@@ -422,7 +443,7 @@ impl WebSocketSync {
         Ok(())
     }
 
-    /// Handle delete_message command from Helix
+    /// Handle delete_message command from external server
     async fn handle_delete_message_command(
         _session_id: &str,
         data: HashMap<String, serde_json::Value>,
@@ -432,29 +453,37 @@ impl WebSocketSync {
         Ok(())
     }
 
-    /// Handle update_context command from Helix
-    /// Handle chat_message command from Helix - this includes a request_id and expects a response
+    /// Handle update_context command from external server
+    /// Handle chat_message command from external server - this includes a request_id and expects a response
     async fn handle_chat_message_command(
         agent_session_id: &str,
         data: HashMap<String, serde_json::Value>,
         event_sender: &mpsc::UnboundedSender<SyncEvent>,
         active_contexts: Option<Arc<RwLock<HashMap<String, ContextId>>>>,
     ) -> Result<()> {
+        eprintln!("🎯 [CHAT_HANDLER] Starting chat message handler for session: {}", agent_session_id);
+        eprintln!("🎯 [CHAT_HANDLER] Data: {:?}", data);
+        
         let request_id = data.get("request_id")
             .and_then(|v| v.as_str())
             .ok_or_else(|| anyhow::anyhow!("Missing request_id in chat_message command"))?;
+        eprintln!("🎯 [CHAT_HANDLER] Extracted request_id: {}", request_id);
 
         let helix_session_id = data.get("session_id")
             .and_then(|v| v.as_str())
             .ok_or_else(|| anyhow::anyhow!("Missing session_id in chat_message command"))?;
+        eprintln!("🎯 [CHAT_HANDLER] Extracted session_id: {}", helix_session_id);
 
         let message = data.get("message")
             .and_then(|v| v.as_str())
             .ok_or_else(|| anyhow::anyhow!("Missing message in chat_message command"))?;
+        eprintln!("🎯 [CHAT_HANDLER] Extracted message: {}", message);
 
         let role = data.get("role")
             .and_then(|v| v.as_str())
             .unwrap_or("user");
+        eprintln!("🎯 [CHAT_HANDLER] Extracted role: {}", role);
+        eprintln!("🎯 [CHAT_HANDLER] About to process session mapping and create thread...");
 
         log::info!(
             "Received chat message from Helix session {} via agent {}: {} (role: {}, request_id: {})",
@@ -509,19 +538,21 @@ impl WebSocketSync {
         );
         
         // Emit event to request thread creation from the UI
-        let create_thread_event = SyncEvent::CreateThreadFromHelixSession {
-            helix_session_id: helix_session_id.to_string(),
+        let create_thread_event = SyncEvent::CreateThreadFromExternalSession {
+            external_session_id: helix_session_id.to_string(),
             message: message.to_string(),
             request_id: request_id.to_string(),
         };
         
         if let Err(e) = event_sender.send(create_thread_event) {
+            eprintln!("❌ [CHAT_HANDLER] Failed to send create thread event: {}", e);
             log::error!("Failed to send create thread event: {}", e);
             return Err(anyhow::anyhow!("Failed to send create thread event: {}", e));
         }
+        eprintln!("✅ [CHAT_HANDLER] Successfully sent CreateThreadFromExternalSession event!");
         
-        log::info!(
-            "🎯 Emitted CreateThreadFromHelixSession event for session {} - UI should create thread now!",
+        log::error!(
+            "🎯 [CHAT_HANDLER] Emitted CreateThreadFromExternalSession event for session {} - UI should create thread now!",
             helix_session_id
         );
         
@@ -556,7 +587,7 @@ impl WebSocketSync {
             SyncEvent::ChatResponseChunk { .. } => "chat_response_chunk".to_string(),
             SyncEvent::ChatResponseDone { .. } => "chat_response_done".to_string(),
             SyncEvent::ChatResponseError { .. } => "chat_response_error".to_string(),
-            SyncEvent::CreateThreadFromHelixSession { .. } => "create_thread_from_helix_session".to_string(),
+            SyncEvent::CreateThreadFromExternalSession { .. } => "create_thread_from_external_session".to_string(),
         }
     }
 
@@ -602,8 +633,8 @@ impl WebSocketSync {
                 data.insert("request_id".to_string(), serde_json::Value::String(request_id));
                 data.insert("error".to_string(), serde_json::Value::String(error));
             }
-            SyncEvent::CreateThreadFromHelixSession { helix_session_id, message, request_id } => {
-                data.insert("helix_session_id".to_string(), serde_json::Value::String(helix_session_id));
+            SyncEvent::CreateThreadFromExternalSession { external_session_id, message, request_id } => {
+                data.insert("external_session_id".to_string(), serde_json::Value::String(external_session_id));
                 data.insert("message".to_string(), serde_json::Value::String(message));
                 data.insert("request_id".to_string(), serde_json::Value::String(request_id));
             }
