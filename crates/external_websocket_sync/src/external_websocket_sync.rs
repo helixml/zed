@@ -56,7 +56,22 @@ pub struct ExternalSessionMapping {
     pub sessions: Arc<RwLock<std::collections::HashMap<String, assistant_context::ContextId>>>,
 }
 
+/// Global WebSocket sender for sending responses back to Helix
+#[derive(Clone)]
+pub struct WebSocketSender {
+    pub sender: Arc<RwLock<Option<tokio::sync::mpsc::UnboundedSender<tungstenite::Message>>>>,
+}
+
+impl Default for WebSocketSender {
+    fn default() -> Self {
+        Self {
+            sender: Arc::new(RwLock::new(None)),
+        }
+    }
+}
+
 impl Global for ExternalSessionMapping {}
+impl Global for WebSocketSender {}
 
 /// Global channel for thread creation requests from WebSocket to UI
 #[derive(Clone)]
@@ -528,8 +543,9 @@ pub fn init(cx: &mut App) {
     let pending_requests_clone = pending_requests.clone();
     cx.set_global(pending_requests);
     
-    // Create global session mapping
+    // Create global session mapping and WebSocket sender
     cx.set_global(ExternalSessionMapping::default());
+    cx.set_global(WebSocketSender::default());
     
     // Spawn background task to listen for thread creation requests
     std::thread::spawn(move || {

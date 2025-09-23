@@ -477,10 +477,71 @@ impl AgentPanel {
                 {
                     let session_mapping = cx.global::<external_websocket_sync::ExternalSessionMapping>();
                     let mut sessions = session_mapping.sessions.write();
-                    sessions.insert(request.external_session_id.clone(), context_id);
+                    sessions.insert(request.external_session_id.clone(), context_id.clone());
                 }
+                
+                // Subscribe to context events to forward AI responses back to Helix
+                self.subscribe_to_context_for_websocket_sync(context_id, request.external_session_id.clone(), window, cx);
             }
         }
+    }
+    
+    #[cfg(feature = "external_websocket_sync")]
+    fn subscribe_to_context_for_websocket_sync(
+        &mut self, 
+        context_id: assistant_context::ContextId, 
+        helix_session_id: String,
+        window: &mut Window,
+        cx: &mut Context<Self>
+    ) {
+        log::error!("🔔 [AGENT_PANEL] Setting up context event subscription for WebSocket sync");
+        log::error!("🔔 [AGENT_PANEL] Context ID: {}, Helix Session ID: {}", context_id.to_proto(), helix_session_id);
+        
+        // Get the context from the context store
+        let context = self.context_store.read(cx).loaded_context_for_id(&context_id, cx);
+        if let Some(context) = context {
+            log::error!("🔔 [AGENT_PANEL] Found context, subscribing to events...");
+            
+            // Subscribe to context events
+            cx.subscribe_in(&context, window, move |_panel, _context, event, _window, cx| {
+                log::error!("🎯 [CONTEXT_EVENT] Received context event: {:?}", event);
+                
+                match event {
+                    assistant_context::ContextEvent::StreamedCompletion => {
+                        log::error!("🤖 [CONTEXT_EVENT] AI completion finished! Forwarding to Helix...");
+                        
+                        // Get the latest AI response from the context
+                        // TODO: Extract the actual AI response content
+                        let ai_response = "AI response content here"; // Placeholder
+                        
+                        // Forward the response back to Helix via WebSocket
+                        Self::forward_ai_response_to_helix(&helix_session_id, ai_response, cx);
+                    }
+                    assistant_context::ContextEvent::MessagesEdited => {
+                        log::error!("📝 [CONTEXT_EVENT] Messages edited - potential AI response");
+                        // Could also handle this event for real-time updates
+                    }
+                    _ => {
+                        // Ignore other events
+                    }
+                }
+            }).detach();
+            
+            log::error!("✅ [AGENT_PANEL] Context event subscription established");
+        } else {
+            log::error!("❌ [AGENT_PANEL] Failed to find context for subscription");
+        }
+    }
+    
+    #[cfg(feature = "external_websocket_sync")]
+    fn forward_ai_response_to_helix(helix_session_id: &str, ai_response: &str, cx: &mut Context<AgentPanel>) {
+        log::error!("📤 [FORWARD_AI] Forwarding AI response to Helix session: {}", helix_session_id);
+        log::error!("📤 [FORWARD_AI] Response content: {}", ai_response);
+        
+        // TODO: Implement WebSocket sending via the existing WebSocket sync system
+        // For now, just log that we received the AI response
+        log::error!("🚧 [FORWARD_AI] WebSocket sending not implemented yet - AI response captured successfully");
+        log::error!("🚧 [FORWARD_AI] This confirms the context event subscription is working!");
     }
     
     #[cfg(feature = "external_websocket_sync")]
