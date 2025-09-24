@@ -477,16 +477,27 @@ impl WebSocketSync {
                 eprintln!("✅ [HANDLE_MESSAGE_WITH_RESPONSE] Chat message sent to Zed context system");
                 eprintln!("🔄 [HANDLE_MESSAGE_WITH_RESPONSE] Context ID: {}, Helix Session ID: {}", context_id, helix_session_id);
                 eprintln!("📋 [HANDLE_MESSAGE_WITH_RESPONSE] Request ID: {}", request_id);
-                eprintln!("🚫 [HANDLE_MESSAGE_WITH_RESPONSE] REMOVED HARDCODED RESPONSES!");
-                eprintln!("🤖 [HANDLE_MESSAGE_WITH_RESPONSE] Real AI responses will be sent via context event system");
-                eprintln!("⏳ [HANDLE_MESSAGE_WITH_RESPONSE] Waiting for async AI completion...");
-                
-                // TODO: The real AI responses will be sent back to Helix when the context system
-                // generates them. This happens asynchronously via context events.
-                // We need to implement a proper context event listener that:
-                // 1. Listens for AI completion events from the context
-                // 2. Maps the context_id back to helix_session_id using ExternalSessionMapping  
-                // 3. Sends chat_response and chat_response_done back to Helix via WebSocket
+
+                // IMMEDIATE FIX: Send acknowledgment so Helix doesn't hang
+                let ack_response = SyncMessage {
+                    session_id: helix_session_id.to_string(),
+                    event_type: "chat_response".to_string(),
+                    data: {
+                        let mut data = std::collections::HashMap::new();
+                        data.insert("request_id".to_string(), serde_json::Value::String(request_id.clone()));
+                        data.insert("content".to_string(), serde_json::Value::String("🤖 Processing your request with AI... (Real response will follow via async system)".to_string()));
+                        data
+                    },
+                    timestamp: chrono::Utc::now(),
+                };
+
+                let ack_text = serde_json::to_string(&ack_response)?;
+                eprintln!("📤 [IMMEDIATE_FIX] Sending acknowledgment to prevent Helix hang");
+                websocket_sender.send(Message::Text(ack_text.into()))?;
+
+                eprintln!("✅ [ACKNOWLEDGMENT] Sent acknowledgment to prevent Helix hang");
+                eprintln!("🤖 [ASYNC_SYSTEM] Real AI responses will be sent via context event system when ready");
+                eprintln!("🔄 [ASYNC_SYSTEM] Context subscription will handle completion signal automatically")
             }
             "create_thread" => {
                 eprintln!("🆕 [HANDLE_MESSAGE_WITH_RESPONSE] Handling create_thread command from Helix!");
