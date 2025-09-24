@@ -930,11 +930,12 @@ impl AgentPanel {
         // Set up WebSocket thread request processing observer
         #[cfg(feature = "external_websocket_sync")]
         {
-            cx.observe_global::<external_websocket_sync::PendingThreadRequests>(|this, cx| {
-                eprintln!("🎯 [AGENT_PANEL] WebSocket thread requests changed - scheduling thread creation!");
-                // Schedule thread creation to happen with window access
-                cx.notify(); // This will trigger a re-render where we can check for pending requests
-            }).detach();
+            // DISABLED: This observer was causing crashes when accessing global state
+            // cx.observe_global::<external_websocket_sync::PendingThreadRequests>(|this, cx| {
+            //     eprintln!("🎯 [AGENT_PANEL] WebSocket thread requests changed - scheduling thread creation!");
+            //     // Schedule thread creation to happen with window access
+            //     cx.notify(); // This will trigger a re-render where we can check for pending requests
+            // }).detach();
         }
         
         // Set up WebSocket thread creation processing - defer to avoid update conflict
@@ -2885,7 +2886,8 @@ impl Render for AgentPanel {
         // Process any pending WebSocket thread requests now that we have window access
         #[cfg(feature = "external_websocket_sync")]
         {
-            self.process_websocket_thread_requests_with_window(window, cx);
+            // DISABLED: This was causing agent panel crashes - auto-processing not needed
+            // self.process_websocket_thread_requests_with_window(window, cx);
         }
         
         // WARNING: Changes to this element hierarchy can have
