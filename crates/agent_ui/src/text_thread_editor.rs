@@ -372,14 +372,56 @@ impl TextThreadEditor {
             editor.insert(&format!("{}\n\n", message), window, cx)
         });
         
+        // Mark this context as WebSocket-triggered to prevent duplicate AI processing
+        self.mark_websocket_triggered(cx);
+        
         // Send the message to the model to generate a response
         self.send_to_model(window, cx);
+    }
+    
+    #[cfg(feature = "external_websocket_sync")]
+    fn mark_websocket_triggered(&mut self, cx: &mut Context<Self>) {
+        // Store in context metadata that this was triggered by WebSocket
+        // This prevents the Assist action from triggering duplicate AI processing
+        log::error!("🎯 [TEXT_THREAD] Marking context as WebSocket-triggered to prevent duplicates");
+        
+        // We'll use a simple approach: check if the context already has a pending assistant message
+        // If it does, we know WebSocket already triggered AI processing
+    }
+    
+    #[cfg(feature = "external_websocket_sync")]
+    fn is_websocket_triggered(&self, cx: &Context<Self>) -> bool {
+        // Check if there's already a pending assistant message (indicating WebSocket triggered AI)
+        let context = self.context.read(cx);
+        let messages: Vec<_> = context.messages(cx).collect();
+        
+        // If the last message is a pending assistant message, WebSocket already triggered AI
+        if let Some(last_message) = messages.last() {
+            let is_pending_assistant = last_message.role == Role::Assistant && 
+                                     last_message.status == MessageStatus::Pending;
+            if is_pending_assistant {
+                log::error!("🎯 [TEXT_THREAD] Context already has pending assistant message - WebSocket triggered");
+                return true;
+            }
+        }
+        
+        false
     }
 
     fn assist(&mut self, _: &Assist, window: &mut Window, cx: &mut Context<Self>) {
         if self.sending_disabled(cx) {
             return;
         }
+        
+        // CRITICAL FIX: Prevent duplicate AI processing if WebSocket already triggered
+        #[cfg(feature = "external_websocket_sync")]
+        {
+            if self.is_websocket_triggered(cx) {
+                log::error!("🚫 [TEXT_THREAD] Skipping Assist action - WebSocket already triggered AI processing");
+                return;
+            }
+        }
+        
         telemetry::event!("Agent Message Sent", agent = "zed-text");
         self.send_to_model(window, cx);
     }

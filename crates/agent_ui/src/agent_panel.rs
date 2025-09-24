@@ -481,8 +481,20 @@ impl AgentPanel {
                     sessions.insert(request.external_session_id.clone(), context_id.clone());
                 }
                 
+                // CRITICAL: Send context_created event to establish proper mapping on Helix side
+                self.send_context_created_event(&context_id.to_proto(), &request.external_session_id, cx);
+                
                 // Subscribe to context events to forward AI responses back to Helix
                 self.subscribe_to_context_for_websocket_sync(context_id, request.external_session_id.clone(), window, cx);
+                
+                // CRITICAL FIX: Auto-activate Agent Panel for external WebSocket sessions
+                // This prevents the parallel processing issue by ensuring UI is ready
+                log::error!("🎯 [AGENT_PANEL] Auto-activating Agent Panel for WebSocket session");
+                if let Some(workspace) = self.workspace.upgrade() {
+                    workspace.update(cx, |workspace, cx| {
+                        workspace.focus_panel::<AgentPanel>(window, cx);
+                    });
+                }
             }
         }
     }
@@ -503,6 +515,9 @@ impl AgentPanel {
         if let Some(context) = context {
             log::error!("🔔 [AGENT_PANEL] Found context, subscribing to events...");
             
+            // Clone the context_id for the closure
+            let zed_context_id = context_id.clone();
+            
             // Subscribe to context events
             cx.subscribe_in(&context.clone(), window, move |_panel, _context, event, _window, cx| {
                 log::error!("🎯 [CONTEXT_EVENT] Received context event: {:?}", event);
@@ -515,8 +530,8 @@ impl AgentPanel {
                         let ai_response = Self::extract_latest_ai_response(_context, cx);
                         log::error!("🤖 [CONTEXT_EVENT] Extracted AI response: {}", ai_response);
                         
-                        // Forward the response back to Helix via WebSocket
-                        Self::forward_ai_response_to_helix(&helix_session_id, &ai_response, cx);
+                        // Forward the response back to Helix via WebSocket with proper context mapping
+                        Self::forward_ai_response_to_helix(&helix_session_id, &ai_response, &zed_context_id.to_proto(), cx);
                     }
                     assistant_context::ContextEvent::MessagesEdited => {
                         log::error!("📝 [CONTEXT_EVENT] Messages edited - potential AI response");
@@ -564,9 +579,10 @@ impl AgentPanel {
     }
     
     #[cfg(feature = "external_websocket_sync")]
-    fn forward_ai_response_to_helix(helix_session_id: &str, ai_response: &str, cx: &mut Context<AgentPanel>) {
+    fn forward_ai_response_to_helix(helix_session_id: &str, ai_response: &str, zed_context_id: &str, cx: &mut Context<AgentPanel>) {
         log::error!("📤 [FORWARD_AI] Forwarding AI response to Helix session: {}", helix_session_id);
         log::error!("📤 [FORWARD_AI] Response content: {}", ai_response);
+        log::error!("📤 [FORWARD_AI] Zed context ID: {}", zed_context_id);
         
         // Get the global WebSocket sender
         if let Some(sender) = external_websocket_sync::get_global_websocket_sender() {
@@ -579,7 +595,7 @@ impl AgentPanel {
                 data: {
                     let mut data = std::collections::HashMap::new();
                     data.insert("content".to_string(), serde_json::Value::String(ai_response.to_string()));
-                    data.insert("context_id".to_string(), serde_json::Value::String(helix_session_id.to_string()));
+                    data.insert("context_id".to_string(), serde_json::Value::String(zed_context_id.to_string()));
                     data.insert("message_id".to_string(), serde_json::Value::String(format!("ai_msg_{}", chrono::Utc::now().timestamp())));
                     data.insert("role".to_string(), serde_json::Value::String("assistant".to_string()));
                     data.insert("timestamp".to_string(), serde_json::Value::Number(serde_json::Number::from(chrono::Utc::now().timestamp())));
@@ -601,6 +617,43 @@ impl AgentPanel {
             }
         } else {
             log::error!("⚠️ [FORWARD_AI] WebSocket sender not available - no connection to Helix");
+        }
+    }
+    
+    #[cfg(feature = "external_websocket_sync")]
+    fn send_context_created_event(&mut self, zed_context_id: &str, helix_session_id: &str, cx: &mut Context<Self>) {
+        log::error!("🎯 [CONTEXT_CREATED] Sending context_created event for proper mapping");
+        log::error!("🎯 [CONTEXT_CREATED] Zed context ID: {}, Helix session ID: {}", zed_context_id, helix_session_id);
+        
+        // Get the global WebSocket sender
+        if let Some(sender) = external_websocket_sync::get_global_websocket_sender() {
+            // Create the sync message for context creation
+            let sync_message = external_websocket_sync::SyncMessage {
+                event_type: "context_created".to_string(),
+                session_id: helix_session_id.to_string(),
+                data: {
+                    let mut data = std::collections::HashMap::new();
+                    data.insert("context_id".to_string(), serde_json::Value::String(zed_context_id.to_string()));
+                    data.insert("title".to_string(), serde_json::Value::String("Zed Agent Conversation".to_string()));
+                    data.insert("created_at".to_string(), serde_json::Value::Number(serde_json::Number::from(chrono::Utc::now().timestamp())));
+                    data
+                },
+                timestamp: chrono::Utc::now(),
+            };
+            
+            // Serialize and send the message
+            if let Ok(json_message) = serde_json::to_string(&sync_message) {
+                let websocket_message = external_websocket_sync::tungstenite::Message::Text(json_message.into());
+                if let Err(e) = sender.send(websocket_message) {
+                    log::error!("❌ [CONTEXT_CREATED] Failed to send WebSocket message: {}", e);
+                } else {
+                    log::error!("✅ [CONTEXT_CREATED] Context created event sent to establish mapping!");
+                }
+            } else {
+                log::error!("❌ [CONTEXT_CREATED] Failed to serialize context_created message");
+            }
+        } else {
+            log::error!("⚠️ [CONTEXT_CREATED] WebSocket sender not available - no connection to Helix");
         }
     }
     
