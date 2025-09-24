@@ -644,7 +644,7 @@ impl AgentPanel {
             
             // Serialize and send the message
             if let Ok(json_message) = serde_json::to_string(&sync_message) {
-                let websocket_message = external_websocket_sync::tungstenite::Message::Text(json_message.into());
+                let websocket_message = external_websocket_sync_dep::tungstenite::Message::Text(json_message.into());
                 if let Err(e) = sender.send(websocket_message) {
                     log::error!("❌ [CONTEXT_CREATED] Failed to send WebSocket message: {}", e);
                 } else {
