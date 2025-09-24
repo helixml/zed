@@ -574,12 +574,15 @@ impl AgentPanel {
             
             // Create the sync message for chat response
             let sync_message = external_websocket_sync::SyncMessage {
-                event_type: "chat_response".to_string(),
+                event_type: "message_added".to_string(),
                 session_id: helix_session_id.to_string(),
                 data: {
                     let mut data = std::collections::HashMap::new();
                     data.insert("content".to_string(), serde_json::Value::String(ai_response.to_string()));
-                    data.insert("request_id".to_string(), serde_json::Value::String("ai_response".to_string()));
+                    data.insert("context_id".to_string(), serde_json::Value::String(helix_session_id.to_string()));
+                    data.insert("message_id".to_string(), serde_json::Value::String(format!("ai_msg_{}", chrono::Utc::now().timestamp())));
+                    data.insert("role".to_string(), serde_json::Value::String("assistant".to_string()));
+                    data.insert("timestamp".to_string(), serde_json::Value::Number(serde_json::Number::from(chrono::Utc::now().timestamp())));
                     data
                 },
                 timestamp: chrono::Utc::now(),
@@ -591,28 +594,7 @@ impl AgentPanel {
                 if let Err(e) = sender.send(websocket_message) {
                     log::error!("❌ [FORWARD_AI] Failed to send WebSocket message: {}", e);
                 } else {
-                    log::error!("✅ [FORWARD_AI] AI response sent to Helix successfully!");
-                    
-                    // Send completion signal
-                    let completion_message = external_websocket_sync::SyncMessage {
-                        event_type: "chat_response_done".to_string(),
-                        session_id: helix_session_id.to_string(),
-                        data: {
-                            let mut data = std::collections::HashMap::new();
-                            data.insert("request_id".to_string(), serde_json::Value::String("ai_response".to_string()));
-                            data
-                        },
-                        timestamp: chrono::Utc::now(),
-                    };
-                    
-                    if let Ok(completion_json) = serde_json::to_string(&completion_message) {
-                        let completion_websocket_message = external_websocket_sync::tungstenite::Message::Text(completion_json.into());
-                        if let Err(e) = sender.send(completion_websocket_message) {
-                            log::error!("❌ [FORWARD_AI] Failed to send completion signal: {}", e);
-                        } else {
-                            log::error!("✅ [FORWARD_AI] Completion signal sent to Helix!");
-                        }
-                    }
+                    log::error!("✅ [FORWARD_AI] AI response sent to Helix as message_added event!");
                 }
             } else {
                 log::error!("❌ [FORWARD_AI] Failed to serialize sync message");
