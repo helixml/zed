@@ -519,8 +519,13 @@ impl ExternalWebSocketSync {
         cx.try_global::<Self>()
     }
 
-    pub fn global_mut(cx: &mut App) -> &mut Self {
-        cx.global_mut::<Self>()
+    pub fn global_mut(cx: &mut App) -> Option<&mut Self> {
+        if cx.has_global::<Self>() {
+            Some(cx.global_mut::<Self>())
+        } else {
+            log::error!("⚠️ [EXTERNAL_WEBSOCKET_SYNC] ExternalWebSocketSync global not available for mutable access");
+            None
+        }
     }
 }
 

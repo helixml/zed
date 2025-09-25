@@ -444,8 +444,14 @@ impl AgentPanel {
 
     #[cfg(feature = "external_websocket_sync")]
     fn process_websocket_thread_requests_with_window(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        log::error!("🎯 [CRASH_DEBUG] process_websocket_thread_requests_with_window ENTRY");
+        
+        log::error!("🎯 [CRASH_DEBUG] About to call process_pending_thread_requests");
         let pending_requests = external_websocket_sync::process_pending_thread_requests(cx);
+        log::error!("🎯 [CRASH_DEBUG] Got {} pending requests", pending_requests.len());
+        
         if pending_requests.is_empty() {
+            log::error!("🎯 [CRASH_DEBUG] No pending requests, returning early");
             return;
         }
         
@@ -456,9 +462,13 @@ impl AgentPanel {
             
             // Check if we already have a thread for this external session
             let existing_context_id = {
-                let session_mapping = cx.global::<external_websocket_sync::ExternalSessionMapping>();
-                let sessions = session_mapping.sessions.read();
-                sessions.get(&request.external_session_id).cloned()
+                if let Some(session_mapping) = cx.try_global::<external_websocket_sync::ExternalSessionMapping>() {
+                    let sessions = session_mapping.sessions.read();
+                    sessions.get(&request.external_session_id).cloned()
+                } else {
+                    log::error!("⚠️ [AGENT_PANEL] ExternalSessionMapping global not available");
+                    None
+                }
             };
             
             if let Some(context_id) = existing_context_id {
@@ -477,9 +487,12 @@ impl AgentPanel {
                 
                 // Store the mapping between Helix session and Zed context
                 {
-                    let session_mapping = cx.global::<external_websocket_sync::ExternalSessionMapping>();
-                    let mut sessions = session_mapping.sessions.write();
-                    sessions.insert(request.external_session_id.clone(), context_id.clone());
+                    if let Some(session_mapping) = cx.try_global::<external_websocket_sync::ExternalSessionMapping>() {
+                        let mut sessions = session_mapping.sessions.write();
+                        sessions.insert(request.external_session_id.clone(), context_id.clone());
+                    } else {
+                        log::error!("⚠️ [AGENT_PANEL] ExternalSessionMapping global not available for storing mapping");
+                    }
                 }
                 
                 // CRITICAL: Send context_created event to establish proper mapping on Helix side
@@ -488,14 +501,10 @@ impl AgentPanel {
                 // Subscribe to context events to forward AI responses back to Helix
                 self.subscribe_to_context_for_websocket_sync(context_id, request.external_session_id.clone(), window, cx);
                 
-                // CRITICAL FIX: Auto-activate Agent Panel for external WebSocket sessions
-                // This prevents the parallel processing issue by ensuring UI is ready
-                log::error!("🎯 [AGENT_PANEL] Auto-activating Agent Panel for WebSocket session");
-                if let Some(workspace) = self.workspace.upgrade() {
-                    workspace.update(cx, |workspace, cx| {
-                        workspace.focus_panel::<AgentPanel>(window, cx);
-                    });
-                }
+                // REMOVED: Auto-activate Agent Panel call causes re-entrancy crash
+                // This was being called from inside render() which crashes the UI framework
+                // The panel is already active since render() is being called
+                log::error!("🎯 [AGENT_PANEL] WebSocket session processed (panel already active)");
             }
         }
     }
@@ -672,9 +681,13 @@ impl AgentPanel {
             
             // Check if we already have a thread for this external session
             let existing_context_id = {
-                let session_mapping = cx.global::<external_websocket_sync::ExternalSessionMapping>();
-                let sessions = session_mapping.sessions.read();
-                sessions.get(&request.external_session_id).cloned()
+                if let Some(session_mapping) = cx.try_global::<external_websocket_sync::ExternalSessionMapping>() {
+                    let sessions = session_mapping.sessions.read();
+                    sessions.get(&request.external_session_id).cloned()
+                } else {
+                    log::error!("⚠️ [AGENT_PANEL] ExternalSessionMapping global not available for checking existing context");
+                    None
+                }
             };
             
             if let Some(context_id) = existing_context_id {
@@ -692,9 +705,12 @@ impl AgentPanel {
                 
                 // Store the mapping from external session to Zed context
                 {
-                    let session_mapping = cx.global::<external_websocket_sync::ExternalSessionMapping>();
-                    let mut sessions = session_mapping.sessions.write();
-                    sessions.insert(request.external_session_id.clone(), context_id.clone());
+                    if let Some(session_mapping) = cx.try_global::<external_websocket_sync::ExternalSessionMapping>() {
+                        let mut sessions = session_mapping.sessions.write();
+                        sessions.insert(request.external_session_id.clone(), context_id.clone());
+                    } else {
+                        log::error!("⚠️ [AGENT_PANEL] ExternalSessionMapping global not available for storing external mapping");
+                    }
                 }
                 
                 log::error!("✅ [AGENT_PANEL] Successfully created thread {} for Helix session {}", 
@@ -930,12 +946,11 @@ impl AgentPanel {
         // Set up WebSocket thread request processing observer
         #[cfg(feature = "external_websocket_sync")]
         {
-            // DISABLED: This observer was causing crashes when accessing global state
-            // cx.observe_global::<external_websocket_sync::PendingThreadRequests>(|this, cx| {
-            //     eprintln!("🎯 [AGENT_PANEL] WebSocket thread requests changed - scheduling thread creation!");
-            //     // Schedule thread creation to happen with window access
-            //     cx.notify(); // This will trigger a re-render where we can check for pending requests
-            // }).detach();
+            cx.observe_global::<external_websocket_sync::PendingThreadRequests>(|this, cx| {
+                eprintln!("🎯 [AGENT_PANEL] WebSocket thread requests changed - scheduling thread creation!");
+                // Schedule thread creation to happen with window access
+                cx.notify(); // This will trigger a re-render where we can check for pending requests
+            }).detach();
         }
         
         // Set up WebSocket thread creation processing - defer to avoid update conflict
@@ -959,7 +974,13 @@ impl AgentPanel {
             DefaultView::TextThread => {
                 let context =
                     context_store.update(cx, |context_store, cx| context_store.create(cx));
-                let lsp_adapter_delegate = make_lsp_adapter_delegate(&project.clone(), cx).unwrap();
+                let lsp_adapter_delegate = match make_lsp_adapter_delegate(&project.clone(), cx) {
+                    Ok(delegate) => delegate,
+                    Err(e) => {
+                        log::error!("⚠️ [AGENT_PANEL] Failed to create LSP adapter delegate: {:?}", e);
+                        None
+                    }
+                };
                 let context_editor = cx.new(|cx| {
                     let mut editor = TextThreadEditor::for_context(
                         context,
@@ -1643,8 +1664,8 @@ impl AgentPanel {
     ) {
         match event {
             AssistantConfigurationEvent::NewThread(provider) => {
-                if LanguageModelRegistry::read_global(cx)
-                    .default_model()
+                if LanguageModelRegistry::try_read_global(cx)
+                    .and_then(|registry| registry.default_model())
                     .is_none_or(|model| model.provider.id() != provider.id())
                     && let Some(model) = provider.default_model(cx)
                 {
@@ -2432,7 +2453,12 @@ impl AgentPanel {
                                     })
                                     .cloned()
                                     .collect::<Vec<_>>();
-                                let custom_settings = cx.global::<SettingsStore>().get::<AllAgentServersSettings>(None).custom.clone();
+                                let custom_settings = if let Some(settings_store) = cx.try_global::<SettingsStore>() {
+                                    settings_store.get::<AllAgentServersSettings>(None).custom.clone()
+                                } else {
+                                    log::error!("⚠️ [AGENT_PANEL] SettingsStore global not available for custom settings");
+                                    Default::default()
+                                };
                                 for agent_name in agent_names {
                                     menu = menu.item(
                                         ContextMenuEntry::new(format!("New {} Thread", agent_name))
@@ -2549,9 +2575,8 @@ impl AgentPanel {
 
         match &self.active_view {
             ActiveView::TextThread { .. } => {
-                if LanguageModelRegistry::global(cx)
-                    .read(cx)
-                    .default_model()
+                if LanguageModelRegistry::try_global(cx)
+                    .and_then(|registry| registry.read(cx).default_model())
                     .is_some_and(|model| {
                         model.provider.id() != language_model::ZED_CLOUD_PROVIDER_ID
                     })
@@ -2605,13 +2630,16 @@ impl AgentPanel {
                         .history_store
                         .update(cx, |store, cx| store.recent_entries(1, cx).is_empty());
 
-                let has_configured_non_zed_providers = LanguageModelRegistry::read_global(cx)
-                    .providers()
-                    .iter()
-                    .any(|provider| {
-                        provider.is_authenticated(cx)
-                            && provider.id() != language_model::ZED_CLOUD_PROVIDER_ID
-                    });
+                let has_configured_non_zed_providers = LanguageModelRegistry::try_read_global(cx)
+                    .map(|registry| registry
+                        .providers()
+                        .iter()
+                        .any(|provider| {
+                            provider.is_authenticated(cx)
+                                && provider.id() != language_model::ZED_CLOUD_PROVIDER_ID
+                        })
+                    )
+                    .unwrap_or(false);
 
                 history_is_empty || !has_configured_non_zed_providers
             }
@@ -2883,11 +2911,15 @@ impl AgentPanel {
 
 impl Render for AgentPanel {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // CRASH DEBUG: Log render entry
+        log::error!("🎯 [CRASH_DEBUG] Agent panel render() called");
+        
         // Process any pending WebSocket thread requests now that we have window access
         #[cfg(feature = "external_websocket_sync")]
         {
-            // DISABLED: This was causing agent panel crashes - auto-processing not needed
-            // self.process_websocket_thread_requests_with_window(window, cx);
+            log::error!("🎯 [CRASH_DEBUG] About to call process_websocket_thread_requests_with_window");
+            self.process_websocket_thread_requests_with_window(window, cx);
+            log::error!("🎯 [CRASH_DEBUG] Completed process_websocket_thread_requests_with_window");
         }
         
         // WARNING: Changes to this element hierarchy can have
@@ -2929,7 +2961,9 @@ impl Render for AgentPanel {
             }))
             .child(self.render_toolbar(window, cx))
             .children(self.render_onboarding(window, cx))
-            .map(|parent| match &self.active_view {
+            .map(|parent| {
+                log::error!("🎯 [CRASH_DEBUG] About to match on active_view: {:?}", std::mem::discriminant(&self.active_view));
+                match &self.active_view {
                 ActiveView::ExternalAgentThread { thread_view, .. } => parent
                     .child(thread_view.clone())
                     .child(self.render_drag_target(cx)),
@@ -2939,7 +2973,10 @@ impl Render for AgentPanel {
                     buffer_search_bar,
                     ..
                 } => {
-                    let model_registry = LanguageModelRegistry::read_global(cx);
+                    let Some(model_registry) = LanguageModelRegistry::try_read_global(cx) else {
+                        log::error!("⚠️ [AGENT_PANEL] LanguageModelRegistry not available");
+                        return parent;
+                    };
                     let configuration_error =
                         model_registry.configuration_error(model_registry.default_model(), cx);
                     parent
@@ -2966,6 +3003,7 @@ impl Render for AgentPanel {
                         ))
                 }
                 ActiveView::Configuration => parent.children(self.configuration.clone()),
+                }
             })
             .children(self.render_trial_end_upsell(window, cx));
 

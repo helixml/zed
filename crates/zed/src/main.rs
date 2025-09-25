@@ -170,6 +170,34 @@ pub fn main() {
     #[cfg(unix)]
     util::prevent_root_execution();
 
+    // CRITICAL CRASH DEBUG: Set up panic hook to capture actual crash backtraces
+    std::panic::set_hook(Box::new(|info| {
+        let backtrace = std::backtrace::Backtrace::force_capture();
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let crash_log = format!(
+            "🔥 ZED CRASH DETECTED 🔥\n\
+             Timestamp: {}\n\
+             Panic Info: {}\n\
+             Backtrace:\n{}\n\
+             ========================",
+            timestamp,
+            info,
+            backtrace
+        );
+        
+        // Write to stderr
+        eprintln!("{}", crash_log);
+        
+        // Write to file for persistence
+        std::fs::write("/tmp/zed_crash_backtrace.log", &crash_log).ok();
+        
+        // Also try to write to integration test directory
+        std::fs::write("/home/luke/pm/helix/integration-test/zed-websocket/zed_crash.log", &crash_log).ok();
+    }));
+
     let args = Args::parse();
 
     // `zed --crash-handler` Makes zed operate in minidump crash handler mode
