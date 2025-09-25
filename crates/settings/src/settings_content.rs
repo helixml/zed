@@ -16,7 +16,7 @@ pub use terminal::*;
 pub use theme::*;
 pub use workspace::*;
 
-use collections::HashMap;
+use collections::{HashMap, IndexMap};
 use gpui::{App, SharedString};
 use release_channel::ReleaseChannel;
 use schemars::JsonSchema;
@@ -182,7 +182,7 @@ pub struct UserSettingsContent {
     pub linux: Option<Box<SettingsContent>>,
 
     #[serde(default)]
-    pub profiles: HashMap<String, SettingsContent>,
+    pub profiles: IndexMap<String, SettingsContent>,
 }
 
 pub struct ExtensionsSettingsContent {
@@ -237,10 +237,6 @@ pub enum BaseKeymapContent {
 #[skip_serializing_none]
 #[derive(Clone, PartialEq, Default, Serialize, Deserialize, JsonSchema, MergeFrom, Debug)]
 pub struct TitleBarSettingsContent {
-    /// Controls when the title bar is visible: "always" | "never" | "hide_in_full_screen".
-    ///
-    /// Default: "always"
-    pub show: Option<TitleBarVisibility>,
     /// Whether to show the branch icon beside branch switcher in the title bar.
     ///
     /// Default: false
@@ -269,14 +265,6 @@ pub struct TitleBarSettingsContent {
     ///
     /// Default: false
     pub show_menus: Option<bool>,
-}
-
-#[derive(Copy, Clone, PartialEq, Serialize, Deserialize, JsonSchema, MergeFrom, Debug)]
-#[serde(rename_all = "snake_case")]
-pub enum TitleBarVisibility {
-    Always,
-    Never,
-    HideInFullScreen,
 }
 
 /// Configuration of audio in Zed.

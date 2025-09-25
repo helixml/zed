@@ -11,8 +11,8 @@ use crate::{
     MouseMoveEvent, MouseUpEvent, Path, Pixels, PlatformAtlas, PlatformDisplay, PlatformInput,
     PlatformInputHandler, PlatformWindow, Point, PolychromeSprite, PromptButton, PromptLevel, Quad,
     Render, RenderGlyphParams, RenderImage, RenderImageParams, RenderSvgParams, Replay, ResizeEdge,
-    SMOOTH_SVG_SCALE_FACTOR, SUBPIXEL_VARIANTS, ScaledPixels, Scene, Shadow, SharedString, Size,
-    StrikethroughStyle, Style, SubscriberSet, Subscription, SystemWindowTab,
+    SMOOTH_SVG_SCALE_FACTOR, SUBPIXEL_VARIANTS_X, SUBPIXEL_VARIANTS_Y, ScaledPixels, Scene, Shadow,
+    SharedString, Size, StrikethroughStyle, Style, SubscriberSet, Subscription, SystemWindowTab,
     SystemWindowTabController, TabHandles, TaffyLayoutEngine, Task, TextStyle, TextStyleRefinement,
     TransformationMatrix, Underline, UnderlineStyle, WindowAppearance, WindowBackgroundAppearance,
     WindowBounds, WindowControls, WindowDecorations, WindowOptions, WindowParams, WindowTextSystem,
@@ -2944,9 +2944,10 @@ impl Window {
         let element_opacity = self.element_opacity();
         let scale_factor = self.scale_factor();
         let glyph_origin = origin.scale(scale_factor);
+
         let subpixel_variant = Point {
-            x: (glyph_origin.x.0.fract() * SUBPIXEL_VARIANTS as f32).floor() as u8,
-            y: (glyph_origin.y.0.fract() * SUBPIXEL_VARIANTS as f32).floor() as u8,
+            x: (glyph_origin.x.0.fract() * SUBPIXEL_VARIANTS_X as f32).floor() as u8,
+            y: (glyph_origin.y.0.fract() * SUBPIXEL_VARIANTS_Y as f32).floor() as u8,
         };
         let params = RenderGlyphParams {
             font_id,
@@ -4022,6 +4023,8 @@ impl Window {
                 let any_action = action.as_any();
                 if action_type == any_action.type_id() {
                     cx.propagate_event = false; // Actions stop propagation by default during the bubble phase
+                    cx.platform.on_action_triggered(action);
+
                     listener(any_action, DispatchPhase::Bubble, self, cx);
 
                     if !cx.propagate_event {
@@ -4039,6 +4042,7 @@ impl Window {
             for listener in global_listeners.iter().rev() {
                 cx.propagate_event = false; // Actions stop propagation by default during the bubble phase
 
+                cx.platform.on_action_triggered(action);
                 listener(action.as_any(), DispatchPhase::Bubble, cx);
                 if !cx.propagate_event {
                     break;

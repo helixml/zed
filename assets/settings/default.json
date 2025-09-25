@@ -391,8 +391,6 @@
   "use_system_window_tabs": false,
   // Titlebar related settings
   "title_bar": {
-    // When to show the title bar: "always" | "never" | "hide_in_full_screen".
-    "show": "always",
     // Whether to show the branch icon beside branch switcher in the titlebar.
     "show_branch_icon": false,
     // Whether to show the branch name button in the titlebar.
@@ -1414,7 +1412,7 @@
     //         "line_height": {
     //           "custom": 2
     //         },
-    "line_height": "comfortable",
+    "line_height": "standard",
     // Activate the python virtual environment, if one is found, in the
     // terminal's working directory (as resolved by the working_directory
     // setting). Set this to "off" to disable this behavior.
@@ -1434,7 +1432,7 @@
       //
       // The shell running in the terminal needs to be configured to emit the title.
       // Example: `echo -e "\e]2;New Title\007";`
-      "breadcrumbs": true
+      "breadcrumbs": false
     },
     // Scrollbar-related settings
     "scrollbar": {
@@ -1514,7 +1512,7 @@
   // }
   //
   "file_types": {
-    "JSONC": ["**/.zed/**/*.json", "**/zed/**/*.json", "**/Zed/**/*.json", "**/.vscode/**/*.json"],
+    "JSONC": ["**/.zed/**/*.json", "**/zed/**/*.json", "**/Zed/**/*.json", "**/.vscode/**/*.json", "tsconfig*.json"],
     "Shell Script": [".env.*"]
   },
   // Settings for which version of Node.js and NPM to use when installing

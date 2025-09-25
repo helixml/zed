@@ -974,8 +974,6 @@ struct ZedAiConfiguration {
 
 impl RenderOnce for ZedAiConfiguration {
     fn render(self, _window: &mut Window, _cx: &mut App) -> impl IntoElement {
-        let young_account_banner = YoungAccountBanner;
-
         let is_pro = self.plan.is_some_and(|plan| {
             matches!(plan, Plan::V1(PlanV1::ZedPro) | Plan::V2(PlanV2::ZedPro))
         });
@@ -986,8 +984,15 @@ impl RenderOnce for ZedAiConfiguration {
             (Some(Plan::V1(PlanV1::ZedProTrial) | Plan::V2(PlanV2::ZedProTrial)), Some(_)) => {
                 "You have access to Zed's hosted models through your Pro trial."
             }
-            (Some(Plan::V1(PlanV1::ZedFree) | Plan::V2(PlanV2::ZedFree)), Some(_)) => {
+            (Some(Plan::V1(PlanV1::ZedFree)), Some(_)) => {
                 "You have basic access to Zed's hosted models through the Free plan."
+            }
+            (Some(Plan::V2(PlanV2::ZedFree)), Some(_)) => {
+                if self.eligible_for_trial {
+                    "Subscribe for access to Zed's hosted models. Start with a 14 day free trial."
+                } else {
+                    "Subscribe for access to Zed's hosted models."
+                }
             }
             _ => {
                 if self.eligible_for_trial {
@@ -1038,7 +1043,7 @@ impl RenderOnce for ZedAiConfiguration {
 
         v_flex().gap_2().w_full().map(|this| {
             if self.account_too_young {
-                this.child(young_account_banner).child(
+                this.child(YoungAccountBanner).child(
                     Button::new("upgrade", "Upgrade to Pro")
                         .style(ui::ButtonStyle::Tinted(ui::TintColor::Accent))
                         .full_width()

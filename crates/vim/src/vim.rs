@@ -822,7 +822,7 @@ impl Vim {
         editor.set_collapse_matches(false);
         editor.set_input_enabled(true);
         editor.set_autoindent(true);
-        editor.selections.line_mode = false;
+        editor.selections.set_line_mode(false);
         editor.unregister_addon::<VimAddon>();
         editor.set_relative_line_number(None, cx);
         if let Some(vim) = Vim::globals(cx).focused_vim()
@@ -1092,6 +1092,8 @@ impl Vim {
                         let mut point = selection.head();
                         if !selection.reversed && !selection.is_empty() {
                             point = movement::left(map, selection.head());
+                        } else if selection.is_empty() {
+                            point = map.clip_point(point, Bias::Left);
                         }
                         selection.collapse_to(point, selection.goal)
                     } else if !last_mode.is_visual() && mode.is_visual() && selection.is_empty() {
@@ -1608,7 +1610,7 @@ impl Vim {
             && !is_multicursor
             && [Mode::Visual, Mode::VisualLine, Mode::VisualBlock].contains(&self.mode)
         {
-            self.switch_mode(Mode::Normal, true, window, cx);
+            self.switch_mode(Mode::Normal, false, window, cx);
         }
     }
 
@@ -1785,7 +1787,9 @@ impl Vim {
             editor.set_collapse_matches(true);
             editor.set_input_enabled(vim.editor_input_enabled());
             editor.set_autoindent(vim.should_autoindent());
-            editor.selections.line_mode = matches!(vim.mode, Mode::VisualLine);
+            editor
+                .selections
+                .set_line_mode(matches!(vim.mode, Mode::VisualLine));
 
             let hide_edit_predictions = !matches!(vim.mode, Mode::Insert | Mode::Replace);
             editor.set_edit_predictions_hidden_for_vim_mode(hide_edit_predictions, window, cx);
