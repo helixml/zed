@@ -5034,7 +5034,6 @@ dependencies = [
  "settings",
  "util",
  "workspace-hack",
- "zed",
  "zlog",
 ]
 

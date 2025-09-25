@@ -78,7 +78,6 @@ gpui_tokio.workspace = true
 edit_prediction_button.workspace = true
 http_client.workspace = true
 image_viewer.workspace = true
-edit_prediction_button.workspace = true
 external_websocket_sync = { workspace = true, optional = true }
 inspector_ui.workspace = true
 install_cli.workspace = true
@@ -92,7 +91,6 @@ language_onboarding.workspace = true
 language_selector.workspace = true
 language_tools.workspace = true
 languages = { workspace = true, features = ["load-grammars"] }
-jj_ui.workspace = true
 libc.workspace = true
 line_ending_selector.workspace = true
 log.workspace = true
