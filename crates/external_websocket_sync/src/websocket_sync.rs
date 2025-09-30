@@ -57,6 +57,8 @@ pub struct WebSocketSync {
     shutdown_tx: Option<oneshot::Sender<()>>,
     // Assistant context management for creating UI threads
     active_contexts: Arc<RwLock<HashMap<String, ContextId>>>, // External session ID -> Zed context ID mapping
+    // CRITICAL: Reverse mapping so async events can find the Helix session ID from context ID
+    context_to_helix_session: Arc<RwLock<HashMap<String, String>>>, // Zed context ID (as String) -> Helix session ID mapping
 }
 
 /// Commands received from external WebSocket server
@@ -95,6 +97,7 @@ impl WebSocketSync {
             is_connected: is_connected.clone(),
             shutdown_tx: Some(shutdown_tx),
             active_contexts: Arc::new(RwLock::new(HashMap::default())),
+            context_to_helix_session: Arc::new(RwLock::new(HashMap::default())),
         };
 
         // Start WebSocket connection task
@@ -128,6 +131,7 @@ impl WebSocketSync {
         // Clone necessary data before async move
         let auth_token = config.auth_token.clone();
         let event_sender = self.event_sender.clone();
+        let context_to_helix_session = self.context_to_helix_session.clone();
 
         tokio::spawn(async move {
             let url = match Url::parse(&url) {
@@ -195,6 +199,7 @@ impl WebSocketSync {
             let event_task = {
                 let is_connected = is_connected.clone();
                 let websocket_sender_for_events = websocket_sender.clone();
+                let context_to_helix_session_for_events = context_to_helix_session.clone();
                 tokio::spawn(async move {
                     while let Some(event) = event_receiver.recv().await {
                         if !*is_connected.read() {
@@ -261,8 +266,36 @@ impl WebSocketSync {
                             }
                         }
 
+                        // CRITICAL FIX: Extract context_id and look up Helix session ID for async events
+                        let context_id_opt = match &event {
+                            SyncEvent::MessageAdded { context_id, .. } => Some(context_id.clone()),
+                            SyncEvent::MessageUpdated { context_id, .. } => Some(context_id.clone()),
+                            SyncEvent::MessageDeleted { context_id, .. } => Some(context_id.clone()),
+                            SyncEvent::ContextTitleChanged { context_id, .. } => Some(context_id.clone()),
+                            _ => None,
+                        };
+
+                        // Look up Helix session ID from GLOBAL context mapping (shared with agent_panel)
+                        let session_id_for_event = if let Some(context_id) = context_id_opt {
+                            // Use the global mapping that agent_panel populates with REAL context IDs
+                            if let Some(global_mapping) = crate::get_context_to_helix_mapping() {
+                                global_mapping.read()
+                                    .get(&context_id)
+                                    .cloned()
+                                    .unwrap_or_else(|| {
+                                        eprintln!("⚠️  [SESSION_MAPPING] No Helix session found in global mapping for context {}, using agent session", context_id);
+                                        session_id_for_outgoing.clone()
+                                    })
+                            } else {
+                                eprintln!("⚠️  [SESSION_MAPPING] Global mapping not available, using agent session");
+                                session_id_for_outgoing.clone()
+                            }
+                        } else {
+                            session_id_for_outgoing.clone()
+                        };
+
                         let sync_message = SyncMessage {
-                            session_id: session_id_for_outgoing.clone(),
+                            session_id: session_id_for_event,
                             event_type: Self::event_type_string(&event),
                             data: Self::event_to_data(event),
                             timestamp: chrono::Utc::now(),
@@ -300,7 +333,7 @@ impl WebSocketSync {
                                 log::info!("Received WebSocket message: {}", text);
                                 
                                 // Handle the message and potentially send response
-                                match Self::handle_incoming_message_with_response(&session_id_for_incoming, text.to_string(), &command_sender, &event_sender, &websocket_sender).await {
+                                match Self::handle_incoming_message_with_response(&session_id_for_incoming, text.to_string(), &command_sender, &event_sender, &websocket_sender, &context_to_helix_session).await {
                                     Ok(()) => {
                                         eprintln!("✅ [WEBSOCKET] ========================================");
                                         eprintln!("✅ [WEBSOCKET] SUCCESSFULLY PROCESSED MESSAGE");
@@ -438,7 +471,8 @@ impl WebSocketSync {
         message: String,
         _command_sender: &mpsc::UnboundedSender<ExternalWebSocketCommand>,
         event_sender: &mpsc::UnboundedSender<SyncEvent>,
-        websocket_sender: &mpsc::UnboundedSender<Message>
+        websocket_sender: &mpsc::UnboundedSender<Message>,
+        context_to_helix_session: &Arc<RwLock<HashMap<String, String>>>,
     ) -> Result<()> {
         
                 eprintln!("🔄 [HANDLE_MESSAGE_WITH_RESPONSE] ========================================");
@@ -477,6 +511,10 @@ impl WebSocketSync {
                 eprintln!("✅ [HANDLE_MESSAGE_WITH_RESPONSE] Chat message sent to Zed context system");
                 eprintln!("🔄 [HANDLE_MESSAGE_WITH_RESPONSE] Context ID: {}, Helix Session ID: {}", context_id, helix_session_id);
                 eprintln!("📋 [HANDLE_MESSAGE_WITH_RESPONSE] Request ID: {}", request_id);
+
+                // CRITICAL FIX: Store mapping so async events can use correct Helix session ID
+                context_to_helix_session.write().insert(context_id.clone(), helix_session_id.clone());
+                eprintln!("💾 [SESSION_MAPPING] Stored mapping: Context {} -> Helix Session {}", context_id, helix_session_id);
 
                 // IMMEDIATE FIX: Send acknowledgment so Helix doesn't hang
                 let ack_response = SyncMessage {

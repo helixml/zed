@@ -57,6 +57,13 @@ pub struct ExternalSessionMapping {
     pub sessions: Arc<RwLock<std::collections::HashMap<String, assistant_context::ContextId>>>,
 }
 
+/// Global REVERSE mapping of Zed context IDs to Helix session IDs
+/// This is critical for async events to use the correct session_id when sending to Helix
+#[derive(Clone, Default)]
+pub struct ContextToHelixSessionMapping {
+    pub contexts: Arc<RwLock<std::collections::HashMap<String, String>>>, // Zed context ID -> Helix session ID
+}
+
 /// Global WebSocket sender for sending responses back to Helix
 #[derive(Clone)]
 pub struct WebSocketSender {
@@ -72,7 +79,18 @@ impl Default for WebSocketSender {
 }
 
 impl Global for ExternalSessionMapping {}
+impl Global for ContextToHelixSessionMapping {}
 impl Global for WebSocketSender {}
+
+/// Get a clone of the global context-to-helix-session mapping for use in async tasks
+pub fn get_context_to_helix_mapping() -> Option<Arc<RwLock<std::collections::HashMap<String, String>>>> {
+    // This will be set during init and can be accessed from async tasks
+    GLOBAL_CONTEXT_TO_HELIX_MAPPING.lock().clone()
+}
+
+/// Static global for context-to-helix mapping that can be accessed from async tasks
+static GLOBAL_CONTEXT_TO_HELIX_MAPPING: parking_lot::Mutex<Option<Arc<RwLock<std::collections::HashMap<String, String>>>>> =
+    parking_lot::Mutex::new(None);
 
 /// Global channel for thread creation requests from WebSocket to UI
 #[derive(Clone)]
@@ -549,9 +567,15 @@ pub fn init(cx: &mut App) {
     let pending_requests_clone = pending_requests.clone();
     cx.set_global(pending_requests);
     
-    // Create global session mapping and WebSocket sender
+    // Create global session mapping, reverse mapping, and WebSocket sender
     cx.set_global(ExternalSessionMapping::default());
+    let context_to_helix_mapping = ContextToHelixSessionMapping::default();
+    cx.set_global(context_to_helix_mapping.clone());
     cx.set_global(WebSocketSender::default());
+
+    // CRITICAL: Store the mapping in static global so async tasks can access it
+    *GLOBAL_CONTEXT_TO_HELIX_MAPPING.lock() = Some(context_to_helix_mapping.contexts.clone());
+    eprintln!("✅ [INIT] Global context-to-helix mapping initialized for async task access");
     
     // Spawn background task to listen for thread creation requests
     std::thread::spawn(move || {

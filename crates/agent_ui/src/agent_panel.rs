@@ -494,6 +494,19 @@ impl AgentPanel {
                         log::error!("⚠️ [AGENT_PANEL] ExternalSessionMapping global not available for storing mapping");
                     }
                 }
+
+                // CRITICAL: Store REVERSE mapping (Zed context ID -> Helix session ID)
+                // This is what the websocket_sync event loop needs to use correct session_id
+                {
+                    if let Some(reverse_mapping) = cx.try_global::<external_websocket_sync::ContextToHelixSessionMapping>() {
+                        let mut contexts = reverse_mapping.contexts.write();
+                        contexts.insert(context_id.to_proto(), request.external_session_id.clone());
+                        log::error!("💾 [AGENT_PANEL] Stored reverse mapping: Context {} -> Helix Session {}",
+                                   context_id.to_proto(), request.external_session_id);
+                    } else {
+                        log::error!("⚠️ [AGENT_PANEL] ContextToHelixSessionMapping global not available for storing reverse mapping");
+                    }
+                }
                 
                 // CRITICAL: Send context_created event to establish proper mapping on Helix side
                 self.send_context_created_event(&context_id.to_proto(), &request.external_session_id, cx);
