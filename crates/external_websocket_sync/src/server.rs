@@ -91,7 +91,7 @@ impl ExternalWebSocketSync {
         let app_state = AppState {
             config: config.clone(),
             start_time: Instant::now(),
-            websocket_clients: Arc::new(RwLock::new(HashMap::new())),
+            websocket_clients: Arc::new(RwLock::new(HashMap::default())),
         };
 
         let app = create_router(app_state);
@@ -416,7 +416,7 @@ pub async fn start_server(config: ServerConfig) -> Result<ServerHandle> {
     let app_state = AppState {
         config: config.clone(),
         start_time: Instant::now(),
-        websocket_clients: Arc::new(RwLock::new(HashMap::new())),
+        websocket_clients: Arc::new(RwLock::new(HashMap::default())),
     };
 
     let app = create_router(app_state);

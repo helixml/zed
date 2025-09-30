@@ -162,7 +162,7 @@ impl ExternalWebSocketSync {
             context_store: None,
             project,
             prompt_builder,
-            active_contexts: Arc::new(RwLock::new(HashMap::new())),
+            active_contexts: Arc::new(RwLock::new(HashMap::default())),
             websocket_sync: None,
             sync_clients: Arc::new(RwLock::new(Vec::new())),
             _subscriptions: Vec::new(),

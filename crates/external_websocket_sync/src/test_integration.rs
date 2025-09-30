@@ -28,7 +28,7 @@ async fn test_bidirectional_message_handling() -> Result<()> {
     let helix_command = HelixCommand {
         command_type: "chat_message".to_string(),
         data: {
-            let mut data = HashMap::new();
+            let mut data = HashMap::default();
             data.insert("request_id".to_string(), json!("req-123"));
             data.insert("message".to_string(), json!("hi"));
             data.insert("session_id".to_string(), json!("test-session"));

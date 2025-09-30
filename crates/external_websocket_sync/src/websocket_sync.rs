@@ -94,7 +94,7 @@ impl WebSocketSync {
             command_receiver: Arc::new(RwLock::new(Some(command_receiver))),
             is_connected: is_connected.clone(),
             shutdown_tx: Some(shutdown_tx),
-            active_contexts: Arc::new(RwLock::new(HashMap::new())),
+            active_contexts: Arc::new(RwLock::new(HashMap::default())),
         };
 
         // Start WebSocket connection task
@@ -886,7 +886,7 @@ impl WebSocketSync {
 
     /// Convert SyncEvent to data HashMap
     pub fn event_to_data(event: SyncEvent) -> HashMap<String, serde_json::Value> {
-        let mut data = HashMap::new();
+        let mut data = HashMap::default();
 
         match event {
             SyncEvent::ContextCreated { context_id } => {

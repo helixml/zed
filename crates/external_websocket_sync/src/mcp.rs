@@ -77,8 +77,8 @@ pub struct McpToolDefinition {
 impl McpManager {
     pub fn new() -> Self {
         Self {
-            servers: Arc::new(RwLock::new(HashMap::new())),
-            tools: Arc::new(RwLock::new(HashMap::new())),
+            servers: Arc::new(RwLock::new(HashMap::default())),
+            tools: Arc::new(RwLock::new(HashMap::default())),
             _tasks: Vec::new(),
         }
     }
@@ -437,7 +437,7 @@ pub fn create_filesystem_mcp_config() -> McpServerConfig {
         name: "filesystem".to_string(),
         command: "npx".to_string(),
         args: vec!["@modelcontextprotocol/server-filesystem".to_string(), "/tmp".to_string()],
-        env: HashMap::new(),
+        env: std::collections::HashMap::new(),
     }
 }
 
@@ -446,7 +446,7 @@ pub fn create_git_mcp_config(repo_path: String) -> McpServerConfig {
         name: "git".to_string(),
         command: "npx".to_string(),
         args: vec!["@modelcontextprotocol/server-git".to_string(), "--repository".to_string(), repo_path],
-        env: HashMap::new(),
+        env: std::collections::HashMap::new(),
     }
 }
 
@@ -455,6 +455,6 @@ pub fn create_sqlite_mcp_config(db_path: String) -> McpServerConfig {
         name: "sqlite".to_string(),
         command: "npx".to_string(),
         args: vec!["@modelcontextprotocol/server-sqlite".to_string(), db_path],
-        env: HashMap::new(),
+        env: std::collections::HashMap::new(),
     }
 }
