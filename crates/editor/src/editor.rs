@@ -83,7 +83,7 @@ use aho_corasick::AhoCorasick;
 use anyhow::{Context as _, Result, anyhow};
 use blink_manager::BlinkManager;
 use buffer_diff::DiffHunkStatus;
-use client::{Collaborator, ParticipantIndex};
+use client::{Collaborator, ParticipantIndex, parse_zed_link};
 use clock::{AGENT_REPLICA_ID, ReplicaId};
 use code_context_menus::{
     AvailableCodeAction, CodeActionContents, CodeActionsItem, CodeActionsMenu, CodeContextMenu,
@@ -142,7 +142,7 @@ use mouse_context_menu::MouseContextMenu;
 use movement::TextLayoutDetails;
 use multi_buffer::{
     ExcerptInfo, ExpandExcerptDirection, MultiBufferDiffHunk, MultiBufferPoint, MultiBufferRow,
-    MultiOrSingleBufferOffsetRange, ToOffsetUtf16,
+    ToOffsetUtf16,
 };
 use parking_lot::Mutex;
 use persistence::DB;
@@ -279,15 +279,15 @@ impl InlineValueCache {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum InlayId {
-    EditPrediction(usize),
-    DebuggerValue(usize),
+    EditPrediction(u32),
+    DebuggerValue(u32),
     // LSP
-    Hint(usize),
-    Color(usize),
+    Hint(u32),
+    Color(u32),
 }
 
 impl InlayId {
-    fn id(&self) -> usize {
+    fn id(&self) -> u32 {
         match self {
             Self::EditPrediction(id) => *id,
             Self::DebuggerValue(id) => *id,
@@ -592,11 +592,22 @@ pub fn make_inlay_hints_style(cx: &mut App) -> HighlightStyle {
         .inlay_hints
         .show_background;
 
-    HighlightStyle {
-        color: Some(cx.theme().status().hint),
-        background_color: show_background.then(|| cx.theme().status().hint_background),
-        ..HighlightStyle::default()
+    let mut style = cx.theme().syntax().get("hint");
+
+    if style.color.is_none() {
+        style.color = Some(cx.theme().status().hint);
     }
+
+    if !show_background {
+        style.background_color = None;
+        return style;
+    }
+
+    if style.background_color.is_none() {
+        style.background_color = Some(cx.theme().status().hint_background);
+    }
+
+    style
 }
 
 pub fn make_suggestion_styles(cx: &mut App) -> EditPredictionStyles {
@@ -627,8 +638,14 @@ enum EditPrediction {
         display_mode: EditDisplayMode,
         snapshot: BufferSnapshot,
     },
-    Move {
+    /// Move to a specific location in the active editor
+    MoveWithin {
         target: Anchor,
+        snapshot: BufferSnapshot,
+    },
+    /// Move to a specific location in a different editor (not the active one)
+    MoveOutside {
+        target: language::Anchor,
         snapshot: BufferSnapshot,
     },
 }
@@ -637,7 +654,7 @@ struct EditPredictionState {
     inlay_ids: Vec<InlayId>,
     completion: EditPrediction,
     completion_id: Option<SharedString>,
-    invalidation_range: Range<Anchor>,
+    invalidation_range: Option<Range<Anchor>>,
 }
 
 enum EditPredictionSettings {
@@ -1107,7 +1124,8 @@ pub struct Editor {
     edit_prediction_indent_conflict: bool,
     edit_prediction_requires_modifier_in_indent_conflict: bool,
     inlay_hint_cache: InlayHintCache,
-    next_inlay_id: usize,
+    next_inlay_id: u32,
+    next_color_inlay_id: u32,
     _subscriptions: Vec<Subscription>,
     pixel_position_of_newest_cursor: Option<gpui::Point<Pixels>>,
     gutter_dimensions: GutterDimensions,
@@ -1171,7 +1189,6 @@ pub struct Editor {
     pub change_list: ChangeList,
     inline_value_cache: InlineValueCache,
     selection_drag_state: SelectionDragState,
-    next_color_inlay_id: usize,
     colors: Option<LspColorData>,
     folding_newlines: Task<()>,
     pub lookup_key: Option<Box<dyn Any + Send + Sync>>,
@@ -3282,9 +3299,11 @@ impl Editor {
         cx: &mut Context<Self>,
     ) -> gpui::Subscription {
         let other_selections = other.read(cx).selections.disjoint_anchors().to_vec();
-        self.selections.change_with(cx, |selections| {
-            selections.select_anchors(other_selections);
-        });
+        if !other_selections.is_empty() {
+            self.selections.change_with(cx, |selections| {
+                selections.select_anchors(other_selections);
+            });
+        }
 
         let other_subscription = cx.subscribe(&other, |this, other, other_evt, cx| {
             if let EditorEvent::SelectionsChanged { local: true } = other_evt {
@@ -6416,37 +6435,36 @@ impl Editor {
                 buffer.read(cx).file().map(|f| f.path().clone())
             });
         })?;
+        if entries.is_empty() {
+            return Ok(());
+        }
 
         // If the project transaction's edits are all contained within this editor, then
         // avoid opening a new editor to display them.
 
-        if let Some((buffer, transaction)) = entries.first() {
-            if entries.len() == 1 {
-                let excerpt = editor.update(cx, |editor, cx| {
-                    editor
-                        .buffer()
-                        .read(cx)
-                        .excerpt_containing(editor.selections.newest_anchor().head(), cx)
+        if let [(buffer, transaction)] = &*entries {
+            let excerpt = editor.update(cx, |editor, cx| {
+                editor
+                    .buffer()
+                    .read(cx)
+                    .excerpt_containing(editor.selections.newest_anchor().head(), cx)
+            })?;
+            if let Some((_, excerpted_buffer, excerpt_range)) = excerpt
+                && excerpted_buffer == *buffer
+            {
+                let all_edits_within_excerpt = buffer.read_with(cx, |buffer, _| {
+                    let excerpt_range = excerpt_range.to_offset(buffer);
+                    buffer
+                        .edited_ranges_for_transaction::<usize>(transaction)
+                        .all(|range| {
+                            excerpt_range.start <= range.start && excerpt_range.end >= range.end
+                        })
                 })?;
-                if let Some((_, excerpted_buffer, excerpt_range)) = excerpt
-                    && excerpted_buffer == *buffer
-                {
-                    let all_edits_within_excerpt = buffer.read_with(cx, |buffer, _| {
-                        let excerpt_range = excerpt_range.to_offset(buffer);
-                        buffer
-                            .edited_ranges_for_transaction::<usize>(transaction)
-                            .all(|range| {
-                                excerpt_range.start <= range.start && excerpt_range.end >= range.end
-                            })
-                    })?;
 
-                    if all_edits_within_excerpt {
-                        return Ok(());
-                    }
+                if all_edits_within_excerpt {
+                    return Ok(());
                 }
             }
-        } else {
-            return Ok(());
         }
 
         let mut ranges_to_highlight = Vec::new();
@@ -7163,13 +7181,7 @@ impl Editor {
             return None;
         }
 
-        provider.refresh(
-            self.project.clone(),
-            buffer,
-            cursor_buffer_position,
-            debounce,
-            cx,
-        );
+        provider.refresh(buffer, cursor_buffer_position, debounce, cx);
         Some(())
     }
 
@@ -7412,10 +7424,8 @@ impl Editor {
             return;
         };
 
-        self.report_edit_prediction_event(active_edit_prediction.completion_id.clone(), true, cx);
-
         match &active_edit_prediction.completion {
-            EditPrediction::Move { target, .. } => {
+            EditPrediction::MoveWithin { target, .. } => {
                 let target = *target;
 
                 if let Some(position_map) = &self.last_position_map {
@@ -7457,7 +7467,19 @@ impl Editor {
                     }
                 }
             }
+            EditPrediction::MoveOutside { snapshot, target } => {
+                if let Some(workspace) = self.workspace() {
+                    Self::open_editor_at_anchor(snapshot, *target, &workspace, window, cx)
+                        .detach_and_log_err(cx);
+                }
+            }
             EditPrediction::Edit { edits, .. } => {
+                self.report_edit_prediction_event(
+                    active_edit_prediction.completion_id.clone(),
+                    true,
+                    cx,
+                );
+
                 if let Some(provider) = self.edit_prediction_provider() {
                     provider.accept(cx);
                 }
@@ -7510,10 +7532,8 @@ impl Editor {
             return;
         }
 
-        self.report_edit_prediction_event(active_edit_prediction.completion_id.clone(), true, cx);
-
         match &active_edit_prediction.completion {
-            EditPrediction::Move { target, .. } => {
+            EditPrediction::MoveWithin { target, .. } => {
                 let target = *target;
                 self.change_selections(
                     SelectionEffects::scroll(Autoscroll::newest()),
@@ -7524,7 +7544,19 @@ impl Editor {
                     },
                 );
             }
+            EditPrediction::MoveOutside { snapshot, target } => {
+                if let Some(workspace) = self.workspace() {
+                    Self::open_editor_at_anchor(snapshot, *target, &workspace, window, cx)
+                        .detach_and_log_err(cx);
+                }
+            }
             EditPrediction::Edit { edits, .. } => {
+                self.report_edit_prediction_event(
+                    active_edit_prediction.completion_id.clone(),
+                    true,
+                    cx,
+                );
+
                 // Find an insertion that starts at the cursor position.
                 let snapshot = self.buffer.read(cx).snapshot(cx);
                 let cursor_offset = self.selections.newest::<usize>(cx).head();
@@ -7617,6 +7649,36 @@ impl Editor {
             suggestion_accepted = accepted,
             file_extension = extension,
         );
+    }
+
+    fn open_editor_at_anchor(
+        snapshot: &language::BufferSnapshot,
+        target: language::Anchor,
+        workspace: &Entity<Workspace>,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> Task<Result<()>> {
+        workspace.update(cx, |workspace, cx| {
+            let path = snapshot.file().map(|file| file.full_path(cx));
+            let Some(path) =
+                path.and_then(|path| workspace.project().read(cx).find_project_path(path, cx))
+            else {
+                return Task::ready(Err(anyhow::anyhow!("Project path not found")));
+            };
+            let target = text::ToPoint::to_point(&target, snapshot);
+            let item = workspace.open_path(path, None, true, window, cx);
+            window.spawn(cx, async move |cx| {
+                let Some(editor) = item.await?.downcast::<Editor>() else {
+                    return Ok(());
+                };
+                editor
+                    .update_in(cx, |editor, window, cx| {
+                        editor.go_to_singleton_buffer_point(target, window, cx);
+                    })
+                    .ok();
+                anyhow::Ok(())
+            })
+        })
     }
 
     pub fn has_active_edit_prediction(&self) -> bool {
@@ -7834,7 +7896,10 @@ impl Editor {
                 .active_edit_prediction
                 .as_ref()
                 .is_some_and(|completion| {
-                    let invalidation_range = completion.invalidation_range.to_offset(&multibuffer);
+                    let Some(invalidation_range) = completion.invalidation_range.as_ref() else {
+                        return false;
+                    };
+                    let invalidation_range = invalidation_range.to_offset(&multibuffer);
                     let invalidation_range = invalidation_range.start..=invalidation_range.end;
                     !invalidation_range.contains(&offset_selection.head())
                 })
@@ -7870,8 +7935,31 @@ impl Editor {
         }
 
         let edit_prediction = provider.suggest(&buffer, cursor_buffer_position, cx)?;
-        let edits = edit_prediction
-            .edits
+
+        let (completion_id, edits, edit_preview) = match edit_prediction {
+            edit_prediction::EditPrediction::Local {
+                id,
+                edits,
+                edit_preview,
+            } => (id, edits, edit_preview),
+            edit_prediction::EditPrediction::Jump {
+                id,
+                snapshot,
+                target,
+            } => {
+                self.stale_edit_prediction_in_menu = None;
+                self.active_edit_prediction = Some(EditPredictionState {
+                    inlay_ids: vec![],
+                    completion: EditPrediction::MoveOutside { snapshot, target },
+                    completion_id: id,
+                    invalidation_range: None,
+                });
+                cx.notify();
+                return Some(());
+            }
+        };
+
+        let edits = edits
             .into_iter()
             .flat_map(|(range, new_text)| {
                 let start = multibuffer.anchor_in_excerpt(excerpt_id, range.start)?;
@@ -7916,7 +8004,7 @@ impl Editor {
             invalidation_row_range =
                 move_invalidation_row_range.unwrap_or(edit_start_row..edit_end_row);
             let target = first_edit_start;
-            EditPrediction::Move { target, snapshot }
+            EditPrediction::MoveWithin { target, snapshot }
         } else {
             let show_completions_in_buffer = !self.edit_prediction_visible_in_cursor_popover(true)
                 && !self.edit_predictions_hidden_for_vim_mode;
@@ -7965,7 +8053,7 @@ impl Editor {
 
             EditPrediction::Edit {
                 edits,
-                edit_preview: edit_prediction.edit_preview,
+                edit_preview,
                 display_mode,
                 snapshot,
             }
@@ -7982,8 +8070,8 @@ impl Editor {
         self.active_edit_prediction = Some(EditPredictionState {
             inlay_ids,
             completion,
-            completion_id: edit_prediction.id,
-            invalidation_range,
+            completion_id,
+            invalidation_range: Some(invalidation_range),
         });
 
         cx.notify();
@@ -8569,7 +8657,7 @@ impl Editor {
         }
 
         match &active_edit_prediction.completion {
-            EditPrediction::Move { target, .. } => {
+            EditPrediction::MoveWithin { target, .. } => {
                 let target_display_point = target.to_display_point(editor_snapshot);
 
                 if self.edit_prediction_requires_modifier() {
@@ -8654,6 +8742,28 @@ impl Editor {
                 window,
                 cx,
             ),
+            EditPrediction::MoveOutside { snapshot, .. } => {
+                let file_name = snapshot
+                    .file()
+                    .map(|file| file.file_name(cx))
+                    .unwrap_or("untitled");
+                let mut element = self
+                    .render_edit_prediction_line_popover(
+                        format!("Jump to {file_name}"),
+                        Some(IconName::ZedPredict),
+                        window,
+                        cx,
+                    )
+                    .into_any();
+
+                let size = element.layout_as_root(AvailableSpace::min_size(), window, cx);
+                let origin_x = text_bounds.size.width / 2. - size.width / 2.;
+                let origin_y = text_bounds.size.height - size.height - px(30.);
+                let origin = text_bounds.origin + gpui::Point::new(origin_x, origin_y);
+                element.prepaint_at(origin, window, cx);
+
+                Some((element, origin))
+            }
         }
     }
 
@@ -8718,13 +8828,13 @@ impl Editor {
             .items_end()
             .when(flag_on_right, |el| el.items_start())
             .child(if flag_on_right {
-                self.render_edit_prediction_line_popover("Jump", None, window, cx)?
+                self.render_edit_prediction_line_popover("Jump", None, window, cx)
                     .rounded_bl(px(0.))
                     .rounded_tl(px(0.))
                     .border_l_2()
                     .border_color(border_color)
             } else {
-                self.render_edit_prediction_line_popover("Jump", None, window, cx)?
+                self.render_edit_prediction_line_popover("Jump", None, window, cx)
                     .rounded_br(px(0.))
                     .rounded_tr(px(0.))
                     .border_r_2()
@@ -8764,7 +8874,7 @@ impl Editor {
         cx: &mut App,
     ) -> Option<(AnyElement, gpui::Point<Pixels>)> {
         let mut element = self
-            .render_edit_prediction_line_popover("Scroll", Some(scroll_icon), window, cx)?
+            .render_edit_prediction_line_popover("Scroll", Some(scroll_icon), window, cx)
             .into_any();
 
         let size = element.layout_as_root(AvailableSpace::min_size(), window, cx);
@@ -8804,7 +8914,7 @@ impl Editor {
                     Some(IconName::ArrowUp),
                     window,
                     cx,
-                )?
+                )
                 .into_any();
 
             let size = element.layout_as_root(AvailableSpace::min_size(), window, cx);
@@ -8823,7 +8933,7 @@ impl Editor {
                     Some(IconName::ArrowDown),
                     window,
                     cx,
-                )?
+                )
                 .into_any();
 
             let size = element.layout_as_root(AvailableSpace::min_size(), window, cx);
@@ -8870,7 +8980,7 @@ impl Editor {
         );
 
         let mut element = self
-            .render_edit_prediction_line_popover(label, None, window, cx)?
+            .render_edit_prediction_line_popover(label, None, window, cx)
             .into_any();
 
         let size = element.layout_as_root(AvailableSpace::min_size(), window, cx);
@@ -8897,7 +9007,7 @@ impl Editor {
             };
 
             element = self
-                .render_edit_prediction_line_popover(label, Some(icon), window, cx)?
+                .render_edit_prediction_line_popover(label, Some(icon), window, cx)
                 .into_any();
 
             let size = element.layout_as_root(AvailableSpace::min_size(), window, cx);
@@ -9151,13 +9261,13 @@ impl Editor {
         icon: Option<IconName>,
         window: &mut Window,
         cx: &App,
-    ) -> Option<Stateful<Div>> {
+    ) -> Stateful<Div> {
         let padding_right = if icon.is_some() { px(4.) } else { px(8.) };
 
         let keybind = self.render_edit_prediction_accept_keybind(window, cx);
         let has_keybind = keybind.is_some();
 
-        let result = h_flex()
+        h_flex()
             .id("ep-line-popover")
             .py_0p5()
             .pl_1()
@@ -9203,9 +9313,7 @@ impl Editor {
                         .mt(px(1.5))
                         .child(Icon::new(icon).size(IconSize::Small)),
                 )
-            });
-
-        Some(result)
+            })
     }
 
     fn edit_prediction_line_popover_bg_color(cx: &App) -> Hsla {
@@ -9269,7 +9377,7 @@ impl Editor {
                             .rounded_tl(px(0.))
                             .overflow_hidden()
                             .child(div().px_1p5().child(match &prediction.completion {
-                                EditPrediction::Move { target, snapshot } => {
+                                EditPrediction::MoveWithin { target, snapshot } => {
                                     use text::ToPoint as _;
                                     if target.text_anchor.to_point(snapshot).row > cursor_point.row
                                     {
@@ -9277,6 +9385,10 @@ impl Editor {
                                     } else {
                                         Icon::new(IconName::ZedPredictUp)
                                     }
+                                }
+                                EditPrediction::MoveOutside { .. } => {
+                                    // TODO [zeta2] custom icon for external jump?
+                                    Icon::new(provider_icon)
                                 }
                                 EditPrediction::Edit { .. } => Icon::new(provider_icon),
                             }))
@@ -9460,7 +9572,7 @@ impl Editor {
             .unwrap_or(true);
 
         match &completion.completion {
-            EditPrediction::Move {
+            EditPrediction::MoveWithin {
                 target, snapshot, ..
             } => {
                 if !supports_jump {
@@ -9482,7 +9594,20 @@ impl Editor {
                         .child(Label::new("Jump to Edit")),
                 )
             }
-
+            EditPrediction::MoveOutside { snapshot, .. } => {
+                let file_name = snapshot
+                    .file()
+                    .map(|file| file.file_name(cx))
+                    .unwrap_or("untitled");
+                Some(
+                    h_flex()
+                        .px_2()
+                        .gap_2()
+                        .flex_1()
+                        .child(Icon::new(IconName::ZedPredict))
+                        .child(Label::new(format!("Jump to {file_name}"))),
+                )
+            }
             EditPrediction::Edit {
                 edits,
                 edit_preview,
@@ -12326,7 +12451,7 @@ impl Editor {
                 }
             });
         });
-        let item = self.cut_common(true, window, cx);
+        let item = self.cut_common(false, window, cx);
         cx.set_global(KillRing(item))
     }
 
@@ -15050,12 +15175,8 @@ impl Editor {
                 }
 
                 let mut new_range = old_range.clone();
-                while let Some((node, containing_range)) = buffer.syntax_ancestor(new_range.clone())
-                {
-                    new_range = match containing_range {
-                        MultiOrSingleBufferOffsetRange::Single(_) => break,
-                        MultiOrSingleBufferOffsetRange::Multi(range) => range,
-                    };
+                while let Some((node, range)) = buffer.syntax_ancestor(new_range.clone()) {
+                    new_range = range;
                     if !node.is_named() {
                         continue;
                     }
@@ -15185,20 +15306,14 @@ impl Editor {
                     && let Some((_, ancestor_range)) =
                         buffer.syntax_ancestor(selection.start..selection.end)
                 {
-                    match ancestor_range {
-                        MultiOrSingleBufferOffsetRange::Single(range) => range,
-                        MultiOrSingleBufferOffsetRange::Multi(range) => range,
-                    }
+                    ancestor_range
                 } else {
                     selection.range()
                 };
 
                 let mut parent = child.clone();
                 while let Some((_, ancestor_range)) = buffer.syntax_ancestor(parent.clone()) {
-                    parent = match ancestor_range {
-                        MultiOrSingleBufferOffsetRange::Single(range) => range,
-                        MultiOrSingleBufferOffsetRange::Multi(range) => range,
-                    };
+                    parent = ancestor_range;
                     if parent.start < child.start || parent.end > child.end {
                         break;
                     }
@@ -16315,7 +16430,7 @@ impl Editor {
             None
         };
 
-        let url_finder = cx.spawn_in(window, async move |editor, cx| {
+        let url_finder = cx.spawn_in(window, async move |_editor, cx| {
             let url = if let Some(end_pos) = end_position {
                 find_url_from_range(&buffer, start_position..end_pos, cx.clone())
             } else {
@@ -16323,12 +16438,16 @@ impl Editor {
             };
 
             if let Some(url) = url {
-                editor.update(cx, |_, cx| {
-                    cx.open_url(&url);
-                })
-            } else {
-                Ok(())
+                cx.update(|window, cx| {
+                    if parse_zed_link(&url, cx).is_some() {
+                        window.dispatch_action(Box::new(zed_actions::OpenZedUrl { url }), cx);
+                    } else {
+                        cx.open_url(&url);
+                    }
+                })?;
             }
+
+            anyhow::Ok(())
         });
 
         url_finder.detach();
@@ -16789,7 +16908,8 @@ impl Editor {
         let item_id = item.item_id();
 
         if split {
-            workspace.split_item(SplitDirection::Right, item, window, cx);
+            let pane = workspace.adjacent_pane(window, cx);
+            workspace.add_item(pane, item, None, true, true, window, cx);
         } else if PreviewTabsSettings::get_global(cx).enable_preview_from_code_navigation {
             let (preview_item_id, preview_item_idx) =
                 workspace.active_pane().read_with(cx, |pane, _| {
@@ -20515,7 +20635,7 @@ impl Editor {
                                     Anchor::in_buffer(excerpt_id, buffer_id, hint.position),
                                     hint.text(),
                                 );
-                                if !inlay.text.chars().contains(&'\n') {
+                                if !inlay.text().chars().contains(&'\n') {
                                     new_inlays.push(inlay);
                                 }
                             });
@@ -21402,7 +21522,7 @@ impl Editor {
         {
             self.hide_context_menu(window, cx);
         }
-        self.discard_edit_prediction(false, cx);
+        self.take_active_edit_prediction(cx);
         cx.emit(EditorEvent::Blurred);
         cx.notify();
     }

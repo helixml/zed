@@ -2,7 +2,7 @@ mod headless;
 
 use anyhow::{Result, anyhow};
 use clap::{Args, Parser, Subcommand};
-use cloud_llm_client::predict_edits_v3::PromptFormat;
+use cloud_llm_client::predict_edits_v3;
 use edit_prediction_context::EditPredictionExcerptOptions;
 use futures::channel::mpsc;
 use futures::{FutureExt as _, StreamExt as _};
@@ -15,6 +15,7 @@ use language_model::LlmApiToken;
 use project::{Project, ProjectPath, Worktree};
 use release_channel::AppVersion;
 use reqwest_client::ReqwestClient;
+use serde_json::json;
 use std::path::{Path, PathBuf};
 use std::process::exit;
 use std::str::FromStr;
@@ -75,16 +76,38 @@ struct Zeta2Args {
     target_before_cursor_over_total_bytes: f32,
     #[arg(long, default_value_t = 1024)]
     max_diagnostic_bytes: usize,
-    #[arg(long, value_parser = parse_format)]
-    format: PromptFormat,
+    #[arg(long, value_enum, default_value_t = PromptFormat::default())]
+    prompt_format: PromptFormat,
+    #[arg(long, value_enum, default_value_t = Default::default())]
+    output_format: OutputFormat,
+    #[arg(long, default_value_t = 42)]
+    file_indexing_parallelism: usize,
 }
 
-fn parse_format(s: &str) -> Result<PromptFormat> {
-    match s {
-        "marked_excerpt" => Ok(PromptFormat::MarkedExcerpt),
-        "labeled_sections" => Ok(PromptFormat::LabeledSections),
-        _ => Err(anyhow!("Invalid format: {}", s)),
+#[derive(clap::ValueEnum, Default, Debug, Clone)]
+enum PromptFormat {
+    #[default]
+    MarkedExcerpt,
+    LabeledSections,
+    OnlySnippets,
+}
+
+impl Into<predict_edits_v3::PromptFormat> for PromptFormat {
+    fn into(self) -> predict_edits_v3::PromptFormat {
+        match self {
+            Self::MarkedExcerpt => predict_edits_v3::PromptFormat::MarkedExcerpt,
+            Self::LabeledSections => predict_edits_v3::PromptFormat::LabeledSections,
+            Self::OnlySnippets => predict_edits_v3::PromptFormat::OnlySnippets,
+        }
     }
+}
+
+#[derive(clap::ValueEnum, Default, Debug, Clone)]
+enum OutputFormat {
+    #[default]
+    Prompt,
+    Request,
+    Both,
 }
 
 #[derive(Debug, Clone)]
@@ -131,7 +154,7 @@ impl FromStr for CursorPosition {
             ));
         }
 
-        let path = RelPath::from_std_path(Path::new(&parts[0]), PathStyle::local())?;
+        let path = RelPath::new(Path::new(&parts[0]), PathStyle::local())?.into_arc();
         let line: u32 = parts[1]
             .parse()
             .map_err(|_| anyhow!("Invalid line number: '{}'", parts[1]))?;
@@ -223,13 +246,19 @@ async fn get_context(
     };
 
     if let Some(zeta2_args) = zeta2_args {
-        Ok(GetContextOutput::Zeta2(
-            cx.update(|cx| {
+        // wait for worktree scan before starting zeta2 so that wait_for_initial_indexing waits for
+        // the whole worktree.
+        worktree
+            .read_with(cx, |worktree, _cx| {
+                worktree.as_local().unwrap().scan_complete()
+            })?
+            .await;
+        let output = cx
+            .update(|cx| {
                 let zeta = cx.new(|cx| {
                     zeta2::Zeta::new(app_state.client.clone(), app_state.user_store.clone(), cx)
                 });
-                zeta.update(cx, |zeta, cx| {
-                    zeta.register_buffer(&buffer, &project, cx);
+                let indexing_done_task = zeta.update(cx, |zeta, cx| {
                     zeta.set_options(zeta2::ZetaOptions {
                         excerpt: EditPredictionExcerptOptions {
                             max_bytes: zeta2_args.max_excerpt_bytes,
@@ -239,26 +268,37 @@ async fn get_context(
                         },
                         max_diagnostic_bytes: zeta2_args.max_diagnostic_bytes,
                         max_prompt_bytes: zeta2_args.max_prompt_bytes,
-                        prompt_format: zeta2_args.format,
-                    })
+                        prompt_format: zeta2_args.prompt_format.into(),
+                        file_indexing_parallelism: zeta2_args.file_indexing_parallelism,
+                    });
+                    zeta.register_buffer(&buffer, &project, cx);
+                    zeta.wait_for_initial_indexing(&project, cx)
                 });
-                // TODO: Actually wait for indexing.
-                let timer = cx.background_executor().timer(Duration::from_secs(5));
                 cx.spawn(async move |cx| {
-                    timer.await;
+                    indexing_done_task.await?;
                     let request = zeta
                         .update(cx, |zeta, cx| {
                             let cursor = buffer.read(cx).snapshot().anchor_before(clipped_cursor);
                             zeta.cloud_request_for_zeta_cli(&project, &buffer, cursor, cx)
                         })?
                         .await?;
+
                     let planned_prompt = cloud_zeta2_prompt::PlannedPrompt::populate(&request)?;
-                    // TODO: Output the section label ranges
-                    anyhow::Ok(planned_prompt.to_prompt_string()?.0)
+                    let prompt_string = planned_prompt.to_prompt_string()?.0;
+                    match zeta2_args.output_format {
+                        OutputFormat::Prompt => anyhow::Ok(prompt_string),
+                        OutputFormat::Request => {
+                            anyhow::Ok(serde_json::to_string_pretty(&request)?)
+                        }
+                        OutputFormat::Both => anyhow::Ok(serde_json::to_string_pretty(&json!({
+                            "request": request,
+                            "prompt": prompt_string,
+                        }))?),
+                    }
                 })
             })?
-            .await?,
-        ))
+            .await?;
+        Ok(GetContextOutput::Zeta2(output))
     } else {
         let prompt_for_events = move || (events, 0);
         Ok(GetContextOutput::Zeta1(
@@ -383,7 +423,7 @@ pub fn wait_for_lang_server(
     ];
 
     cx.spawn(async move |cx| {
-        let timeout = cx.background_executor().timer(Duration::new(60 * 5, 0));
+        let timeout = cx.background_executor().timer(Duration::from_secs(60 * 5));
         let result = futures::select! {
             _ = rx.next() => {
                 println!("{}⚑ Language server idle", log_prefix);
@@ -399,13 +439,14 @@ pub fn wait_for_lang_server(
 }
 
 fn main() {
+    zlog::init();
+    zlog::init_output_stderr();
     let args = ZetaCliArgs::parse();
     let http_client = Arc::new(ReqwestClient::new());
     let app = Application::headless().with_http_client(http_client);
 
     app.run(move |cx| {
         let app_state = Arc::new(headless::init(cx));
-        let is_zeta2_context_command = matches!(args.command, Commands::Zeta2Context { .. });
         cx.spawn(async move |cx| {
             let result = match args.command {
                 Commands::Zeta2Context {
@@ -467,10 +508,6 @@ fn main() {
             match result {
                 Ok(output) => {
                     println!("{}", output);
-                    // TODO: Remove this once the 5 second delay is properly replaced.
-                    if is_zeta2_context_command {
-                        eprintln!("Note that zeta2-context doesn't yet wait for indexing, instead waits 5 seconds.");
-                    }
                     let _ = cx.update(|cx| cx.quit());
                 }
                 Err(e) => {

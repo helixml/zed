@@ -17,8 +17,8 @@ use gpui::{
     App, Entity, EntityId, Global, SemanticVersion, SharedString, Subscription, Task, WeakEntity,
     http_client, prelude::*,
 };
-use language::BufferSnapshot;
 use language::{Buffer, DiagnosticSet, LanguageServerId, ToOffset as _, ToPoint};
+use language::{BufferSnapshot, TextBufferSnapshot};
 use language_model::{LlmApiToken, RefreshLlmTokenListener};
 use project::Project;
 use release_channel::AppVersion;
@@ -35,7 +35,7 @@ use workspace::notifications::{ErrorMessagePrompt, NotificationId, show_app_noti
 mod prediction;
 mod provider;
 
-use crate::prediction::{EditPrediction, edits_from_response, interpolate_edits};
+use crate::prediction::EditPrediction;
 pub use provider::ZetaEditPredictionProvider;
 
 const BUFFER_CHANGE_GROUPING_INTERVAL: Duration = Duration::from_secs(1);
@@ -53,7 +53,8 @@ pub const DEFAULT_OPTIONS: ZetaOptions = ZetaOptions {
     excerpt: DEFAULT_EXCERPT_OPTIONS,
     max_prompt_bytes: DEFAULT_MAX_PROMPT_BYTES,
     max_diagnostic_bytes: 2048,
-    prompt_format: PromptFormat::MarkedExcerpt,
+    prompt_format: PromptFormat::DEFAULT,
+    file_indexing_parallelism: 1,
 };
 
 #[derive(Clone)]
@@ -78,6 +79,7 @@ pub struct ZetaOptions {
     pub max_prompt_bytes: usize,
     pub max_diagnostic_bytes: usize,
     pub prompt_format: predict_edits_v3::PromptFormat,
+    pub file_indexing_parallelism: usize,
 }
 
 pub struct PredictionDebugInfo {
@@ -94,6 +96,47 @@ struct ZetaProject {
     syntax_index: Entity<SyntaxIndex>,
     events: VecDeque<Event>,
     registered_buffers: HashMap<gpui::EntityId, RegisteredBuffer>,
+    current_prediction: Option<CurrentEditPrediction>,
+}
+
+#[derive(Clone)]
+struct CurrentEditPrediction {
+    pub requested_by_buffer_id: EntityId,
+    pub prediction: EditPrediction,
+}
+
+impl CurrentEditPrediction {
+    fn should_replace_prediction(
+        &self,
+        old_prediction: &Self,
+        snapshot: &TextBufferSnapshot,
+    ) -> bool {
+        if self.requested_by_buffer_id != old_prediction.requested_by_buffer_id {
+            return true;
+        }
+
+        let Some(old_edits) = old_prediction.prediction.interpolate(snapshot) else {
+            return true;
+        };
+
+        let Some(new_edits) = self.prediction.interpolate(snapshot) else {
+            return false;
+        };
+        if old_edits.len() == 1 && new_edits.len() == 1 {
+            let (old_range, old_text) = &old_edits[0];
+            let (new_range, new_text) = &new_edits[0];
+            new_range == old_range && new_text.starts_with(old_text)
+        } else {
+            true
+        }
+    }
+}
+
+/// A prediction from the perspective of a buffer.
+#[derive(Debug)]
+enum BufferEditPrediction<'a> {
+    Local { prediction: &'a EditPrediction },
+    Jump { prediction: &'a EditPrediction },
 }
 
 struct RegisteredBuffer {
@@ -201,9 +244,12 @@ impl Zeta {
         self.projects
             .entry(project.entity_id())
             .or_insert_with(|| ZetaProject {
-                syntax_index: cx.new(|cx| SyntaxIndex::new(project, cx)),
+                syntax_index: cx.new(|cx| {
+                    SyntaxIndex::new(project, self.options.file_indexing_parallelism, cx)
+                }),
                 events: VecDeque::new(),
                 registered_buffers: HashMap::new(),
+                current_prediction: None,
             })
     }
 
@@ -305,7 +351,83 @@ impl Zeta {
         events.push_back(event);
     }
 
-    pub fn request_prediction(
+    fn current_prediction_for_buffer(
+        &self,
+        buffer: &Entity<Buffer>,
+        project: &Entity<Project>,
+        cx: &App,
+    ) -> Option<BufferEditPrediction<'_>> {
+        let project_state = self.projects.get(&project.entity_id())?;
+
+        let CurrentEditPrediction {
+            requested_by_buffer_id,
+            prediction,
+        } = project_state.current_prediction.as_ref()?;
+
+        if prediction.targets_buffer(buffer.read(cx), cx) {
+            Some(BufferEditPrediction::Local { prediction })
+        } else if *requested_by_buffer_id == buffer.entity_id() {
+            Some(BufferEditPrediction::Jump { prediction })
+        } else {
+            None
+        }
+    }
+
+    fn accept_current_prediction(&mut self, project: &Entity<Project>) {
+        if let Some(project_state) = self.projects.get_mut(&project.entity_id()) {
+            project_state.current_prediction.take();
+        };
+        // TODO report accepted
+    }
+
+    fn discard_current_prediction(&mut self, project: &Entity<Project>) {
+        if let Some(project_state) = self.projects.get_mut(&project.entity_id()) {
+            project_state.current_prediction.take();
+        };
+    }
+
+    pub fn refresh_prediction(
+        &mut self,
+        project: &Entity<Project>,
+        buffer: &Entity<Buffer>,
+        position: language::Anchor,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<()>> {
+        let request_task = self.request_prediction(project, buffer, position, cx);
+        let buffer = buffer.clone();
+        let project = project.clone();
+
+        cx.spawn(async move |this, cx| {
+            if let Some(prediction) = request_task.await? {
+                this.update(cx, |this, cx| {
+                    let project_state = this
+                        .projects
+                        .get_mut(&project.entity_id())
+                        .context("Project not found")?;
+
+                    let new_prediction = CurrentEditPrediction {
+                        requested_by_buffer_id: buffer.entity_id(),
+                        prediction: prediction,
+                    };
+
+                    if project_state
+                        .current_prediction
+                        .as_ref()
+                        .is_none_or(|old_prediction| {
+                            new_prediction
+                                .should_replace_prediction(&old_prediction, buffer.read(cx))
+                        })
+                    {
+                        project_state.current_prediction = Some(new_prediction);
+                    }
+                    anyhow::Ok(())
+                })??;
+            }
+            Ok(())
+        })
+    }
+
+    fn request_prediction(
         &mut self,
         project: &Entity<Project>,
         buffer: &Entity<Buffer>,
@@ -339,33 +461,37 @@ impl Zeta {
                 state
                     .events
                     .iter()
-                    .map(|event| match event {
+                    .filter_map(|event| match event {
                         Event::BufferChange {
                             old_snapshot,
                             new_snapshot,
                             ..
                         } => {
-                            let path = new_snapshot.file().map(|f| f.path().clone());
+                            let path = new_snapshot.file().map(|f| f.full_path(cx));
 
                             let old_path = old_snapshot.file().and_then(|f| {
-                                let old_path = f.path();
-                                if Some(old_path) != path.as_ref() {
-                                    Some(old_path.clone())
+                                let old_path = f.full_path(cx);
+                                if Some(&old_path) != path.as_ref() {
+                                    Some(old_path)
                                 } else {
                                     None
                                 }
                             });
 
-                            predict_edits_v3::Event::BufferChange {
-                                old_path: old_path
-                                    .map(|old_path| old_path.as_std_path().to_path_buf()),
-                                path: path.map(|path| path.as_std_path().to_path_buf()),
-                                diff: language::unified_diff(
-                                    &old_snapshot.text(),
-                                    &new_snapshot.text(),
-                                ),
-                                //todo: Actually detect if this edit was predicted or not
-                                predicted: false,
+                            // TODO [zeta2] move to bg?
+                            let diff =
+                                language::unified_diff(&old_snapshot.text(), &new_snapshot.text());
+
+                            if path == old_path && diff.is_empty() {
+                                None
+                            } else {
+                                Some(predict_edits_v3::Event::BufferChange {
+                                    old_path,
+                                    path,
+                                    diff,
+                                    //todo: Actually detect if this edit was predicted or not
+                                    predicted: false,
+                                })
                             }
                         }
                     })
@@ -453,74 +579,63 @@ impl Zeta {
                         .ok();
                 }
 
-                let (response, usage) = response?;
-                let edits = edits_from_response(&response.edits, &snapshot);
-
-                anyhow::Ok(Some((response.request_id, edits, usage)))
+                anyhow::Ok(Some(response?))
             }
         });
 
         let buffer = buffer.clone();
 
-        cx.spawn(async move |this, cx| {
-            match request_task.await {
-                Ok(Some((id, edits, usage))) => {
-                    if let Some(usage) = usage {
-                        this.update(cx, |this, cx| {
-                            this.user_store.update(cx, |user_store, cx| {
-                                user_store.update_edit_prediction_usage(usage, cx);
-                            });
-                        })
-                        .ok();
-                    }
-
-                    // TODO telemetry: duration, etc
-                    let Some((edits, snapshot, edit_preview_task)) =
-                        buffer.read_with(cx, |buffer, cx| {
-                            let new_snapshot = buffer.snapshot();
-                            let edits: Arc<[_]> =
-                                interpolate_edits(&snapshot, &new_snapshot, edits)?.into();
-                            Some((edits.clone(), new_snapshot, buffer.preview_edits(edits, cx)))
-                        })?
-                    else {
-                        return Ok(None);
-                    };
-
-                    Ok(Some(EditPrediction {
-                        id: id.into(),
-                        edits,
-                        snapshot,
-                        edit_preview: edit_preview_task.await,
-                    }))
-                }
-                Ok(None) => Ok(None),
-                Err(err) => {
-                    if err.is::<ZedUpdateRequiredError>() {
-                        cx.update(|cx| {
-                            this.update(cx, |this, _cx| {
-                                this.update_required = true;
+        cx.spawn({
+            let project = project.clone();
+            async move |this, cx| {
+                match request_task.await {
+                    Ok(Some((response, usage))) => {
+                        if let Some(usage) = usage {
+                            this.update(cx, |this, cx| {
+                                this.user_store.update(cx, |user_store, cx| {
+                                    user_store.update_edit_prediction_usage(usage, cx);
+                                });
                             })
                             .ok();
+                        }
 
-                            let error_message: SharedString = err.to_string().into();
-                            show_app_notification(
-                                NotificationId::unique::<ZedUpdateRequiredError>(),
-                                cx,
-                                move |cx| {
-                                    cx.new(|cx| {
-                                        ErrorMessagePrompt::new(error_message.clone(), cx)
-                                            .with_link_button(
-                                                "Update Zed",
-                                                "https://zed.dev/releases",
-                                            )
-                                    })
-                                },
-                            );
-                        })
-                        .ok();
+                        let prediction = EditPrediction::from_response(
+                            response, &snapshot, &buffer, &project, cx,
+                        )
+                        .await;
+
+                        // TODO telemetry: duration, etc
+                        Ok(prediction)
                     }
+                    Ok(None) => Ok(None),
+                    Err(err) => {
+                        if err.is::<ZedUpdateRequiredError>() {
+                            cx.update(|cx| {
+                                this.update(cx, |this, _cx| {
+                                    this.update_required = true;
+                                })
+                                .ok();
 
-                    Err(err)
+                                let error_message: SharedString = err.to_string().into();
+                                show_app_notification(
+                                    NotificationId::unique::<ZedUpdateRequiredError>(),
+                                    cx,
+                                    move |cx| {
+                                        cx.new(|cx| {
+                                            ErrorMessagePrompt::new(error_message.clone(), cx)
+                                                .with_link_button(
+                                                    "Update Zed",
+                                                    "https://zed.dev/releases",
+                                                )
+                                        })
+                                    },
+                                );
+                            })
+                            .ok();
+                        }
+
+                        Err(err)
+                    }
                 }
             }
         })
@@ -706,6 +821,18 @@ impl Zeta {
             })
         })
     }
+
+    pub fn wait_for_initial_indexing(
+        &mut self,
+        project: &Entity<Project>,
+        cx: &mut App,
+    ) -> Task<Result<()>> {
+        let zeta_project = self.get_or_init_zeta_project(project, cx);
+        zeta_project
+            .syntax_index
+            .read(cx)
+            .wait_for_initial_file_indexing(cx)
+    }
 }
 
 #[derive(Error, Debug)]
@@ -734,7 +861,7 @@ fn make_cloud_request(
     let mut declaration_to_signature_index = HashMap::default();
     let mut referenced_declarations = Vec::new();
 
-    for snippet in context.snippets {
+    for snippet in context.declarations {
         let project_entry_id = snippet.declaration.project_entry_id();
         let Some(path) = worktrees.iter().find_map(|worktree| {
             worktree.entry_for_id(project_entry_id).map(|entry| {
@@ -832,4 +959,418 @@ fn add_signature(
     });
     declaration_to_signature_index.insert(declaration_id, signature_index);
     Some(signature_index)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{
+        path::{Path, PathBuf},
+        sync::Arc,
+    };
+
+    use client::UserStore;
+    use clock::FakeSystemClock;
+    use cloud_llm_client::predict_edits_v3;
+    use futures::{
+        AsyncReadExt, StreamExt,
+        channel::{mpsc, oneshot},
+    };
+    use gpui::{
+        Entity, TestAppContext,
+        http_client::{FakeHttpClient, Response},
+        prelude::*,
+    };
+    use indoc::indoc;
+    use language::{LanguageServerId, OffsetRangeExt as _};
+    use pretty_assertions::{assert_eq, assert_matches};
+    use project::{FakeFs, Project};
+    use serde_json::json;
+    use settings::SettingsStore;
+    use util::path;
+    use uuid::Uuid;
+
+    use crate::{BufferEditPrediction, Zeta};
+
+    #[gpui::test]
+    async fn test_current_state(cx: &mut TestAppContext) {
+        let (zeta, mut req_rx) = init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(
+            "/root",
+            json!({
+                "1.txt": "Hello!\nHow\nBye",
+                "2.txt": "Hola!\nComo\nAdios"
+            }),
+        )
+        .await;
+        let project = Project::test(fs, vec![path!("/root").as_ref()], cx).await;
+
+        zeta.update(cx, |zeta, cx| {
+            zeta.register_project(&project, cx);
+        });
+
+        let buffer1 = project
+            .update(cx, |project, cx| {
+                let path = project.find_project_path(path!("root/1.txt"), cx).unwrap();
+                project.open_buffer(path, cx)
+            })
+            .await
+            .unwrap();
+        let snapshot1 = buffer1.read_with(cx, |buffer, _cx| buffer.snapshot());
+        let position = snapshot1.anchor_before(language::Point::new(1, 3));
+
+        // Prediction for current file
+
+        let prediction_task = zeta.update(cx, |zeta, cx| {
+            zeta.refresh_prediction(&project, &buffer1, position, cx)
+        });
+        let (_request, respond_tx) = req_rx.next().await.unwrap();
+        respond_tx
+            .send(predict_edits_v3::PredictEditsResponse {
+                request_id: Uuid::new_v4(),
+                edits: vec![predict_edits_v3::Edit {
+                    path: Path::new(path!("root/1.txt")).into(),
+                    range: 0..snapshot1.len(),
+                    content: "Hello!\nHow are you?\nBye".into(),
+                }],
+                debug_info: None,
+            })
+            .unwrap();
+        prediction_task.await.unwrap();
+
+        zeta.read_with(cx, |zeta, cx| {
+            let prediction = zeta
+                .current_prediction_for_buffer(&buffer1, &project, cx)
+                .unwrap();
+            assert_matches!(prediction, BufferEditPrediction::Local { .. });
+        });
+
+        // Prediction for another file
+
+        let prediction_task = zeta.update(cx, |zeta, cx| {
+            zeta.refresh_prediction(&project, &buffer1, position, cx)
+        });
+        let (_request, respond_tx) = req_rx.next().await.unwrap();
+        respond_tx
+            .send(predict_edits_v3::PredictEditsResponse {
+                request_id: Uuid::new_v4(),
+                edits: vec![predict_edits_v3::Edit {
+                    path: Path::new(path!("root/2.txt")).into(),
+                    range: 0..snapshot1.len(),
+                    content: "Hola!\nComo estas?\nAdios".into(),
+                }],
+                debug_info: None,
+            })
+            .unwrap();
+        prediction_task.await.unwrap();
+
+        zeta.read_with(cx, |zeta, cx| {
+            let prediction = zeta
+                .current_prediction_for_buffer(&buffer1, &project, cx)
+                .unwrap();
+            assert_matches!(
+                prediction,
+                BufferEditPrediction::Jump { prediction } if prediction.path.as_ref() == Path::new(path!("root/2.txt"))
+            );
+        });
+
+        let buffer2 = project
+            .update(cx, |project, cx| {
+                let path = project.find_project_path(path!("root/2.txt"), cx).unwrap();
+                project.open_buffer(path, cx)
+            })
+            .await
+            .unwrap();
+
+        zeta.read_with(cx, |zeta, cx| {
+            let prediction = zeta
+                .current_prediction_for_buffer(&buffer2, &project, cx)
+                .unwrap();
+            assert_matches!(prediction, BufferEditPrediction::Local { .. });
+        });
+    }
+
+    #[gpui::test]
+    async fn test_simple_request(cx: &mut TestAppContext) {
+        let (zeta, mut req_rx) = init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(
+            "/root",
+            json!({
+                "foo.md":  "Hello!\nHow\nBye"
+            }),
+        )
+        .await;
+        let project = Project::test(fs, vec![path!("/root").as_ref()], cx).await;
+
+        let buffer = project
+            .update(cx, |project, cx| {
+                let path = project.find_project_path(path!("root/foo.md"), cx).unwrap();
+                project.open_buffer(path, cx)
+            })
+            .await
+            .unwrap();
+        let snapshot = buffer.read_with(cx, |buffer, _cx| buffer.snapshot());
+        let position = snapshot.anchor_before(language::Point::new(1, 3));
+
+        let prediction_task = zeta.update(cx, |zeta, cx| {
+            zeta.request_prediction(&project, &buffer, position, cx)
+        });
+
+        let (request, respond_tx) = req_rx.next().await.unwrap();
+        assert_eq!(
+            request.excerpt_path.as_ref(),
+            Path::new(path!("root/foo.md"))
+        );
+        assert_eq!(request.cursor_offset, 10);
+
+        respond_tx
+            .send(predict_edits_v3::PredictEditsResponse {
+                request_id: Uuid::new_v4(),
+                edits: vec![predict_edits_v3::Edit {
+                    path: Path::new(path!("root/foo.md")).into(),
+                    range: 0..snapshot.len(),
+                    content: "Hello!\nHow are you?\nBye".into(),
+                }],
+                debug_info: None,
+            })
+            .unwrap();
+
+        let prediction = prediction_task.await.unwrap().unwrap();
+
+        assert_eq!(prediction.edits.len(), 1);
+        assert_eq!(
+            prediction.edits[0].0.to_point(&snapshot).start,
+            language::Point::new(1, 3)
+        );
+        assert_eq!(prediction.edits[0].1, " are you?");
+    }
+
+    #[gpui::test]
+    async fn test_request_events(cx: &mut TestAppContext) {
+        let (zeta, mut req_rx) = init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(
+            "/root",
+            json!({
+                "foo.md": "Hello!\n\nBye"
+            }),
+        )
+        .await;
+        let project = Project::test(fs, vec![path!("/root").as_ref()], cx).await;
+
+        let buffer = project
+            .update(cx, |project, cx| {
+                let path = project.find_project_path(path!("root/foo.md"), cx).unwrap();
+                project.open_buffer(path, cx)
+            })
+            .await
+            .unwrap();
+
+        zeta.update(cx, |zeta, cx| {
+            zeta.register_buffer(&buffer, &project, cx);
+        });
+
+        buffer.update(cx, |buffer, cx| {
+            buffer.edit(vec![(7..7, "How")], None, cx);
+        });
+
+        let snapshot = buffer.read_with(cx, |buffer, _cx| buffer.snapshot());
+        let position = snapshot.anchor_before(language::Point::new(1, 3));
+
+        let prediction_task = zeta.update(cx, |zeta, cx| {
+            zeta.request_prediction(&project, &buffer, position, cx)
+        });
+
+        let (request, respond_tx) = req_rx.next().await.unwrap();
+
+        assert_eq!(request.events.len(), 1);
+        assert_eq!(
+            request.events[0],
+            predict_edits_v3::Event::BufferChange {
+                path: Some(PathBuf::from(path!("root/foo.md"))),
+                old_path: None,
+                diff: indoc! {"
+                        @@ -1,3 +1,3 @@
+                         Hello!
+                        -
+                        +How
+                         Bye
+                    "}
+                .to_string(),
+                predicted: false
+            }
+        );
+
+        respond_tx
+            .send(predict_edits_v3::PredictEditsResponse {
+                request_id: Uuid::new_v4(),
+                edits: vec![predict_edits_v3::Edit {
+                    path: Path::new(path!("root/foo.md")).into(),
+                    range: 0..snapshot.len(),
+                    content: "Hello!\nHow are you?\nBye".into(),
+                }],
+                debug_info: None,
+            })
+            .unwrap();
+
+        let prediction = prediction_task.await.unwrap().unwrap();
+
+        assert_eq!(prediction.edits.len(), 1);
+        assert_eq!(
+            prediction.edits[0].0.to_point(&snapshot).start,
+            language::Point::new(1, 3)
+        );
+        assert_eq!(prediction.edits[0].1, " are you?");
+    }
+
+    #[gpui::test]
+    async fn test_request_diagnostics(cx: &mut TestAppContext) {
+        let (zeta, mut req_rx) = init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(
+            "/root",
+            json!({
+                "foo.md": "Hello!\nBye"
+            }),
+        )
+        .await;
+        let project = Project::test(fs, vec![path!("/root").as_ref()], cx).await;
+
+        let path_to_buffer_uri = lsp::Uri::from_file_path(path!("/root/foo.md")).unwrap();
+        let diagnostic = lsp::Diagnostic {
+            range: lsp::Range::new(lsp::Position::new(1, 1), lsp::Position::new(1, 5)),
+            severity: Some(lsp::DiagnosticSeverity::ERROR),
+            message: "\"Hello\" deprecated. Use \"Hi\" instead".to_string(),
+            ..Default::default()
+        };
+
+        project.update(cx, |project, cx| {
+            project.lsp_store().update(cx, |lsp_store, cx| {
+                // Create some diagnostics
+                lsp_store
+                    .update_diagnostics(
+                        LanguageServerId(0),
+                        lsp::PublishDiagnosticsParams {
+                            uri: path_to_buffer_uri.clone(),
+                            diagnostics: vec![diagnostic],
+                            version: None,
+                        },
+                        None,
+                        language::DiagnosticSourceKind::Pushed,
+                        &[],
+                        cx,
+                    )
+                    .unwrap();
+            });
+        });
+
+        let buffer = project
+            .update(cx, |project, cx| {
+                let path = project.find_project_path(path!("root/foo.md"), cx).unwrap();
+                project.open_buffer(path, cx)
+            })
+            .await
+            .unwrap();
+
+        let snapshot = buffer.read_with(cx, |buffer, _cx| buffer.snapshot());
+        let position = snapshot.anchor_before(language::Point::new(0, 0));
+
+        let _prediction_task = zeta.update(cx, |zeta, cx| {
+            zeta.request_prediction(&project, &buffer, position, cx)
+        });
+
+        let (request, _respond_tx) = req_rx.next().await.unwrap();
+
+        assert_eq!(request.diagnostic_groups.len(), 1);
+        let value = serde_json::from_str::<serde_json::Value>(request.diagnostic_groups[0].0.get())
+            .unwrap();
+        // We probably don't need all of this. TODO define a specific diagnostic type in predict_edits_v3
+        assert_eq!(
+            value,
+            json!({
+                "entries": [{
+                    "range": {
+                        "start": 8,
+                        "end": 10
+                    },
+                    "diagnostic": {
+                        "source": null,
+                        "code": null,
+                        "code_description": null,
+                        "severity": 1,
+                        "message": "\"Hello\" deprecated. Use \"Hi\" instead",
+                        "markdown": null,
+                        "group_id": 0,
+                        "is_primary": true,
+                        "is_disk_based": false,
+                        "is_unnecessary": false,
+                        "source_kind": "Pushed",
+                        "data": null,
+                        "underline": true
+                    }
+                }],
+                "primary_ix": 0
+            })
+        );
+    }
+
+    fn init_test(
+        cx: &mut TestAppContext,
+    ) -> (
+        Entity<Zeta>,
+        mpsc::UnboundedReceiver<(
+            predict_edits_v3::PredictEditsRequest,
+            oneshot::Sender<predict_edits_v3::PredictEditsResponse>,
+        )>,
+    ) {
+        cx.update(move |cx| {
+            let settings_store = SettingsStore::test(cx);
+            cx.set_global(settings_store);
+            language::init(cx);
+            Project::init_settings(cx);
+
+            let (req_tx, req_rx) = mpsc::unbounded();
+
+            let http_client = FakeHttpClient::create({
+                move |req| {
+                    let uri = req.uri().path().to_string();
+                    let mut body = req.into_body();
+                    let req_tx = req_tx.clone();
+                    async move {
+                        let resp = match uri.as_str() {
+                            "/client/llm_tokens" => serde_json::to_string(&json!({
+                                "token": "test"
+                            }))
+                            .unwrap(),
+                            "/predict_edits/v3" => {
+                                let mut buf = Vec::new();
+                                body.read_to_end(&mut buf).await.ok();
+                                let req = serde_json::from_slice(&buf).unwrap();
+
+                                let (res_tx, res_rx) = oneshot::channel();
+                                req_tx.unbounded_send((req, res_tx)).unwrap();
+                                serde_json::to_string(&res_rx.await.unwrap()).unwrap()
+                            }
+                            _ => {
+                                panic!("Unexpected path: {}", uri)
+                            }
+                        };
+
+                        Ok(Response::builder().body(resp.into()).unwrap())
+                    }
+                }
+            });
+
+            let client = client::Client::new(Arc::new(FakeSystemClock::new()), http_client, cx);
+            client.cloud_client().set_credentials(1, "test".into());
+
+            language_model::init(client.clone(), cx);
+
+            let user_store = cx.new(|cx| UserStore::new(client.clone(), cx));
+            let zeta = Zeta::global(&client, &user_store, cx);
+
+            (zeta, req_rx)
+        })
+    }
 }

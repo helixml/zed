@@ -55,7 +55,7 @@ impl ManifestProvider for PyprojectTomlManifestProvider {
         }: ManifestQuery,
     ) -> Option<Arc<RelPath>> {
         for path in path.ancestors().take(depth) {
-            let p = path.join(RelPath::new("pyproject.toml").unwrap());
+            let p = path.join(RelPath::unix("pyproject.toml").unwrap());
             if delegate.exists(&p, Some(false)) {
                 return Some(path.into());
             }
@@ -107,13 +107,13 @@ impl TyLspAdapter {
 
 #[cfg(target_os = "linux")]
 impl TyLspAdapter {
-    const GITHUB_ASSET_KIND: AssetKind = AssetKind::Gz;
+    const GITHUB_ASSET_KIND: AssetKind = AssetKind::TarGz;
     const ARCH_SERVER_NAME: &str = "unknown-linux-gnu";
 }
 
 #[cfg(target_os = "freebsd")]
 impl TyLspAdapter {
-    const GITHUB_ASSET_KIND: AssetKind = AssetKind::Gz;
+    const GITHUB_ASSET_KIND: AssetKind = AssetKind::TarGz;
     const ARCH_SERVER_NAME: &str = "unknown-freebsd";
 }
 
@@ -1008,6 +1008,16 @@ fn get_venv_parent_dir(env: &PythonEnvironment) -> Option<PathBuf> {
     venv.parent().map(|parent| parent.to_path_buf())
 }
 
+fn wr_distance(wr: &PathBuf, venv: Option<&PathBuf>) -> usize {
+    if let Some(venv) = venv
+        && let Ok(p) = venv.strip_prefix(wr)
+    {
+        p.components().count()
+    } else {
+        usize::MAX
+    }
+}
+
 #[async_trait]
 impl ToolchainLister for PythonToolchainProvider {
     async fn list(
@@ -1030,7 +1040,7 @@ impl ToolchainLister for PythonToolchainProvider {
         config.workspace_directories = Some(
             subroot_relative_path
                 .ancestors()
-                .map(|ancestor| worktree_root.join(ancestor))
+                .map(|ancestor| worktree_root.join(ancestor.as_std_path()))
                 .collect(),
         );
         for locator in locators.iter() {
@@ -1069,12 +1079,7 @@ impl ToolchainLister for PythonToolchainProvider {
             let proj_ordering = || {
                 let lhs_project = lhs.project.clone().or_else(|| get_venv_parent_dir(lhs));
                 let rhs_project = rhs.project.clone().or_else(|| get_venv_parent_dir(rhs));
-                match (&lhs_project, &rhs_project) {
-                    (Some(l), Some(r)) => (r == &wr).cmp(&(l == &wr)),
-                    (Some(l), None) if l == &wr => Ordering::Less,
-                    (None, Some(r)) if r == &wr => Ordering::Greater,
-                    _ => Ordering::Equal,
-                }
+                wr_distance(&wr, lhs_project.as_ref()).cmp(&wr_distance(&wr, rhs_project.as_ref()))
             };
 
             // Compare environment priorities

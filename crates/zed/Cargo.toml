@@ -82,6 +82,7 @@ external_websocket_sync = { workspace = true, optional = true }
 inspector_ui.workspace = true
 install_cli.workspace = true
 journal.workspace = true
+json_schema_store.workspace = true
 keymap_editor.workspace = true
 language.workspace = true
 language_extension.workspace = true
@@ -171,6 +172,7 @@ zlog_settings.workspace = true
 
 [target.'cfg(target_os = "windows")'.dependencies]
 windows.workspace = true
+windows-sys.workspace = true
 
 [target.'cfg(target_os = "windows")'.build-dependencies]
 winresource = "0.1"

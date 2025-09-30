@@ -554,7 +554,7 @@ fn resolve_path(
                 .context("Can't create file: invalid filename")?;
 
             let new_file_path = parent_project_path.map(|parent| ProjectPath {
-                path: parent.path.join(RelPath::new(file_name).unwrap()),
+                path: parent.path.join(RelPath::unix(file_name).unwrap()),
                 ..parent
             });
 
@@ -1161,7 +1161,7 @@ async fn build_buffer(
     LineEnding::normalize(&mut text);
     let text = Rope::from(text);
     let language = cx
-        .update(|_cx| language_registry.language_for_file_path(&path))?
+        .update(|_cx| language_registry.load_language_for_file_path(&path))?
         .await
         .ok();
     let buffer = cx.new(|cx| {
