@@ -820,12 +820,14 @@ impl AcpThreadView {
         }
     }
 
+    #[allow(dead_code)]
     pub fn message_editor(&self) -> &Entity<MessageEditor> {
         &self.message_editor
     }
 
+    #[allow(dead_code)]
     pub fn send(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.send_impl(window, cx)
+        self.send_message(window, cx)
     }
 
     pub fn cancel_generation(&mut self, cx: &mut Context<Self>) {
@@ -993,7 +995,7 @@ impl AcpThreadView {
         .detach();
     }
 
-    fn send_impl(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    fn send_message(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(thread) = self.thread() else { return };
 
         if self.is_loading_contents {

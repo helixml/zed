@@ -44,7 +44,7 @@ use ai_onboarding::AgentPanelOnboarding;
 use anyhow::{Result, anyhow};
 use assistant_context::{AssistantContext, ContextEvent, ContextSummary};
 use assistant_slash_command::SlashCommandWorkingSet;
-use language_model::Role;
+
 use assistant_tool::ToolWorkingSet;
 use client::{UserStore, zed_urls};
 use cloud_llm_client::{Plan, PlanV1, PlanV2, UsageLimit};
@@ -888,35 +888,6 @@ impl AgentPanel {
         })
         .detach();
 
-        // Start background task to poll for WebSocket thread creation requests
-        // This is needed because render() isn't called until the panel becomes visible
-        #[cfg(feature = "external_websocket_sync")]
-        {
-            use std::time::Duration;
-            
-            let panel_entity = cx.entity();
-            cx.spawn_in(window, |panel, mut cx: AsyncWindowContext| async move {
-                loop {
-                    cx.background_executor().timer(Duration::from_millis(100)).await;
-                    
-                    let _ = panel.update(&mut cx, |_panel, cx| {
-                        // Check for pending requests
-                        let pending_requests = external_websocket_sync::process_pending_thread_requests(cx);
-                        if !pending_requests.is_empty() {
-                            log::error!("🎯 [BACKGROUND_POLL] Found {} pending WebSocket thread requests!", pending_requests.len());
-                            
-                            // Need window access to create threads, so we need to defer this
-                            // Mark that we need to process these on next render
-                            cx.notify(panel_entity.entity_id());
-                        }
-                    });
-                }
-            })
-            .detach();
-            
-            log::error!("✅ [AGENT_PANEL] Started background polling task for WebSocket requests");
-        }
-
         Self {
             active_view,
             workspace,
@@ -1142,33 +1113,27 @@ impl AgentPanel {
         let server = agent.server(self.fs.clone(), self.acp_history_store.clone());
         
         let initial_message = initial_message.to_string();
-        let workspace = self.workspace.clone();
-        let project = self.project.clone();
-        let acp_history_store = self.acp_history_store.clone();
-        let prompt_store = self.prompt_store.clone();
         
-        cx.spawn_in(window, |this, mut cx| async move {
-            log::error!("🔧 [ACP_CREATE] Creating ACP thread view...");
-            
-            // Create the ACP thread view - this will connect and create the session
-            let thread_view = cx.new(|cx| {
-                crate::acp::AcpThreadView::new(
-                    server.clone(),
-                    None, // resume_thread
-                    None, // summarize_thread
-                    workspace.clone(),
-                    project.clone(),
-                    acp_history_store.clone(),
-                    prompt_store.clone(),
-                    window,
-                    cx,
-                )
-            }).ok();
-            
-            let Some(thread_view) = thread_view else {
-                log::error!("❌ [ACP_CREATE] Failed to create ACP thread view");
-                return;
-            };
+        // Create the ACP thread view synchronously with window access
+        let thread_view = cx.new(|cx| {
+            crate::acp::AcpThreadView::new(
+                server.clone(),
+                None, // resume_thread
+                None, // summarize_thread
+                self.workspace.clone(),
+                self.project.clone(),
+                self.acp_history_store.clone(),
+                self.prompt_store.clone(),
+                window,
+                cx,
+            )
+        });
+        
+        log::error!("🔧 [ACP_CREATE] Created ACP thread view");
+        
+        // Now handle the async parts - move thread_view into the closure
+        cx.spawn(|this: WeakEntity<AgentPanel>, mut cx| async move {
+            log::error!("🔧 [ACP_CREATE] Initializing ACP thread asynchronously...");
             
             log::error!("⏳ [ACP_CREATE] Waiting for ACP thread to be ready...");
             
@@ -1177,7 +1142,7 @@ impl AgentPanel {
             
             // Try to get the session ID from the thread
             let session_id = thread_view.update(&mut cx, |view, cx| {
-                if let Some(thread) = view.thread(cx) {
+                if let Some(thread) = view.thread() {
                     let id = thread.read(cx).session_id().clone();
                     log::error!("✅ [ACP_CREATE] Got ACP session ID: {:?}", id);
                     Some(id)
@@ -1189,26 +1154,28 @@ impl AgentPanel {
             
             if let Some(session_id) = session_id {
                 // Store mapping: Helix session -> ACP session
-                if let Some(session_mapping) = cx.try_global::<external_websocket_sync::ExternalSessionMapping>() {
-                    let mut sessions = session_mapping.sessions.write();
-                    // Store as string for compatibility
-                    let session_id_string = session_id.0.to_string();
-                    sessions.insert(helix_session_id.clone(), assistant_context::ContextId::from_proto(session_id_string.clone()));
-                    log::error!("💾 [SESSION_MAPPING] Stored Helix {} -> ACP {}", helix_session_id, session_id_string);
-                }
-                
-                // Store REVERSE mapping: ACP session -> Helix session
-                if let Some(reverse_mapping) = cx.try_global::<external_websocket_sync::ContextToHelixSessionMapping>() {
-                    let mut contexts = reverse_mapping.contexts.write();
-                    let session_id_string = session_id.0.to_string();
-                    contexts.insert(session_id_string.clone(), helix_session_id.clone());
-                    log::error!("💾 [REVERSE_MAPPING] Stored ACP {} -> Helix {}", session_id_string, helix_session_id);
-                }
+                let _ = cx.update(|_, cx| {
+                    if let Some(session_mapping) = cx.try_global::<external_websocket_sync::ExternalSessionMapping>() {
+                        let mut sessions = session_mapping.sessions.write();
+                        // Store as string for compatibility
+                        let session_id_string = session_id.0.to_string();
+                        sessions.insert(helix_session_id.clone(), assistant_context::ContextId::from_proto(session_id_string.clone()));
+                        log::error!("💾 [SESSION_MAPPING] Stored Helix {} -> ACP {}", helix_session_id, session_id_string);
+                    }
+                    
+                    // Store REVERSE mapping: ACP session -> Helix session
+                    if let Some(reverse_mapping) = cx.try_global::<external_websocket_sync::ContextToHelixSessionMapping>() {
+                        let mut contexts = reverse_mapping.contexts.write();
+                        let session_id_string = session_id.0.to_string();
+                        contexts.insert(session_id_string.clone(), helix_session_id.clone());
+                        log::error!("💾 [REVERSE_MAPPING] Stored ACP {} -> Helix {}", session_id_string, helix_session_id);
+                    }
+                });
                 
                 // Subscribe to thread events to send responses back to Helix
                 let helix_session_for_events = helix_session_id.clone();
-                thread_view.update(&mut cx, |view, cx| {
-                    if let Some(thread) = view.thread(cx) {
+                let _ = thread_view.update(&mut cx, |view, cx| {
+                    if let Some(thread) = view.thread() {
                         cx.subscribe(thread, move |_view, thread_entity, event: &acp_thread::AcpThreadEvent, cx| {
                             use acp_thread::AcpThreadEvent;
                             match event {
@@ -1246,8 +1213,8 @@ impl AgentPanel {
                                             });
                                             
                                             if let Ok(json_str) = serde_json::to_string(&message) {
-                                                use tungstenite::Message;
-                                                if let Err(e) = ws_sender.send(Message::Text(json_str)) {
+                                                use external_websocket_sync::tungstenite::Message;
+                                                if let Err(e) = ws_sender.send(Message::Text(json_str.into())) {
                                                     log::error!("❌ [ACP_EVENTS] Failed to send to WebSocket: {}", e);
                                                 } else {
                                                     log::error!("✅ [ACP_EVENTS] Sent response to Helix session: {}", helix_session_for_events);
@@ -1267,24 +1234,37 @@ impl AgentPanel {
                             }
                         }).detach();
                     }
-                }).ok();
+                });
                 
-                // Send initial message to the thread
+                // Send initial message to the thread by directly submitting to the ACP thread
                 if !initial_message.is_empty() {
-                    log::error!("💬 [ACP_CREATE] Sending initial message: {}", initial_message);
-                    thread_view.update(&mut cx, |view, window, cx| {
-                        // Set the message text in the editor
-                        view.message_editor().update(cx, |editor, cx| {
-                            editor.set_text(&initial_message, window, cx);
-                        });
-                        // Send the message
-                        view.send(window, cx);
-                    }).ok();
+                    log::error!("💬 [ACP_CREATE] Sending initial message to ACP thread: {}", initial_message);
+                    let _ = thread_view.update(&mut cx, |view, cx| {
+                        if let Some(thread) = view.thread() {
+                            // Send the message directly to the ACP thread
+                            let message = vec![agent_client_protocol::ContentBlock::Text(
+                                agent_client_protocol::TextContent {
+                                    text: initial_message.clone(),
+                                    annotations: None,
+                                    meta: None,
+                                }
+                            )];
+                            let task = thread.update(cx, |thread, cx| {
+                                thread.send(message, cx)
+                            });
+                            cx.spawn(|_, _| async move {
+                                task.await.log_err();
+                            }).detach();
+                            log::error!("✅ [ACP_CREATE] Submitted message to ACP thread");
+                        } else {
+                            log::error!("⚠️ [ACP_CREATE] Thread not ready to receive message");
+                        }
+                    });
                 }
             }
             
             // Show the UI with the new thread
-            this.update_in(&mut cx, |this, window, cx| {
+            let _ = this.update_in(&mut cx, |this, window, cx| {
                 log::error!("🎨 [ACP_CREATE] Setting active view to new ACP thread");
                 
                 let selected_agent = AgentType::NativeAgent;
@@ -1294,7 +1274,7 @@ impl AgentPanel {
                 }
                 
                 this.set_active_view(ActiveView::ExternalAgentThread { thread_view }, window, cx);
-            }).ok();
+            });
             
             log::error!("✅ [ACP_CREATE] ACP thread creation complete");
         })
