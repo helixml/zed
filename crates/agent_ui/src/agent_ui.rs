@@ -3,6 +3,8 @@ mod agent_configuration;
 mod agent_diff;
 mod agent_model_selector;
 mod agent_panel;
+#[cfg(all(test, feature = "external_websocket_sync"))]
+mod agent_panel_tests;
 mod buffer_codegen;
 mod context_picker;
 mod context_server_configuration;
