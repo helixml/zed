@@ -916,6 +916,35 @@ impl AgentPanel {
         })
         .detach();
 
+        // Start background task to poll for WebSocket thread creation requests
+        // This is needed because render() isn't called until the panel becomes visible
+        #[cfg(feature = "external_websocket_sync")]
+        {
+            use std::time::Duration;
+            
+            let panel_entity = cx.entity();
+            cx.spawn_in(window, |panel, mut cx: AsyncWindowContext| async move {
+                loop {
+                    cx.background_executor().timer(Duration::from_millis(100)).await;
+                    
+                    let _ = panel.update(&mut cx, |_panel, cx| {
+                        // Check for pending requests
+                        let pending_requests = external_websocket_sync::process_pending_thread_requests(cx);
+                        if !pending_requests.is_empty() {
+                            log::error!("🎯 [BACKGROUND_POLL] Found {} pending WebSocket thread requests!", pending_requests.len());
+                            
+                            // Need window access to create threads, so we need to defer this
+                            // Mark that we need to process these on next render
+                            cx.notify(panel_entity.entity_id());
+                        }
+                    });
+                }
+            })
+            .detach();
+            
+            log::error!("✅ [AGENT_PANEL] Started background polling task for WebSocket requests");
+        }
+
         Self {
             active_view,
             workspace,
