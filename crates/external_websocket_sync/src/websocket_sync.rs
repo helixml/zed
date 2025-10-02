@@ -232,9 +232,10 @@ impl WebSocketSync {
                                 }
                                 
                                 // CRITICAL FIX: Send context_created response directly back to Helix
+                                // Use the Helix session ID from the event, not the agent instance ID
                                 let context_id = format!("zed-context-{}", chrono::Utc::now().timestamp_millis());
                                 let context_created_response = SyncMessage {
-                                    session_id: session_id_for_outgoing.clone(),
+                                    session_id: external_session_id.clone(),
                                     event_type: "context_created".to_string(),
                                     data: {
                                         let mut data = std::collections::HashMap::new();

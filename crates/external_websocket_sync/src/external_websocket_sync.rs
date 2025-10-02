@@ -635,24 +635,32 @@ pub fn init(cx: &mut App) {
                     
                     // Keep the runtime alive and handle the WebSocket connection
                     rt.block_on(async move {
-                        // Connect as a general external agent (not tied to specific sessions)
-                        let agent_id = format!("zed-agent-{}", chrono::Utc::now().timestamp());
+                        // Get agent instance ID from environment (set by Helix)
+                        // Falls back to generated ID for standalone/development usage
+                        let agent_id = std::env::var("HELIX_AGENT_INSTANCE_ID")
+                            .unwrap_or_else(|_| format!("zed-agent-{}", chrono::Utc::now().timestamp()));
                         
-                        // Create WebSocket sync config - Zed connects as a general agent
+                        let scope_type = std::env::var("HELIX_SCOPE_TYPE").unwrap_or_else(|_| "session".to_string());
+                        let scope_id = std::env::var("HELIX_SCOPE_ID").unwrap_or_else(|_| "unknown".to_string());
+                        
+                        // Create WebSocket sync config
                         let websocket_config = WebSocketSyncConfig {
                             enabled: true,
                             helix_url: helix_url_clone,
-                            session_id: agent_id.clone(), // This identifies this Zed instance
+                            session_id: agent_id.clone(), // Used as agent_id in WebSocket URL
                             auth_token: auth_token_clone,
                             use_tls,
                         };
                         
-                        eprintln!("🔌 [EXTERNAL_WEBSOCKET_SYNC] Connecting Zed as external agent: {}", agent_id);
-                        eprintln!("🔧 [EXTERNAL_WEBSOCKET_SYNC] WebSocket config: url={}, agent_id={}, use_tls={}", 
-                                  websocket_config.helix_url, agent_id, use_tls);
+                        eprintln!("🔌 [EXTERNAL_WEBSOCKET_SYNC] Connecting Zed as external agent");
+                        eprintln!("🆔 [EXTERNAL_WEBSOCKET_SYNC] Agent ID: {}", agent_id);
+                        eprintln!("📋 [EXTERNAL_WEBSOCKET_SYNC] Scope: {} ({})", scope_type, scope_id);
+                        eprintln!("🔧 [EXTERNAL_WEBSOCKET_SYNC] WebSocket config: url={}, use_tls={}", 
+                                  websocket_config.helix_url, use_tls);
                         log::info!("Connecting Zed as external agent: {}", agent_id);
-                        log::info!("WebSocket config: url={}, agent_id={}, use_tls={}", 
-                                  websocket_config.helix_url, agent_id, use_tls);
+                        log::info!("Scope: {} ({})", scope_type, scope_id);
+                        log::info!("WebSocket config: url={}, use_tls={}", 
+                                  websocket_config.helix_url, use_tls);
                         
                         // Start WebSocket connection - this will listen for session messages from Helix
                         match WebSocketSync::new(websocket_config, Some(thread_creation_sender.clone())).await {
