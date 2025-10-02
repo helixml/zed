@@ -15,6 +15,7 @@ use rust_embed::RustEmbed;
 #[include = "prompts/**/*"]
 #[include = "*.md"]
 #[exclude = "*.DS_Store"]
+#[debug_embed]
 pub struct Assets;
 
 impl AssetSource for Assets {

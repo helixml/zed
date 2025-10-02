@@ -443,242 +443,11 @@ pub struct AgentPanel {
 impl AgentPanel {
 
     #[cfg(feature = "external_websocket_sync")]
-    fn process_websocket_thread_requests_with_window(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        log::error!("🎯 [CRASH_DEBUG] process_websocket_thread_requests_with_window ENTRY");
-        
-        log::error!("🎯 [CRASH_DEBUG] About to call process_pending_thread_requests");
-        let pending_requests = external_websocket_sync::process_pending_thread_requests(cx);
-        log::error!("🎯 [CRASH_DEBUG] Got {} pending requests", pending_requests.len());
-        
-        if pending_requests.is_empty() {
-            log::error!("🎯 [CRASH_DEBUG] No pending requests, returning early");
-            return;
-        }
-        
-        log::error!("🎯 [AGENT_PANEL] Found {} pending WebSocket thread requests with window access!", pending_requests.len());
-        
-        for request in pending_requests {
-            log::error!("🎯 [AGENT_PANEL] Processing WebSocket thread creation request for session: {}", request.external_session_id);
-            
-            // Check if we already have a thread for this external session
-            let existing_context_id = {
-                if let Some(session_mapping) = cx.try_global::<external_websocket_sync::ExternalSessionMapping>() {
-                    let sessions = session_mapping.sessions.read();
-                    sessions.get(&request.external_session_id).cloned()
-                } else {
-                    log::error!("⚠️ [AGENT_PANEL] ExternalSessionMapping global not available");
-                    None
-                }
-            };
-            
-            if let Some(context_id) = existing_context_id {
-                log::error!("🔄 [AGENT_PANEL] Thread already exists for session {}, context_id: {}", 
-                           request.external_session_id, context_id.to_proto());
-            } else {
-                log::error!("🆕 [AGENT_PANEL] Creating NEW TextThread (traditional Zed assistant) for session: {}", request.external_session_id);
-                
-                // REVERT: Use TextThread approach which was working perfectly
-                // The only issue was UI labeling, but functionality was 100% working
-                // TextThread: Creates traditional Zed assistant threads that persist properly
-                let context_id = self.new_prompt_editor_with_message(window, cx, &request.message);
-                
-                log::error!("✅ [AGENT_PANEL] Created Zed Agent thread {} for session: {}", 
-                           context_id.to_proto(), request.external_session_id);
-                
-                // Store the mapping between Helix session and Zed context
-                {
-                    if let Some(session_mapping) = cx.try_global::<external_websocket_sync::ExternalSessionMapping>() {
-                        let mut sessions = session_mapping.sessions.write();
-                        sessions.insert(request.external_session_id.clone(), context_id.clone());
-                    } else {
-                        log::error!("⚠️ [AGENT_PANEL] ExternalSessionMapping global not available for storing mapping");
-                    }
-                }
-
-                // CRITICAL: Store REVERSE mapping (Zed context ID -> Helix session ID)
-                // This is what the websocket_sync event loop needs to use correct session_id
-                {
-                    if let Some(reverse_mapping) = cx.try_global::<external_websocket_sync::ContextToHelixSessionMapping>() {
-                        let mut contexts = reverse_mapping.contexts.write();
-                        contexts.insert(context_id.to_proto(), request.external_session_id.clone());
-                        log::error!("💾 [AGENT_PANEL] Stored reverse mapping: Context {} -> Helix Session {}",
-                                   context_id.to_proto(), request.external_session_id);
-                    } else {
-                        log::error!("⚠️ [AGENT_PANEL] ContextToHelixSessionMapping global not available for storing reverse mapping");
-                    }
-                }
-                
-                // CRITICAL: Send context_created event to establish proper mapping on Helix side
-                self.send_context_created_event(&context_id.to_proto(), &request.external_session_id, cx);
-                
-                // Subscribe to context events to forward AI responses back to Helix
-                self.subscribe_to_context_for_websocket_sync(context_id, request.external_session_id.clone(), window, cx);
-                
-                // REMOVED: Auto-activate Agent Panel call causes re-entrancy crash
-                // This was being called from inside render() which crashes the UI framework
-                // The panel is already active since render() is being called
-                log::error!("🎯 [AGENT_PANEL] WebSocket session processed (panel already active)");
-            }
-        }
-    }
+    // REMOVED: Dead code - was never called because render() wasn't reliably triggered
+    // Message completion is now handled in TextThreadEditor which always runs
     
-    #[cfg(feature = "external_websocket_sync")]
-    fn subscribe_to_context_for_websocket_sync(
-        &mut self, 
-        context_id: assistant_context::ContextId, 
-        helix_session_id: String,
-        window: &mut Window,
-        cx: &mut Context<Self>
-    ) {
-        log::error!("🔔 [AGENT_PANEL] Setting up context event subscription for WebSocket sync");
-        log::error!("🔔 [AGENT_PANEL] Context ID: {}, Helix Session ID: {}", context_id.to_proto(), helix_session_id);
-        
-        // Get the context from the context store
-        let context = self.context_store.read(cx).loaded_context_for_id(&context_id, cx);
-        if let Some(context) = context {
-            log::error!("🔔 [AGENT_PANEL] Found context, subscribing to events...");
-            
-            // Clone the context_id for the closure
-            let zed_context_id = context_id.clone();
-            
-            // Subscribe to context events
-            cx.subscribe_in(&context.clone(), window, move |_panel, _context, event, _window, cx| {
-                log::error!("🎯 [CONTEXT_EVENT] Received context event: {:?}", event);
-                
-                match event {
-                    assistant_context::ContextEvent::StreamedCompletion => {
-                        log::error!("🤖 [CONTEXT_EVENT] AI completion finished! Forwarding to Helix...");
-                        
-                        // Extract the latest AI response from the context
-                        let ai_response = Self::extract_latest_ai_response(_context, cx);
-                        log::error!("🤖 [CONTEXT_EVENT] Extracted AI response: {}", ai_response);
-                        
-                        // Forward the response back to Helix via WebSocket with proper context mapping
-                        Self::forward_ai_response_to_helix(&helix_session_id, &ai_response, &zed_context_id.to_proto(), cx);
-                    }
-                    assistant_context::ContextEvent::MessagesEdited => {
-                        log::error!("📝 [CONTEXT_EVENT] Messages edited - potential AI response");
-                        // Could also handle this event for real-time updates
-                    }
-                    _ => {
-                        // Ignore other events
-                    }
-                }
-            }).detach();
-            
-            log::error!("✅ [AGENT_PANEL] Context event subscription established");
-        } else {
-            log::error!("❌ [AGENT_PANEL] Failed to find context for subscription");
-        }
-    }
-    
-    #[cfg(feature = "external_websocket_sync")]
-    fn extract_latest_ai_response(context: &Entity<assistant_context::AssistantContext>, cx: &App) -> String {
-        log::error!("🔍 [EXTRACT_AI] Extracting latest AI response from context");
-        
-        // Get all messages from the context
-        let messages: Vec<_> = context.read(cx).messages(cx).collect();
-        log::error!("🔍 [EXTRACT_AI] Found {} total messages", messages.len());
-        
-        // Find the last assistant message (AI response)
-        if let Some(last_ai_message) = messages.iter().rev().find(|msg| {
-            msg.role == Role::Assistant
-        }) {
-            log::error!("🔍 [EXTRACT_AI] Found last AI message at offset range: {:?}", last_ai_message.offset_range);
-            
-            // Extract the text content from the buffer
-            let mut ai_text = String::new();
-            let buffer = context.read(cx).buffer();
-            for chunk in buffer.read(cx).text_for_range(last_ai_message.offset_range.clone()) {
-                ai_text.push_str(chunk);
-            }
-            
-            log::error!("🔍 [EXTRACT_AI] Extracted AI text: {}", ai_text.trim());
-            ai_text.trim().to_string()
-        } else {
-            log::error!("⚠️ [EXTRACT_AI] No AI message found in context");
-            String::new()
-        }
-    }
-    
-    #[cfg(feature = "external_websocket_sync")]
-    fn forward_ai_response_to_helix(helix_session_id: &str, ai_response: &str, zed_context_id: &str, cx: &mut Context<AgentPanel>) {
-        log::error!("📤 [FORWARD_AI] Forwarding AI response to Helix session: {}", helix_session_id);
-        log::error!("📤 [FORWARD_AI] Response content: {}", ai_response);
-        log::error!("📤 [FORWARD_AI] Zed context ID: {}", zed_context_id);
-        
-        // Get the global WebSocket sender
-        if let Some(sender) = external_websocket_sync::get_global_websocket_sender() {
-            log::error!("📤 [FORWARD_AI] WebSocket sender available, sending AI response...");
-            
-            // Create the sync message for chat response
-            let sync_message = external_websocket_sync::SyncMessage {
-                event_type: "message_added".to_string(),
-                session_id: helix_session_id.to_string(),
-                data: {
-                    let mut data = std::collections::HashMap::new();
-                    data.insert("content".to_string(), serde_json::Value::String(ai_response.to_string()));
-                    data.insert("context_id".to_string(), serde_json::Value::String(zed_context_id.to_string()));
-                    data.insert("message_id".to_string(), serde_json::Value::String(format!("ai_msg_{}", chrono::Utc::now().timestamp())));
-                    data.insert("role".to_string(), serde_json::Value::String("assistant".to_string()));
-                    data.insert("timestamp".to_string(), serde_json::Value::Number(serde_json::Number::from(chrono::Utc::now().timestamp())));
-                    data
-                },
-                timestamp: chrono::Utc::now(),
-            };
-            
-            // Serialize and send the message
-            if let Ok(json_message) = serde_json::to_string(&sync_message) {
-                let websocket_message = external_websocket_sync_dep::tungstenite::Message::Text(json_message.into());
-                if let Err(e) = sender.send(websocket_message) {
-                    log::error!("❌ [FORWARD_AI] Failed to send WebSocket message: {}", e);
-                } else {
-                    log::error!("✅ [FORWARD_AI] AI response sent to Helix as message_added event!");
-                }
-            } else {
-                log::error!("❌ [FORWARD_AI] Failed to serialize sync message");
-            }
-        } else {
-            log::error!("⚠️ [FORWARD_AI] WebSocket sender not available - no connection to Helix");
-        }
-    }
-    
-    #[cfg(feature = "external_websocket_sync")]
-    fn send_context_created_event(&mut self, zed_context_id: &str, helix_session_id: &str, cx: &mut Context<Self>) {
-        log::error!("🎯 [CONTEXT_CREATED] Sending context_created event for proper mapping");
-        log::error!("🎯 [CONTEXT_CREATED] Zed context ID: {}, Helix session ID: {}", zed_context_id, helix_session_id);
-        
-        // Get the global WebSocket sender
-        if let Some(sender) = external_websocket_sync::get_global_websocket_sender() {
-            // Create the sync message for context creation
-            let sync_message = external_websocket_sync::SyncMessage {
-                event_type: "context_created".to_string(),
-                session_id: helix_session_id.to_string(),
-                data: {
-                    let mut data = std::collections::HashMap::new();
-                    data.insert("context_id".to_string(), serde_json::Value::String(zed_context_id.to_string()));
-                    data.insert("title".to_string(), serde_json::Value::String("Zed Agent Conversation".to_string()));
-                    data.insert("created_at".to_string(), serde_json::Value::Number(serde_json::Number::from(chrono::Utc::now().timestamp())));
-                    data
-                },
-                timestamp: chrono::Utc::now(),
-            };
-            
-            // Serialize and send the message
-            if let Ok(json_message) = serde_json::to_string(&sync_message) {
-                let websocket_message = external_websocket_sync_dep::tungstenite::Message::Text(json_message.into());
-                if let Err(e) = sender.send(websocket_message) {
-                    log::error!("❌ [CONTEXT_CREATED] Failed to send WebSocket message: {}", e);
-                } else {
-                    log::error!("✅ [CONTEXT_CREATED] Context created event sent to establish mapping!");
-                }
-            } else {
-                log::error!("❌ [CONTEXT_CREATED] Failed to serialize context_created message");
-            }
-        } else {
-            log::error!("⚠️ [CONTEXT_CREATED] WebSocket sender not available - no connection to Helix");
-        }
-    }
+    // REMOVED: Dead UI-layer WebSocket code that was never reliably called
+    // Message completion now handled in TextThreadEditor which always runs
     
     #[cfg(feature = "external_websocket_sync")]
     fn process_websocket_thread_requests_deferred(&mut self, cx: &mut Context<Self>) {
@@ -956,22 +725,8 @@ impl AgentPanel {
 
         cx.observe(&history_store, |_, _, cx| cx.notify()).detach();
 
-        // Set up WebSocket thread request processing observer
-        #[cfg(feature = "external_websocket_sync")]
-        {
-            cx.observe_global::<external_websocket_sync::PendingThreadRequests>(|this, cx| {
-                eprintln!("🎯 [AGENT_PANEL] WebSocket thread requests changed - scheduling thread creation!");
-                // Schedule thread creation to happen with window access
-                cx.notify(); // This will trigger a re-render where we can check for pending requests
-            }).detach();
-        }
-        
-        // Set up WebSocket thread creation processing - defer to avoid update conflict
-        #[cfg(feature = "external_websocket_sync")]
-        {
-            eprintln!("🎉 [AGENT_PANEL] FEATURE FLAG ACTIVE! external_websocket_sync is compiled!");
-            eprintln!("🔄 [AGENT_PANEL] Will start WebSocket polling task after panel creation...");
-        }
+        // REMOVED: Dead WebSocket observer code - was unreliable because it depended on render()
+        // Message completion now handled in TextThreadEditor which always runs
 
         let panel_type = AgentSettings::get_global(cx).default_view;
         let active_view = match panel_type {
@@ -2924,16 +2679,7 @@ impl AgentPanel {
 
 impl Render for AgentPanel {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        // CRASH DEBUG: Log render entry
-        log::error!("🎯 [CRASH_DEBUG] Agent panel render() called");
-        
-        // Process any pending WebSocket thread requests now that we have window access
-        #[cfg(feature = "external_websocket_sync")]
-        {
-            log::error!("🎯 [CRASH_DEBUG] About to call process_websocket_thread_requests_with_window");
-            self.process_websocket_thread_requests_with_window(window, cx);
-            log::error!("🎯 [CRASH_DEBUG] Completed process_websocket_thread_requests_with_window");
-        }
+        // Message completion now handled in TextThreadEditor which runs reliably
         
         // WARNING: Changes to this element hierarchy can have
         // non-obvious implications to the layout of children.

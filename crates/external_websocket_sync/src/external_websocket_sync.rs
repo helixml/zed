@@ -47,6 +47,7 @@ pub use tungstenite;
 #[derive(Clone, Debug)]
 pub struct CreateThreadRequest {
     pub external_session_id: String,
+    pub zed_context_id: Option<String>, // If provided, reuse this context; if None, create new
     pub message: String,
     pub request_id: String,
 }
@@ -512,6 +513,19 @@ impl ExternalWebSocketSync {
             };
             if let Err(e) = websocket_sync.send_event(event) {
                 log::warn!("Failed to send message added event: {}", e);
+            }
+        }
+    }
+
+    /// Notify WebSocket of message completion
+    pub fn notify_message_completed(&self, context_id: &ContextId, message_id: &MessageId) {
+        if let Some(websocket_sync) = &self.websocket_sync {
+            let event = SyncEvent::MessageCompleted {
+                context_id: context_id.to_proto(),
+                message_id: message_id.as_u64(),
+            };
+            if let Err(e) = websocket_sync.send_event(event) {
+                log::warn!("Failed to send message completed event: {}", e);
             }
         }
     }

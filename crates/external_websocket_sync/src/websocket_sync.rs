@@ -208,16 +208,17 @@ impl WebSocketSync {
 
                         // Handle local events that should create UI threads
                         match &event {
-                            SyncEvent::CreateThreadFromExternalSession { external_session_id, message, request_id } => {
+                            SyncEvent::CreateThreadFromExternalSession { external_session_id, zed_context_id, message, request_id } => {
                                 log::error!(
-                                    "🎯 [WEBSOCKET] Processing CreateThreadFromExternalSession event: session={}, message={}, request={}",
-                                    external_session_id, message, request_id
+                                    "🎯 [WEBSOCKET] Processing CreateThreadFromExternalSession event: session={}, zed_context_id={:?}, message={}, request={}",
+                                    external_session_id, zed_context_id, message, request_id
                                 );
                                 
                                 // Send thread creation request to UI via channel
                                 if let Some(ref sender) = thread_creation_sender {
                                     let request = crate::CreateThreadRequest {
                                         external_session_id: external_session_id.clone(),
+                                        zed_context_id: zed_context_id.clone(),
                                         message: message.clone(),
                                         request_id: request_id.clone(),
                                     };
@@ -231,33 +232,9 @@ impl WebSocketSync {
                                     log::error!("❌ [WEBSOCKET] Thread creation sender not available - cannot create UI thread");
                                 }
                                 
-                                // CRITICAL FIX: Send context_created response directly back to Helix
-                                // Use the Helix session ID from the event, not the agent instance ID
-                                let context_id = format!("zed-context-{}", chrono::Utc::now().timestamp_millis());
-                                let context_created_response = SyncMessage {
-                                    session_id: external_session_id.clone(),
-                                    event_type: "context_created".to_string(),
-                                    data: {
-                                        let mut data = std::collections::HashMap::new();
-                                        data.insert("context_id".to_string(), serde_json::Value::String(context_id.clone()));
-                                        data
-                                    },
-                                    timestamp: chrono::Utc::now(),
-                                };
-                                
-                                let response_text = match serde_json::to_string(&context_created_response) {
-                                    Ok(text) => text,
-                                    Err(e) => {
-                                        log::error!("❌ [WEBSOCKET] Failed to serialize context_created response: {}", e);
-                                        continue;
-                                    }
-                                };
-                                
-                                if let Err(e) = websocket_sender_for_events.send(Message::Text(response_text.into())) {
-                                    log::error!("❌ [WEBSOCKET] Failed to send context_created response: {}", e);
-                                } else {
-                                    log::error!("✅ [WEBSOCKET] Successfully sent context_created response with context_id: {}", context_id);
-                                }
+                                // NOTE: We don't send synthetic context_created here
+                                // The real context_created will be sent by agent_panel when it actually creates the context
+                                // This keeps Zed stateless - it doesn't generate fake IDs
                                 
                                 // Don't send this event to external server - it's for local processing only
                                 continue;
@@ -494,20 +471,29 @@ impl WebSocketSync {
                 eprintln!("💬 [HANDLE_MESSAGE_WITH_RESPONSE] HANDLING CHAT_MESSAGE COMMAND");
                 eprintln!("💬 [HANDLE_MESSAGE_WITH_RESPONSE] ========================================");
                 
-                // Extract request_id before moving command.data
+                // Extract request_id
                 let request_id = command.data.get("request_id")
                     .and_then(|v| v.as_str())
                     .unwrap_or("unknown")
                     .to_string();
                 
-                // Extract the actual Helix session ID from command data
-                let helix_session_id = command.data.get("session_id")
+                // Extract helix_session_id
+                let helix_session_id = command.data.get("helix_session_id")
                     .and_then(|v| v.as_str())
                     .unwrap_or(session_id)
                     .to_string();
                 
-                // Handle the chat_message command - this will trigger AI processing in Zed
-                let (context_id, _) = Self::handle_chat_message_with_response(session_id, command.data.clone(), event_sender).await?;
+                // Extract zed_context_id (null on first message, real UUID on subsequent messages)
+                let zed_context_id = command.data.get("zed_context_id")
+                    .and_then(|v| v.as_str())
+                    .filter(|s| !s.is_empty())  // Filter out empty strings - treat them as None
+                    .map(|s| s.to_string());
+                
+                eprintln!("🔍 [HANDLE_MESSAGE_WITH_RESPONSE] helix_session_id: {}", helix_session_id);
+                eprintln!("🔍 [HANDLE_MESSAGE_WITH_RESPONSE] zed_context_id: {:?}", zed_context_id);
+                
+                // Handle the chat message - pass zed_context_id so we can reuse existing context if it exists
+                let (context_id, _) = Self::handle_chat_message_with_response(&helix_session_id, zed_context_id, command.data.clone(), event_sender).await?;
                 
                 eprintln!("✅ [HANDLE_MESSAGE_WITH_RESPONSE] Chat message sent to Zed context system");
                 eprintln!("🔄 [HANDLE_MESSAGE_WITH_RESPONSE] Context ID: {}, Helix Session ID: {}", context_id, helix_session_id);
@@ -783,6 +769,7 @@ impl WebSocketSync {
         // Emit event to request thread creation from the UI
         let create_thread_event = SyncEvent::CreateThreadFromExternalSession {
             external_session_id: helix_session_id.to_string(),
+            zed_context_id: None, // New thread - no existing context
             message: message.to_string(),
             request_id: request_id.to_string(),
         };
@@ -812,11 +799,13 @@ impl WebSocketSync {
 
     /// Handle chat_message command from Helix with response
     async fn handle_chat_message_with_response(
-        session_id: &str,
+        helix_session_id: &str,
+        zed_context_id: Option<String>,
         data: HashMap<String, serde_json::Value>,
         event_sender: &mpsc::UnboundedSender<SyncEvent>
     ) -> Result<(String, String)> {
-        eprintln!("💬 [CHAT_MESSAGE] Processing chat_message command for session: {}", session_id);
+        eprintln!("💬 [CHAT_MESSAGE] Processing chat_message for helix_session: {}", helix_session_id);
+        eprintln!("💬 [CHAT_MESSAGE] zed_context_id: {:?}", zed_context_id);
         
         // Extract request_id and message from the command data
         let request_id = data.get("request_id")
@@ -829,29 +818,29 @@ impl WebSocketSync {
             
         eprintln!("💬 [CHAT_MESSAGE] Request ID: {}, message: {}", request_id, message);
         
-        // For chat messages, we assume there's already a thread/context
-        // We'll generate a context_id based on the session_id for consistency
-        let context_id = format!("zed-context-{}", session_id);
-        
-        // Create a chat message event to add to existing thread
+        // Create event with zed_context_id (Some if reusing, None if creating new)
         let chat_event = SyncEvent::CreateThreadFromExternalSession {
-            external_session_id: session_id.to_string(),
+            external_session_id: helix_session_id.to_string(),
+            zed_context_id: zed_context_id.clone(),
             message: message.to_string(),
             request_id: request_id.to_string(),
         };
         
-        eprintln!("💬 [CHAT_MESSAGE] Sending chat event to existing thread...");
+        if let Some(ref context_id) = zed_context_id {
+            eprintln!("🔄 [CHAT_MESSAGE] Reusing existing Zed context: {}", context_id);
+        } else {
+            eprintln!("🆕 [CHAT_MESSAGE] Creating NEW Zed context for helix session: {}", helix_session_id);
+        }
         
-        // Send the event to add message to existing thread
         if let Err(e) = event_sender.send(chat_event) {
             log::error!("Failed to send chat message event: {}", e);
             return Err(anyhow::anyhow!("Failed to send chat message event: {}", e));
         }
         
-        eprintln!("✅ [CHAT_MESSAGE] Successfully sent chat message event for session: {}", session_id);
+        eprintln!("✅ [CHAT_MESSAGE] Sent chat event for session: {}", helix_session_id);
         
-        // Return the context_id and session_id for the response
-        Ok((context_id, session_id.to_string()))
+        // Return the context_id (or empty if creating new - real one comes via context_created)
+        Ok((zed_context_id.unwrap_or_default(), helix_session_id.to_string()))
     }
 
     /// Handle create_thread command from Helix
@@ -876,6 +865,7 @@ impl WebSocketSync {
         // Create a CreateThreadFromExternalSession event to trigger thread creation in the UI
         let create_thread_event = SyncEvent::CreateThreadFromExternalSession {
             external_session_id: helix_session_id.to_string(),
+            zed_context_id: None, // New thread - no existing context
             message: message.to_string(),
             request_id: format!("req-{}", chrono::Utc::now().timestamp_millis()),
         };
@@ -912,6 +902,7 @@ impl WebSocketSync {
             SyncEvent::ContextCreated { .. } => "context_created".to_string(),
             SyncEvent::ContextDeleted { .. } => "context_deleted".to_string(),
             SyncEvent::MessageAdded { .. } => "message_added".to_string(),
+            SyncEvent::MessageCompleted { .. } => "message_completed".to_string(),
             SyncEvent::MessageUpdated { .. } => "message_updated".to_string(),
             SyncEvent::MessageDeleted { .. } => "message_deleted".to_string(),
             SyncEvent::ContextTitleChanged { .. } => "context_title_changed".to_string(),
@@ -935,6 +926,10 @@ impl WebSocketSync {
                 data.insert("context_id".to_string(), serde_json::Value::String(context_id));
             }
             SyncEvent::MessageAdded { context_id, message_id } => {
+                data.insert("context_id".to_string(), serde_json::Value::String(context_id));
+                data.insert("message_id".to_string(), serde_json::Value::Number(message_id.into()));
+            }
+            SyncEvent::MessageCompleted { context_id, message_id } => {
                 data.insert("context_id".to_string(), serde_json::Value::String(context_id));
                 data.insert("message_id".to_string(), serde_json::Value::Number(message_id.into()));
             }
@@ -965,8 +960,11 @@ impl WebSocketSync {
                 data.insert("request_id".to_string(), serde_json::Value::String(request_id));
                 data.insert("error".to_string(), serde_json::Value::String(error));
             }
-            SyncEvent::CreateThreadFromExternalSession { external_session_id, message, request_id } => {
+            SyncEvent::CreateThreadFromExternalSession { external_session_id, zed_context_id, message, request_id } => {
                 data.insert("external_session_id".to_string(), serde_json::Value::String(external_session_id));
+                if let Some(context_id) = zed_context_id {
+                    data.insert("zed_context_id".to_string(), serde_json::Value::String(context_id));
+                }
                 data.insert("message".to_string(), serde_json::Value::String(message));
                 data.insert("request_id".to_string(), serde_json::Value::String(request_id));
             }

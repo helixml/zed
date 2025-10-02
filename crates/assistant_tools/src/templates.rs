@@ -7,6 +7,7 @@ use std::sync::Arc;
 #[derive(RustEmbed)]
 #[folder = "src/templates"]
 #[include = "*.hbs"]
+#[debug_embed]
 struct Assets;
 
 pub struct Templates(Handlebars<'static>);

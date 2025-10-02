@@ -125,6 +125,10 @@ pub enum SyncEvent {
         context_id: String,
         message_id: u64,
     },
+    MessageCompleted {
+        context_id: String,
+        message_id: u64,
+    },
     MessageUpdated {
         context_id: String,
         message_id: u64,
@@ -155,6 +159,7 @@ pub enum SyncEvent {
     /// Request to create a new assistant thread from an external session
     CreateThreadFromExternalSession {
         external_session_id: String,
+        zed_context_id: Option<String>, // If Some, reuse existing context; if None, create new
         message: String,
         request_id: String,
     },

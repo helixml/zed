@@ -8,6 +8,8 @@ use anyhow::Result;
 use assistant_slash_command::{SlashCommand, SlashCommandOutputSection, SlashCommandWorkingSet};
 use assistant_slash_commands::{DefaultSlashCommand, FileSlashCommand, selections_creases};
 use client::{proto, zed_urls};
+#[cfg(feature = "external_websocket_sync")]
+use external_websocket_sync_dep as external_websocket_sync;
 use collections::{BTreeSet, HashMap, HashSet, hash_map};
 use editor::{
     Anchor, Editor, EditorEvent, MenuEditPredictionsPolicy, MultiBuffer, MultiBufferSnapshot,
@@ -773,7 +775,29 @@ impl TextThreadEditor {
             ContextEvent::SlashCommandOutputSectionAdded { section } => {
                 self.insert_slash_command_output_sections([section.clone()], false, window, cx);
             }
-            ContextEvent::Operation(_) => {}
+            ContextEvent::Operation(op) => {
+                // Check for message completion to send message_completed event
+                #[cfg(feature = "external_websocket_sync")]
+                {
+                    use assistant_context::{ContextOperation, MessageStatus};
+                    
+                    if let ContextOperation::UpdateMessage { message_id, metadata, .. } = op {
+                        // Check if message status is Done
+                        if metadata.status == MessageStatus::Done {
+                            log::error!("✅ [TEXT_THREAD] Message completed! message_id={:?}", message_id);
+                            
+                            // Get context ID and notify via external websocket sync
+                            let context_id = self.context.read(cx).id();
+                            if let Some(sync) = external_websocket_sync::ExternalWebSocketSync::global(cx) {
+                                sync.notify_message_completed(&context_id, message_id);
+                                log::error!("✅ [TEXT_THREAD] Sent message_completed event to Helix");
+                            } else {
+                                log::error!("❌ [TEXT_THREAD] ExternalWebSocketSync not available");
+                            }
+                        }
+                    }
+                }
+            }
             ContextEvent::ShowAssistError(error_message) => {
                 self.last_error = Some(AssistError::Message(error_message.clone()));
             }
