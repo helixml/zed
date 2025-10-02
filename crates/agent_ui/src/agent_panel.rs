@@ -1131,8 +1131,16 @@ impl AgentPanel {
         
         log::error!("🔧 [ACP_CREATE] Created ACP thread view");
         
-        // Now handle the async parts - move thread_view into the closure
-        cx.spawn(|this: WeakEntity<AgentPanel>, mut cx| async move {
+        // Show the UI immediately with the new thread
+        let selected_agent = AgentType::NativeAgent;
+        if self.selected_agent != selected_agent {
+            self.selected_agent = selected_agent;
+            self.serialize(cx);
+        }
+        self.set_active_view(ActiveView::ExternalAgentThread { thread_view: thread_view.clone() }, window, cx);
+        
+        // Now handle the async parts (session mapping, events, initial message)
+        cx.spawn(async move |_this, cx| {
             log::error!("🔧 [ACP_CREATE] Initializing ACP thread asynchronously...");
             
             log::error!("⏳ [ACP_CREATE] Waiting for ACP thread to be ready...");
@@ -1141,7 +1149,7 @@ impl AgentPanel {
             cx.background_executor().timer(std::time::Duration::from_millis(500)).await;
             
             // Try to get the session ID from the thread
-            let session_id = thread_view.update(&mut cx, |view, cx| {
+            let session_id = thread_view.update(cx, |view, cx| {
                 if let Some(thread) = view.thread() {
                     let id = thread.read(cx).session_id().clone();
                     log::error!("✅ [ACP_CREATE] Got ACP session ID: {:?}", id);
@@ -1154,7 +1162,7 @@ impl AgentPanel {
             
             if let Some(session_id) = session_id {
                 // Store mapping: Helix session -> ACP session
-                let _ = cx.update(|_, cx| {
+                let _ = cx.update(|cx| {
                     if let Some(session_mapping) = cx.try_global::<external_websocket_sync::ExternalSessionMapping>() {
                         let mut sessions = session_mapping.sessions.write();
                         // Store as string for compatibility
@@ -1174,7 +1182,7 @@ impl AgentPanel {
                 
                 // Subscribe to thread events to send responses back to Helix
                 let helix_session_for_events = helix_session_id.clone();
-                let _ = thread_view.update(&mut cx, |view, cx| {
+                let _ = thread_view.update(cx, |view, cx| {
                     if let Some(thread) = view.thread() {
                         cx.subscribe(thread, move |_view, thread_entity, event: &acp_thread::AcpThreadEvent, cx| {
                             use acp_thread::AcpThreadEvent;
@@ -1239,7 +1247,7 @@ impl AgentPanel {
                 // Send initial message to the thread by directly submitting to the ACP thread
                 if !initial_message.is_empty() {
                     log::error!("💬 [ACP_CREATE] Sending initial message to ACP thread: {}", initial_message);
-                    let _ = thread_view.update(&mut cx, |view, cx| {
+                    let _ = thread_view.update(cx, |view, cx| {
                         if let Some(thread) = view.thread() {
                             // Send the message directly to the ACP thread
                             let message = vec![agent_client_protocol::ContentBlock::Text(
@@ -1252,7 +1260,7 @@ impl AgentPanel {
                             let task = thread.update(cx, |thread, cx| {
                                 thread.send(message, cx)
                             });
-                            cx.spawn(|_, _| async move {
+                            cx.spawn(async move |_, _| {
                                 task.await.log_err();
                             }).detach();
                             log::error!("✅ [ACP_CREATE] Submitted message to ACP thread");
@@ -1263,20 +1271,7 @@ impl AgentPanel {
                 }
             }
             
-            // Show the UI with the new thread
-            let _ = this.update_in(&mut cx, |this, window, cx| {
-                log::error!("🎨 [ACP_CREATE] Setting active view to new ACP thread");
-                
-                let selected_agent = AgentType::NativeAgent;
-                if this.selected_agent != selected_agent {
-                    this.selected_agent = selected_agent;
-                    this.serialize(cx);
-                }
-                
-                this.set_active_view(ActiveView::ExternalAgentThread { thread_view }, window, cx);
-            });
-            
-            log::error!("✅ [ACP_CREATE] ACP thread creation complete");
+            log::error!("✅ [ACP_CREATE] ACP thread initialization complete");
         })
         .detach();
     }
