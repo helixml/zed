@@ -1209,19 +1209,55 @@ impl AgentPanel {
                 let helix_session_for_events = helix_session_id.clone();
                 thread_view.update(&mut cx, |view, cx| {
                     if let Some(thread) = view.thread(cx) {
-                        cx.subscribe(thread, move |_view, _thread, event: &acp_thread::AcpThreadEvent, cx| {
+                        cx.subscribe(thread, move |_view, thread_entity, event: &acp_thread::AcpThreadEvent, cx| {
                             use acp_thread::AcpThreadEvent;
                             match event {
                                 AcpThreadEvent::Stopped => {
                                     log::error!("🎬 [ACP_EVENTS] Thread stopped, response complete");
-                                    // Get the response and send to Helix
-                                    if let Some(sync) = external_websocket_sync::ExternalWebSocketSync::global(cx) {
-                                        // Get the last assistant message from the thread
-                                        if let Some(_thread_entity) = _view.thread(cx) {
-                                            // TODO: Extract the actual response text
-                                            sync.send_message_to_helix(&helix_session_for_events, "AI response completed", cx);
-                                            log::error!("📤 [ACP_EVENTS] Sent response to Helix session: {}", helix_session_for_events);
+                                    
+                                    // Extract the last assistant message from the thread
+                                    let response_text = thread_entity.read(cx).entries()
+                                        .iter()
+                                        .rev()
+                                        .find_map(|entry| {
+                                            if let acp_thread::AgentThreadEntry::AssistantMessage(assistant_msg) = entry {
+                                                Some(assistant_msg.to_markdown(cx))
+                                            } else {
+                                                None
+                                            }
+                                        })
+                                        .unwrap_or_else(|| "AI response completed (no text)".to_string());
+                                    
+                                    log::error!("📝 [ACP_EVENTS] Extracted response: {}", 
+                                               if response_text.len() > 100 { 
+                                                   format!("{}...", &response_text[..100]) 
+                                               } else { 
+                                                   response_text.clone() 
+                                               });
+                                    
+                                    // Send the response to Helix
+                                    if let Some(sender) = cx.try_global::<external_websocket_sync::WebSocketSender>() {
+                                        let sender_guard = sender.sender.read();
+                                        if let Some(ws_sender) = sender_guard.as_ref() {
+                                            let message = serde_json::json!({
+                                                "type": "message_completed",
+                                                "session_id": helix_session_for_events,
+                                                "content": response_text
+                                            });
+                                            
+                                            if let Ok(json_str) = serde_json::to_string(&message) {
+                                                use tungstenite::Message;
+                                                if let Err(e) = ws_sender.send(Message::Text(json_str)) {
+                                                    log::error!("❌ [ACP_EVENTS] Failed to send to WebSocket: {}", e);
+                                                } else {
+                                                    log::error!("✅ [ACP_EVENTS] Sent response to Helix session: {}", helix_session_for_events);
+                                                }
+                                            }
+                                        } else {
+                                            log::error!("⚠️ [ACP_EVENTS] WebSocket sender not available");
                                         }
+                                    } else {
+                                        log::error!("⚠️ [ACP_EVENTS] WebSocketSender global not available");
                                     }
                                 }
                                 AcpThreadEvent::EntryUpdated(index) => {
