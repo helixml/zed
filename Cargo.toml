@@ -622,7 +622,7 @@ rsa = "0.9.6"
 runtimelib = {  git = "https://github.com/ConradIrwin/runtimed", rev = "7130c804216b6914355d15d0b91ea91f6babd734", default-features = false, features = [
     "async-dispatcher-runtime",
 ] }
-rust-embed = { version = "8.4", features = ["include-exclude"] }
+rust-embed = { version = "8.4", features = ["include-exclude", "debug-embed"] }
 rustc-demangle = "0.1.23"
 rustc-hash = "2.1.0"
 rustls = { version = "0.23.26" }

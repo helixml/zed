@@ -36,7 +36,6 @@ pub(crate) use package_json::{PackageJson, PackageJsonData};
 #[derive(RustEmbed)]
 #[folder = "src/"]
 #[exclude = "*.rs"]
-#[debug_embed]
 struct LanguageDir;
 
 /// A shared grammar for plain text, exposed for reuse by downstream crates.

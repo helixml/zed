@@ -73,7 +73,6 @@ impl fmt::Display for WorktreeId {
 #[include = "settings/*"]
 #[include = "keymaps/*"]
 #[exclude = "*.DS_Store"]
-#[debug_embed]
 pub struct SettingsAssets;
 
 pub fn init(cx: &mut App) {
