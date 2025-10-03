@@ -168,12 +168,12 @@ pub struct ErrorResponse {
     pub details: Option<HashMap<String, serde_json::Value>>,
 }
 
-/// WebSocket message types
+/// WebSocket message types (DEPRECATED - use SyncEvent directly)
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "type")]
 pub enum WebSocketMessage {
-    /// Sync event from Zed to Helix
-    SyncEvent(TimestampedSyncEvent),
+    /// Sync event from Zed to external system
+    SyncEvent(SyncEvent),
     /// Ping message
     Ping { id: String },
     /// Pong response

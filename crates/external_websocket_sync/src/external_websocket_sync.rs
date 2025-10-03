@@ -225,65 +225,10 @@ impl ExternalWebSocketSync {
         Ok(())
     }
 
-    /// Start the sync service
-    pub async fn start(&mut self, cx: &mut App) -> Result<()> {
-        log::info!("Starting external WebSocket thread sync service");
-
-        // Load configuration
-        let config = self.load_config(cx).unwrap_or_default();
-        
-        if !config.enabled {
-            log::info!("External WebSocket sync is disabled");
-            return Ok(());
-        }
-
-        // Initialize context store if we have a project
-        log::info!("Attempting to initialize context store");
-        // Note: We can't get mutable self here due to async context
-        // This will need to be handled differently in the actual implementation
-
-        // Start HTTP server if enabled
-        let settings = ExternalSyncSettings::get_global(cx);
-        if settings.server.enabled {
-            let server_config = crate::server::ServerConfig {
-                enabled: settings.server.enabled,
-                host: settings.server.host.clone(),
-                port: settings.server.port,
-                auth_token: settings.server.auth_token.clone(),
-            };
-            
-            match crate::server::start_server(server_config).await {
-                Ok(_server_handle) => {
-                    log::info!("HTTP server started on {}:{}", settings.server.host, settings.server.port);
-                    // TODO: Store server_handle for proper shutdown
-                }
-                Err(e) => {
-                    log::error!("Failed to start HTTP server: {}", e);
-                }
-            }
-        }
-
-        // Start WebSocket sync if enabled
-        if config.websocket_sync.enabled {
-            match WebSocketSync::new(config.websocket_sync.clone()).await {
-                Ok(_websocket_sync) => {
-                    log::info!("WebSocket sync initialized successfully");
-                    // TODO: Store websocket_sync in a thread-safe way
-                }
-                Err(e) => {
-                    log::error!("Failed to initialize WebSocket sync: {}", e);
-                }
-            }
-        }
-
-        // Initialize MCP if enabled
-        if config.mcp.enabled {
-            if let Err(e) = self.initialize_mcp(config.mcp, cx).await {
-                log::error!("Failed to initialize MCP: {}", e);
-            }
-        }
-
-        log::info!("External WebSocket sync service started successfully");
+    /// Start the sync service (DEPRECATED - use init_websocket_service instead)
+    #[allow(dead_code)]
+    pub async fn start(&mut self, _cx: &mut App) -> Result<()> {
+        log::warn!("ExternalWebSocketSync::start() is deprecated - use websocket_sync::init_websocket_service()");
         Ok(())
     }
 
@@ -310,8 +255,7 @@ impl ExternalWebSocketSync {
             enabled: settings.enabled,
             websocket_sync: WebSocketSyncConfig {
                 enabled: settings.websocket_sync.enabled,
-                helix_url: settings.websocket_sync.external_url.clone(),
-                session_id: self.session.id().to_string(),
+                url: settings.websocket_sync.external_url.clone(),
                 auth_token: settings.websocket_sync.auth_token.clone().unwrap_or_default(),
                 use_tls: settings.websocket_sync.use_tls,
             },
@@ -333,7 +277,7 @@ impl ExternalWebSocketSync {
             session_id: self.session.id().to_string(),
             last_session_id: self.session.last_session_id().map(|s| s.to_string()),
             active_contexts: self.active_contexts.read().len(),
-            websocket_connected: self.websocket_sync.as_ref().map_or(false, |ws| ws.is_connected()),
+            websocket_connected: false, // TODO: check if websocket service is active
             sync_clients: self.sync_clients.read().len(),
         }
     }
@@ -452,28 +396,16 @@ impl ExternalWebSocketSync {
         Ok(message_id)
     }
 
-    /// Notify WebSocket of context creation
-    fn notify_context_created(&self, context_id: &ContextId) {
-        if let Some(websocket_sync) = &self.websocket_sync {
-            let event = SyncEvent::ContextCreated {
-                context_id: context_id.to_proto(),
-            };
-            if let Err(e) = websocket_sync.send_event(event) {
-                log::warn!("Failed to send context created event: {}", e);
-            }
-        }
+    /// Notify WebSocket of context creation (DEPRECATED - use thread_created)
+    #[allow(dead_code)]
+    fn notify_context_created(&self, _context_id: &ContextId) {
+        // Context creation now sends thread_created event via the callback mechanism
     }
 
-    /// Notify WebSocket of context deletion
-    fn notify_context_deleted(&self, context_id: &ContextId) {
-        if let Some(websocket_sync) = &self.websocket_sync {
-            let event = SyncEvent::ContextDeleted {
-                context_id: context_id.to_proto(),
-            };
-            if let Err(e) = websocket_sync.send_event(event) {
-                log::warn!("Failed to send context deleted event: {}", e);
-            }
-        }
+    /// Notify WebSocket of context deletion (DEPRECATED)
+    #[allow(dead_code)]
+    fn notify_context_deleted(&self, _context_id: &ContextId) {
+        // Not part of the simplified protocol
     }
 
     /// Notify WebSocket of message addition
@@ -545,137 +477,30 @@ impl ExternalWebSocketSync {
 
 /// Initialize the external WebSocket sync module
 pub fn init(cx: &mut App) {
-    // Force output to stderr regardless of log level
-    eprintln!("🚀 [EXTERNAL_WEBSOCKET_SYNC] Initializing external WebSocket sync module");
     log::info!("Initializing external WebSocket sync module");
 
-    // Initialize our settings (don't call settings::init again as it's already called in main)
+    // Initialize settings
     sync_settings::init(cx);
 
-    // Create global session mapping, reverse mapping, and WebSocket sender
-    cx.set_global(ExternalSessionMapping::default());
-    let context_to_helix_mapping = ContextToHelixSessionMapping::default();
-    cx.set_global(context_to_helix_mapping.clone());
+    // Create global WebSocket sender
     cx.set_global(WebSocketSender::default());
 
-    // CRITICAL: Store the mapping in static global so async tasks can access it
-    *GLOBAL_CONTEXT_TO_HELIX_MAPPING.lock() = Some(context_to_helix_mapping.contexts.clone());
-    eprintln!("✅ [INIT] Global context-to-helix mapping initialized for async task access");
-
-    // Check if WebSocket sync is enabled via environment variables
-    let enabled = std::env::var("ZED_EXTERNAL_SYNC_ENABLED")
-        .map(|v| v.parse().unwrap_or(false))
-        .unwrap_or(false);
-        
-    let websocket_enabled = std::env::var("ZED_WEBSOCKET_SYNC_ENABLED")
-        .map(|v| v.parse().unwrap_or(false))
-        .unwrap_or(enabled);
-        
-    eprintln!("🔍 [EXTERNAL_WEBSOCKET_SYNC] External sync enabled: {}, WebSocket enabled: {}", enabled, websocket_enabled);
-    log::error!("🔍 [INIT] External sync enabled: {}, WebSocket enabled: {}", enabled, websocket_enabled);
-    
-    if enabled && websocket_enabled {
-        eprintln!("🚀 [EXTERNAL_WEBSOCKET_SYNC] External WebSocket sync is enabled - attempting to start WebSocket connection");
-        log::error!("🚀 [INIT] External WebSocket sync is enabled - attempting to start WebSocket connection");
-        
-        // Start WebSocket sync in a background task
-        let helix_url = std::env::var("ZED_HELIX_URL")
-            .unwrap_or_else(|_| "localhost:8080".to_string());
-        let auth_token = std::env::var("ZED_HELIX_TOKEN")
-            .unwrap_or_else(|_| "".to_string());
-        let use_tls = std::env::var("ZED_HELIX_TLS")
-            .map(|v| v.parse().unwrap_or(false))
-            .unwrap_or(false);
-            
-        log::error!("🔌 [INIT] Starting WebSocket sync with: {}://{}", 
-                  if use_tls { "wss" } else { "ws" }, helix_url);
-        
-                // Try to start WebSocket connection using tokio runtime
-                let helix_url_clone = helix_url.clone();
-                let auth_token_clone = auth_token.clone();
-                
-                // Use std::thread to avoid async context issues
-                std::thread::spawn(move || {
-                    // Create a new tokio runtime for this thread
-                    let rt = tokio::runtime::Runtime::new().expect("Failed to create tokio runtime");
-                    
-                    // Keep the runtime alive and handle the WebSocket connection
-                    rt.block_on(async move {
-                        // Get agent instance ID from environment (set by Helix)
-                        // Falls back to generated ID for standalone/development usage
-                        let agent_id = std::env::var("HELIX_AGENT_INSTANCE_ID")
-                            .unwrap_or_else(|_| format!("zed-agent-{}", chrono::Utc::now().timestamp()));
-                        
-                        let scope_type = std::env::var("HELIX_SCOPE_TYPE").unwrap_or_else(|_| "session".to_string());
-                        let scope_id = std::env::var("HELIX_SCOPE_ID").unwrap_or_else(|_| "unknown".to_string());
-                        
-                        // Create WebSocket sync config
-                        let websocket_config = WebSocketSyncConfig {
-                            enabled: true,
-                            helix_url: helix_url_clone,
-                            session_id: agent_id.clone(), // Used as agent_id in WebSocket URL
-                            auth_token: auth_token_clone,
-                            use_tls,
-                        };
-                        
-                        eprintln!("🔌 [EXTERNAL_WEBSOCKET_SYNC] Connecting Zed as external agent");
-                        eprintln!("🆔 [EXTERNAL_WEBSOCKET_SYNC] Agent ID: {}", agent_id);
-                        eprintln!("📋 [EXTERNAL_WEBSOCKET_SYNC] Scope: {} ({})", scope_type, scope_id);
-                        eprintln!("🔧 [EXTERNAL_WEBSOCKET_SYNC] WebSocket config: url={}, use_tls={}", 
-                                  websocket_config.helix_url, use_tls);
-                        log::info!("Connecting Zed as external agent: {}", agent_id);
-                        log::info!("Scope: {} ({})", scope_type, scope_id);
-                        log::info!("WebSocket config: url={}, use_tls={}", 
-                                  websocket_config.helix_url, use_tls);
-                        
-                        // Start WebSocket connection - this will listen for session messages from Helix
-                        match WebSocketSync::new(websocket_config).await {
-                            Ok(websocket_sync) => {
-                                eprintln!("✅ [EXTERNAL_WEBSOCKET_SYNC] Zed WebSocket sync connected successfully - ready to receive session messages");
-                                log::error!("✅ [INIT] Zed WebSocket sync connected successfully - ready to receive session messages");
-                                
-                                // Keep the WebSocket connection alive by running indefinitely
-                                // This prevents the thread and runtime from shutting down
-                                loop {
-                                    tokio::time::sleep(tokio::time::Duration::from_secs(30)).await;
-                                    log::debug!("WebSocket sync thread still running...");
-                                }
-                            }
-                            Err(e) => {
-                                eprintln!("❌ [EXTERNAL_WEBSOCKET_SYNC] Failed to connect Zed WebSocket sync: {}", e);
-                                log::error!("Failed to connect Zed WebSocket sync: {}", e);
-                                // Retry after a delay
-                                tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
-                                log::info!("Retrying WebSocket connection...");
-                            }
-                        }
-                    });
-                });
-        
-        log::info!("WebSocket sync startup task launched");
-    } else {
-        log::info!("External WebSocket sync is disabled or not configured");
-    }
-    
+    // WebSocket initialization now done via init_websocket_service()
+    // when needed (typically in tests or when configured)
     log::info!("External WebSocket sync module initialization completed");
+    log::info!("Use websocket_sync::init_websocket_service() to start WebSocket connection");
 }
 
 
-/// Initialize the external WebSocket sync with full assistant support
+/// Initialize the external WebSocket sync with full assistant support (DEPRECATED)
+#[allow(dead_code)]
 pub fn init_full(
-    session: Arc<AppSession>, 
-    project: Entity<Project>, 
-    prompt_builder: Arc<PromptBuilder>,
-    cx: &mut App
+    _session: Arc<AppSession>,
+    _project: Entity<Project>,
+    _prompt_builder: Arc<PromptBuilder>,
+    _cx: &mut App
 ) -> Result<()> {
-    log::info!("Initializing full external WebSocket sync with assistant support");
-    
-    let sync_service = ExternalWebSocketSync::new(session, project, prompt_builder);
-    cx.set_global(sync_service);
-    
-    // Initialize sync service synchronously for now
-    log::info!("External WebSocket sync with project initialized - async startup deferred");
-    
+    log::warn!("init_full() is deprecated - use websocket_sync::init_websocket_service()");
     Ok(())
 }
 
@@ -688,27 +513,15 @@ pub async fn init_with_session(
     Ok(())
 }
 
-/// Initialize with project when available (called from workspace creation) 
+/// Initialize with project when available (DEPRECATED)
+#[allow(dead_code)]
 pub fn init_with_project_when_available(
-    project: Entity<Project>, 
-    session: Arc<AppSession>,
-    prompt_builder: Arc<PromptBuilder>, 
-    cx: &mut App
+    _project: Entity<Project>,
+    _session: Arc<AppSession>,
+    _prompt_builder: Arc<PromptBuilder>,
+    _cx: &mut App
 ) -> Result<()> {
-    log::info!("Initializing external WebSocket sync with project");
-    
-    // Check if sync service already exists globally
-    if cx.has_global::<ExternalWebSocketSync>() {
-        log::info!("External WebSocket sync already initialized");
-        return Ok(());
-    }
-    
-    let sync_service = ExternalWebSocketSync::new(session, project, prompt_builder);
-    cx.set_global(sync_service);
-        
-        // Initialize sync service synchronously for now
-        log::info!("External WebSocket sync with project available initialized - async startup deferred");
-    
+    log::warn!("init_with_project_when_available() is deprecated");
     Ok(())
 }
 
