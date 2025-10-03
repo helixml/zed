@@ -1055,7 +1055,7 @@ impl AgentPanel {
                 .log_err()
                 .ok_or_else(|| anyhow::anyhow!("Failed to connect to agent"))?;
 
-            let acp_thread_id = cx.update(|cx| {
+            let (acp_thread_id, thread_entity, _subscription) = cx.update(|cx| {
                 // Create ACP thread entity
                 let action_log = cx.new(|_| acp::ActionLog::default());
                 let (_, prompt_caps_rx) = tokio::sync::watch::channel(acp::PromptCapabilities::default());
@@ -1077,22 +1077,77 @@ impl AgentPanel {
                 let thread_id = thread.entity_id().to_string();
                 log::info!("✅ [HEADLESS] Created ACP thread: {}", thread_id);
 
-                thread_id
+                // Subscribe to thread events for streaming
+                let thread_id_for_events = thread_id.clone();
+                let request_id_for_events = request_id_clone.clone();
+                let subscription = cx.subscribe(&thread, move |thread_entity, event, cx| {
+                    use acp_thread::AcpThreadEvent;
+
+                    match event {
+                        AcpThreadEvent::EntryUpdated(entry_idx) => {
+                            // Get the updated content
+                            let thread = thread_entity.read(cx);
+                            if let Some(entry) = thread.entries().get(*entry_idx) {
+                                if let Some(content) = entry.content.as_ref() {
+                                    // Send message_added event
+                                    let event = external_websocket_sync::SyncEvent::MessageAdded {
+                                        acp_thread_id: thread_id_for_events.clone(),
+                                        message_id: entry_idx.to_string(),
+                                        role: "assistant".to_string(),
+                                        content: content.clone(),
+                                        timestamp: chrono::Utc::now().timestamp(),
+                                    };
+
+                                    if let Err(e) = external_websocket_sync::send_websocket_event(event) {
+                                        log::error!("Failed to send message_added: {}", e);
+                                    } else {
+                                        log::debug!("📤 Sent message_added chunk (entry {})", entry_idx);
+                                    }
+                                }
+                            }
+                        }
+                        AcpThreadEvent::Stopped => {
+                            // Send message_completed event
+                            let event = external_websocket_sync::SyncEvent::MessageCompleted {
+                                acp_thread_id: thread_id_for_events.clone(),
+                                message_id: "0".to_string(), // TODO: track actual message ID
+                                request_id: request_id_for_events.clone(),
+                            };
+
+                            if let Err(e) = external_websocket_sync::send_websocket_event(event) {
+                                log::error!("Failed to send message_completed: {}", e);
+                            } else {
+                                log::info!("📤 Sent message_completed");
+                            }
+                        }
+                        _ => {}
+                    }
+                });
+
+                (thread_id, thread.clone(), subscription)
             })?;
 
             // Send thread_created event via WebSocket
-            let event = external_websocket_sync::SyncEvent::ThreadCreated {
+            let thread_created_event = external_websocket_sync::SyncEvent::ThreadCreated {
                 acp_thread_id: acp_thread_id.clone(),
-                request_id: request_id_clone,
+                request_id: request_id_clone.clone(),
             };
 
-            if let Err(e) = external_websocket_sync::send_websocket_event(event) {
+            if let Err(e) = external_websocket_sync::send_websocket_event(thread_created_event) {
                 log::error!("Failed to send thread_created event: {}", e);
             } else {
                 log::info!("📤 Sent thread_created: {}", acp_thread_id);
             }
 
-            // TODO: Subscribe to thread events, send initial message
+            // Send the initial message to the thread to trigger AI response
+            let initial_message_clone = initial_message.to_string();
+            cx.update(|cx| {
+                thread_entity.update(cx, |thread, cx| {
+                    thread.run_user_prompt(initial_message_clone, cx)
+                })
+            })?;
+
+            log::info!("✅ [HEADLESS] Sent initial message to thread - AI should start responding");
 
             Ok(())
         }).detach();
