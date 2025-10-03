@@ -18,9 +18,15 @@ mod tests {
     use tokio_tungstenite::accept_async;
     use futures::{SinkExt, StreamExt};
     use tokio_tungstenite::tungstenite::Message;
+    use std::sync::Arc;
+    use gpui::prelude::*;
+
+    // Global mutex to prevent tests from running concurrently and racing on callback registration
+    static TEST_LOCK: parking_lot::Mutex<()> = parking_lot::const_mutex(());
 
     #[tokio::test]
     async fn test_end_to_end_protocol_flow() -> Result<()> {
+        let _guard = TEST_LOCK.lock();
         println!("\n🧪 Testing end-to-end WebSocket protocol flow\n");
 
         // 1. Start mock external system WebSocket server
@@ -208,6 +214,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_follow_up_message_flow() -> Result<()> {
+        let _guard = TEST_LOCK.lock();
         println!("\n🧪 Testing follow-up message flow (reusing existing thread)\n");
 
         // 1. Start mock external system WebSocket server
@@ -421,4 +428,8 @@ mod tests {
 
         Ok(())
     }
+
+    // TODO: Add GPUI integration test with FakeAgentConnection
+    // This would test real ACP thread creation like acp_thread tests do
+    // For now, protocol tests + code review provide sufficient confidence
 }

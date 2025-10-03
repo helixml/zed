@@ -49,6 +49,7 @@ pub use crate::agent_panel::{AgentPanel, ConcreteAssistantPanelDelegate};
 pub use crate::inline_assistant::InlineAssistant;
 pub use agent_diff::{AgentDiffPane, AgentDiffToolbar};
 pub use text_thread_editor::{AgentPanelDelegate, TextThreadEditor};
+
 use zed_actions;
 
 actions!(

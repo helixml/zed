@@ -623,6 +623,18 @@ fn initialize_panels(
                 if agent_settings::AgentSettings::get_global(cx).auto_open_panel {
                     workspace.focus_panel::<agent_ui::AgentPanel>(window, cx);
                 }
+
+                // Setup WebSocket thread handler (service layer, not UI)
+                #[cfg(feature = "external_websocket_sync")]
+                {
+                    external_websocket_sync::setup_thread_handler(
+                        workspace.project().clone(),
+                        agent_panel.read(cx).acp_history_store().clone(),
+                        workspace.app_state().fs.clone(),
+                        cx
+                    );
+                    log::info!("✅ [ZED] WebSocket thread handler initialized");
+                }
             }
 
             // Register the actions that are shared between `assistant` and `assistant2`.

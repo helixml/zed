@@ -29,7 +29,7 @@ mod thread_service;
 pub use thread_service::*;
 
 mod types;
-pub use types::*;
+pub use types::{ExternalAgent, *};
 
 // mod sync;
 // pub use sync::*;

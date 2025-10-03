@@ -2,7 +2,52 @@
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use schemars::JsonSchema;
 use std::collections::HashMap;
+use std::rc::Rc;
+use std::sync::Arc;
+use gpui::SharedString;
+use project::agent_server_store::AgentServerCommand;
+
+/// External agent type for thread creation
+#[derive(Default, Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ExternalAgent {
+    #[default]
+    Gemini,
+    ClaudeCode,
+    NativeAgent,
+    Custom {
+        name: SharedString,
+        command: AgentServerCommand,
+    },
+}
+
+impl ExternalAgent {
+    pub fn name(&self) -> &'static str {
+        match self {
+            Self::NativeAgent => "zed",
+            Self::Gemini => "gemini-cli",
+            Self::ClaudeCode => "claude-code",
+            Self::Custom { .. } => "custom",
+        }
+    }
+
+    pub fn server(
+        &self,
+        fs: Arc<dyn fs::Fs>,
+        history: gpui::Entity<agent2::HistoryStore>,
+    ) -> Rc<dyn agent_servers::AgentServer> {
+        match self {
+            Self::Gemini => Rc::new(agent_servers::Gemini),
+            Self::ClaudeCode => Rc::new(agent_servers::ClaudeCode),
+            Self::NativeAgent => Rc::new(agent2::NativeAgentServer::new(fs, history)),
+            Self::Custom { name, command: _ } => {
+                Rc::new(agent_servers::CustomAgentServer::new(name.clone()))
+            }
+        }
+    }
+}
 
 /// Information about the current session
 #[derive(Clone, Debug, Serialize, Deserialize)]
