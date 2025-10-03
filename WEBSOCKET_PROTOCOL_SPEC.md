@@ -12,19 +12,19 @@ All external agents (including Helix) MUST implement this protocol exactly as sp
 
 ### External System Side (e.g., Helix)
 - **Session**: A conversation thread (e.g., `ses_01k6jg...`)
-- **Interaction**: A single user request + AI response pair within a session  
+- **Interaction**: A single user request + AI response pair within a session
 - **Interaction States**: `waiting` → `complete` or `error`
 
 ### Zed Side
-- **Context**: A conversation thread with the AI assistant (e.g., `8405cd2a-24ae-...`)
-- **Message**: Individual messages within a context (user or assistant)
-- **Context is the source of truth** for the conversation
+- **ACP Thread**: A conversation thread with the AI assistant (e.g., `8405cd2a-24ae-...`)
+- **Message**: Individual messages within a thread (user or assistant)
+- **ACP Thread is the source of truth** for the conversation
 
 ### Key Mapping Principle
 - **One External Session ↔ One ACP Thread** (1:1 relationship)
-- **Only external system maintains the mapping**: `session_id → acp_thread_id`
-- **Zed is stateless** - doesn't maintain any session mapping
-- **All messages include BOTH IDs** (whichever are known at the time)
+- **Only external system maintains the mapping**: `external_session_id → acp_thread_id`
+- **Zed is stateless** - doesn't know or store external session IDs
+- **Zed ONLY uses acp_thread_id** - external system is responsible for tracking which acp_thread_id corresponds to which of its own sessions
 
 ---
 
@@ -40,13 +40,14 @@ User creates a new session in external system, sends first message to Zed agent.
 {
   "type": "chat_message",
   "data": {
-    "helix_session_id": "ses_01k6abc...",
     "acp_thread_id": null,
     "message": "Hello, can you help me?",
     "request_id": "req_1234567890"
   }
 }
 ```
+
+**Note**: External system does NOT send its own session ID to Zed. It only needs to track the request_id to correlate responses.
 
 **2. Zed Processing**
 - Sees `acp_thread_id` is `null` → creates new context
@@ -55,28 +56,27 @@ User creates a new session in external system, sends first message to Zed agent.
 - Adds user message to the context
 - Starts AI completion
 
-**3. Zed → External System: context_created**
+**3. Zed → External System: thread_created**
 ```json
 {
-  "session_id": "ses_01k6abc...",
-  "event_type": "context_created",
+  "type": "thread_created",
   "data": {
     "acp_thread_id": "8405cd2a-24ae-...",
-    "helix_session_id": "ses_01k6abc..."
+    "request_id": "req_1234567890"
   }
 }
 ```
 
 **4. External System Processing**
+- Uses `request_id` to find the original request
 - Stores mapping: `session["ses_01k6abc..."].acp_thread_id = "8405cd2a-24ae-..."`
 - Does NOT create new session (already exists)
-- Does NOT mark interaction complete yet
+- Does NOT mark interaction complete yet (waiting for message_completed)
 
 **5. Zed → External System: message_added** (streaming)
 ```json
 {
-  "session_id": "ses_01k6abc...",
-  "event_type": "message_added",
+  "type": "message_added",
   "data": {
     "acp_thread_id": "8405cd2a-24ae-...",
     "message_id": "ai_msg_1759410084",
@@ -90,8 +90,7 @@ User creates a new session in external system, sends first message to Zed agent.
 **6. Zed → External System: message_added** (continues streaming)
 ```json
 {
-  "session_id": "ses_01k6abc...",
-  "event_type": "message_added",
+  "type": "message_added",
   "data": {
     "acp_thread_id": "8405cd2a-24ae-...",
     "message_id": "ai_msg_1759410084",
@@ -107,8 +106,7 @@ User creates a new session in external system, sends first message to Zed agent.
 **7. Zed → External System: message_completed**
 ```json
 {
-  "session_id": "ses_01k6abc...",
-  "event_type": "message_completed",
+  "type": "message_completed",
   "data": {
     "acp_thread_id": "8405cd2a-24ae-...",
     "message_id": "ai_msg_1759410084",
@@ -118,7 +116,8 @@ User creates a new session in external system, sends first message to Zed agent.
 ```
 
 **8. External System Processing**
-- Finds waiting interaction for session `"ses_01k6abc..."`
+- Uses `acp_thread_id` to look up which of its sessions this belongs to
+- Finds waiting interaction using stored mapping (external session → acp_thread_id)
 - Marks interaction as `complete`
 - Response content already stored from `message_added` events
 
@@ -136,7 +135,6 @@ User sends another message in same session (context already exists).
 {
   "type": "chat_message",
   "data": {
-    "helix_session_id": "ses_01k6abc...",
     "acp_thread_id": "8405cd2a-24ae-...",
     "message": "Can you explain more?",
     "request_id": "req_9876543210"
@@ -144,18 +142,19 @@ User sends another message in same session (context already exists).
 }
 ```
 
+**Note**: External system looks up the acp_thread_id from its own session mapping, then sends it to Zed.
+
 **2. Zed Processing**
-- Sees `acp_thread_id` is provided → uses existing context
-- Finds existing context: `"8405cd2a-24ae-..."`
-- Adds user message to EXISTING context
+- Sees `acp_thread_id` is provided → uses existing thread
+- Finds existing thread: `"8405cd2a-24ae-..."`
+- Adds user message to EXISTING thread
 - Starts AI completion
-- **Does NOT send `context_created`** (already exists)
+- **Does NOT send `thread_created`** (already exists)
 
 **3. Zed → External System: message_added** (streaming)
 ```json
 {
-  "session_id": "ses_01k6abc...",
-  "event_type": "message_added",
+  "type": "message_added",
   "data": {
     "acp_thread_id": "8405cd2a-24ae-...",
     "message_id": "ai_msg_1759420000",
@@ -169,8 +168,7 @@ User sends another message in same session (context already exists).
 **4. Zed → External System: message_completed**
 ```json
 {
-  "session_id": "ses_01k6abc...",
-  "event_type": "message_completed",
+  "type": "message_completed",
   "data": {
     "acp_thread_id": "8405cd2a-24ae-...",
     "message_id": "ai_msg_1759420000",
@@ -190,45 +188,41 @@ Send user message (new or follow-up).
 
 **Fields:**
 - `type`: `"chat_message"`
-- `data.helix_session_id`: External system's session ID (required)
-- `data.acp_thread_id`: ACP thread ID if known, `null` for first message
+- `data.acp_thread_id`: ACP thread ID if known, `null` for first message (required)
 - `data.message`: User's message text (required)
-- `data.request_id`: Unique request identifier (required)
+- `data.request_id`: Unique request identifier for tracking this specific request (required)
 
 ---
 
 ### Zed → External System
 
-#### context_created
-Sent ONCE when Zed creates a new context.
+#### thread_created
+Sent ONCE when Zed creates a new ACP thread.
 
 **Fields:**
-- `session_id`: External session ID (echo back)
-- `event_type`: `"context_created"`
-- `data.acp_thread_id`: Zed's context UUID
-- `data.helix_session_id`: External session ID (echo back)
+- `type`: `"thread_created"`
+- `data.acp_thread_id`: Zed's ACP thread UUID (required)
+- `data.request_id`: Request ID from original chat_message (required)
 
 #### message_added
 Streaming AI response (sent multiple times with same `message_id`).
 
 **Fields:**
-- `session_id`: External session ID
-- `event_type`: `"message_added"`
-- `data.acp_thread_id`: Zed's context UUID
-- `data.message_id`: Message identifier (same across streaming updates)
-- `data.role`: `"assistant"`
-- `data.content`: AI response text (progressively longer)
-- `data.timestamp`: Unix timestamp
+- `type`: `"message_added"`
+- `data.acp_thread_id`: Zed's ACP thread UUID (required)
+- `data.message_id`: Message identifier - same across streaming updates (required)
+- `data.role`: `"assistant"` (required)
+- `data.content`: AI response text (progressively longer) (required)
+- `data.timestamp`: Unix timestamp (required)
 
 #### message_completed
 Sent when AI finishes responding.
 
 **Fields:**
-- `session_id`: External session ID
-- `event_type`: `"message_completed"`
-- `data.acp_thread_id`: Zed's context UUID
-- `data.message_id`: Message identifier
-- `data.request_id`: Request ID from original chat_message
+- `type`: `"message_completed"`
+- `data.acp_thread_id`: Zed's ACP thread UUID (required)
+- `data.message_id`: Message identifier (required)
+- `data.request_id`: Request ID from original chat_message (required)
 
 ---
 
@@ -238,25 +232,26 @@ Sent when AI finishes responding.
 
 1. **Stateless Design**
    - Zed does NOT store external session IDs
-   - Zed does NOT maintain session-to-context mapping
-   - All session routing is external system's responsibility
+   - Zed does NOT know about external system's session structure
+   - Zed ONLY tracks acp_thread_id internally
+   - All external session mapping is external system's responsibility
 
-2. **Context Creation**
+2. **Thread Creation**
    ```rust
    if data.acp_thread_id.is_null() {
-       // Create new context
-       let context_id = create_new_context();
-       send_context_created(session_id, context_id);
+       // Create new ACP thread
+       let acp_thread_id = create_new_acp_thread();
+       send_thread_created(acp_thread_id, request_id);
    } else {
-       // Use existing context
-       add_message_to_context(data.acp_thread_id, message);
+       // Use existing thread
+       add_message_to_thread(data.acp_thread_id, message);
    }
    ```
 
-3. **Only Send context_created Once**
-   - Only when Zed actually creates a new context
+3. **Only Send thread_created Once**
+   - Only when Zed actually creates a new ACP thread
    - NOT for follow-up messages
-   - Include both `acp_thread_id` and `helix_session_id`
+   - Include `acp_thread_id` and `request_id` (so external system can map)
 
 4. **Stream with Same message_id**
    - As content arrives, send `message_added` with progressively longer content
@@ -266,12 +261,15 @@ Sent when AI finishes responding.
 5. **Always Send message_completed**
    - After AI stops generating
    - Include `request_id` so external system knows which request finished
+   - Include `acp_thread_id` so external system can route to correct session
 
 ### External System Side
 
-1. **Store Mapping on context_created**
+1. **Store Mapping on thread_created**
    ```go
-   session.ZedContextID = event.data.acp_thread_id
+   // Use request_id to find which session initiated this
+   session := findSessionByRequestId(event.data.request_id)
+   session.AcpThreadID = event.data.acp_thread_id
    UpdateSession(session)
    ```
 
@@ -280,21 +278,21 @@ Sent when AI finishes responding.
    command := ExternalAgentCommand{
        Type: "chat_message",
        Data: {
-           "helix_session_id": session.ID,
-           "acp_thread_id":   session.ZedContextID,  // null on first message
-           "message":          userMessage,
-           "request_id":       requestID,
+           "acp_thread_id": session.AcpThreadID,  // null on first message
+           "message":       userMessage,
+           "request_id":    requestID,
        },
    }
    ```
 
 3. **Update Response on message_added**
-   - Find waiting interaction for session
+   - Use acp_thread_id to find which session this belongs to
    - Update `interaction.response_message` with latest content
    - Keep state as `waiting` (don't mark complete yet)
 
 4. **Mark Complete on message_completed**
-   - Find waiting interaction for session
+   - Use acp_thread_id to find session
+   - Use request_id to find specific interaction
    - Mark `interaction.state = "complete"`
    - Set completion timestamp
 
@@ -305,14 +303,16 @@ Sent when AI finishes responding.
 ## Why This Design Works
 
 ### Separation of Concerns
-- **External system** owns session lifecycle and routing
-- **Zed** owns context/conversation content
+- **External system** owns session lifecycle and all session-to-thread mapping
+- **Zed** owns ACP thread/conversation content
+- **Zed never knows about external session IDs** - completely decoupled
 - Clean boundary at the WebSocket protocol
 
 ### Stateless Zed
-- Zed can restart without losing session mappings
-- External system maintains authoritative state
+- Zed can restart without losing any state
+- External system maintains all mapping (external session → acp_thread_id)
 - No synchronization issues
+- Zed only needs to know acp_thread_id
 
 ### Streaming Support
 - Multiple `message_added` events build response incrementally
@@ -320,9 +320,10 @@ Sent when AI finishes responding.
 - Only `message_completed` triggers state transition
 
 ### Simple Protocol
-- Two message types in, three out
+- One message type in (chat_message), three types out (thread_created, message_added, message_completed)
 - Easy to implement in any language
-- Self-documenting with explicit IDs
+- No external IDs leak into Zed
+- request_id enables correlation without coupling
 
 ---
 
