@@ -43,15 +43,6 @@ pub use server::*;
 pub use websocket_sync::*;
 pub use tungstenite;
 
-/// Request to create a thread from external session
-#[derive(Clone, Debug)]
-pub struct CreateThreadRequest {
-    pub external_session_id: String,
-    pub zed_context_id: Option<String>, // If provided, reuse this context; if None, create new
-    pub message: String,
-    pub request_id: String,
-}
-
 /// Global mapping of external session IDs to Zed context IDs
 #[derive(Clone, Default)]
 pub struct ExternalSessionMapping {
@@ -92,36 +83,6 @@ pub fn get_context_to_helix_mapping() -> Option<Arc<RwLock<std::collections::Has
 /// Static global for context-to-helix mapping that can be accessed from async tasks
 static GLOBAL_CONTEXT_TO_HELIX_MAPPING: parking_lot::Mutex<Option<Arc<RwLock<std::collections::HashMap<String, String>>>>> =
     parking_lot::Mutex::new(None);
-
-/// Global channel for thread creation requests from WebSocket to UI
-#[derive(Clone)]
-pub struct ThreadCreationChannel {
-    pub sender: mpsc::UnboundedSender<CreateThreadRequest>,
-}
-
-impl Global for ThreadCreationChannel {}
-
-/// Global queue for pending thread creation requests that the UI can poll
-#[derive(Clone, Default)]
-pub struct PendingThreadRequests {
-    pub requests: Arc<RwLock<Vec<CreateThreadRequest>>>,
-}
-
-impl Global for PendingThreadRequests {}
-
-/// Process pending thread creation requests from the global queue
-pub fn process_pending_thread_requests(cx: &mut App) -> Vec<CreateThreadRequest> {
-    if let Some(pending) = cx.try_global::<PendingThreadRequests>() {
-        let mut requests = pending.requests.write();
-        let processed: Vec<CreateThreadRequest> = requests.drain(..).collect();
-        if !processed.is_empty() {
-            log::info!("🎯 Processing {} pending thread creation requests", processed.len());
-        }
-        processed
-    } else {
-        Vec::new()
-    }
-}
 
 /// Type alias for compatibility with existing code
 pub type HelixIntegration = ExternalWebSocketSync;
@@ -293,7 +254,7 @@ impl ExternalWebSocketSync {
 
         // Start WebSocket sync if enabled
         if config.websocket_sync.enabled {
-            match WebSocketSync::new(config.websocket_sync.clone(), None).await {
+            match WebSocketSync::new(config.websocket_sync.clone()).await {
                 Ok(_websocket_sync) => {
                     log::info!("WebSocket sync initialized successfully");
                     // TODO: Store websocket_sync in a thread-safe way
@@ -566,21 +527,10 @@ pub fn init(cx: &mut App) {
     // Force output to stderr regardless of log level
     eprintln!("🚀 [EXTERNAL_WEBSOCKET_SYNC] Initializing external WebSocket sync module");
     log::info!("Initializing external WebSocket sync module");
-    
+
     // Initialize our settings (don't call settings::init again as it's already called in main)
     sync_settings::init(cx);
-    
-    // Create global channel for thread creation requests
-    let (thread_creation_sender, mut thread_creation_receiver) = mpsc::unbounded_channel();
-    cx.set_global(ThreadCreationChannel {
-        sender: thread_creation_sender.clone(),
-    });
-    
-    // Create global queue for pending thread creation requests
-    let pending_requests = PendingThreadRequests::default();
-    let pending_requests_clone = pending_requests.clone();
-    cx.set_global(pending_requests);
-    
+
     // Create global session mapping, reverse mapping, and WebSocket sender
     cx.set_global(ExternalSessionMapping::default());
     let context_to_helix_mapping = ContextToHelixSessionMapping::default();
@@ -590,26 +540,7 @@ pub fn init(cx: &mut App) {
     // CRITICAL: Store the mapping in static global so async tasks can access it
     *GLOBAL_CONTEXT_TO_HELIX_MAPPING.lock() = Some(context_to_helix_mapping.contexts.clone());
     eprintln!("✅ [INIT] Global context-to-helix mapping initialized for async task access");
-    
-    // Spawn background task to listen for thread creation requests
-    std::thread::spawn(move || {
-        let rt = tokio::runtime::Runtime::new().expect("Failed to create tokio runtime");
-        rt.block_on(async move {
-            while let Some(request) = thread_creation_receiver.recv().await {
-                eprintln!("🎯 [BACKGROUND] Received thread creation request from WebSocket: {:?}", request);
-                log::error!("🎯 [BACKGROUND] Received thread creation request from WebSocket: {:?}", request);
-                
-                // Add request to global pending queue for UI to process
-                {
-                    let mut requests = pending_requests_clone.requests.write();
-                    requests.push(request.clone());
-                    eprintln!("✅ [BACKGROUND] Added thread creation request to global queue for session {}", request.external_session_id);
-                    log::error!("✅ [BACKGROUND] Added thread creation request to global queue for session {}", request.external_session_id);
-                }
-            }
-        });
-    });
-    
+
     // Check if WebSocket sync is enabled via environment variables
     let enabled = std::env::var("ZED_EXTERNAL_SYNC_ENABLED")
         .map(|v| v.parse().unwrap_or(false))
@@ -677,7 +608,7 @@ pub fn init(cx: &mut App) {
                                   websocket_config.helix_url, use_tls);
                         
                         // Start WebSocket connection - this will listen for session messages from Helix
-                        match WebSocketSync::new(websocket_config, Some(thread_creation_sender.clone())).await {
+                        match WebSocketSync::new(websocket_config).await {
                             Ok(websocket_sync) => {
                                 eprintln!("✅ [EXTERNAL_WEBSOCKET_SYNC] Zed WebSocket sync connected successfully - ready to receive session messages");
                                 log::error!("✅ [INIT] Zed WebSocket sync connected successfully - ready to receive session messages");

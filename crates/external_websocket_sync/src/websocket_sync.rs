@@ -81,12 +81,11 @@ pub struct SyncMessage {
 impl WebSocketSync {
     /// Create a new WebSocket sync client
     pub async fn new(
-        config: WebSocketSyncConfig, 
-        thread_creation_sender: Option<mpsc::UnboundedSender<crate::CreateThreadRequest>>
+        config: WebSocketSyncConfig
     ) -> Result<Self> {
         let (event_sender, event_receiver) = mpsc::unbounded_channel();
         let (command_sender, command_receiver) = mpsc::unbounded_channel();
-        
+
         let is_connected = Arc::new(RwLock::new(false));
         let (shutdown_tx, shutdown_rx) = oneshot::channel();
 
@@ -101,7 +100,7 @@ impl WebSocketSync {
         };
 
         // Start WebSocket connection task
-        sync.start_connection_task(config, event_receiver, command_sender, is_connected.clone(), shutdown_rx, thread_creation_sender).await?;
+        sync.start_connection_task(config, event_receiver, command_sender, is_connected.clone(), shutdown_rx).await?;
 
         Ok(sync)
     }
@@ -114,7 +113,6 @@ impl WebSocketSync {
         command_sender: mpsc::UnboundedSender<ExternalWebSocketCommand>,
         is_connected: Arc<RwLock<bool>>,
         shutdown_rx: oneshot::Receiver<()>,
-        thread_creation_sender: Option<mpsc::UnboundedSender<crate::CreateThreadRequest>>,
     ) -> Result<()> {
         let protocol = if config.use_tls { "wss" } else { "ws" };
         let url = format!(
@@ -207,43 +205,6 @@ impl WebSocketSync {
                         }
 
                         // Handle local events that should create UI threads
-                        match &event {
-                            SyncEvent::CreateThreadFromExternalSession { external_session_id, zed_context_id, message, request_id } => {
-                                log::error!(
-                                    "🎯 [WEBSOCKET] Processing CreateThreadFromExternalSession event: session={}, zed_context_id={:?}, message={}, request={}",
-                                    external_session_id, zed_context_id, message, request_id
-                                );
-                                
-                                // Send thread creation request to UI via channel
-                                if let Some(ref sender) = thread_creation_sender {
-                                    let request = crate::CreateThreadRequest {
-                                        external_session_id: external_session_id.clone(),
-                                        zed_context_id: zed_context_id.clone(),
-                                        message: message.clone(),
-                                        request_id: request_id.clone(),
-                                    };
-                                    
-                                    if let Err(e) = sender.send(request) {
-                                        log::error!("❌ [WEBSOCKET] Failed to send thread creation request: {}", e);
-                                    } else {
-                                        log::error!("✅ [WEBSOCKET] Sent thread creation request to UI for session {}", external_session_id);
-                                    }
-                                } else {
-                                    log::error!("❌ [WEBSOCKET] Thread creation sender not available - cannot create UI thread");
-                                }
-                                
-                                // NOTE: We don't send synthetic context_created here
-                                // The real context_created will be sent by agent_panel when it actually creates the context
-                                // This keeps Zed stateless - it doesn't generate fake IDs
-                                
-                                // Don't send this event to external server - it's for local processing only
-                                continue;
-                            }
-                            _ => {
-                                // Handle other events normally by sending to external server
-                            }
-                        }
-
                         // CRITICAL FIX: Extract context_id and look up Helix session ID for async events
                         let context_id_opt = match &event {
                             SyncEvent::MessageAdded { context_id, .. } => Some(context_id.clone()),
@@ -994,7 +955,7 @@ impl ReconnectingWebSocket {
 
     pub async fn connect_with_retry(&mut self) -> Result<()> {
         while self.reconnect_attempts < self.max_reconnect_attempts {
-            match WebSocketSync::new(self.config.clone(), None).await {
+            match WebSocketSync::new(self.config.clone()).await {
                 Ok(sync) => {
                     self.websocket_sync = Some(sync);
                     self.reconnect_attempts = 0;
