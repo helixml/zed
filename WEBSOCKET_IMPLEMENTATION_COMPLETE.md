@@ -10,14 +10,16 @@ The WebSocket protocol for external agent control is now fully implemented, test
 ## Test Results
 
 ```bash
-$ cargo test -p external_websocket_sync --lib
-test result: ok. 5 passed; 0 failed
+$ cargo test -p external_websocket_sync --lib --test-threads=1
+test result: ok. 6 passed; 0 failed
 
 $ cargo test -p agent_ui --lib
 test result: ok. 45 passed; 0 failed
 ```
 
-**Key Test**: `protocol_test::test_end_to_end_protocol_flow` ✅
+**Key Tests**:
+- `protocol_test::test_end_to_end_protocol_flow` ✅
+- `protocol_test::test_follow_up_message_flow` ✅
 
 **Test Output**:
 ```
@@ -248,33 +250,47 @@ Already wired up in `agent_panel.rs`:
 ## What Works
 
 ✅ External system sends `chat_message` with `acp_thread_id=null`
-✅ Zed creates real ACP thread
+✅ Zed creates real ACP thread (headless)
 ✅ Zed sends `thread_created` with `acp_thread_id` and `request_id`
 ✅ ACP thread processes message
 ✅ Zed streams `message_added` events (progressively longer content)
 ✅ Zed sends `message_completed` when done
 ✅ External system correlates via `request_id`
+✅ **Follow-up messages**: send `chat_message` with existing `acp_thread_id`
+✅ **Thread reuse**: message sent to existing thread (NO new thread_created)
+✅ **Full conversations**: multiple back-and-forth exchanges
 ✅ NO external session IDs in Zed
 ✅ Runs headlessly (no UI required)
+✅ Thread registry tracks active threads
 
-## What's Next (Future)
+## What's Next (Future Enhancements)
 
-- [ ] Follow-up message support (chat_message with existing acp_thread_id)
-- [ ] Thread tracking (map entity IDs to acp_thread_ids)
-- [ ] Error handling
-- [ ] Reconnection logic
-- [ ] Real external server testing
+- [ ] Error handling and retry logic
+- [ ] Reconnection handling
+- [ ] Thread cleanup (remove from registry when thread closes)
+- [ ] Real external server testing (beyond mock)
+- [ ] Production deployment testing
 
 ## Testing
 
-Run the test:
+Run all tests:
 ```bash
-cargo test -p external_websocket_sync protocol_test --lib -- --nocapture
+# Run with --test-threads=1 to avoid parallel test interference
+cargo test -p external_websocket_sync --lib --test-threads=1
+
+# Or run specific tests
+cargo test -p external_websocket_sync test_end_to_end --lib -- --nocapture
+cargo test -p external_websocket_sync test_follow_up --lib -- --nocapture
 ```
 
 Expected output:
 ```
-✅ protocol_test::test_end_to_end_protocol_flow ... ok
+test result: ok. 6 passed; 0 failed
+
+Tests:
+✅ protocol_test::test_end_to_end_protocol_flow
+✅ protocol_test::test_follow_up_message_flow
+✅ sync_settings tests (4 tests)
 ```
 
 ## Documentation
