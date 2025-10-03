@@ -460,30 +460,10 @@ impl WebSocketSync {
                 eprintln!("🔄 [HANDLE_MESSAGE_WITH_RESPONSE] Context ID: {}, Helix Session ID: {}", context_id, helix_session_id);
                 eprintln!("📋 [HANDLE_MESSAGE_WITH_RESPONSE] Request ID: {}", request_id);
 
-                // CRITICAL FIX: Store mapping so async events can use correct Helix session ID
-                context_to_helix_session.write().insert(context_id.clone(), helix_session_id.clone());
-                eprintln!("💾 [SESSION_MAPPING] Stored mapping: Context {} -> Helix Session {}", context_id, helix_session_id);
-
-                // Per WEBSOCKET_PROTOCOL_SPEC.md: Send context_created with acp_thread_id
-                let context_created_response = SyncMessage {
-                    session_id: helix_session_id.to_string(),
-                    event_type: "context_created".to_string(),
-                    data: {
-                        let mut data = std::collections::HashMap::new();
-                        data.insert("acp_thread_id".to_string(), serde_json::Value::String(context_id.clone()));
-                        data.insert("helix_session_id".to_string(), serde_json::Value::String(helix_session_id.clone()));
-                        data
-                    },
-                    timestamp: chrono::Utc::now(),
-                };
-
-                let response_text = serde_json::to_string(&context_created_response)?;
-                eprintln!("📤 [SPEC_COMPLIANCE] Sending context_created per WEBSOCKET_PROTOCOL_SPEC.md");
-                websocket_sender.send(Message::Text(response_text.into()))?;
-
-                eprintln!("✅ [SPEC_COMPLIANCE] Sent context_created with acp_thread_id: {}", context_id);
-                eprintln!("🤖 [TODO] Need to actually create real ACP thread in agent_panel");
-                eprintln!("🔄 [TODO] For now, external system has the mapping to route responses")
+                // NOTE: context_created will be sent by agent_panel's create_headless_acp_thread()
+                // with the REAL acp_thread_id after actual thread is created.
+                // We don't send fake/placeholder IDs anymore per WEBSOCKET_PROTOCOL_SPEC.md
+                eprintln!("🎯 [CHAT_MESSAGE] Thread creation requested - agent_panel will send context_created with real ID")
             }
             "create_thread" => {
                 eprintln!("🆕 [HANDLE_MESSAGE_WITH_RESPONSE] Handling create_thread command from Helix!");
@@ -800,18 +780,26 @@ impl WebSocketSync {
         
         eprintln!("✅ [CHAT_MESSAGE] Sent chat event for session: {}", helix_session_id);
 
-        // Generate context_id if creating new, or return existing
-        let context_id = zed_context_id.unwrap_or_else(|| {
-            // TODO: This should be a REAL ACP thread ID from agent_panel
-            // For now, generate a placeholder that follows UUID format
-            use assistant_context::ContextId;
-            let real_id = ContextId::new();
-            let id_string = real_id.to_proto();
-            eprintln!("🆕 [CHAT_MESSAGE] Generated new context_id: {}", id_string);
-            id_string
-        });
+        // If creating new thread, request it from agent_panel via callback
+        if zed_context_id.is_none() {
+            eprintln!("🎯 [CHAT_MESSAGE] Requesting thread creation from agent_panel");
+            let creation_request = crate::ThreadCreationRequest {
+                helix_session_id: helix_session_id.to_string(),
+                acp_thread_id: None,
+                message: message.to_string(),
+                request_id: request_id.to_string(),
+            };
 
-        Ok((context_id, helix_session_id.to_string()))
+            if let Err(e) = crate::request_thread_creation(creation_request) {
+                log::error!("❌ Failed to request thread creation: {}", e);
+                eprintln!("❌ [CHAT_MESSAGE] Failed to request thread creation: {}", e);
+            } else {
+                eprintln!("✅ [CHAT_MESSAGE] Thread creation request sent to agent_panel");
+            }
+        }
+
+        // Return empty context_id - the real one will be sent via context_created by agent_panel
+        Ok((zed_context_id.unwrap_or_default(), helix_session_id.to_string()))
     }
 
     /// Handle create_thread command from Helix

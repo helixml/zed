@@ -80,38 +80,44 @@ pub fn get_context_to_helix_mapping() -> Option<Arc<RwLock<std::collections::Has
     GLOBAL_CONTEXT_TO_HELIX_MAPPING.lock().clone()
 }
 
-/// Send a thread creation request from WebSocket async task to UI thread
-pub fn send_thread_creation_request(request: ExternalThreadCreationRequest) -> Result<()> {
-    if let Some(sender) = GLOBAL_THREAD_CREATION_CHANNEL.lock().clone() {
-        sender.send(request)
-            .map_err(|_| anyhow::anyhow!("Failed to send thread creation request"))
-    } else {
-        Err(anyhow::anyhow!("Thread creation channel not initialized"))
-    }
-}
-
-/// Get the thread creation receiver (for agent_panel to consume)
-pub fn take_thread_creation_receiver() -> Option<tokio::sync::mpsc::UnboundedReceiver<ExternalThreadCreationRequest>> {
-    // This will be called once by agent_panel during initialization
-    static RECEIVER: parking_lot::Mutex<Option<tokio::sync::mpsc::UnboundedReceiver<ExternalThreadCreationRequest>>> =
-        parking_lot::Mutex::new(None);
-    RECEIVER.lock().take()
-}
-
 /// Static global for context-to-helix mapping that can be accessed from async tasks
 static GLOBAL_CONTEXT_TO_HELIX_MAPPING: parking_lot::Mutex<Option<Arc<RwLock<std::collections::HashMap<String, String>>>>> =
     parking_lot::Mutex::new(None);
 
-/// Global channel for thread creation requests from external WebSocket
-static GLOBAL_THREAD_CREATION_CHANNEL: parking_lot::Mutex<Option<tokio::sync::mpsc::UnboundedSender<ExternalThreadCreationRequest>>> =
+/// Static global for thread creation callback
+static GLOBAL_THREAD_CREATION_CALLBACK: parking_lot::Mutex<Option<mpsc::UnboundedSender<ThreadCreationRequest>>> =
     parking_lot::Mutex::new(None);
 
 /// Request to create ACP thread from external WebSocket message
 #[derive(Clone, Debug)]
-pub struct ExternalThreadCreationRequest {
+pub struct ThreadCreationRequest {
     pub helix_session_id: String,
+    pub acp_thread_id: Option<String>, // null = create new, Some(id) = use existing
     pub message: String,
     pub request_id: String,
+}
+
+/// Global callback for thread creation from WebSocket (set by agent_panel)
+#[derive(Clone)]
+pub struct ThreadCreationCallback {
+    pub sender: mpsc::UnboundedSender<ThreadCreationRequest>,
+}
+
+impl Global for ThreadCreationCallback {}
+
+/// Send thread creation request to agent_panel via callback
+pub fn request_thread_creation(request: ThreadCreationRequest) -> Result<()> {
+    if let Some(sender) = GLOBAL_THREAD_CREATION_CALLBACK.lock().clone() {
+        sender.send(request)
+            .map_err(|_| anyhow::anyhow!("Failed to send thread creation request"))
+    } else {
+        Err(anyhow::anyhow!("Thread creation callback not initialized"))
+    }
+}
+
+/// Initialize the global callback sender (called from agent_panel or tests)
+pub fn init_thread_creation_callback(sender: mpsc::UnboundedSender<ThreadCreationRequest>) {
+    *GLOBAL_THREAD_CREATION_CALLBACK.lock() = Some(sender);
 }
 
 /// Type alias for compatibility with existing code

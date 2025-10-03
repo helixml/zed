@@ -326,13 +326,95 @@ Sent when AI finishes responding.
 
 ---
 
+## Implementation Architecture (Zed Side)
+
+### Problem: WebSocket Runs Without GPUI Context
+
+**Current Issue:**
+- WebSocket connection runs in `std::thread` spawned from `init()` (no GPUI context)
+- Cannot call `agent_panel.new_acp_thread_with_message()` (requires Window context)
+- Cannot use `cx.spawn()` or emit GPUI events
+- Creates fake context IDs instead of real ACP threads
+
+**Solution: Callback Channel Pattern**
+
+```rust
+// 1. agent_panel initialization - create callback channel
+let (thread_creation_callback_tx, mut thread_creation_callback_rx) = mpsc::unbounded_channel();
+
+// Store sender in global for websocket_sync to access
+cx.set_global(ThreadCreationCallback {
+    sender: thread_creation_callback_tx,
+});
+
+// 2. agent_panel spawns background task to process requests
+cx.spawn(|panel, mut cx| async move {
+    while let Some(request) = thread_creation_callback_rx.recv().await {
+        // Execute in GPUI context with window access
+        cx.update(|cx| {
+            panel.update(cx, |panel, cx| {
+                // Get window handle (from workspace or store it)
+                let window = ...; // TODO: Need window reference
+
+                // Create REAL ACP thread
+                panel.new_acp_thread_with_message(
+                    &request.message,
+                    request.helix_session_id.clone(),
+                    window,
+                    cx
+                );
+
+                // Real context_id will be sent via ACP event subscription
+            })
+        }).ok();
+    }
+}).detach();
+
+// 3. websocket_sync calls callback when chat_message arrives
+if let Some(callback) = cx.try_global::<ThreadCreationCallback>() {
+    callback.sender.send(ThreadCreationRequest {
+        helix_session_id,
+        message,
+        request_id,
+    })?;
+}
+```
+
+### Open Questions
+
+1. **Window Reference**: How does background task get Window handle?
+   - Store weak reference during agent_panel creation?
+   - Get from workspace?
+   - Create headless window context?
+
+2. **ACP Thread Persistence**: Do ACP threads reliably persist without UI open?
+   - Concern: Threads may not save to database without panel visible
+   - Need to verify thread_store works headlessly
+
+3. **Existing Assumptions**: Does other Zed code assume agent panel is open?
+   - Tool execution?
+   - Message handling?
+   - Event subscriptions?
+
+### Alternative: GPUI-Free Layer
+
+If GPUI context is too problematic, consider:
+- Create standalone `AcpThreadManager` that doesn't require Window
+- Uses async context only
+- agent_panel just observes and renders
+- More refactoring but cleaner architecture
+
+---
+
 ## Testing Checklist
 
-- [ ] New session creates ACP thread
-- [ ] `context_created` sent with correct IDs
-- [ ] Follow-up message reuses existing context  
+- [ ] New session creates REAL ACP thread (not fake ID)
+- [ ] `context_created` sent with REAL acp_thread_id from created thread
+- [ ] Follow-up message reuses existing context
 - [ ] NO second `context_created` for follow-ups
 - [ ] Streaming works (multiple `message_added` with same `message_id`)
 - [ ] `message_completed` sent at end
 - [ ] `request_id` correctly echoed back
 - [ ] External session ID always preserved in responses
+- [ ] Works headlessly (no UI/panel required)
+- [ ] ACP threads persist to database correctly

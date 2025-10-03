@@ -598,10 +598,47 @@ impl AgentPanel {
                 }
                 panel.as_mut(cx).loading = false;
 
+                // Set up WebSocket thread creation callback (headless, no render() polling needed)
+                #[cfg(feature = "external_websocket_sync")]
+                {
+                    use external_websocket_sync_dep as external_websocket_sync;
+
+                    let (callback_tx, mut callback_rx) = tokio::sync::mpsc::unbounded_channel();
+
+                    // Store callback in global for websocket_sync to access
+                    cx.set_global(external_websocket_sync::ThreadCreationCallback {
+                        sender: callback_tx.clone(),
+                    });
+                    external_websocket_sync::init_thread_creation_callback(callback_tx);
+
+                    // Get dependencies needed for headless ACP thread creation
+                    let panel_weak = panel.downgrade();
+
+                    // Spawn headless listener task
+                    cx.spawn(move |mut cx| async move {
+                        while let Some(request) = callback_rx.recv().await {
+                            log::error!("🎯 [HEADLESS] Received thread creation request for session: {}", request.helix_session_id);
+
+                            // Create ACP thread in GPUI context (no window needed!)
+                            let result = panel_weak.update(&mut cx, |panel, cx| {
+                                panel.create_headless_acp_thread(
+                                    &request.message,
+                                    request.helix_session_id,
+                                    cx
+                                )
+                            });
+
+                            if let Err(e) = result {
+                                log::error!("❌ [HEADLESS] Failed to create thread: {}", e);
+                            }
+                        }
+                    }).detach();
+
+                    log::error!("✅ [AGENT_PANEL] Headless WebSocket thread creation listener started");
+                }
+
                 panel
     })?;
-
-            // WebSocket thread creation is now handled in the render method
 
             Ok(panel)
         })
@@ -992,6 +1029,145 @@ impl AgentPanel {
     }
 
     #[cfg(feature = "external_websocket_sync")]
+    /// Create ACP thread headlessly (no UI/Window required) for WebSocket integration
+    #[cfg(feature = "external_websocket_sync")]
+    fn create_headless_acp_thread(
+        &mut self,
+        initial_message: &str,
+        helix_session_id: String,
+        cx: &mut Context<Self>,
+    ) -> anyhow::Result<()> {
+        use external_websocket_sync_dep as external_websocket_sync;
+
+        log::error!("🎯 [HEADLESS] Creating headless ACP thread for session: {}", helix_session_id);
+
+        // Create agent server
+        let agent = ExternalAgent::NativeAgent;
+        let server = agent.server(self.fs.clone(), self.acp_history_store.clone());
+
+        // Create ACP thread entity directly (no View wrapper = headless!)
+        let thread = cx.new(|cx| {
+            use acp_thread::AcpThread;
+            use std::rc::Rc;
+            use tokio::sync::watch;
+
+            let (prompt_caps_tx, prompt_caps_rx) = watch::channel(acp::PromptCapabilities::default());
+            let action_log = cx.new(|_| acp::ActionLog::default());
+
+            AcpThread::new(
+                "External Agent Session".into(),
+                server.connection(),
+                self.project.clone(),
+                action_log,
+                server.session_id(),
+                prompt_caps_rx,
+                cx,
+            )
+        });
+
+        let session_id = thread.read(cx).session_id().clone();
+        let session_id_string = format!("{:?}", session_id);
+
+        log::error!("✅ [HEADLESS] Created ACP thread with session_id: {}", session_id_string);
+
+        // Store session mapping (Helix session → ACP context)
+        if let Some(session_mapping) = cx.try_global::<external_websocket_sync::ExternalSessionMapping>() {
+            use assistant_context::ContextId;
+            // Parse session_id into ContextId
+            // TODO: This is a hack - need proper conversion
+            let context_id = ContextId::new(); // For now use fresh ID
+            session_mapping.sessions.write().insert(helix_session_id.clone(), context_id.clone());
+            log::error!("💾 [HEADLESS] Stored forward mapping: Helix {} -> ACP {:?}", helix_session_id, context_id);
+        }
+
+        // Store reverse mapping (ACP context → Helix session)
+        if let Some(reverse_mapping) = cx.try_global::<external_websocket_sync::ContextToHelixSessionMapping>() {
+            reverse_mapping.contexts.write().insert(session_id_string.clone(), helix_session_id.clone());
+            log::error!("💾 [HEADLESS] Stored reverse mapping: ACP {} -> Helix {}", session_id_string, helix_session_id);
+        }
+
+        // Subscribe to thread events to send responses
+        let helix_session_for_events = helix_session_id.clone();
+        cx.subscribe(&thread, move |_panel, thread_entity, event: &acp_thread::AcpThreadEvent, cx| {
+            use acp_thread::AcpThreadEvent;
+            if let AcpThreadEvent::Stopped = event {
+                log::error!("🎬 [HEADLESS] Thread stopped - extracting response");
+
+                let response_text = thread_entity.read(cx).entries()
+                    .iter()
+                    .rev()
+                    .find_map(|entry| {
+                        if let acp_thread::AgentThreadEntry::AssistantMessage(msg) = entry {
+                            Some(msg.to_markdown(cx))
+                        } else {
+                            None
+                        }
+                    })
+                    .unwrap_or_else(|| "AI response completed".to_string());
+
+                // Send message_completed per WEBSOCKET_PROTOCOL_SPEC.md
+                if let Some(sender) = cx.try_global::<external_websocket_sync::WebSocketSender>() {
+                    let sender_guard = sender.sender.read();
+                    if let Some(ws_sender) = sender_guard.as_ref() {
+                        let message = serde_json::json!({
+                            "session_id": helix_session_for_events,
+                            "event_type": "message_completed",
+                            "data": {
+                                "acp_thread_id": format!("{:?}", thread_entity.read(cx).session_id()),
+                                "message_id": format!("msg_{}", chrono::Utc::now().timestamp_millis()),
+                                "request_id": "req_from_event" // TODO: Track request_id properly
+                            }
+                        });
+
+                        if let Ok(json_str) = serde_json::to_string(&message) {
+                            use external_websocket_sync::tungstenite::Message;
+                            let _ = ws_sender.send(Message::Text(json_str.into()));
+                            log::error!("✅ [HEADLESS] Sent message_completed to Helix");
+                        }
+                    }
+                }
+            }
+        }).detach();
+
+        // Send context_created per spec
+        if let Some(sender) = cx.try_global::<external_websocket_sync::WebSocketSender>() {
+            let sender_guard = sender.sender.read();
+            if let Some(ws_sender) = sender_guard.as_ref() {
+                let message = serde_json::json!({
+                    "session_id": helix_session_id,
+                    "event_type": "context_created",
+                    "data": {
+                        "acp_thread_id": session_id_string,
+                        "helix_session_id": helix_session_id
+                    }
+                });
+
+                if let Ok(json_str) = serde_json::to_string(&message) {
+                    use external_websocket_sync::tungstenite::Message;
+                    let _ = ws_sender.send(Message::Text(json_str.into()));
+                    log::error!("✅ [HEADLESS] Sent context_created with REAL acp_thread_id: {}", session_id_string);
+                }
+            }
+        }
+
+        // Send initial message to thread
+        let message = vec![agent_client_protocol::ContentBlock::Text(
+            agent_client_protocol::TextContent {
+                text: initial_message.to_string(),
+                annotations: None,
+                meta: None,
+            }
+        )];
+
+        let task = thread.update(cx, |thread, cx| thread.send(message, cx));
+        cx.spawn(async move |_, _| {
+            task.await.log_err();
+        }).detach();
+
+        log::error!("✅ [HEADLESS] ACP thread created and message sent (fully headless!)");
+        Ok(())
+    }
+
     pub(crate) fn new_acp_thread_with_message(
         &mut self,
         initial_message: &str,
