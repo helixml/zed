@@ -1168,6 +1168,7 @@ impl AgentPanel {
         Ok(())
     }
 
+    #[cfg(feature = "external_websocket_sync")]
     pub(crate) fn new_acp_thread_with_message(
         &mut self,
         initial_message: &str,
@@ -1175,6 +1176,8 @@ impl AgentPanel {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        use external_websocket_sync_dep as external_websocket_sync;
+
         log::error!("🎯 [AGENT_PANEL] Creating new ACP thread for Helix session: {}", helix_session_id);
         
         let agent = ExternalAgent::NativeAgent;

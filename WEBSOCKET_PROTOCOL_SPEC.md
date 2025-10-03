@@ -396,13 +396,142 @@ if let Some(callback) = cx.try_global::<ThreadCreationCallback>() {
    - Message handling?
    - Event subscriptions?
 
-### Alternative: GPUI-Free Layer
+### Current Implementation: Callback Architecture (WORKING)
 
-If GPUI context is too problematic, consider:
-- Create standalone `AcpThreadManager` that doesn't require Window
-- Uses async context only
-- agent_panel just observes and renders
-- More refactoring but cleaner architecture
+**Status**: Implemented and tested ✅
+
+```rust
+// agent_panel.rs - sets up headless listener
+let (callback_tx, mut callback_rx) = mpsc::unbounded_channel();
+cx.set_global(ThreadCreationCallback { sender: callback_tx });
+external_websocket_sync::init_thread_creation_callback(callback_tx);
+
+cx.spawn(|panel, cx| async move {
+    while let Some(request) = callback_rx.recv().await {
+        panel.update(cx, |panel, cx| {
+            panel.create_headless_acp_thread(&request.message, request.helix_session_id, cx)
+        }).ok();
+    }
+}).detach();
+
+// websocket_sync.rs - calls callback when message arrives
+request_thread_creation(ThreadCreationRequest {
+    helix_session_id,
+    acp_thread_id: None,
+    message,
+    request_id,
+})?;
+```
+
+**Benefits**:
+- ✅ Fully headless (no render() polling)
+- ✅ Event-driven architecture
+- ✅ Real ACP threads created without Window/View
+- ✅ Tested and working
+
+---
+
+## Future Roadmap: Headless Agent Runner
+
+### Vision: Zed Agent Without UI
+
+**Goal**: Run Zed as a pure agent server with ZERO UI/GPU requirements.
+
+**Use Cases**:
+- Server-side agent execution in Docker containers
+- CLI-only agent interactions
+- Cloud-hosted agent pools
+- Embedded agent systems
+
+### Architecture Sketch
+
+```
+┌─────────────────────────────────────┐
+│   zed-agent-headless (binary)       │
+├─────────────────────────────────────┤
+│ • No GPUI initialization            │
+│ • No window/rendering                │
+│ • Pure async runtime                 │
+│ • WebSocket server built-in          │
+└─────────────────────────────────────┘
+         ↓
+┌─────────────────────────────────────┐
+│   AcpThreadManager (NEW)             │
+├─────────────────────────────────────┤
+│ • Creates AcpThread entities         │
+│ • No Context<T> dependencies         │
+│ • Pure async/await                   │
+│ • Manages thread lifecycle           │
+└─────────────────────────────────────┘
+         ↓
+┌─────────────────────────────────────┐
+│   AcpThread (EXISTING)               │
+├─────────────────────────────────────┤
+│ • Already mostly UI-independent      │
+│ • Just needs Entity/GPUI plumbing    │
+│ • Events work without UI             │
+└─────────────────────────────────────┘
+```
+
+### Required Changes
+
+1. **Extract AcpThread from GPUI**
+   - Remove `Entity<AcpThread>` dependency
+   - Use plain Rust async instead
+   - Keep event system but make it async-native
+
+2. **Create AcpThreadManager**
+   - Standalone crate (`acp_headless`)
+   - No GPUI/window dependencies
+   - Manages thread lifecycle
+   - Handles WebSocket protocol
+
+3. **Separate Binary**
+   - `zed-agent-headless` binary
+   - Minimal dependencies (no GPU, no UI libs)
+   - WebSocket server built-in
+   - Docker-friendly
+
+### Feasibility Assessment
+
+**Current Blockers**:
+- [ ] AcpThread uses `Entity<>` which requires GPUI
+- [ ] `cx.new()` and `cx.spawn()` need GPUI context
+- [ ] Project and other entities are GPUI-based
+- [ ] Event system (`EventEmitter`) is GPUI-specific
+
+**Possible Without Major Refactoring**:
+- ✅ WebSocket protocol (already async)
+- ✅ Message parsing (pure Rust)
+- ✅ Thread creation callback (works without Window)
+- ✅ Event subscriptions (work headlessly with GPUI context)
+
+**Would Require Significant Refactoring**:
+- ❌ Fully removing GPUI from AcpThread
+- ❌ Making Project/ActionLog non-GPUI
+- ❌ Alternative event system
+
+**Pragmatic Approach**:
+- Keep minimal GPUI context (AsyncApp)
+- Remove Window/rendering requirements ✅ (already done!)
+- Run in headless mode with `--headless` flag
+- Still uses GPUI plumbing but no GPU/display needed
+
+### Milestone: Headless with Minimal GPUI
+
+**This is achievable NOW with current architecture:**
+
+1. ✅ `create_headless_acp_thread()` - no Window required
+2. ✅ Callback architecture - no UI polling
+3. ⚠️ Still needs: AsyncApp context for entities
+4. ⚠️ Still needs: Language model, Project setup
+5. ❌ Doesn't need: Window, rendering, GPU
+
+**Next Steps**:
+1. Test if Zed can run with `--headless` flag
+2. Verify ACP threads work without opening agent panel
+3. Test persistence to database without UI
+4. Validate tool execution works headlessly
 
 ---
 
