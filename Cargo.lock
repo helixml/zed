@@ -5862,6 +5862,8 @@ dependencies = [
 name = "external_websocket_sync"
 version = "0.1.0"
 dependencies = [
+ "acp_thread",
+ "agent2",
  "anyhow",
  "assistant_context",
  "assistant_slash_command",

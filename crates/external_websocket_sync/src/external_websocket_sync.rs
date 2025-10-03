@@ -25,6 +25,9 @@ use settings::{Settings, SettingsStore};
 
 mod websocket_sync;
 
+mod thread_service;
+pub use thread_service::*;
+
 mod types;
 pub use types::*;
 

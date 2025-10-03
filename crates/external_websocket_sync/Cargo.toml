@@ -18,6 +18,8 @@ server = ["axum", "tower", "tower-http"]
 test-support = []
 
 [dependencies]
+acp_thread.workspace = true
+agent2.workspace = true
 anyhow.workspace = true
 assistant_context.workspace = true
 assistant_slash_command.workspace = true
