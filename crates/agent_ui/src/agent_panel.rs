@@ -617,13 +617,13 @@ impl AgentPanel {
                     // Spawn headless listener task
                     cx.spawn(move |_panel_entity, mut cx| async move {
                         while let Some(request) = callback_rx.recv().await {
-                            log::error!("🎯 [HEADLESS] Received thread creation request for session: {}", request.helix_session_id);
+                            log::info!("🎯 [HEADLESS] Received thread creation request: {}", request.request_id);
 
                             // Create ACP thread in GPUI context (no window needed!)
                             let result = panel_weak.update(&mut cx, |panel, cx| {
                                 panel.create_headless_acp_thread(
                                     &request.message,
-                                    request.helix_session_id,
+                                    request.request_id.clone(),
                                     cx
                                 )
                             });
@@ -1034,12 +1034,12 @@ impl AgentPanel {
     fn create_headless_acp_thread(
         &mut self,
         initial_message: &str,
-        helix_session_id: String,
+        request_id: String,
         cx: &mut Context<Self>,
     ) -> anyhow::Result<()> {
         use external_websocket_sync_dep as external_websocket_sync;
 
-        log::error!("🎯 [HEADLESS] Creating headless ACP thread for session: {}", helix_session_id);
+        log::info!("🎯 [HEADLESS] Creating headless ACP thread for request: {}", request_id);
 
         // Create agent server and connect (doesn't need window!)
         let agent = ExternalAgent::NativeAgent;
@@ -1049,12 +1049,13 @@ impl AgentPanel {
         let connection_task = server.connect(None, Default::default(), cx);
 
         // Create ACP thread with the connection
+        let request_id_clone = request_id.clone();
         cx.spawn(|_panel, mut cx| async move {
             let (connection, _spawn_task) = connection_task.await
                 .log_err()
                 .ok_or_else(|| anyhow::anyhow!("Failed to connect to agent"))?;
 
-            cx.update(|cx| {
+            let acp_thread_id = cx.update(|cx| {
                 // Create ACP thread entity
                 let action_log = cx.new(|_| acp::ActionLog::default());
                 let (_, prompt_caps_rx) = tokio::sync::watch::channel(acp::PromptCapabilities::default());
@@ -1072,11 +1073,28 @@ impl AgentPanel {
                     )
                 });
 
-                log::error!("✅ [HEADLESS] Created real ACP thread entity");
+                // Get the thread ID
+                let thread_id = thread.entity_id().to_string();
+                log::info!("✅ [HEADLESS] Created ACP thread: {}", thread_id);
 
-                // TODO: Subscribe to events, send context_created, send initial message
-                Ok(())
-            })
+                thread_id
+            })?;
+
+            // Send thread_created event via WebSocket
+            let event = external_websocket_sync::SyncEvent::ThreadCreated {
+                acp_thread_id: acp_thread_id.clone(),
+                request_id: request_id_clone,
+            };
+
+            if let Err(e) = external_websocket_sync::send_websocket_event(event) {
+                log::error!("Failed to send thread_created event: {}", e);
+            } else {
+                log::info!("📤 Sent thread_created: {}", acp_thread_id);
+            }
+
+            // TODO: Subscribe to thread events, send initial message
+
+            Ok(())
         }).detach();
 
         Ok(())
