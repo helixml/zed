@@ -43,20 +43,7 @@ pub use server::*;
 pub use websocket_sync::*;
 pub use tungstenite;
 
-/// Global mapping of external session IDs to Zed context IDs
-#[derive(Clone, Default)]
-pub struct ExternalSessionMapping {
-    pub sessions: Arc<RwLock<std::collections::HashMap<String, assistant_context::ContextId>>>,
-}
-
-/// Global REVERSE mapping of Zed context IDs to Helix session IDs
-/// This is critical for async events to use the correct session_id when sending to Helix
-#[derive(Clone, Default)]
-pub struct ContextToHelixSessionMapping {
-    pub contexts: Arc<RwLock<std::collections::HashMap<String, String>>>, // Zed context ID -> Helix session ID
-}
-
-/// Global WebSocket sender for sending responses back to Helix
+/// Global WebSocket sender for sending responses back to external system
 #[derive(Clone)]
 pub struct WebSocketSender {
     pub sender: Arc<RwLock<Option<tokio::sync::mpsc::UnboundedSender<tungstenite::Message>>>>,
@@ -70,19 +57,8 @@ impl Default for WebSocketSender {
     }
 }
 
-impl Global for ExternalSessionMapping {}
-impl Global for ContextToHelixSessionMapping {}
 impl Global for WebSocketSender {}
 
-/// Get a clone of the global context-to-helix-session mapping for use in async tasks
-pub fn get_context_to_helix_mapping() -> Option<Arc<RwLock<std::collections::HashMap<String, String>>>> {
-    // This will be set during init and can be accessed from async tasks
-    GLOBAL_CONTEXT_TO_HELIX_MAPPING.lock().clone()
-}
-
-/// Static global for context-to-helix mapping that can be accessed from async tasks
-static GLOBAL_CONTEXT_TO_HELIX_MAPPING: parking_lot::Mutex<Option<Arc<RwLock<std::collections::HashMap<String, String>>>>> =
-    parking_lot::Mutex::new(None);
 
 /// Static global for thread creation callback
 static GLOBAL_THREAD_CREATION_CALLBACK: parking_lot::Mutex<Option<mpsc::UnboundedSender<ThreadCreationRequest>>> =
@@ -91,7 +67,6 @@ static GLOBAL_THREAD_CREATION_CALLBACK: parking_lot::Mutex<Option<mpsc::Unbounde
 /// Request to create ACP thread from external WebSocket message
 #[derive(Clone, Debug)]
 pub struct ThreadCreationRequest {
-    pub helix_session_id: String,
     pub acp_thread_id: Option<String>, // null = create new, Some(id) = use existing
     pub message: String,
     pub request_id: String,

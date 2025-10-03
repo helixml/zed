@@ -111,66 +111,42 @@ pub struct McpServerConfig {
     pub env: HashMap<String, String>,
 }
 
-/// Events that can be synchronized with Helix
+/// Events that Zed sends to external system via WebSocket
+/// Per WEBSOCKET_PROTOCOL_SPEC.md - Zed is stateless and only knows about acp_thread_id
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "type")]
 pub enum SyncEvent {
-    ContextCreated {
-        context_id: String,
+    /// Sent when Zed creates a new ACP thread
+    #[serde(rename = "thread_created")]
+    ThreadCreated {
+        acp_thread_id: String,
+        request_id: String,
     },
-    ContextDeleted {
-        context_id: String,
-    },
+    /// Sent while AI is streaming response (same message_id, progressively longer content)
+    #[serde(rename = "message_added")]
     MessageAdded {
-        context_id: String,
-        message_id: u64,
-    },
-    MessageCompleted {
-        context_id: String,
-        message_id: u64,
-    },
-    MessageUpdated {
-        context_id: String,
-        message_id: u64,
-    },
-    MessageDeleted {
-        context_id: String,
-        message_id: u64,
-    },
-    ContextTitleChanged {
-        context_id: String,
-        new_title: String,
-    },
-    ChatResponse {
-        request_id: String,
+        acp_thread_id: String,
+        message_id: String,
+        role: String,
         content: String,
+        timestamp: i64,
     },
-    ChatResponseChunk {
-        request_id: String,
-        chunk: String,
-    },
-    ChatResponseDone {
-        request_id: String,
-    },
-    ChatResponseError {
-        request_id: String,
-        error: String,
-    },
-    /// Request to create a new assistant thread from an external session
-    CreateThreadFromExternalSession {
-        external_session_id: String,
-        zed_context_id: Option<String>, // If Some, reuse existing context; if None, create new
-        message: String,
+    /// Sent when AI finishes responding
+    #[serde(rename = "message_completed")]
+    MessageCompleted {
+        acp_thread_id: String,
+        message_id: String,
         request_id: String,
     },
 }
 
-/// Sync event with timestamp
+/// Incoming command from external system to Zed
+/// Per WEBSOCKET_PROTOCOL_SPEC.md - external system sends chat_message
 #[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct TimestampedSyncEvent {
-    pub event: SyncEvent,
-    pub timestamp: DateTime<Utc>,
-    pub session_id: String,
+pub struct IncomingChatMessage {
+    pub acp_thread_id: Option<String>,  // null = create new thread, Some(id) = use existing
+    pub message: String,
+    pub request_id: String,
 }
 
 /// Response for health check endpoint
