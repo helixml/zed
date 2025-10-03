@@ -28,8 +28,8 @@ mod websocket_sync;
 mod types;
 pub use types::*;
 
-mod sync;
-pub use sync::*;
+// mod sync;
+// pub use sync::*;
 
 mod mcp;
 pub use mcp::*;
@@ -37,8 +37,8 @@ pub use mcp::*;
 mod sync_settings;
 pub use sync_settings::*;
 
-mod server;
-pub use server::*;
+// mod server;
+// pub use server::*;
 
 pub use websocket_sync::*;
 pub use tungstenite;
@@ -480,8 +480,11 @@ impl ExternalWebSocketSync {
     fn notify_message_added(&self, context_id: &ContextId, message_id: &MessageId) {
         if let Some(websocket_sync) = &self.websocket_sync {
             let event = SyncEvent::MessageAdded {
-                context_id: context_id.to_proto(),
-                message_id: message_id.as_u64(),
+                acp_thread_id: context_id.to_proto(),
+                message_id: message_id.as_u64().to_string(),
+                role: "assistant".to_string(),
+                content: String::new(), // TODO: get actual content
+                timestamp: chrono::Utc::now().timestamp(),
             };
             if let Err(e) = websocket_sync.send_event(event) {
                 log::warn!("Failed to send message added event: {}", e);
@@ -493,8 +496,9 @@ impl ExternalWebSocketSync {
     pub fn notify_message_completed(&self, context_id: &ContextId, message_id: &MessageId) {
         if let Some(websocket_sync) = &self.websocket_sync {
             let event = SyncEvent::MessageCompleted {
-                context_id: context_id.to_proto(),
-                message_id: message_id.as_u64(),
+                acp_thread_id: context_id.to_proto(),
+                message_id: message_id.as_u64().to_string(),
+                request_id: String::new(), // TODO: track request_id
             };
             if let Err(e) = websocket_sync.send_event(event) {
                 log::warn!("Failed to send message completed event: {}", e);
@@ -714,10 +718,7 @@ pub fn get_global_sync_service(cx: &App) -> Option<&ExternalWebSocketSync> {
 }
 
 #[cfg(test)]
-mod test_integration;
-
-#[cfg(test)]
-mod real_websocket_tests;
+mod protocol_test;
 
 /// Execute a function with the global sync service if available
 pub fn with_sync_service<T>(

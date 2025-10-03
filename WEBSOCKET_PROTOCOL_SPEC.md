@@ -570,41 +570,38 @@ request_thread_creation(ThreadCreationRequest {
 
 ### 🚧 In Progress
 
-3. **Code Refactoring** (CURRENT TASK)
-   - websocket_sync.rs needs complete rewrite to match protocol
-   - Remove all session mapping logic from Zed
-   - Simplify to just: receive chat_message → call callback → send events
-   - Current status: Types updated, code compilation broken (expected)
+3. **Code Refactoring**
+   - ✅ websocket_sync.rs - completely rewritten (183 lines vs 998 lines)
+   - ✅ Headless service - no UI dependencies
+   - ✅ Protocol test framework created
+   - ⚠️ Legacy code in external_websocket_sync.rs needs cleanup
+   - ⚠️ Test doesn't compile yet due to legacy code conflicts
 
-### ⏳ Remaining Tasks
+### ⏳ Remaining Tasks (Next Session)
 
-4. **Fix websocket_sync.rs**
-   - Rewrite handle_incoming_message to only parse chat_message
-   - Remove all CreateThreadFromExternalSession event usage
-   - Simplify event sending (no session_id routing)
-   - Remove context-to-helix mapping lookups
+4. **Clean Up Legacy Code**
+   - Comment out/remove old code in external_websocket_sync.rs
+   - Remove references to WebSocketSync::new (now WebSocketSync::start)
+   - Remove ExternalSessionMapping/ContextToHelixSessionMapping usage
+   - Fix compilation errors
 
-5. **Fix sync.rs and server.rs**
-   - Remove TimestampedSyncEvent references
-   - Update to use simplified SyncEvent enum
-   - May deprecate sync.rs entirely (not needed for WebSocket protocol)
+5. **Complete Test Implementation**
+   - Get protocol_test.rs compiling
+   - Verify end-to-end flow: chat_message → thread_created → message_added (x3) → message_completed
+   - Test should use mock AI responses (no real LLM needed)
+   - Verify streaming works (progressively longer content, same message_id)
 
-6. **Fix agent_panel.rs**
-   - Remove helix_session_id storage and mapping
-   - Update create_headless_acp_thread to not take helix_session_id
-   - Send thread_created with acp_thread_id + request_id only
-   - Send message_added and message_completed with acp_thread_id
+6. **Wire Up Service Layer**
+   - Thread creation callback should trigger actual ACP thread creation
+   - ACP thread events (message updates) should send via WebSocket
+   - No dependency on agent_panel being open
+   - Service runs independently of UI
 
-7. **Update Tests**
-   - Fix real_websocket_tests.rs to match new protocol
-   - Remove session_id from test messages
-   - Verify request_id correlation works
-   - Test that external system can map via request_id
-
-8. **Run Full Test Suite**
-   - Ensure all WebSocket tests pass
+7. **Integration Testing**
+   - Test with real external WebSocket server
    - Verify protocol compliance
-   - Test headless operation
+   - Test follow-up messages (acp_thread_id provided)
+   - Test request_id correlation
 
 ### 📝 Design Notes
 
@@ -621,3 +618,49 @@ request_thread_creation(ThreadCreationRequest {
 - Stream response via message_added
 - Send message_completed when done
 - All events include acp_thread_id for external system to route
+
+---
+
+## Implementation Summary (End of Session 2025-10-03)
+
+### ✅ Major Achievements
+
+1. **Protocol Specification Corrected**
+   - Removed all external session ID leakage into Zed
+   - Clear separation: external system owns ALL mapping
+   - Zed is truly stateless
+
+2. **New WebSocket Service** (`websocket_sync.rs`)
+   - 183 lines (down from 998)
+   - Zero UI dependencies
+   - Clean protocol implementation
+   - Headless service architecture
+
+3. **Type System Simplified**
+   - SyncEvent: 3 variants (was 12)
+   - IncomingChatMessage type added
+   - All acp_thread_id based
+
+4. **Test Framework Created**
+   - protocol_test.rs with full end-to-end flow
+   - Mock AI streaming (no LLM needed)
+   - Tests protocol compliance
+
+### 🔧 What's Left
+
+**Critical Path**: Fix compilation errors, get test passing, wire up to ACP thread creation.
+
+**Files to Fix**:
+- `external_websocket_sync.rs` - remove legacy code (lines 268, 632, 673, 706)
+- `agent_panel.rs` - update to use new WebSocket service
+- `protocol_test.rs` - ensure compilation
+
+**Key Integration Point**: Thread creation callback needs to create real ACP thread and subscribe to its events to send message_added/message_completed.
+
+**Expected Flow**:
+```
+External → chat_message → WebSocket service → callback → create ACP thread
+                                                             ↓
+ACP thread event → message_added → WebSocket service → External
+ACP thread event → message_completed → WebSocket service → External
+```
