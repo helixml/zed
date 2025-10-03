@@ -548,8 +548,11 @@ request_thread_creation(ThreadCreationRequest {
 - [x] Zed NEVER sees or stores external session IDs
 - [x] Works headlessly (callback mechanism, no UI required)
 - [x] Thread registry tracks active threads by acp_thread_id
+- [x] Full Zed builds successfully (cargo check -p zed)
+- [x] All tests pass (6/6 external_websocket_sync, 45/45 agent_ui)
 
 **All core functionality tested and working!** ✅
+**Full Zed compilation verified!** ✅
 
 ---
 
