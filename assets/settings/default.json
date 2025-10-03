@@ -957,7 +957,11 @@
     // Minimum number of lines to display in the agent message editor.
     //
     // Default: 4
-    "message_editor_min_lines": 4
+    "message_editor_min_lines": 4,
+    // Whether to show the Zed Pro onboarding banner in the agent panel.
+    //
+    // Default: true
+    "show_onboarding": true
   },
   // Whether the screen sharing icon is shown in the os status bar.
   "show_call_status_icon": true,

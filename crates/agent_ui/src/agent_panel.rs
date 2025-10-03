@@ -2476,6 +2476,14 @@ impl AgentPanel {
     }
 
     fn should_render_onboarding(&self, cx: &mut Context<Self>) -> bool {
+        if std::env::var("ZED_SHOW_ONBOARDING").is_ok_and(|v| v == "0" || v.to_lowercase() == "false") {
+            return false;
+        }
+
+        if !AgentSettings::get_global(cx).show_onboarding {
+            return false;
+        }
+
         if OnboardingUpsell::dismissed() {
             return false;
         }
