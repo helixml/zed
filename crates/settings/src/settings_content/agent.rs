@@ -109,6 +109,10 @@ pub struct AgentSettingsContent {
     ///
     /// Default: 4
     pub message_editor_min_lines: Option<usize>,
+    /// Whether to show the Zed Pro onboarding banner in the agent panel.
+    ///
+    /// Default: true
+    pub show_onboarding: Option<bool>,
 }
 
 impl AgentSettingsContent {

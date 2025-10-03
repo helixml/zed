@@ -464,26 +464,26 @@ impl WebSocketSync {
                 context_to_helix_session.write().insert(context_id.clone(), helix_session_id.clone());
                 eprintln!("💾 [SESSION_MAPPING] Stored mapping: Context {} -> Helix Session {}", context_id, helix_session_id);
 
-                // IMMEDIATE FIX: Send acknowledgment so Helix doesn't hang
-                let ack_response = SyncMessage {
+                // Per WEBSOCKET_PROTOCOL_SPEC.md: Send context_created with acp_thread_id
+                let context_created_response = SyncMessage {
                     session_id: helix_session_id.to_string(),
-                    event_type: "chat_response".to_string(),
+                    event_type: "context_created".to_string(),
                     data: {
                         let mut data = std::collections::HashMap::new();
-                        data.insert("request_id".to_string(), serde_json::Value::String(request_id.clone()));
-                        data.insert("content".to_string(), serde_json::Value::String("🤖 Processing your request with AI... (Real response will follow via async system)".to_string()));
+                        data.insert("acp_thread_id".to_string(), serde_json::Value::String(context_id.clone()));
+                        data.insert("helix_session_id".to_string(), serde_json::Value::String(helix_session_id.clone()));
                         data
                     },
                     timestamp: chrono::Utc::now(),
                 };
 
-                let ack_text = serde_json::to_string(&ack_response)?;
-                eprintln!("📤 [IMMEDIATE_FIX] Sending acknowledgment to prevent Helix hang");
-                websocket_sender.send(Message::Text(ack_text.into()))?;
+                let response_text = serde_json::to_string(&context_created_response)?;
+                eprintln!("📤 [SPEC_COMPLIANCE] Sending context_created per WEBSOCKET_PROTOCOL_SPEC.md");
+                websocket_sender.send(Message::Text(response_text.into()))?;
 
-                eprintln!("✅ [ACKNOWLEDGMENT] Sent acknowledgment to prevent Helix hang");
-                eprintln!("🤖 [ASYNC_SYSTEM] Real AI responses will be sent via context event system when ready");
-                eprintln!("🔄 [ASYNC_SYSTEM] Context subscription will handle completion signal automatically")
+                eprintln!("✅ [SPEC_COMPLIANCE] Sent context_created with acp_thread_id: {}", context_id);
+                eprintln!("🤖 [TODO] Need to actually create real ACP thread in agent_panel");
+                eprintln!("🔄 [TODO] For now, external system has the mapping to route responses")
             }
             "create_thread" => {
                 eprintln!("🆕 [HANDLE_MESSAGE_WITH_RESPONSE] Handling create_thread command from Helix!");
@@ -799,9 +799,19 @@ impl WebSocketSync {
         }
         
         eprintln!("✅ [CHAT_MESSAGE] Sent chat event for session: {}", helix_session_id);
-        
-        // Return the context_id (or empty if creating new - real one comes via context_created)
-        Ok((zed_context_id.unwrap_or_default(), helix_session_id.to_string()))
+
+        // Generate context_id if creating new, or return existing
+        let context_id = zed_context_id.unwrap_or_else(|| {
+            // TODO: This should be a REAL ACP thread ID from agent_panel
+            // For now, generate a placeholder that follows UUID format
+            use assistant_context::ContextId;
+            let real_id = ContextId::new();
+            let id_string = real_id.to_proto();
+            eprintln!("🆕 [CHAT_MESSAGE] Generated new context_id: {}", id_string);
+            id_string
+        });
+
+        Ok((context_id, helix_session_id.to_string()))
     }
 
     /// Handle create_thread command from Helix

@@ -80,9 +80,39 @@ pub fn get_context_to_helix_mapping() -> Option<Arc<RwLock<std::collections::Has
     GLOBAL_CONTEXT_TO_HELIX_MAPPING.lock().clone()
 }
 
+/// Send a thread creation request from WebSocket async task to UI thread
+pub fn send_thread_creation_request(request: ExternalThreadCreationRequest) -> Result<()> {
+    if let Some(sender) = GLOBAL_THREAD_CREATION_CHANNEL.lock().clone() {
+        sender.send(request)
+            .map_err(|_| anyhow::anyhow!("Failed to send thread creation request"))
+    } else {
+        Err(anyhow::anyhow!("Thread creation channel not initialized"))
+    }
+}
+
+/// Get the thread creation receiver (for agent_panel to consume)
+pub fn take_thread_creation_receiver() -> Option<tokio::sync::mpsc::UnboundedReceiver<ExternalThreadCreationRequest>> {
+    // This will be called once by agent_panel during initialization
+    static RECEIVER: parking_lot::Mutex<Option<tokio::sync::mpsc::UnboundedReceiver<ExternalThreadCreationRequest>>> =
+        parking_lot::Mutex::new(None);
+    RECEIVER.lock().take()
+}
+
 /// Static global for context-to-helix mapping that can be accessed from async tasks
 static GLOBAL_CONTEXT_TO_HELIX_MAPPING: parking_lot::Mutex<Option<Arc<RwLock<std::collections::HashMap<String, String>>>>> =
     parking_lot::Mutex::new(None);
+
+/// Global channel for thread creation requests from external WebSocket
+static GLOBAL_THREAD_CREATION_CHANNEL: parking_lot::Mutex<Option<tokio::sync::mpsc::UnboundedSender<ExternalThreadCreationRequest>>> =
+    parking_lot::Mutex::new(None);
+
+/// Request to create ACP thread from external WebSocket message
+#[derive(Clone, Debug)]
+pub struct ExternalThreadCreationRequest {
+    pub helix_session_id: String,
+    pub message: String,
+    pub request_id: String,
+}
 
 /// Type alias for compatibility with existing code
 pub type HelixIntegration = ExternalWebSocketSync;
@@ -504,6 +534,12 @@ pub enum ExternalSyncEvent {
     MessageAdded { context_id: String, message_id: u64 },
     SyncClientConnected { client_id: String },
     SyncClientDisconnected { client_id: String },
+    /// External system requests thread creation (e.g., Helix sends first message)
+    ExternalThreadCreationRequested {
+        helix_session_id: String,
+        message: String,
+        request_id: String,
+    },
 }
 
 /// Global access to external WebSocket sync
@@ -698,6 +734,9 @@ pub fn get_global_sync_service(cx: &App) -> Option<&ExternalWebSocketSync> {
 
 #[cfg(test)]
 mod test_integration;
+
+#[cfg(test)]
+mod real_websocket_tests;
 
 /// Execute a function with the global sync service if available
 pub fn with_sync_service<T>(

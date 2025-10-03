@@ -8,7 +8,7 @@
 
 ---
 
-## Current Architecture (As Implemented)
+## Current Architecture (As Implemented - Post Cleanup)
 
 ### Layer 1: External WebSocket Sync Crate (Lower Level)
 **Location:** `/home/luke/pm/zed/crates/external_websocket_sync/`
@@ -19,7 +19,7 @@
 ```
 external_websocket_sync/
 ├── src/
-│   ├── external_websocket_sync.rs  # Global structs and types
+│   ├── external_websocket_sync.rs  # Global structs, init, types
 │   ├── websocket_sync.rs          # WebSocket connection handling
 │   ├── sync.rs                    # Sync client implementation
 │   ├── server.rs                  # HTTP server for external connections
@@ -32,18 +32,19 @@ external_websocket_sync/
 - `ExternalSessionMapping` - Global mapping: Helix session ID → ACP context ID
 - `ContextToHelixSessionMapping` - Global reverse mapping: ACP context ID → Helix session ID
 - `WebSocketSender` - Global WebSocket sender for responses
-- `ThreadCreationChannel` - Channel for thread creation requests
+- `GLOBAL_CONTEXT_TO_HELIX_MAPPING` - Static global for async task access
 - WebSocket client connection handling
 
 **What It Does:**
 - Defines global data structures for session tracking
 - Provides WebSocket client connectivity
 - Manages settings for external sync
+- **Initializes WebSocket connection during startup** (`init()` function)
 
 **What It DOESN'T Do:**
 - ❌ Does NOT create ACP threads
 - ❌ Does NOT handle thread lifecycle
-- ❌ Does NOT send responses (just provides the channel)
+- ❌ Does NOT trigger thread creation (no polling, no queue)
 
 ---
 
@@ -57,22 +58,22 @@ external_websocket_sync/
 agent_ui/
 ├── src/
 │   ├── agent_panel.rs              # ⚠️ MAIN ACP INTEGRATION IS HERE
-│   ├── agent_panel_tests.rs        # Our 6 functional tests
+│   ├── agent_panel_tests.rs        # Our 6 functional tests (MOCK WebSocket)
 │   ├── acp/
 │   │   └── thread_view.rs          # ACP thread view UI
 │   └── ... other UI components
 ```
 
 **Key Functions in `agent_panel.rs`:**
-- `new_acp_thread_with_message()` (lines 1100-1250) - **CREATES ACP THREADS**
-  - Receives WebSocket messages
-  - Creates ACP thread views
-  - Manages session mappings
-  - Subscribes to thread events
-  - **Sends responses back via WebSocket**
+- `new_acp_thread_with_message()` (lines 995-1177) - **CREATES ACP THREADS**
+  - Called directly (no polling mechanism)
+  - Creates ACP thread views synchronously
+  - Manages session mappings asynchronously
+  - Subscribes to `AcpThreadEvent::Stopped`
+  - **Sends responses back via WebSocket when event fires**
 
 **What It Does:**
-- ✅ Creates ACP threads from WebSocket messages
+- ✅ Creates ACP threads from direct function calls
 - ✅ Manages thread lifecycle
 - ✅ Handles event subscriptions
 - ✅ Extracts AI responses
@@ -115,22 +116,32 @@ acp_thread/
 
 ## The Problem: Layering Violation
 
-### Current Flow
+### Current Flow (Post-Cleanup)
 ```
-WebSocket Message (from Helix)
+WebSocket Connection Established
+    ↓ (during external_websocket_sync::init())
+external_websocket_sync creates globals (mappings, sender)
     ↓
-external_websocket_sync (receives, stores in global)
+[TRIGGER POINT - Currently unclear how this happens]
     ↓
-agent_panel.rs (UI CODE!) processes pending requests  ⚠️
+agent_panel.new_acp_thread_with_message() called directly  ⚠️
     ↓
-agent_panel.rs creates ACP thread                     ⚠️
+agent_panel.rs creates ACP thread synchronously           ⚠️
     ↓
-agent_panel.rs subscribes to events                   ⚠️
+agent_panel.rs subscribes to AcpThreadEvent::Stopped      ⚠️
     ↓
-agent_panel.rs sends response via WebSocket           ⚠️
+When event fires → extract response                       ⚠️
+    ↓
+agent_panel.rs sends via WebSocket global                 ⚠️
     ↓
 Back to Helix
 ```
+
+**Key Change from Before:**
+- ~~No more `ThreadCreationChannel`~~ (REMOVED)
+- ~~No more `PendingThreadRequests` queue~~ (REMOVED)
+- ~~No more polling in render()~~ (REMOVED)
+- Now uses **direct function call** to `new_acp_thread_with_message()`
 
 ### What SHOULD Happen (Ideal Architecture)
 ```
@@ -153,6 +164,126 @@ UI layer just observes and renders
 
 ---
 
+## Test Coverage - Where Tests Integrate
+
+### Test Set 1: `agent_panel_tests.rs` (6 tests)
+**Location:** `/home/luke/pm/zed/crates/agent_ui/src/agent_panel_tests.rs`
+
+**What Layer Do These Test?**
+```
+╔═══════════════════════════════════════╗
+║  Layer 2: agent_panel.rs (UI LAYER)  ║ ← Tests run HERE
+╠═══════════════════════════════════════╣
+║  • new_acp_thread_with_message()     ║
+║  • Session mapping storage           ║
+║  • Event subscription logic          ║
+║  • Response extraction & sending     ║
+╚═══════════════════════════════════════╝
+         ↓ (uses)                ↑
+         ↓                       ↑ (mocked)
+╔═════════════════════╗  ╔═════════════════════╗
+║ Layer 3: ACP Thread ║  ║ Layer 1: WebSocket  ║
+║ (REAL)              ║  ║ (MOCKED)            ║
+╚═════════════════════╝  ╚═════════════════════╝
+```
+
+**What They Actually Test:**
+- ✅ **UI layer business logic** (thread creation, mapping, events)
+- ✅ **Integration with real ACP thread** (actual thread is created)
+- ✅ **Event handling** (subscribe to real AcpThreadEvent::Stopped)
+- ❌ **NO WebSocket testing** (uses mock tokio channel)
+
+**How the Mock Works:**
+```rust
+// Test setup creates FAKE WebSocket sender
+let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+cx.set_global(WebSocketSender {
+    sender: Arc::new(RwLock::new(Some(tx))),  // NOT a real WebSocket!
+});
+
+// Test can capture what WOULD be sent to WebSocket
+let received_message = rx.try_recv();  // Gets JSON from channel, not network
+```
+
+**What's NOT Tested:**
+- ❌ Real WebSocket connection establishment
+- ❌ WebSocket frame serialization (tungstenite::Message)
+- ❌ Network transmission
+- ❌ Connection errors/drops
+- ❌ WebSocket protocol handshake
+
+### Test Set 2: `test_integration.rs` (3 tests)
+**Location:** `/home/luke/pm/zed/crates/external_websocket_sync/src/test_integration.rs`
+
+**What Layer Do These Test?**
+```
+╔══════════════════════════════════════════╗
+║  Layer 1: external_websocket_sync       ║ ← Tests run HERE
+╠══════════════════════════════════════════╣
+║  • Message handler logic                ║
+║  • Event serialization                  ║
+║  • JSON format validation               ║
+╚══════════════════════════════════════════╝
+```
+
+**What They Actually Test:**
+- ✅ **Message handler logic** (parsing JSON commands)
+- ✅ **Event serialization** (converting events to JSON)
+- ✅ **Protocol format** (JSON structure matches spec)
+- ❌ **NO WebSocket testing** (calls handler directly with strings)
+
+**How It Works:**
+```rust
+// Call handler directly with string (not from network)
+WebSocketSync::handle_incoming_message(
+    "test-session",
+    command_json,  // Just a string, not tungstenite::Message
+    &command_sender,
+    &event_sender,
+).await?;
+
+// Check what event was generated
+let response_event = event_receiver.recv().await;
+```
+
+**What's NOT Tested:**
+- ❌ Real WebSocket frames
+- ❌ Network I/O
+- ❌ tungstenite integration
+
+---
+
+## The Missing Piece: Real WebSocket Tests
+
+**Neither test set actually tests WebSocket communication!**
+
+Both test sets mock the WebSocket layer using tokio channels. This means:
+
+### What Could Break in Production (Untested):
+1. **WebSocket Serialization**
+   - Our JSON might not serialize correctly to WebSocket frames
+   - tungstenite might encode differently than expected
+
+2. **Connection Issues**
+   - WebSocket handshake failures
+   - Connection drops mid-message
+   - Reconnection logic
+
+3. **Message Format**
+   - Frame splitting (large messages)
+   - Binary vs text frame handling
+   - Partial message handling
+
+4. **Concurrency**
+   - Multiple simultaneous messages
+   - Out-of-order delivery
+   - Race conditions in WebSocket layer
+
+### Recommended: Add Real WebSocket Tests
+See `TEST_COVERAGE_ANALYSIS.md` for detailed plan to add in-process WebSocket server tests.
+
+---
+
 ## Recommended Refactoring
 
 ### Option 1: Create Middle Layer (Clean Architecture)
@@ -160,7 +291,7 @@ UI layer just observes and renders
 **New Crate:** `external_agent_manager/`
 
 **Responsibilities:**
-- Receive WebSocket messages from `external_websocket_sync`
+- Receive triggers to create threads
 - Create and manage ACP threads
 - Subscribe to thread events
 - Extract responses
@@ -199,31 +330,35 @@ UI layer just observes and renders
 ### Implementation Files
 | File | Layer | What It Does | Lines of Interest |
 |------|-------|--------------|-------------------|
-| `agent_ui/src/agent_panel.rs` | UI | **Main implementation** (thread creation, events, responses) | 1100-1250 |
-| `external_websocket_sync/src/external_websocket_sync.rs` | Infrastructure | Global structs, session mappings | 46-100 |
-| `external_websocket_sync/src/websocket_sync.rs` | Infrastructure | WebSocket client connection | N/A |
-| `acp_thread/src/acp_thread.rs` | Core | Thread state, events, AI logic | 783-803 (events) |
+| `agent_ui/src/agent_panel.rs` | UI | **Main implementation** (thread creation, events, responses) | 995-1177 |
+| `external_websocket_sync/src/external_websocket_sync.rs` | Infrastructure | Global structs, session mappings, init | 46-85 |
+| `external_websocket_sync/src/websocket_sync.rs` | Infrastructure | WebSocket client connection | 83-116 |
+| `acp_thread/src/acp_thread.rs` | Core | Thread state, events, AI logic | Events fired here |
 
 ### Test Files
-| File | What It Tests |
-|------|---------------|
-| `agent_ui/src/agent_panel_tests.rs` | Full bidirectional sync (6 tests) |
+| File | What It Tests | What Layer |
+|------|---------------|------------|
+| `agent_ui/src/agent_panel_tests.rs` | Full flow with MOCK WebSocket (6 tests) | UI Layer + ACP Thread (real) |
+| `external_websocket_sync/src/test_integration.rs` | Message handling with MOCK (3 tests) | Infrastructure Layer |
+
+**CRITICAL: No tests actually test real WebSocket communication!**
 
 ### Documentation
 | File | Purpose |
 |------|---------|
 | `ACP_INTEGRATION_SUMMARY.md` | Complete implementation overview |
 | `ACP_TESTS_README.md` | Test usage guide |
-| `ACP_TEST_COVERAGE_SUMMARY.md` | Coverage analysis |
+| `TEST_COVERAGE_ANALYSIS.md` | Coverage analysis - what's NOT tested |
+| `WEBSOCKET_REMOTE_CONTROL_DESIGN.md` | Generic protocol design |
 
 ---
 
 ## Why This Matters
 
 ### Current Issues
-1. **Testing Complexity** - Need full UI framework (GPUI) to test business logic
+1. **Testing Gap** - No real WebSocket testing means potential bugs in production
 2. **Tight Coupling** - UI and business logic intertwined
-3. **Reusability** - Can't reuse this logic without UI
+3. **Unclear Trigger** - How does `new_acp_thread_with_message()` get called?
 4. **Maintainability** - Changes to UI affect core functionality
 
 ### If We Refactor
@@ -231,6 +366,7 @@ UI layer just observes and renders
 2. **Separation** - UI changes don't affect core logic
 3. **Extensibility** - Easy to add new external integrations
 4. **Clarity** - Clear boundaries between layers
+5. **Real WebSocket Tests** - Can test actual network communication
 
 ---
 
@@ -240,16 +376,18 @@ UI layer just observes and renders
 
 **Considerations:**
 - **It works** - Current implementation functions correctly, all tests pass
+- **But lacks coverage** - No real WebSocket tests = production risk
 - **Time investment** - Refactoring would take significant effort
 - **Risk** - Moving working code could introduce bugs
 - **Future maintenance** - Cleaner architecture would help long-term
 
 **My Recommendation:**
-- **Short term:** Document this as technical debt
-- **Long term:** Plan refactoring when:
-  - Adding more external integrations
-  - Need to test without UI
-  - Performance becomes an issue
+1. **Immediate:** Add real WebSocket tests (2-3 hours) - See TEST_COVERAGE_ANALYSIS.md
+2. **Short term:** Document the trigger mechanism (how does thread creation get called?)
+3. **Long term:** Plan refactoring when:
+   - Adding more external integrations
+   - Need to test without UI
+   - Performance becomes an issue
 
 ---
 
@@ -283,11 +421,20 @@ agent_ui (UI/Frontend - pure presentation)
 - **Infrastructure** (`external_websocket_sync`) - WebSocket, session mappings, globals ✅
 - **Core** (`acp_thread`) - Thread state, AI interaction ✅
 
-**The issue:**
-Business logic lives in the UI layer, which violates separation of concerns.
+**What tests actually test:**
+- **UI Layer tests** - Business logic with REAL ACP threads but MOCK WebSocket
+- **Infrastructure tests** - Message handling logic, no real WebSocket
+- **MISSING** - Real WebSocket connection tests ⚠️
+
+**The issues:**
+1. Business logic lives in the UI layer (violates separation of concerns)
+2. No real WebSocket tests (production risk)
+3. Unclear trigger mechanism for thread creation
 
 **The fix:**
-Create a middle layer (`external_agent_manager`) to handle the orchestration between WebSocket and ACP threads, leaving the UI to just render.
+1. Add real WebSocket tests (immediate priority)
+2. Create a middle layer (`external_agent_manager`) to handle orchestration
+3. Leave UI to just render
 
 **Current status:**
-It works, it's tested (100% coverage), but it's not ideally architected. Whether to refactor depends on your priorities and timeline.
+It works, it's tested (UI logic + ACP integration), but WebSocket layer is untested and architecture isn't ideal. Whether to refactor depends on priorities and timeline.

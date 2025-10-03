@@ -11,7 +11,7 @@ use std::collections::HashMap;
 use tokio::sync::mpsc;
 
 use crate::types::*;
-use crate::websocket_sync::{HelixCommand, WebSocketSync};
+use crate::websocket_sync::{ExternalWebSocketCommand, WebSocketSync};
 
 /// Test the core bidirectional message handling
 #[tokio::test]
@@ -25,7 +25,7 @@ async fn test_bidirectional_message_handling() -> Result<()> {
     println!("✅ Created test channels");
 
     // Simulate Helix sending a chat_message command
-    let helix_command = HelixCommand {
+    let helix_command = ExternalWebSocketCommand {
         command_type: "chat_message".to_string(),
         data: {
             let mut data = HashMap::default();
