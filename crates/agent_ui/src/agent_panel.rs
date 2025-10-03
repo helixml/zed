@@ -617,19 +617,25 @@ impl AgentPanel {
                     // Spawn headless listener task
                     cx.spawn(move |_panel_entity, mut cx| async move {
                         while let Some(request) = callback_rx.recv().await {
-                            log::info!("🎯 [HEADLESS] Received thread creation request: {}", request.request_id);
+                            log::info!("🎯 [HEADLESS] Received request: acp_thread_id={:?}, request_id={}",
+                                     request.acp_thread_id, request.request_id);
 
-                            // Create ACP thread in GPUI context (no window needed!)
-                            let result = panel_weak.update(&mut cx, |panel, cx| {
-                                panel.create_headless_acp_thread(
-                                    &request.message,
-                                    request.request_id.clone(),
-                                    cx
-                                )
-                            });
+                            if request.acp_thread_id.is_none() {
+                                // Create new ACP thread
+                                let result = panel_weak.update(&mut cx, |panel, cx| {
+                                    panel.create_headless_acp_thread(
+                                        &request.message,
+                                        request.request_id.clone(),
+                                        cx
+                                    )
+                                });
 
-                            if let Err(e) = result {
-                                log::error!("❌ [HEADLESS] Failed to create thread: {}", e);
+                                if let Err(e) = result {
+                                    log::error!("❌ [HEADLESS] Failed to create thread: {}", e);
+                                }
+                            } else {
+                                // TODO: Send message to existing thread
+                                log::warn!("Follow-up messages (existing thread) not yet implemented");
                             }
                         }
                     }).detach();

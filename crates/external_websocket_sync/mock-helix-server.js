@@ -1,11 +1,17 @@
 #!/usr/bin/env node
 
 /**
- * Mock Helix Server for Testing Zed Integration
- * 
- * This server simulates a Helix AI platform instance for testing
- * the bidirectional communication with Zed's helix_integration.
- * 
+ * Mock External System Server for Testing Zed WebSocket Protocol
+ *
+ * This server simulates an external system (like Helix) for testing
+ * Zed's WebSocket protocol implementation.
+ *
+ * Protocol (per WEBSOCKET_PROTOCOL_SPEC.md):
+ * - Receives: thread_created, message_added, message_completed from Zed
+ * - Sends: chat_message to Zed
+ * - Zed is stateless - only knows acp_thread_id
+ * - External system maintains session → acp_thread_id mapping
+ *
  * Features:
  * - HTTP API endpoints
  * - WebSocket real-time sync
@@ -319,13 +325,45 @@ wss.on('connection', (ws, req) => {
 });
 
 function handleWebSocketMessage(ws, clientId, message) {
-    const { event_type, type, data, session_id } = message;
-    const messageType = event_type || type;
-    
+    const messageType = message.type;
+    const data = message.data || message;
+
     switch (messageType) {
+        case 'thread_created':
+            console.log(`[WS] ✅ Thread created in Zed:`);
+            console.log(`     acp_thread_id: ${data.acp_thread_id}`);
+            console.log(`     request_id: ${data.request_id}`);
+
+            // External system would store this mapping:
+            // sessions[request_id].acp_thread_id = data.acp_thread_id
+
+            // Could send a follow-up message to the thread
+            // (not done here to keep test simple)
+            break;
+
+        case 'message_added':
+            console.log(`[WS] 📝 Message added (streaming):`);
+            console.log(`     acp_thread_id: ${data.acp_thread_id}`);
+            console.log(`     message_id: ${data.message_id}`);
+            console.log(`     content: ${data.content.substring(0, 50)}...`);
+
+            // External system updates its UI with streaming content
+            break;
+
+        case 'message_completed':
+            console.log(`[WS] ✅ Message completed:`);
+            console.log(`     acp_thread_id: ${data.acp_thread_id}`);
+            console.log(`     message_id: ${data.message_id}`);
+            console.log(`     request_id: ${data.request_id}`);
+
+            // External system marks interaction as complete
+            break;
+
         case 'context_created':
+            // Legacy event - deprecated
+            console.log(`[WS] ⚠️ Received legacy context_created event (deprecated)`);
             console.log(`[WS] Context created in Zed: ${data.context_id}`);
-            
+
             // Simulate adding a welcome message to the new context
             setTimeout(() => {
                 ws.send(JSON.stringify({
