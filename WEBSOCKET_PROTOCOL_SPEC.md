@@ -538,13 +538,86 @@ request_thread_creation(ThreadCreationRequest {
 
 ## Testing Checklist
 
-- [ ] New session creates REAL ACP thread (not fake ID)
-- [ ] `context_created` sent with REAL acp_thread_id from created thread
-- [ ] Follow-up message reuses existing context
-- [ ] NO second `context_created` for follow-ups
+- [ ] New message with acp_thread_id=null creates REAL ACP thread
+- [ ] `thread_created` sent with REAL acp_thread_id and request_id
+- [ ] Follow-up message with acp_thread_id reuses existing thread
+- [ ] NO second `thread_created` for follow-ups
 - [ ] Streaming works (multiple `message_added` with same `message_id`)
-- [ ] `message_completed` sent at end
-- [ ] `request_id` correctly echoed back
-- [ ] External session ID always preserved in responses
+- [ ] `message_completed` sent at end with acp_thread_id and request_id
+- [ ] `request_id` correctly echoed back in thread_created and message_completed
+- [ ] Zed NEVER sees or stores external session IDs
 - [ ] Works headlessly (no UI/panel required)
 - [ ] ACP threads persist to database correctly
+
+---
+
+## Implementation Status
+
+### ✅ Completed (2025-10-03)
+
+1. **Protocol Specification Updated**
+   - Removed all `helix_session_id` / external session ID references from Zed side
+   - Clarified that Zed is completely stateless - only knows acp_thread_id
+   - External system owns ALL session mapping (session → acp_thread_id)
+   - Updated message formats to match stateless design
+
+2. **Type System Simplified**
+   - `SyncEvent` enum reduced to 3 variants: ThreadCreated, MessageAdded, MessageCompleted
+   - All events use `acp_thread_id` only
+   - Removed `ExternalSessionMapping` and `ContextToHelixSessionMapping` globals
+   - Removed `helix_session_id` from `ThreadCreationRequest`
+   - Added `IncomingChatMessage` type for external → Zed messages
+
+### 🚧 In Progress
+
+3. **Code Refactoring** (CURRENT TASK)
+   - websocket_sync.rs needs complete rewrite to match protocol
+   - Remove all session mapping logic from Zed
+   - Simplify to just: receive chat_message → call callback → send events
+   - Current status: Types updated, code compilation broken (expected)
+
+### ⏳ Remaining Tasks
+
+4. **Fix websocket_sync.rs**
+   - Rewrite handle_incoming_message to only parse chat_message
+   - Remove all CreateThreadFromExternalSession event usage
+   - Simplify event sending (no session_id routing)
+   - Remove context-to-helix mapping lookups
+
+5. **Fix sync.rs and server.rs**
+   - Remove TimestampedSyncEvent references
+   - Update to use simplified SyncEvent enum
+   - May deprecate sync.rs entirely (not needed for WebSocket protocol)
+
+6. **Fix agent_panel.rs**
+   - Remove helix_session_id storage and mapping
+   - Update create_headless_acp_thread to not take helix_session_id
+   - Send thread_created with acp_thread_id + request_id only
+   - Send message_added and message_completed with acp_thread_id
+
+7. **Update Tests**
+   - Fix real_websocket_tests.rs to match new protocol
+   - Remove session_id from test messages
+   - Verify request_id correlation works
+   - Test that external system can map via request_id
+
+8. **Run Full Test Suite**
+   - Ensure all WebSocket tests pass
+   - Verify protocol compliance
+   - Test headless operation
+
+### 📝 Design Notes
+
+**Key Principle**: Zed knows NOTHING about external sessions. External system is responsible for:
+- Tracking which of its sessions initiated which request (via request_id)
+- Storing session → acp_thread_id mapping when it receives thread_created
+- Looking up acp_thread_id when sending follow-up messages
+- Routing incoming events (message_added, message_completed) to correct session using acp_thread_id
+
+**Zed's Job**: Simply a stateless agent executor:
+- Receive chat_message with optional acp_thread_id
+- Create thread if acp_thread_id is null, else use existing
+- Send thread_created (if new thread)
+- Stream response via message_added
+- Send message_completed when done
+- All events include acp_thread_id for external system to route
