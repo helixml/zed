@@ -1,5 +1,11 @@
 # External WebSocket Thread Sync for Zed Editor
 
+**Status**: ✅ FULLY IMPLEMENTED AND TESTED
+
+This crate provides a WebSocket protocol for external systems to control Zed's AI agent threads. The protocol is stateless - Zed only knows about `acp_thread_id`, and external systems maintain all session mapping.
+
+**See**: `/WEBSOCKET_PROTOCOL_SPEC.md` for the complete authoritative specification.
+
 This crate provides a generic system for synchronizing Zed editor conversation threads with external services via WebSocket connections, enabling real-time collaboration and integration with AI platforms and other external tools.
 
 ## Features
