@@ -59,7 +59,6 @@ impl Default for WebSocketSender {
 
 impl Global for WebSocketSender {}
 
-
 /// Static global for thread creation callback
 static GLOBAL_THREAD_CREATION_CALLBACK: parking_lot::Mutex<Option<mpsc::UnboundedSender<ThreadCreationRequest>>> =
     parking_lot::Mutex::new(None);

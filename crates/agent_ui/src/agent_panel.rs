@@ -81,6 +81,32 @@ use zed_actions::{
 
 const AGENT_PANEL_KEY: &str = "agent_panel";
 
+#[cfg(feature = "external_websocket_sync")]
+use parking_lot::RwLock as StdRwLock;
+#[cfg(feature = "external_websocket_sync")]
+use std::sync::Arc as StdArc;
+
+/// Global registry of active ACP threads for WebSocket integration
+#[cfg(feature = "external_websocket_sync")]
+static ACTIVE_THREADS: parking_lot::Mutex<Option<StdArc<StdRwLock<std::collections::HashMap<String, WeakEntity<acp_thread::AcpThread>>>>>> =
+    parking_lot::Mutex::new(None);
+
+#[cfg(feature = "external_websocket_sync")]
+fn register_thread(acp_thread_id: String, thread: WeakEntity<acp_thread::AcpThread>) {
+    let mut registry = ACTIVE_THREADS.lock();
+    if registry.is_none() {
+        *registry = Some(StdArc::new(StdRwLock::new(std::collections::HashMap::new())));
+    }
+    if let Some(reg) = registry.as_ref() {
+        reg.write().insert(acp_thread_id, thread);
+    }
+}
+
+#[cfg(feature = "external_websocket_sync")]
+fn get_thread(acp_thread_id: &str) -> Option<WeakEntity<acp_thread::AcpThread>> {
+    ACTIVE_THREADS.lock().as_ref()?.read().get(acp_thread_id).cloned()
+}
+
 #[derive(Serialize, Deserialize, Debug)]
 struct SerializedAgentPanel {
     width: Option<Pixels>,
@@ -620,7 +646,25 @@ impl AgentPanel {
                             log::info!("🎯 [HEADLESS] Received request: acp_thread_id={:?}, request_id={}",
                                      request.acp_thread_id, request.request_id);
 
-                            if request.acp_thread_id.is_none() {
+                            if let Some(acp_thread_id) = &request.acp_thread_id {
+                                // Follow-up message - send to existing thread
+                                log::info!("📬 [HEADLESS] Follow-up message to thread: {}", acp_thread_id);
+
+                                if let Some(thread) = get_thread(acp_thread_id) {
+                                    let message = request.message.clone();
+                                    let result = thread.update(&mut cx, |thread, cx| {
+                                        thread.run_user_prompt(message, cx)
+                                    });
+
+                                    if let Err(e) = result {
+                                        log::error!("❌ [HEADLESS] Failed to send message to thread: {}", e);
+                                    } else {
+                                        log::info!("✅ [HEADLESS] Sent follow-up message to thread");
+                                    }
+                                } else {
+                                    log::error!("❌ [HEADLESS] Thread not found: {}", acp_thread_id);
+                                }
+                            } else {
                                 // Create new ACP thread
                                 let result = panel_weak.update(&mut cx, |panel, cx| {
                                     panel.create_headless_acp_thread(
@@ -633,9 +677,6 @@ impl AgentPanel {
                                 if let Err(e) = result {
                                     log::error!("❌ [HEADLESS] Failed to create thread: {}", e);
                                 }
-                            } else {
-                                // TODO: Send message to existing thread
-                                log::warn!("Follow-up messages (existing thread) not yet implemented");
                             }
                         }
                     }).detach();
@@ -1129,6 +1170,9 @@ impl AgentPanel {
                         _ => {}
                     }
                 });
+
+                // Register thread for follow-up messages
+                register_thread(thread_id.clone(), thread.downgrade());
 
                 (thread_id, thread.clone(), subscription)
             })?;

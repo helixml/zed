@@ -205,4 +205,220 @@ mod tests {
 
         Ok(())
     }
+
+    #[tokio::test]
+    async fn test_follow_up_message_flow() -> Result<()> {
+        println!("\n🧪 Testing follow-up message flow (reusing existing thread)\n");
+
+        // 1. Start mock external system WebSocket server
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let addr = listener.local_addr()?;
+        println!("✅ Mock external system listening on {}", addr);
+
+        let (ext_to_zed_tx, mut ext_to_zed_rx) = mpsc::unbounded_channel::<String>();
+        let (zed_to_ext_tx, mut zed_to_ext_rx) = mpsc::unbounded_channel::<String>();
+
+        let zed_to_ext_tx_for_server = zed_to_ext_tx.clone();
+
+        // Spawn mock external system server
+        tokio::spawn(async move {
+            let zed_to_ext_tx = zed_to_ext_tx_for_server;
+            let (stream, _) = listener.accept().await.unwrap();
+            let ws_stream = accept_async(stream).await.unwrap();
+            let (mut write, mut read) = ws_stream.split();
+
+            let send_task = tokio::spawn(async move {
+                while let Some(msg) = ext_to_zed_rx.recv().await {
+                    write.send(Message::Text(msg.into())).await.unwrap();
+                }
+            });
+
+            let recv_task = tokio::spawn(async move {
+                while let Some(msg) = read.next().await {
+                    if let Ok(Message::Text(text)) = msg {
+                        zed_to_ext_tx.send(text.to_string()).unwrap();
+                    }
+                }
+            });
+
+            let _ = tokio::join!(send_task, recv_task);
+        });
+
+        // 2. Setup thread creation callback
+        let (callback_tx, mut callback_rx) = mpsc::unbounded_channel();
+        init_thread_creation_callback(callback_tx);
+
+        let zed_to_ext_tx_clone = zed_to_ext_tx.clone();
+
+        // Track the created thread ID
+        let (thread_id_tx, mut thread_id_rx) = mpsc::unbounded_channel::<String>();
+
+        // Spawn task to handle thread creation and messages
+        tokio::spawn(async move {
+            while let Some(request) = callback_rx.recv().await {
+                println!("🎯 Received request: acp_thread_id={:?}", request.acp_thread_id);
+
+                let acp_thread_id = if let Some(id) = request.acp_thread_id {
+                    println!("📬 Follow-up message to existing thread: {}", id);
+                    id
+                } else {
+                    let id = format!("acp-thread-{}", uuid::Uuid::new_v4());
+                    println!("🆕 Creating new thread: {}", id);
+
+                    // Send thread_created only for new threads
+                    let thread_created = SyncEvent::ThreadCreated {
+                        acp_thread_id: id.clone(),
+                        request_id: request.request_id.clone(),
+                    };
+                    zed_to_ext_tx_clone.send(serde_json::to_string(&thread_created).unwrap()).unwrap();
+                    println!("📤 Sent thread_created");
+
+                    // Notify test of the thread ID
+                    thread_id_tx.send(id.clone()).unwrap();
+
+                    id
+                };
+
+                // Simulate AI response (for both new and follow-up)
+                for i in 1..=2 {
+                    tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+
+                    let content = format!("Response {} to: {}", i, request.message);
+
+                    let message_added = SyncEvent::MessageAdded {
+                        acp_thread_id: acp_thread_id.clone(),
+                        message_id: format!("msg-{}", request.request_id),
+                        role: "assistant".to_string(),
+                        content: content.clone(),
+                        timestamp: chrono::Utc::now().timestamp(),
+                    };
+                    zed_to_ext_tx_clone.send(serde_json::to_string(&message_added).unwrap()).unwrap();
+                    println!("📤 Sent message_added: {}", content);
+                }
+
+                // Send message_completed
+                let message_completed = SyncEvent::MessageCompleted {
+                    acp_thread_id: acp_thread_id.clone(),
+                    message_id: format!("msg-{}", request.request_id),
+                    request_id: request.request_id.clone(),
+                };
+                zed_to_ext_tx_clone.send(serde_json::to_string(&message_completed).unwrap()).unwrap();
+                println!("📤 Sent message_completed");
+            }
+        });
+
+        // 3. Start Zed WebSocket client
+        let config = super::super::websocket_sync::WebSocketSyncConfig {
+            enabled: true,
+            url: format!("localhost:{}", addr.port()),
+            auth_token: String::new(),
+            use_tls: false,
+        };
+
+        let _service = super::super::websocket_sync::WebSocketSync::start(config).await?;
+        println!("✅ Zed WebSocket client connected");
+
+        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+
+        // 4. Send FIRST message (creates thread)
+        let first_message = json!({
+            "type": "chat_message",
+            "data": {
+                "acp_thread_id": null,
+                "message": "First message",
+                "request_id": "req-001"
+            }
+        });
+
+        ext_to_zed_tx.send(first_message.to_string())?;
+        println!("📤 External system sent first chat_message");
+
+        // 5. Get thread_created response and extract acp_thread_id
+        let thread_id = tokio::time::timeout(
+            tokio::time::Duration::from_secs(2),
+            thread_id_rx.recv()
+        ).await
+        .map_err(|_| anyhow::anyhow!("Timeout waiting for thread ID"))?
+        .ok_or_else(|| anyhow::anyhow!("No thread ID received"))?;
+
+        println!("✅ Received thread ID: {}", thread_id);
+
+        // Consume first batch of responses (including thread_created)
+        let mut first_batch = Vec::new();
+        for _ in 0..4 { // thread_created + 2 message_added + message_completed
+            if let Ok(Some(msg)) = tokio::time::timeout(
+                tokio::time::Duration::from_secs(1),
+                zed_to_ext_rx.recv()
+            ).await {
+                first_batch.push(msg);
+            }
+        }
+
+        println!("📥 Received {} messages from first interaction", first_batch.len());
+
+        // 6. Send FOLLOW-UP message (reuses thread)
+        tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
+
+        let followup_message = json!({
+            "type": "chat_message",
+            "data": {
+                "acp_thread_id": thread_id,
+                "message": "Follow-up question",
+                "request_id": "req-002"
+            }
+        });
+
+        ext_to_zed_tx.send(followup_message.to_string())?;
+        println!("📤 External system sent follow-up chat_message");
+
+        // 7. Collect follow-up responses
+        let mut followup_batch = Vec::new();
+        let timeout = tokio::time::timeout(
+            tokio::time::Duration::from_secs(2),
+            async {
+                for _ in 0..3 { // 2 message_added + message_completed
+                    if let Some(msg) = zed_to_ext_rx.recv().await {
+                        followup_batch.push(msg);
+                    }
+                }
+            }
+        );
+
+        timeout.await?;
+
+        println!("\n📥 Received {} follow-up messages:", followup_batch.len());
+        for (i, msg) in followup_batch.iter().enumerate() {
+            let parsed: serde_json::Value = serde_json::from_str(msg)?;
+            println!("  {}. {} - {}", i + 1, parsed["type"], parsed.get("content").and_then(|v| v.as_str()).unwrap_or(""));
+        }
+
+        // 8. Verify follow-up responses
+        assert_eq!(followup_batch.len(), 3, "Should receive 3 messages for follow-up");
+
+        let parsed: Vec<serde_json::Value> = followup_batch.iter()
+            .map(|r| serde_json::from_str(r).unwrap())
+            .collect();
+
+        // Check no second thread_created
+        for msg in &parsed {
+            assert_ne!(msg["type"], "thread_created", "Should NOT send thread_created for follow-up");
+        }
+
+        // Check message_added
+        assert_eq!(parsed[0]["type"], "message_added");
+        assert_eq!(parsed[0]["acp_thread_id"], thread_id);
+        assert!(parsed[0]["content"].as_str().unwrap().contains("Follow-up"));
+
+        // Check message_completed
+        assert_eq!(parsed[2]["type"], "message_completed");
+        assert_eq!(parsed[2]["acp_thread_id"], thread_id);
+        assert_eq!(parsed[2]["request_id"], "req-002");
+
+        println!("\n🎉 FOLLOW-UP MESSAGE TEST PASSED!");
+        println!("✅ Thread reused (same acp_thread_id)");
+        println!("✅ No second thread_created");
+        println!("✅ Responses correctly routed to same thread");
+
+        Ok(())
+    }
 }
