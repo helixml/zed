@@ -1,12 +1,17 @@
 /// Tests for ACP (Agent Client Protocol) external agent integration
-/// 
-/// These tests verify the functionality of creating ACP threads from external
-/// WebSocket messages, managing session mappings between Helix and ACP, and agent
-/// selection.
-/// 
+///
+/// NOTE: These tests are DISABLED because they test the OLD architecture
+/// with ExternalSessionMapping and ContextToHelixSessionMapping which have
+/// been removed per the new protocol spec (WEBSOCKET_PROTOCOL_SPEC.md).
+///
+/// The new architecture is stateless - Zed doesn't maintain session mappings.
+/// Protocol-level tests are in external_websocket_sync/src/protocol_test.rs
+///
+/// TODO: Rewrite these as integration tests for the new callback-based architecture
+///
 /// Run tests with: `./run_acp_tests.sh` (uses --test-threads=1 for reliability)
 /// Or: `cargo test --package agent_ui --lib --features external_websocket_sync -- agent_panel_tests --test-threads=1`
-#[cfg(all(test, feature = "external_websocket_sync"))]
+#[cfg(all(test, feature = "external_websocket_sync", feature = "DISABLED_OLD_ARCHITECTURE_TESTS"))]
 mod external_agent_tests {
     use crate::agent_panel::{ActiveView, AgentPanel, AgentType};
     use acp_thread::AcpThreadEvent;
@@ -14,9 +19,7 @@ mod external_agent_tests {
     use agent_settings::AgentSettings;
     use editor::EditorSettings;
     use external_websocket_sync_dep as external_websocket_sync;
-    use external_websocket_sync::{
-        ContextToHelixSessionMapping, ExternalSessionMapping, WebSocketSender,
-    };
+    use external_websocket_sync::WebSocketSender;
     use fs::{self, FakeFs};
     use gpui::{Entity, SemanticVersion, TestAppContext, VisualTestContext};
     use language;
