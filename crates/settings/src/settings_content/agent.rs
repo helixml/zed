@@ -113,6 +113,10 @@ pub struct AgentSettingsContent {
     ///
     /// Default: true
     pub show_onboarding: Option<bool>,
+    /// Whether to automatically open the agent panel when Zed launches.
+    ///
+    /// Default: false
+    pub auto_open_panel: Option<bool>,
 }
 
 impl AgentSettingsContent {

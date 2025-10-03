@@ -52,6 +52,7 @@ pub struct AgentSettings {
     pub use_modifier_to_send: bool,
     pub message_editor_min_lines: usize,
     pub show_onboarding: bool,
+    pub auto_open_panel: bool,
 }
 
 impl AgentSettings {
@@ -186,6 +187,7 @@ impl Settings for AgentSettings {
             use_modifier_to_send: agent.use_modifier_to_send.unwrap(),
             message_editor_min_lines: agent.message_editor_min_lines.unwrap(),
             show_onboarding: agent.show_onboarding.unwrap(),
+            auto_open_panel: agent.auto_open_panel.unwrap(),
         }
     }
 

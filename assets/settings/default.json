@@ -961,7 +961,11 @@
     // Whether to show the Zed Pro onboarding banner in the agent panel.
     //
     // Default: true
-    "show_onboarding": true
+    "show_onboarding": true,
+    // Whether to automatically open the agent panel when Zed launches.
+    //
+    // Default: false
+    "auto_open_panel": false
   },
   // Whether the screen sharing icon is shown in the os status bar.
   "show_call_status_icon": true,

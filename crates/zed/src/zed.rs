@@ -617,7 +617,12 @@ fn initialize_panels(
 
         workspace_handle.update_in(cx, |workspace, window, cx| {
             if let Some(agent_panel) = agent_panel {
-                workspace.add_panel(agent_panel, window, cx);
+                workspace.add_panel(agent_panel.clone(), window, cx);
+
+                // Auto-open agent panel if configured
+                if agent_settings::AgentSettings::get_global(cx).auto_open_panel {
+                    workspace.focus_panel::<agent_ui::AgentPanel>(window, cx);
+                }
             }
 
             // Register the actions that are shared between `assistant` and `assistant2`.
