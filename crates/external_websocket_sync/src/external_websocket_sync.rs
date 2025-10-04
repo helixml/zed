@@ -487,10 +487,25 @@ pub fn init(cx: &mut App) {
     // Create global WebSocket sender
     cx.set_global(WebSocketSender::default());
 
-    // WebSocket initialization now done via init_websocket_service()
-    // when needed (typically in tests or when configured)
+    // Check if WebSocket sync is enabled in settings
+    let settings = ExternalSyncSettings::get_global(cx);
+    if settings.enabled && settings.websocket_sync.enabled {
+        log::info!("🔌 [WEBSOCKET] WebSocket sync is enabled in settings - starting service");
+
+        let config = websocket_sync::WebSocketSyncConfig {
+            enabled: true,
+            url: settings.websocket_sync.external_url.clone(),
+            auth_token: settings.websocket_sync.auth_token.clone().unwrap_or_default(),
+            use_tls: settings.websocket_sync.use_tls,
+        };
+
+        websocket_sync::init_websocket_service(config);
+        log::info!("✅ [WEBSOCKET] WebSocket service started");
+    } else {
+        log::info!("⚠️  [WEBSOCKET] WebSocket sync disabled in settings");
+    }
+
     log::info!("External WebSocket sync module initialization completed");
-    log::info!("Use websocket_sync::init_websocket_service() to start WebSocket connection");
 }
 
 
