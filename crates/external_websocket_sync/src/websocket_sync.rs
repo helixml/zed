@@ -149,7 +149,7 @@ impl WebSocketSync {
 }
 
 /// Global WebSocket service instance
-static WEBSOCKET_SERVICE: parking_lot::Mutex<Option<Arc<WebSocketSync>>> =
+pub(crate) static WEBSOCKET_SERVICE: parking_lot::Mutex<Option<Arc<WebSocketSync>>> =
     parking_lot::Mutex::new(None);
 
 /// Initialize global WebSocket service

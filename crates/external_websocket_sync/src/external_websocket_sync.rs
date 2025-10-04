@@ -490,7 +490,7 @@ pub fn init(cx: &mut App) {
     // Check if WebSocket sync is enabled in settings
     let settings = ExternalSyncSettings::get_global(cx);
     if settings.enabled && settings.websocket_sync.enabled {
-        log::info!("🔌 [WEBSOCKET] WebSocket sync is enabled in settings - starting service");
+        log::info!("🔌 [WEBSOCKET] WebSocket sync is enabled in settings - will start service");
 
         let config = websocket_sync::WebSocketSyncConfig {
             enabled: true,
@@ -499,8 +499,22 @@ pub fn init(cx: &mut App) {
             use_tls: settings.websocket_sync.use_tls,
         };
 
-        websocket_sync::init_websocket_service(config);
-        log::info!("✅ [WEBSOCKET] WebSocket service started");
+        // Spawn async task to start WebSocket service
+        // (can't use tokio::spawn during init, must use GPUI executor)
+        cx.spawn(async move |_cx| {
+            match websocket_sync::WebSocketSync::start(config).await {
+                Ok(service) => {
+                    *websocket_sync::WEBSOCKET_SERVICE.lock() = Some(Arc::new(service));
+                    log::info!("✅ [WEBSOCKET] WebSocket service started successfully");
+                }
+                Err(e) => {
+                    log::error!("❌ [WEBSOCKET] Failed to start WebSocket service: {}", e);
+                }
+            }
+            anyhow::Ok(())
+        }).detach();
+
+        log::info!("✅ [WEBSOCKET] WebSocket service startup task spawned");
     } else {
         log::info!("⚠️  [WEBSOCKET] WebSocket sync disabled in settings");
     }
