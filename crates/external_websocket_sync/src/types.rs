@@ -156,10 +156,16 @@ pub struct McpServerConfig {
     pub env: HashMap<String, String>,
 }
 
+/// Wrapper for outgoing WebSocket messages that matches API's SyncMessage format
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct OutgoingMessage {
+    pub event_type: String,
+    pub data: serde_json::Value,
+}
+
 /// Events that Zed sends to external system via WebSocket
 /// Per WEBSOCKET_PROTOCOL_SPEC.md - Zed is stateless and only knows about acp_thread_id
 #[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(tag = "type")]
 pub enum SyncEvent {
     /// Sent when Zed creates a new ACP thread
     #[serde(rename = "thread_created")]
@@ -183,6 +189,41 @@ pub enum SyncEvent {
         message_id: String,
         request_id: String,
     },
+}
+
+impl SyncEvent {
+    /// Convert to OutgoingMessage format expected by API
+    pub fn to_outgoing_message(&self) -> Result<OutgoingMessage, serde_json::Error> {
+        let (event_type, data) = match self {
+            SyncEvent::ThreadCreated { acp_thread_id, request_id } => (
+                "thread_created".to_string(),
+                serde_json::json!({
+                    "acp_thread_id": acp_thread_id,
+                    "request_id": request_id,
+                })
+            ),
+            SyncEvent::MessageAdded { acp_thread_id, message_id, role, content, timestamp } => (
+                "message_added".to_string(),
+                serde_json::json!({
+                    "acp_thread_id": acp_thread_id,
+                    "message_id": message_id,
+                    "role": role,
+                    "content": content,
+                    "timestamp": timestamp,
+                })
+            ),
+            SyncEvent::MessageCompleted { acp_thread_id, message_id, request_id } => (
+                "message_completed".to_string(),
+                serde_json::json!({
+                    "acp_thread_id": acp_thread_id,
+                    "message_id": message_id,
+                    "request_id": request_id,
+                })
+            ),
+        };
+
+        Ok(OutgoingMessage { event_type, data })
+    }
 }
 
 /// Incoming command from external system to Zed

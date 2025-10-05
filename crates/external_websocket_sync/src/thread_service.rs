@@ -71,9 +71,15 @@ pub fn setup_thread_handler(
 
     // Spawn handler task to process thread creation requests
     cx.spawn(async move |cx| {
+        eprintln!("🔧 [THREAD_SERVICE] Handler task started, waiting for requests...");
         log::info!("🔧 [THREAD_SERVICE] Handler task started, waiting for requests...");
 
         while let Some(request) = callback_rx.recv().await {
+            eprintln!(
+                "📨 [THREAD_SERVICE] Received thread creation request: acp_thread_id={:?}, request_id={}",
+                request.acp_thread_id,
+                request.request_id
+            );
             log::info!(
                 "📨 [THREAD_SERVICE] Received thread creation request: acp_thread_id={:?}, request_id={}",
                 request.acp_thread_id,
@@ -83,15 +89,24 @@ pub fn setup_thread_handler(
             // Check if this is a follow-up message to existing thread
             if let Some(existing_thread_id) = &request.acp_thread_id {
                 if let Some(thread) = get_thread(existing_thread_id) {
+                    eprintln!(
+                        "🔄 [THREAD_SERVICE] Sending to existing thread: {}",
+                        existing_thread_id
+                    );
                     log::info!(
                         "🔄 [THREAD_SERVICE] Sending to existing thread: {}",
                         existing_thread_id
                     );
                     if let Err(e) = handle_follow_up_message(thread, request.message, cx.clone()).await {
+                        eprintln!("❌ [THREAD_SERVICE] Failed to send follow-up message: {}", e);
                         log::error!("❌ [THREAD_SERVICE] Failed to send follow-up message: {}", e);
                     }
                     continue;
                 }
+                eprintln!(
+                    "⚠️ [THREAD_SERVICE] Thread {} not found, creating new thread",
+                    existing_thread_id
+                );
                 log::warn!(
                     "⚠️ [THREAD_SERVICE] Thread {} not found, creating new thread",
                     existing_thread_id
@@ -99,6 +114,7 @@ pub fn setup_thread_handler(
             }
 
             // Create new ACP thread (synchronously via cx.update to avoid async context issues)
+            eprintln!("🆕 [THREAD_SERVICE] Creating new ACP thread for request: {}", request.request_id);
             log::info!("🆕 [THREAD_SERVICE] Creating new ACP thread for request: {}", request.request_id);
             if let Err(e) = cx.update(|cx| {
                 create_new_thread_sync(
@@ -129,6 +145,7 @@ fn create_new_thread_sync(
     request: ThreadCreationRequest,
     cx: &mut App,
 ) -> Result<()> {
+    eprintln!("🔨 [THREAD_SERVICE] Creating ACP thread...");
     log::info!("🔨 [THREAD_SERVICE] Creating ACP thread...");
 
     // Create agent server
@@ -158,35 +175,27 @@ fn create_new_thread_sync(
             .log_err()
             .ok_or_else(|| anyhow::anyhow!("Failed to connect to agent"))?;
 
+        eprintln!("✅ [THREAD_SERVICE] Connected to agent server");
         log::info!("✅ [THREAD_SERVICE] Connected to agent server");
 
-        // Create ACP thread entity
-        let (acp_thread_id, thread_entity, action_log_entity) = cx.update(|cx| {
-            // Create action log entity
-            let action_log = cx.new(|_| ActionLog::new(project_clone.clone()));
-            let (_, prompt_caps_rx) = watch::channel(PromptCapabilities::default());
-
-            // Create thread entity
-            let thread = cx.new(|cx| {
-                acp_thread::AcpThread::new(
-                    gpui::SharedString::from("External Agent Session"),
-                    connection.clone(),
-                    project_clone.clone(),
-                    action_log.clone(),
-                    SessionId(Arc::from(uuid::Uuid::new_v4().to_string())),
-                    prompt_caps_rx.clone(),
-                    cx,
-                )
-            });
-
-            let thread_id = thread.entity_id().to_string();
-            log::info!("✅ [THREAD_SERVICE] Created ACP thread: {}", thread_id);
-
-            (thread_id, thread, action_log)
+        // Create thread using connection's new_thread method (properly registers session)
+        eprintln!("🔨 [THREAD_SERVICE] Calling connection.new_thread()...");
+        let cwd = std::path::Path::new("/workspace");
+        let thread_creation_task = cx.update(|cx| {
+            connection.new_thread(project_clone.clone(), cwd, cx)
         })?;
 
-        // Keep action_log entity alive for the thread's lifetime
-        let _action_log_keep_alive = action_log_entity;
+        let thread_entity = thread_creation_task.await?;
+
+        let acp_thread_id = cx.update(|cx| {
+            let thread_id = thread_entity.entity_id().to_string();
+            eprintln!("✅ [THREAD_SERVICE] Created ACP thread: {}", thread_id);
+            log::info!("✅ [THREAD_SERVICE] Created ACP thread: {}", thread_id);
+            thread_id
+        })?;
+
+        // Keep thread entity alive for the duration of this task
+        let _thread_keep_alive = thread_entity.clone();
 
         // Subscribe to thread events for streaming responses
         let thread_id_for_events = acp_thread_id.clone();
@@ -195,6 +204,7 @@ fn create_new_thread_sync(
             cx.subscribe(&thread_entity, move |thread_entity, event, cx| {
                 match event {
                     AcpThreadEvent::EntryUpdated(entry_idx) => {
+                        eprintln!("🔔 [THREAD_SERVICE] EntryUpdated event received for entry {}", entry_idx);
                         // Get the updated content
                         let thread = thread_entity.read(cx);
                         if let Some(entry) = thread.entries().get(*entry_idx) {
@@ -203,7 +213,10 @@ fn create_new_thread_sync(
                                 acp_thread::AgentThreadEntry::AssistantMessage(msg) => {
                                     msg.to_markdown(cx)
                                 }
-                                _ => return, // Only send events for assistant messages
+                                _ => {
+                                    eprintln!("⚠️ [THREAD_SERVICE] Entry {} is not an AssistantMessage, skipping", entry_idx);
+                                    return; // Only send events for assistant messages
+                                }
                             };
 
                             // Send message_added event
@@ -211,18 +224,21 @@ fn create_new_thread_sync(
                                 acp_thread_id: thread_id_for_events.clone(),
                                 message_id: entry_idx.to_string(),
                                 role: "assistant".to_string(),
-                                content,
+                                content: content.clone(),
                                 timestamp: chrono::Utc::now().timestamp(),
                             };
 
                             if let Err(e) = crate::send_websocket_event(event) {
+                                eprintln!("❌ [THREAD_SERVICE] Failed to send message_added: {}", e);
                                 log::error!("❌ [THREAD_SERVICE] Failed to send message_added: {}", e);
                             } else {
+                                eprintln!("📤 [THREAD_SERVICE] Sent message_added chunk (entry {}): {} chars", entry_idx, content.len());
                                 log::debug!("📤 [THREAD_SERVICE] Sent message_added chunk (entry {})", entry_idx);
                             }
                         }
                     }
                     AcpThreadEvent::Stopped => {
+                        eprintln!("🛑 [THREAD_SERVICE] Thread Stopped event received");
                         // Send message_completed event
                         let event = SyncEvent::MessageCompleted {
                             acp_thread_id: thread_id_for_events.clone(),
@@ -231,8 +247,10 @@ fn create_new_thread_sync(
                         };
 
                         if let Err(e) = crate::send_websocket_event(event) {
+                            eprintln!("❌ [THREAD_SERVICE] Failed to send message_completed: {}", e);
                             log::error!("❌ [THREAD_SERVICE] Failed to send message_completed: {}", e);
                         } else {
+                            eprintln!("📤 [THREAD_SERVICE] Sent message_completed for request: {}", request_id_for_events);
                             log::info!("📤 [THREAD_SERVICE] Sent message_completed for request: {}", request_id_for_events);
                         }
                     }
@@ -244,6 +262,7 @@ fn create_new_thread_sync(
 
         // Register thread for follow-up messages
         register_thread(acp_thread_id.clone(), thread_entity.downgrade());
+        eprintln!("📋 [THREAD_SERVICE] Registered thread: {}", acp_thread_id);
         log::info!("📋 [THREAD_SERVICE] Registered thread: {}", acp_thread_id);
 
         // Send thread_created event via WebSocket
@@ -253,29 +272,45 @@ fn create_new_thread_sync(
         };
 
         if let Err(e) = crate::send_websocket_event(thread_created_event) {
+            eprintln!("❌ [THREAD_SERVICE] Failed to send thread_created event: {}", e);
             log::error!("❌ [THREAD_SERVICE] Failed to send thread_created event: {}", e);
         } else {
+            eprintln!("📤 [THREAD_SERVICE] Sent thread_created: {}", acp_thread_id);
             log::info!("📤 [THREAD_SERVICE] Sent thread_created: {}", acp_thread_id);
         }
 
         // Send the initial message to the thread to trigger AI response
-        cx.update(|cx| {
+        eprintln!("🔧 [THREAD_SERVICE] About to send message to thread...");
+        let send_task = cx.update(|cx| {
+            eprintln!("🔧 [THREAD_SERVICE] Updating thread entity to send message...");
             let send_task = thread_entity.update(cx, |thread, cx| {
                 let message = vec![ContentBlock::Text(TextContent {
                     text: request_clone.message.clone(),
                     annotations: None,
                     meta: None,
                 })];
+                eprintln!("🔧 [THREAD_SERVICE] Calling thread.send() with message: {}", request_clone.message);
                 thread.send(message, cx)
             });
-            // Spawn the send task
-            cx.spawn(async move |_| {
-                send_task.await.log_err();
-                anyhow::Ok(())
-            }).detach();
+            eprintln!("✅ [THREAD_SERVICE] thread.send() returned Task");
+            send_task
         })?;
 
-        log::info!("✅ [THREAD_SERVICE] Sent initial message to thread - AI should start responding");
+        // Await the send task directly (don't spawn and detach)
+        eprintln!("🔧 [THREAD_SERVICE] Awaiting send task...");
+        match send_task.await {
+            Ok(_) => {
+                eprintln!("✅ [THREAD_SERVICE] Send task completed successfully - message sent to AI");
+                log::info!("✅ [THREAD_SERVICE] Send task completed successfully");
+            }
+            Err(e) => {
+                eprintln!("❌ [THREAD_SERVICE] Send task failed: {}", e);
+                log::error!("❌ [THREAD_SERVICE] Send task failed: {}", e);
+            }
+        }
+
+        eprintln!("✅ [THREAD_SERVICE] Message send awaited - AI should be responding");
+        log::info!("✅ [THREAD_SERVICE] Message send awaited - AI should be responding");
 
         anyhow::Ok(())
     }).detach();
