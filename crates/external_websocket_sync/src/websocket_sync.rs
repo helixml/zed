@@ -239,8 +239,16 @@ impl WebSocketSync {
             data: IncomingChatMessage,
         }
 
-        let command: Command = serde_json::from_str(text)
-            .context("Failed to parse incoming message")?;
+        let command: Command = match serde_json::from_str(text) {
+            Ok(cmd) => cmd,
+            Err(e) => {
+                eprintln!("❌ [WEBSOCKET-IN] Failed to parse incoming message: {}", e);
+                log::error!("❌ [WEBSOCKET-IN] Failed to parse incoming message: {}", e);
+                eprintln!("❌ [WEBSOCKET-IN] Raw message was: {}", text);
+                log::error!("❌ [WEBSOCKET-IN] Raw message was: {}", text);
+                return Err(anyhow::anyhow!("Failed to parse incoming message: {}", e));
+            }
+        };
         eprintln!("✅ [WEBSOCKET-IN] Parsed command type: {}", command.command_type);
         log::info!("✅ [WEBSOCKET-IN] Parsed command type: {}", command.command_type);
 

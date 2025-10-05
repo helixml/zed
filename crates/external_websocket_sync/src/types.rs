@@ -233,6 +233,10 @@ pub struct IncomingChatMessage {
     pub acp_thread_id: Option<String>,  // null = create new thread, Some(id) = use existing
     pub message: String,
     pub request_id: String,
+    #[serde(default)]
+    pub role: Option<String>,  // Optional role field from API (can be ignored)
+    #[serde(default)]
+    pub session_id: Option<String>,  // Optional session_id field from API (can be ignored)
 }
 
 /// Response for health check endpoint

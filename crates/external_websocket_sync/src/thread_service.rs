@@ -88,7 +88,14 @@ pub fn setup_thread_handler(
 
             // Check if this is a follow-up message to existing thread
             if let Some(existing_thread_id) = &request.acp_thread_id {
-                if let Some(thread) = get_thread(existing_thread_id) {
+                eprintln!("🔍 [THREAD_SERVICE] Checking for existing thread: '{}'", existing_thread_id);
+                log::info!("🔍 [THREAD_SERVICE] Checking for existing thread: '{}'", existing_thread_id);
+
+                // Skip empty string thread IDs (these are new thread requests)
+                if existing_thread_id.is_empty() {
+                    eprintln!("⚠️ [THREAD_SERVICE] Empty thread ID, creating new thread");
+                    log::warn!("⚠️ [THREAD_SERVICE] Empty thread ID, creating new thread");
+                } else if let Some(thread) = get_thread(existing_thread_id) {
                     eprintln!(
                         "🔄 [THREAD_SERVICE] Sending to existing thread: {}",
                         existing_thread_id
@@ -102,15 +109,16 @@ pub fn setup_thread_handler(
                         log::error!("❌ [THREAD_SERVICE] Failed to send follow-up message: {}", e);
                     }
                     continue;
+                } else {
+                    eprintln!(
+                        "⚠️ [THREAD_SERVICE] Thread {} not found, creating new thread",
+                        existing_thread_id
+                    );
+                    log::warn!(
+                        "⚠️ [THREAD_SERVICE] Thread {} not found, creating new thread",
+                        existing_thread_id
+                    );
                 }
-                eprintln!(
-                    "⚠️ [THREAD_SERVICE] Thread {} not found, creating new thread",
-                    existing_thread_id
-                );
-                log::warn!(
-                    "⚠️ [THREAD_SERVICE] Thread {} not found, creating new thread",
-                    existing_thread_id
-                );
             }
 
             // Create new ACP thread (synchronously via cx.update to avoid async context issues)
