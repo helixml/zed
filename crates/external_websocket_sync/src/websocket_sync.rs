@@ -154,16 +154,28 @@ pub(crate) static WEBSOCKET_SERVICE: parking_lot::Mutex<Option<Arc<WebSocketSync
 
 /// Initialize global WebSocket service
 pub fn init_websocket_service(config: WebSocketSyncConfig) {
-    tokio::spawn(async move {
-        match WebSocketSync::start(config).await {
-            Ok(service) => {
-                *WEBSOCKET_SERVICE.lock() = Some(Arc::new(service));
-                log::info!("✅ WebSocket service initialized");
+    // WebSocket uses tokio_tungstenite which requires Tokio runtime
+    // Create a dedicated runtime for the WebSocket service
+    std::thread::spawn(move || {
+        let rt = tokio::runtime::Runtime::new().expect("Failed to create Tokio runtime for WebSocket");
+
+        rt.block_on(async move {
+            log::info!("🔌 [WEBSOCKET] Starting WebSocket service with Tokio runtime");
+
+            match WebSocketSync::start(config).await {
+                Ok(service) => {
+                    *WEBSOCKET_SERVICE.lock() = Some(Arc::new(service));
+                    log::info!("✅ [WEBSOCKET] WebSocket service initialized successfully");
+                }
+                Err(e) => {
+                    log::error!("❌ [WEBSOCKET] Failed to start WebSocket service: {}", e);
+                }
             }
-            Err(e) => {
-                log::error!("❌ Failed to start WebSocket service: {}", e);
-            }
-        }
+
+            // Keep runtime alive
+            log::info!("🔌 [WEBSOCKET] WebSocket runtime active");
+            std::future::pending::<()>().await;
+        });
     });
 }
 

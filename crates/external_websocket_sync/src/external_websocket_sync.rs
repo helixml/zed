@@ -487,34 +487,21 @@ pub fn init(cx: &mut App) {
     // Create global WebSocket sender
     cx.set_global(WebSocketSender::default());
 
-    // Check if WebSocket sync is enabled in settings
+    // TODO: Auto-start WebSocket service when enabled
+    // Currently disabled because tokio_tungstenite requires Tokio runtime
+    // which isn't available during GPUI init. Need to either:
+    // 1. Use smol-based WebSocket library (compatible with GPUI), or
+    // 2. Create Tokio runtime wrapper, or
+    // 3. Start WebSocket from workspace creation (has executor context)
+    //
+    // For now: WebSocket must be started manually via init_websocket_service()
+    // or will be started when first workspace is created (if we add that)
+
     let settings = ExternalSyncSettings::get_global(cx);
     if settings.enabled && settings.websocket_sync.enabled {
-        log::info!("🔌 [WEBSOCKET] WebSocket sync is enabled in settings - will start service");
-
-        let config = websocket_sync::WebSocketSyncConfig {
-            enabled: true,
-            url: settings.websocket_sync.external_url.clone(),
-            auth_token: settings.websocket_sync.auth_token.clone().unwrap_or_default(),
-            use_tls: settings.websocket_sync.use_tls,
-        };
-
-        // Spawn async task to start WebSocket service
-        // (can't use tokio::spawn during init, must use GPUI executor)
-        cx.spawn(async move |_cx| {
-            match websocket_sync::WebSocketSync::start(config).await {
-                Ok(service) => {
-                    *websocket_sync::WEBSOCKET_SERVICE.lock() = Some(Arc::new(service));
-                    log::info!("✅ [WEBSOCKET] WebSocket service started successfully");
-                }
-                Err(e) => {
-                    log::error!("❌ [WEBSOCKET] Failed to start WebSocket service: {}", e);
-                }
-            }
-            anyhow::Ok(())
-        }).detach();
-
-        log::info!("✅ [WEBSOCKET] WebSocket service startup task spawned");
+        log::warn!("⚠️  [WEBSOCKET] WebSocket sync enabled in settings but auto-start not yet supported");
+        log::warn!("⚠️  [WEBSOCKET] WebSocket requires Tokio runtime - incompatible with GPUI init");
+        log::warn!("⚠️  [WEBSOCKET] Will start when workspace is created (has executor)");
     } else {
         log::info!("⚠️  [WEBSOCKET] WebSocket sync disabled in settings");
     }

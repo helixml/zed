@@ -634,6 +634,25 @@ fn initialize_panels(
                         cx
                     );
                     log::info!("✅ [ZED] WebSocket thread handler initialized");
+
+                    // Start WebSocket service if enabled in settings
+                    use external_websocket_sync::ExternalSyncSettings;
+                    use settings::Settings;
+
+                    let settings = ExternalSyncSettings::get_global(cx);
+                    if settings.enabled && settings.websocket_sync.enabled {
+                        log::info!("🔌 [ZED] WebSocket sync enabled - starting service");
+
+                        let config = external_websocket_sync::WebSocketSyncConfig {
+                            enabled: true,
+                            url: settings.websocket_sync.external_url.clone(),
+                            auth_token: settings.websocket_sync.auth_token.clone().unwrap_or_default(),
+                            use_tls: settings.websocket_sync.use_tls,
+                        };
+
+                        external_websocket_sync::init_websocket_service(config);
+                        log::info!("✅ [ZED] WebSocket service started");
+                    }
                 }
             }
 
