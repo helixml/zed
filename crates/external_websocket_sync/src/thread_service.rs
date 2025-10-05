@@ -21,7 +21,8 @@ use watch;
 use crate::{ExternalAgent, ThreadCreationRequest, SyncEvent};
 
 /// Global registry of active ACP threads (service layer)
-static THREAD_REGISTRY: parking_lot::Mutex<Option<Arc<RwLock<HashMap<String, WeakEntity<AcpThread>>>>>> =
+/// Stores STRONG references to keep threads alive for follow-up messages
+static THREAD_REGISTRY: parking_lot::Mutex<Option<Arc<RwLock<HashMap<String, Entity<AcpThread>>>>>> =
     parking_lot::Mutex::new(None);
 
 /// Initialize the thread registry
@@ -32,8 +33,8 @@ pub fn init_thread_registry() {
     }
 }
 
-/// Register an active thread
-pub fn register_thread(acp_thread_id: String, thread: WeakEntity<AcpThread>) {
+/// Register an active thread (stores strong reference to keep thread alive)
+pub fn register_thread(acp_thread_id: String, thread: Entity<AcpThread>) {
     init_thread_registry();
     let registry = THREAD_REGISTRY.lock();
     if let Some(reg) = registry.as_ref() {
@@ -41,10 +42,10 @@ pub fn register_thread(acp_thread_id: String, thread: WeakEntity<AcpThread>) {
     }
 }
 
-/// Get an active thread
+/// Get an active thread as weak reference
 pub fn get_thread(acp_thread_id: &str) -> Option<WeakEntity<AcpThread>> {
     let registry = THREAD_REGISTRY.lock();
-    registry.as_ref()?.read().get(acp_thread_id).cloned()
+    registry.as_ref()?.read().get(acp_thread_id).map(|e| e.downgrade())
 }
 
 /// Setup WebSocket thread handler for a workspace
@@ -268,10 +269,10 @@ fn create_new_thread_sync(
             .detach();
         })?;
 
-        // Register thread for follow-up messages
-        register_thread(acp_thread_id.clone(), thread_entity.downgrade());
-        eprintln!("📋 [THREAD_SERVICE] Registered thread: {}", acp_thread_id);
-        log::info!("📋 [THREAD_SERVICE] Registered thread: {}", acp_thread_id);
+        // Register thread for follow-up messages (strong reference keeps it alive)
+        register_thread(acp_thread_id.clone(), thread_entity.clone());
+        eprintln!("📋 [THREAD_SERVICE] Registered thread: {} (strong reference)", acp_thread_id);
+        log::info!("📋 [THREAD_SERVICE] Registered thread: {} (strong reference)", acp_thread_id);
 
         // Send thread_created event via WebSocket
         let thread_created_event = SyncEvent::ThreadCreated {
