@@ -627,6 +627,8 @@ fn initialize_panels(
                 // Setup WebSocket thread handler (service layer, not UI)
                 #[cfg(feature = "external_websocket_sync")]
                 {
+                    log::info!("🔧 [ZED] Setting up WebSocket integration...");
+
                     external_websocket_sync::setup_thread_handler(
                         workspace.project().clone(),
                         agent_panel.read(cx).acp_history_store().clone(),
@@ -639,9 +641,13 @@ fn initialize_panels(
                     use external_websocket_sync::ExternalSyncSettings;
                     use settings::Settings;
 
+                    log::info!("🔧 [ZED] Checking WebSocket settings...");
                     let settings = ExternalSyncSettings::get_global(cx);
+                    log::info!("🔧 [ZED] Settings: enabled={}, websocket.enabled={}, url={}",
+                              settings.enabled, settings.websocket_sync.enabled, settings.websocket_sync.external_url);
+
                     if settings.enabled && settings.websocket_sync.enabled {
-                        log::info!("🔌 [ZED] WebSocket sync enabled - starting service");
+                        log::info!("🔌 [ZED] WebSocket sync ENABLED - starting service");
 
                         let config = external_websocket_sync::WebSocketSyncConfig {
                             enabled: true,
@@ -650,9 +656,14 @@ fn initialize_panels(
                             use_tls: settings.websocket_sync.use_tls,
                         };
 
+                        log::info!("🔌 [ZED] Calling init_websocket_service()...");
                         external_websocket_sync::init_websocket_service(config);
-                        log::info!("✅ [ZED] WebSocket service started");
+                        log::info!("✅ [ZED] WebSocket service init call completed");
+                    } else {
+                        log::warn!("⚠️  [ZED] WebSocket sync DISABLED in settings");
                     }
+
+                    log::info!("✅ [ZED] WebSocket integration setup complete");
                 }
             }
 

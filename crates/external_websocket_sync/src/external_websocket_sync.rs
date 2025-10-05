@@ -84,17 +84,31 @@ impl Global for ThreadCreationCallback {}
 
 /// Send thread creation request to agent_panel via callback
 pub fn request_thread_creation(request: ThreadCreationRequest) -> Result<()> {
-    if let Some(sender) = GLOBAL_THREAD_CREATION_CALLBACK.lock().clone() {
+    log::info!("🔧 [CALLBACK] request_thread_creation() called: acp_thread_id={:?}, request_id={}",
+               request.acp_thread_id, request.request_id);
+
+    let sender = GLOBAL_THREAD_CREATION_CALLBACK.lock().clone();
+    if let Some(sender) = sender {
+        log::info!("✅ [CALLBACK] Found global callback sender, sending request...");
         sender.send(request)
-            .map_err(|_| anyhow::anyhow!("Failed to send thread creation request"))
+            .map_err(|e| {
+                log::error!("❌ [CALLBACK] Failed to send to channel: {:?}", e);
+                anyhow::anyhow!("Failed to send thread creation request")
+            })?;
+        log::info!("✅ [CALLBACK] Request sent to callback channel successfully");
+        Ok(())
     } else {
+        log::error!("❌ [CALLBACK] Thread creation callback not initialized!");
+        log::error!("❌ [CALLBACK] This means setup_thread_handler() was never called");
         Err(anyhow::anyhow!("Thread creation callback not initialized"))
     }
 }
 
-/// Initialize the global callback sender (called from agent_panel or tests)
+/// Initialize the global callback sender (called from thread_service or tests)
 pub fn init_thread_creation_callback(sender: mpsc::UnboundedSender<ThreadCreationRequest>) {
+    log::info!("🔧 [CALLBACK] init_thread_creation_callback() called - registering global callback");
     *GLOBAL_THREAD_CREATION_CALLBACK.lock() = Some(sender);
+    log::info!("✅ [CALLBACK] Global thread creation callback registered");
 }
 
 /// Type alias for compatibility with existing code
