@@ -607,6 +607,20 @@ impl NativeAgent {
         id: acp::SessionId,
         cx: &mut Context<Self>,
     ) -> Task<Result<Entity<AcpThread>>> {
+        // CRITICAL: Check if thread is already loaded in memory before loading from database
+        // This prevents duplicate thread creation when WebSocket creates headless thread
+        // and UI tries to view it before database save completes
+        if let Some(session) = self.sessions.get(&id) {
+            if let Some(acp_thread) = session.acp_thread.upgrade() {
+                eprintln!("🔄 [AGENT] open_thread: Found existing session for {}, returning it", id);
+                log::info!("🔄 [AGENT] open_thread: Found existing session for {}, returning it", id);
+                return Task::ready(Ok(acp_thread));
+            }
+        }
+
+        eprintln!("📂 [AGENT] open_thread: No existing session for {}, loading from database", id);
+        log::info!("📂 [AGENT] open_thread: No existing session for {}, loading from database", id);
+
         let database_future = ThreadsDatabase::connect(cx);
         cx.spawn(async move |this, cx| {
             let database = database_future.await.map_err(|err| anyhow!(err))?;

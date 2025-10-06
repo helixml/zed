@@ -8,7 +8,7 @@ use acp_thread::{AcpThread, AcpThreadEvent};
 use action_log::ActionLog;
 use agent2::HistoryStore;
 use agent_client_protocol::{ContentBlock, PromptCapabilities, SessionId, TextContent};
-use gpui::{App, Entity, WeakEntity, prelude::*};
+use gpui::{App, Entity, EventEmitter, WeakEntity, prelude::*};
 use parking_lot::RwLock;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -25,12 +25,38 @@ use crate::{ExternalAgent, ThreadCreationRequest, SyncEvent};
 static THREAD_REGISTRY: parking_lot::Mutex<Option<Arc<RwLock<HashMap<String, Entity<AcpThread>>>>>> =
     parking_lot::Mutex::new(None);
 
+/// Global map of thread_id -> current_request_id
+/// Tracks the request_id for the CURRENT/LATEST message being processed by each thread
+/// This ensures message_completed events use the correct request_id (not the first one)
+static THREAD_REQUEST_MAP: parking_lot::Mutex<Option<Arc<RwLock<HashMap<String, String>>>>> =
+    parking_lot::Mutex::new(None);
+
 /// Initialize the thread registry
 pub fn init_thread_registry() {
     let mut registry = THREAD_REGISTRY.lock();
     if registry.is_none() {
         *registry = Some(Arc::new(RwLock::new(HashMap::new())));
     }
+
+    let mut request_map = THREAD_REQUEST_MAP.lock();
+    if request_map.is_none() {
+        *request_map = Some(Arc::new(RwLock::new(HashMap::new())));
+    }
+}
+
+/// Set the current request_id for a thread (used when sending new message to thread)
+pub fn set_thread_request_id(acp_thread_id: String, request_id: String) {
+    init_thread_registry();
+    let map = THREAD_REQUEST_MAP.lock();
+    if let Some(m) = map.as_ref() {
+        m.write().insert(acp_thread_id, request_id);
+    }
+}
+
+/// Get the current request_id for a thread
+pub fn get_thread_request_id(acp_thread_id: &str) -> Option<String> {
+    let map = THREAD_REQUEST_MAP.lock();
+    map.as_ref()?.read().get(acp_thread_id).cloned()
 }
 
 /// Register an active thread (stores strong reference to keep thread alive)
@@ -105,7 +131,13 @@ pub fn setup_thread_handler(
                         "🔄 [THREAD_SERVICE] Sending to existing thread: {}",
                         existing_thread_id
                     );
-                    if let Err(e) = handle_follow_up_message(thread, request.message, cx.clone()).await {
+                    if let Err(e) = handle_follow_up_message(
+                        thread,
+                        existing_thread_id.clone(),
+                        request.request_id.clone(),
+                        request.message,
+                        cx.clone()
+                    ).await {
                         eprintln!("❌ [THREAD_SERVICE] Failed to send follow-up message: {}", e);
                         log::error!("❌ [THREAD_SERVICE] Failed to send follow-up message: {}", e);
                     }
@@ -206,9 +238,11 @@ fn create_new_thread_sync(
         // Keep thread entity alive for the duration of this task
         let _thread_keep_alive = thread_entity.clone();
 
+        // Store the current request_id for this thread (so message_completed uses correct ID)
+        set_thread_request_id(acp_thread_id.clone(), request_clone.request_id.clone());
+
         // Subscribe to thread events for streaming responses
         let thread_id_for_events = acp_thread_id.clone();
-        let request_id_for_events = request_clone.request_id.clone();
         cx.update(|cx| {
             cx.subscribe(&thread_entity, move |thread_entity, event, cx| {
                 match event {
@@ -248,19 +282,27 @@ fn create_new_thread_sync(
                     }
                     AcpThreadEvent::Stopped => {
                         eprintln!("🛑 [THREAD_SERVICE] Thread Stopped event received");
-                        // Send message_completed event
+
+                        // Get the CURRENT request_id for this thread (not the first one!)
+                        let current_request_id = get_thread_request_id(&thread_id_for_events)
+                            .unwrap_or_else(|| {
+                                eprintln!("⚠️ [THREAD_SERVICE] No request_id found for thread {}, using empty string", thread_id_for_events);
+                                String::new()
+                            });
+
+                        // Send message_completed event with CORRECT request_id
                         let event = SyncEvent::MessageCompleted {
                             acp_thread_id: thread_id_for_events.clone(),
                             message_id: "0".to_string(), // TODO: track actual message ID
-                            request_id: request_id_for_events.clone(),
+                            request_id: current_request_id.clone(),
                         };
 
                         if let Err(e) = crate::send_websocket_event(event) {
                             eprintln!("❌ [THREAD_SERVICE] Failed to send message_completed: {}", e);
                             log::error!("❌ [THREAD_SERVICE] Failed to send message_completed: {}", e);
                         } else {
-                            eprintln!("📤 [THREAD_SERVICE] Sent message_completed for request: {}", request_id_for_events);
-                            log::info!("📤 [THREAD_SERVICE] Sent message_completed for request: {}", request_id_for_events);
+                            eprintln!("📤 [THREAD_SERVICE] Sent message_completed for request: {}", current_request_id);
+                            log::info!("📤 [THREAD_SERVICE] Sent message_completed for request: {}", current_request_id);
                         }
                     }
                     _ => {}
@@ -273,6 +315,18 @@ fn create_new_thread_sync(
         register_thread(acp_thread_id.clone(), thread_entity.clone());
         eprintln!("📋 [THREAD_SERVICE] Registered thread: {} (strong reference)", acp_thread_id);
         log::info!("📋 [THREAD_SERVICE] Registered thread: {} (strong reference)", acp_thread_id);
+
+        // Notify AgentPanel to display this thread (for auto-select in UI)
+        if let Err(e) = crate::notify_thread_display(crate::ThreadDisplayNotification {
+            thread_entity: thread_entity.clone(),
+            helix_session_id: request_clone.request_id.clone(),
+        }) {
+            eprintln!("⚠️ [THREAD_SERVICE] Failed to notify thread display: {}", e);
+            log::warn!("⚠️ [THREAD_SERVICE] Failed to notify thread display: {}", e);
+        } else {
+            eprintln!("📤 [THREAD_SERVICE] Notified AgentPanel to display thread");
+            log::info!("📤 [THREAD_SERVICE] Notified AgentPanel to display thread");
+        }
 
         // Send thread_created event via WebSocket
         let thread_created_event = SyncEvent::ThreadCreated {
@@ -330,10 +384,17 @@ fn create_new_thread_sync(
 /// Handle a follow-up message to an existing thread
 async fn handle_follow_up_message(
     thread: WeakEntity<AcpThread>,
+    thread_id: String,
+    request_id: String,
     message: String,
     cx: gpui::AsyncApp,
 ) -> Result<()> {
     log::info!("💬 [THREAD_SERVICE] Sending follow-up message: {}", message);
+
+    // CRITICAL: Update the request_id for this thread so message_completed uses the correct ID!
+    set_thread_request_id(thread_id.clone(), request_id.clone());
+    eprintln!("🔄 [THREAD_SERVICE] Updated request_id for thread {} to {}", thread_id, request_id);
+    log::info!("🔄 [THREAD_SERVICE] Updated request_id for thread {} to {}", thread_id, request_id);
 
     cx.update(|cx| {
         let send_task = thread.update(cx, |thread, cx| {

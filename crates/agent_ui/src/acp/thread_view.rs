@@ -10,7 +10,8 @@ use agent_servers::{AgentServer, AgentServerDelegate};
 use agent_settings::{AgentProfileId, AgentSettings, CompletionMode};
 use agent2::{DbThreadMetadata, HistoryEntry, HistoryEntryId, HistoryStore, NativeAgentServer};
 use anyhow::{Context as _, Result, anyhow, bail};
-use external_websocket_sync;
+#[cfg(feature = "external_websocket_sync")]
+use external_websocket_sync_dep as external_websocket_sync;
 use arrayvec::ArrayVec;
 use audio::{Audio, Sound};
 use buffer_diff::BufferDiff;

@@ -66,12 +66,23 @@ impl Global for WebSocketSender {}
 static GLOBAL_THREAD_CREATION_CALLBACK: parking_lot::Mutex<Option<mpsc::UnboundedSender<ThreadCreationRequest>>> =
     parking_lot::Mutex::new(None);
 
+/// Static global for thread display callback (notifies AgentPanel to auto-select thread)
+static GLOBAL_THREAD_DISPLAY_CALLBACK: parking_lot::Mutex<Option<mpsc::UnboundedSender<ThreadDisplayNotification>>> =
+    parking_lot::Mutex::new(None);
+
 /// Request to create ACP thread from external WebSocket message
 #[derive(Clone, Debug)]
 pub struct ThreadCreationRequest {
     pub acp_thread_id: Option<String>, // null = create new, Some(id) = use existing
     pub message: String,
     pub request_id: String,
+}
+
+/// Notification to display a thread in AgentPanel (for auto-select)
+#[derive(Clone, Debug)]
+pub struct ThreadDisplayNotification {
+    pub thread_entity: gpui::Entity<acp_thread::AcpThread>,
+    pub helix_session_id: String,
 }
 
 /// Global callback for thread creation from WebSocket (set by agent_panel)
@@ -109,6 +120,33 @@ pub fn init_thread_creation_callback(sender: mpsc::UnboundedSender<ThreadCreatio
     log::info!("🔧 [CALLBACK] init_thread_creation_callback() called - registering global callback");
     *GLOBAL_THREAD_CREATION_CALLBACK.lock() = Some(sender);
     log::info!("✅ [CALLBACK] Global thread creation callback registered");
+}
+
+/// Initialize the global thread display callback (called from agent_panel)
+pub fn init_thread_display_callback(sender: mpsc::UnboundedSender<ThreadDisplayNotification>) {
+    log::info!("🔧 [CALLBACK] init_thread_display_callback() called - registering global callback");
+    *GLOBAL_THREAD_DISPLAY_CALLBACK.lock() = Some(sender);
+    log::info!("✅ [CALLBACK] Global thread display callback registered");
+}
+
+/// Notify AgentPanel to display a thread (for auto-select)
+pub fn notify_thread_display(notification: ThreadDisplayNotification) -> Result<()> {
+    log::info!("🔧 [CALLBACK] notify_thread_display() called for session: {}", notification.helix_session_id);
+
+    let sender = GLOBAL_THREAD_DISPLAY_CALLBACK.lock().clone();
+    if let Some(sender) = sender {
+        log::info!("✅ [CALLBACK] Found global display callback sender, sending notification...");
+        sender.send(notification)
+            .map_err(|e| {
+                log::error!("❌ [CALLBACK] Failed to send to channel: {:?}", e);
+                anyhow::anyhow!("Failed to send thread display notification")
+            })?;
+        log::info!("✅ [CALLBACK] Notification sent to callback channel successfully");
+        Ok(())
+    } else {
+        log::warn!("⚠️ [CALLBACK] Thread display callback not initialized - AgentPanel may not be ready");
+        Ok(()) // Not an error - AgentPanel might not be created yet
+    }
 }
 
 /// Type alias for compatibility with existing code
@@ -472,6 +510,11 @@ pub enum ExternalSyncEvent {
         helix_session_id: String,
         message: String,
         request_id: String,
+    },
+    /// Thread was created and should be displayed in UI (e.g., response to Helix message)
+    ThreadCreatedForDisplay {
+        thread_entity: gpui::Entity<acp_thread::AcpThread>,
+        helix_session_id: String,
     },
 }
 

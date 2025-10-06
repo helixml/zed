@@ -258,6 +258,14 @@ impl WebSocketSync {
             return Ok(());
         }
 
+        // CRITICAL: Ignore echoed user messages from Helix (they have role="user")
+        // Helix broadcasts user messages back via WebSocket for UI sync, but we already processed the original
+        if command.data.role.as_deref() == Some("user") {
+            eprintln!("🔄 [WEBSOCKET-IN] Ignoring echoed user message (role=user) - already processed original");
+            log::info!("🔄 [WEBSOCKET-IN] Ignoring echoed user message (role=user) - already processed original");
+            return Ok(());
+        }
+
         eprintln!("💬 [WEBSOCKET-IN] Processing chat_message: acp_thread_id={:?}, request_id={}, message_len={}",
                    command.data.acp_thread_id, command.data.request_id, command.data.message.len());
         log::info!("💬 [WEBSOCKET-IN] Processing chat_message: acp_thread_id={:?}, request_id={}, message_len={}",

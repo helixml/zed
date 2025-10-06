@@ -33,6 +33,8 @@ use crate::{
 };
 #[cfg(feature = "external_websocket_sync")]
 use external_websocket_sync_dep as external_websocket_sync;
+#[cfg(feature = "external_websocket_sync")]
+use tokio::sync::mpsc;
 
 use agent::{
     context_store::ContextStore,
@@ -51,7 +53,7 @@ use cloud_llm_client::{Plan, PlanV1, PlanV2, UsageLimit};
 use editor::{Anchor, AnchorRangeExt as _, Editor, EditorEvent, MultiBuffer};
 use fs::Fs;
 use gpui::{
-    Action, AnyElement, App, AsyncWindowContext, Corner, DismissEvent, Entity, EventEmitter,
+    Action, AnyElement, App, AsyncApp, AsyncWindowContext, Corner, DismissEvent, Entity, EventEmitter,
     ExternalPaths, FocusHandle, Focusable, KeyContext, Pixels, Subscription, Task, UpdateGlobal,
     WeakEntity, prelude::*,
 };
@@ -723,6 +725,62 @@ impl AgentPanel {
             }
         })
         .detach();
+
+        // Setup callback handler for auto-opening threads created by external systems
+        #[cfg(feature = "external_websocket_sync")]
+        {
+            let (callback_tx, mut callback_rx) = mpsc::unbounded_channel::<external_websocket_sync::ThreadDisplayNotification>();
+            external_websocket_sync::init_thread_display_callback(callback_tx);
+
+            let workspace_weak = workspace.clone();
+
+            cx.spawn_in(window, async move |this, cx| {
+                eprintln!("🔧 [AGENT_PANEL] Thread display handler task started");
+                log::info!("🔧 [AGENT_PANEL] Thread display handler task started");
+
+                while let Some(notification) = callback_rx.recv().await {
+                    eprintln!("🎯 [AGENT_PANEL] Received thread created for session: {}", notification.helix_session_id);
+                    log::info!("🎯 [AGENT_PANEL] Received thread created for session: {}", notification.helix_session_id);
+
+                    // Get thread metadata from entity
+                    let thread_metadata_result = notification.thread_entity.read_with(cx, |thread, _cx| {
+                        agent2::DbThreadMetadata {
+                            id: thread.session_id().clone(),
+                            title: thread.title(),
+                            updated_at: chrono::Utc::now(),
+                        }
+                    });
+
+                    if let Ok(thread_metadata) = thread_metadata_result {
+                        // First ensure the panel is focused (must do BEFORE updating panel to avoid reentrancy)
+                        if let Some(workspace) = workspace_weak.upgrade() {
+                            let _ = workspace.update_in(cx, |workspace, window, cx| {
+                                eprintln!("📂 [AGENT_PANEL] Ensuring agent panel is focused");
+                                log::info!("📂 [AGENT_PANEL] Ensuring agent panel is focused");
+                                workspace.focus_panel::<AgentPanel>(window, cx);
+                            });
+                        }
+
+                        // Now call external_thread() which will find the existing session (not create duplicate)
+                        this.update_in(cx, |this, window, cx| {
+                            this.external_thread(
+                                Some(crate::ExternalAgent::NativeAgent),
+                                Some(thread_metadata),
+                                None,
+                                window,
+                                cx,
+                            );
+                            eprintln!("✅ [AGENT_PANEL] Auto-opened thread in UI");
+                            log::info!("✅ [AGENT_PANEL] Auto-opened thread in UI");
+                        }).log_err();
+                    }
+                }
+
+                log::warn!("⚠️ [AGENT_PANEL] Thread display handler task exiting");
+                anyhow::Ok(())
+            })
+            .detach();
+        }
 
         Self {
             active_view,
