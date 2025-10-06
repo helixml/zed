@@ -85,6 +85,14 @@ impl AssistantMessage {
                 .join("\n\n")
         )
     }
+
+    /// Get content without the "## Assistant" heading (for external sync)
+    pub fn content_only(&self, cx: &App) -> String {
+        self.chunks
+            .iter()
+            .map(|chunk| chunk.to_markdown(cx))
+            .join("\n\n")
+    }
 }
 
 #[derive(Debug, PartialEq)]
