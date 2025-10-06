@@ -320,6 +320,159 @@ struct LoadingView {
 }
 
 impl AcpThreadView {
+    /// Create view for existing headless thread entity (bypasses database loading)
+    ///
+    /// This is needed for WebSocket-created threads because:
+    /// - Each server.connect() creates a NEW NativeAgent instance
+    /// - Thread exists in agent A's sessions, but UI uses agent B
+    /// - Can't look up across instances!
+    /// - Database save is async, might not be ready yet
+    /// - Solution: Directly wrap the existing Entity<AcpThread> we already have
+    #[cfg(feature = "external_websocket_sync")]
+    pub fn from_existing_thread(
+        thread: Entity<acp_thread::AcpThread>,
+        workspace: WeakEntity<Workspace>,
+        project: Entity<Project>,
+        history_store: Entity<HistoryStore>,
+        prompt_store: Option<Entity<PromptStore>>,
+        fs: Arc<dyn Fs>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        // Create a server (will be used for capabilities, not for the thread itself)
+        let agent = crate::ExternalAgent::NativeAgent.server(fs.clone(), history_store.clone());
+
+        let prompt_capabilities = Rc::new(RefCell::new(thread.read(cx).prompt_capabilities()));
+        let available_commands = Rc::new(RefCell::new(vec![]));
+
+        let placeholder = format!("Message {} — @ to include context", agent.name());
+
+        let message_editor = cx.new(|cx| {
+            MessageEditor::new(
+                workspace.clone(),
+                project.clone(),
+                history_store.clone(),
+                prompt_store.clone(),
+                prompt_capabilities.clone(),
+                available_commands.clone(),
+                agent.name(),
+                &placeholder,
+                editor::EditorMode::AutoHeight {
+                    min_lines: AgentSettings::get_global(cx).message_editor_min_lines,
+                    max_lines: Some(AgentSettings::get_global(cx).set_message_editor_max_lines()),
+                },
+                window,
+                cx,
+            )
+        });
+
+        let list_state = ListState::new(0, gpui::ListAlignment::Bottom, px(2048.0));
+        let entry_view_state = cx.new(|_| {
+            EntryViewState::new(
+                workspace.clone(),
+                project.clone(),
+                history_store.clone(),
+                prompt_store.clone(),
+                prompt_capabilities.clone(),
+                available_commands.clone(),
+                agent.name(),
+            )
+        });
+
+        // Sync all existing entries from the thread
+        let action_log = thread.read(cx).action_log().clone();
+        let count = thread.read(cx).entries().len();
+        entry_view_state.update(cx, |view_state, cx| {
+            for ix in 0..count {
+                view_state.sync_entry(ix, &thread, window, cx);
+            }
+        });
+
+        let title_editor = if thread.update(cx, |thread, cx| thread.can_set_title(cx)) {
+            let editor = cx.new(|cx| {
+                let mut editor = Editor::single_line(window, cx);
+                editor.set_text(thread.read(cx).title(), window, cx);
+                editor
+            });
+            cx.subscribe_in(&editor, window, Self::handle_title_editor_event).detach();
+            Some(editor)
+        } else {
+            None
+        };
+
+        let mode_selector = thread.read(cx).connection().session_modes(thread.read(cx).session_id(), cx).map(|session_modes| {
+            let fs = project.read(cx).fs().clone();
+            let focus_handle = cx.focus_handle();
+            cx.new(|_cx| ModeSelector::new(session_modes, agent.clone(), fs, focus_handle))
+        });
+
+        let thread_subscriptions = vec![
+            cx.subscribe_in(&thread, window, Self::handle_thread_event),
+            cx.observe(&action_log, |_, _, cx| cx.notify()),
+        ];
+
+        AgentDiff::set_active_thread(&workspace, thread.clone(), window, cx);
+
+        let model_selector = thread.read(cx).connection().model_selector(thread.read(cx).session_id()).map(|selector| {
+            cx.new(|cx| {
+                AcpModelSelectorPopover::new(
+                    selector,
+                    PopoverMenuHandle::default(),
+                    cx.focus_handle(),
+                    window,
+                    cx,
+                )
+            })
+        });
+
+        let subscriptions = [
+            cx.observe_global_in::<SettingsStore>(window, Self::agent_font_size_changed),
+            cx.observe_global_in::<AgentFontSize>(window, Self::agent_font_size_changed),
+            cx.subscribe_in(&message_editor, window, Self::handle_message_editor_event),
+            cx.subscribe_in(&entry_view_state, window, Self::handle_entry_view_event),
+        ];
+
+        Self {
+            agent,
+            workspace,
+            project,
+            entry_view_state,
+            thread_state: ThreadState::Ready {
+                thread,
+                title_editor,
+                mode_selector,
+                _subscriptions: thread_subscriptions,
+            },
+            login: None,
+            message_editor,
+            model_selector,
+            profile_selector: None,
+            notifications: Vec::new(),
+            notification_subscriptions: HashMap::default(),
+            list_state,
+            thread_retry_status: None,
+            thread_error: None,
+            thread_feedback: Default::default(),
+            auth_task: None,
+            expanded_tool_calls: HashSet::default(),
+            expanded_thinking_blocks: HashSet::default(),
+            editing_message: None,
+            edits_expanded: false,
+            plan_expanded: false,
+            prompt_capabilities,
+            available_commands,
+            editor_expanded: false,
+            should_be_following: false,
+            history_store,
+            hovered_recent_history_item: None,
+            is_loading_contents: false,
+            _subscriptions: subscriptions,
+            _cancel_task: None,
+            focus_handle: cx.focus_handle(),
+            new_server_version_available: None,
+        }
+    }
+
     pub fn new(
         agent: Rc<dyn AgentServer>,
         resume_thread: Option<DbThreadMetadata>,

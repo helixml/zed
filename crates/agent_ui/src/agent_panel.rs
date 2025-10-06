@@ -751,7 +751,7 @@ impl AgentPanel {
                         }
                     });
 
-                    if let Ok(thread_metadata) = thread_metadata_result {
+                    if let Ok(_thread_metadata) = thread_metadata_result {
                         // First ensure the panel is focused (must do BEFORE updating panel to avoid reentrancy)
                         if let Some(workspace) = workspace_weak.upgrade() {
                             let _ = workspace.update_in(cx, |workspace, window, cx| {
@@ -761,17 +761,24 @@ impl AgentPanel {
                             });
                         }
 
-                        // Now call external_thread() which will find the existing session (not create duplicate)
+                        // Create view directly from existing thread entity (avoids agent instance mismatch)
                         this.update_in(cx, |this, window, cx| {
-                            this.external_thread(
-                                Some(crate::ExternalAgent::NativeAgent),
-                                Some(thread_metadata),
-                                None,
-                                window,
-                                cx,
-                            );
-                            eprintln!("✅ [AGENT_PANEL] Auto-opened thread in UI");
-                            log::info!("✅ [AGENT_PANEL] Auto-opened thread in UI");
+                            let thread_view = cx.new(|cx| {
+                                crate::acp::AcpThreadView::from_existing_thread(
+                                    notification.thread_entity.clone(),
+                                    this.workspace.clone(),
+                                    this.project.clone(),
+                                    this.acp_history_store.clone(),
+                                    this.prompt_store.clone(),
+                                    this.fs.clone(),
+                                    window,
+                                    cx,
+                                )
+                            });
+
+                            this.set_active_view(ActiveView::ExternalAgentThread { thread_view }, window, cx);
+                            eprintln!("✅ [AGENT_PANEL] Auto-opened existing headless thread in UI");
+                            log::info!("✅ [AGENT_PANEL] Auto-opened existing headless thread in UI");
                         }).log_err();
                     }
                 }
