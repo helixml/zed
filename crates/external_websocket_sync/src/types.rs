@@ -167,11 +167,23 @@ pub struct OutgoingMessage {
 /// Per WEBSOCKET_PROTOCOL_SPEC.md - Zed is stateless and only knows about acp_thread_id
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum SyncEvent {
-    /// Sent when Zed creates a new ACP thread
+    /// Sent when Zed creates a new ACP thread (in response to Helix message)
     #[serde(rename = "thread_created")]
     ThreadCreated {
         acp_thread_id: String,
         request_id: String,
+    },
+    /// Sent when user creates a new thread in Zed UI (should create new Helix session)
+    #[serde(rename = "user_created_thread")]
+    UserCreatedThread {
+        acp_thread_id: String,
+        title: Option<String>,
+    },
+    /// Sent when thread title changes in Zed (sync to Helix session name)
+    #[serde(rename = "thread_title_changed")]
+    ThreadTitleChanged {
+        acp_thread_id: String,
+        title: String,
     },
     /// Sent while AI is streaming response (same message_id, progressively longer content)
     #[serde(rename = "message_added")]
@@ -200,6 +212,20 @@ impl SyncEvent {
                 serde_json::json!({
                     "acp_thread_id": acp_thread_id,
                     "request_id": request_id,
+                })
+            ),
+            SyncEvent::UserCreatedThread { acp_thread_id, title } => (
+                "user_created_thread".to_string(),
+                serde_json::json!({
+                    "acp_thread_id": acp_thread_id,
+                    "title": title,
+                })
+            ),
+            SyncEvent::ThreadTitleChanged { acp_thread_id, title } => (
+                "thread_title_changed".to_string(),
+                serde_json::json!({
+                    "acp_thread_id": acp_thread_id,
+                    "title": title,
                 })
             ),
             SyncEvent::MessageAdded { acp_thread_id, message_id, role, content, timestamp } => (

@@ -10,6 +10,7 @@ use agent_servers::{AgentServer, AgentServerDelegate};
 use agent_settings::{AgentProfileId, AgentSettings, CompletionMode};
 use agent2::{DbThreadMetadata, HistoryEntry, HistoryEntryId, HistoryStore, NativeAgentServer};
 use anyhow::{Context as _, Result, anyhow, bail};
+use external_websocket_sync;
 use arrayvec::ArrayVec;
 use audio::{Audio, Sound};
 use buffer_diff::BufferDiff;
@@ -573,6 +574,24 @@ impl AcpThreadView {
                                     cx,
                                 );
                             });
+                        } else {
+                            // User created a new thread in Zed UI - notify Helix to create corresponding session
+                            let acp_thread_id = thread.entity_id().to_string();
+                            let title = thread.read(cx).title().to_string();
+                            let title_opt = if title.is_empty() { None } else { Some(title) };
+
+                            eprintln!("📤 [ZED-UI] User created new thread: {}, title: {:?}", acp_thread_id, title_opt);
+                            log::info!("📤 [ZED-UI] User created new thread: {}, title: {:?}", acp_thread_id, title_opt);
+
+                            if let Err(e) = external_websocket_sync::send_websocket_event(
+                                external_websocket_sync::SyncEvent::UserCreatedThread {
+                                    acp_thread_id,
+                                    title: title_opt,
+                                }
+                            ) {
+                                eprintln!("❌ [ZED-UI] Failed to send user_created_thread event: {}", e);
+                                log::error!("❌ [ZED-UI] Failed to send user_created_thread event: {}", e);
+                            }
                         }
 
                         AgentDiff::set_active_thread(&workspace, thread.clone(), window, cx);
@@ -1373,9 +1392,26 @@ impl AcpThreadView {
                 if let Some(title_editor) = self.title_editor() {
                     title_editor.update(cx, |editor, cx| {
                         if editor.text(cx) != title {
-                            editor.set_text(title, window, cx);
+                            editor.set_text(title.clone(), window, cx);
                         }
                     });
+                }
+
+                // Notify Helix of title change
+                let acp_thread_id = thread.entity_id().to_string();
+                let title_str = title.to_string();
+
+                eprintln!("📤 [ZED-UI] Thread title changed: {} -> '{}'", acp_thread_id, title_str);
+                log::info!("📤 [ZED-UI] Thread title changed: {} -> '{}'", acp_thread_id, title_str);
+
+                if let Err(e) = external_websocket_sync::send_websocket_event(
+                    external_websocket_sync::SyncEvent::ThreadTitleChanged {
+                        acp_thread_id,
+                        title: title_str,
+                    }
+                ) {
+                    eprintln!("❌ [ZED-UI] Failed to send thread_title_changed event: {}", e);
+                    log::error!("❌ [ZED-UI] Failed to send thread_title_changed event: {}", e);
                 }
             }
             AcpThreadEvent::PromptCapabilitiesUpdated => {
