@@ -254,7 +254,8 @@ fn create_new_thread_sync(
                             // Extract content from AssistantMessage variant
                             let content = match entry {
                                 acp_thread::AgentThreadEntry::AssistantMessage(msg) => {
-                                    msg.to_markdown(cx)
+                                    // Use content_only() to avoid "## Assistant" heading in Helix UI
+                                    msg.content_only(cx)
                                 }
                                 _ => {
                                     eprintln!("⚠️ [THREAD_SERVICE] Entry {} is not an AssistantMessage, skipping", entry_idx);
