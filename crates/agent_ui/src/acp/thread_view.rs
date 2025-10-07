@@ -729,22 +729,29 @@ impl AcpThreadView {
                                 );
                             });
                         } else {
-                            // User created a new thread in Zed UI - notify Helix to create corresponding session
-                            let acp_thread_id = thread.entity_id().to_string();
-                            let title = thread.read(cx).title().to_string();
-                            let title_opt = if title.is_empty() { None } else { Some(title) };
+                            // User created a new thread in Zed UI - notify external system
+                            // Only send if thread has entries (user actually typed something)
+                            // This filters out empty "New Thread" templates and external-created threads
+                            let entry_count = thread.read(cx).entries().len();
+                            if entry_count > 0 {
+                                let acp_thread_id = thread.entity_id().to_string();
+                                let title = thread.read(cx).title().to_string();
+                                let title_opt = if title.is_empty() { None } else { Some(title) };
 
-                            eprintln!("📤 [ZED-UI] User created new thread: {}, title: {:?}", acp_thread_id, title_opt);
-                            log::info!("📤 [ZED-UI] User created new thread: {}, title: {:?}", acp_thread_id, title_opt);
+                                eprintln!("📤 [ZED-UI] User created new thread with content: {}, title: {:?}, entries: {}", acp_thread_id, title_opt, entry_count);
+                                log::info!("📤 [ZED-UI] User created new thread with content: {}, title: {:?}, entries: {}", acp_thread_id, title_opt, entry_count);
 
-                            if let Err(e) = external_websocket_sync::send_websocket_event(
-                                external_websocket_sync::SyncEvent::UserCreatedThread {
-                                    acp_thread_id,
-                                    title: title_opt,
+                                if let Err(e) = external_websocket_sync::send_websocket_event(
+                                    external_websocket_sync::SyncEvent::UserCreatedThread {
+                                        acp_thread_id,
+                                        title: title_opt,
+                                    }
+                                ) {
+                                    eprintln!("❌ [ZED-UI] Failed to send user_created_thread event: {}", e);
+                                    log::error!("❌ [ZED-UI] Failed to send user_created_thread event: {}", e);
                                 }
-                            ) {
-                                eprintln!("❌ [ZED-UI] Failed to send user_created_thread event: {}", e);
-                                log::error!("❌ [ZED-UI] Failed to send user_created_thread event: {}", e);
+                            } else {
+                                eprintln!("🔄 [ZED-UI] Thread empty, not sending UserCreatedThread yet", );
                             }
                         }
 
