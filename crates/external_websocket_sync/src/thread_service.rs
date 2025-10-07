@@ -10,7 +10,7 @@ use agent2::HistoryStore;
 use agent_client_protocol::{ContentBlock, PromptCapabilities, SessionId, TextContent};
 use gpui::{App, Entity, EventEmitter, WeakEntity, prelude::*};
 use parking_lot::RwLock;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use fs::Fs;
 use project::Project;
@@ -31,6 +31,11 @@ static THREAD_REGISTRY: parking_lot::Mutex<Option<Arc<RwLock<HashMap<String, Ent
 static THREAD_REQUEST_MAP: parking_lot::Mutex<Option<Arc<RwLock<HashMap<String, String>>>>> =
     parking_lot::Mutex::new(None);
 
+/// Global map of thread_id -> Set of entry indices that originated from external system
+/// Prevents echoing external messages back (initial + follow-ups)
+static EXTERNAL_ORIGINATED_ENTRIES: parking_lot::Mutex<Option<Arc<RwLock<HashMap<String, HashSet<usize>>>>>> =
+    parking_lot::Mutex::new(None);
+
 /// Initialize the thread registry
 pub fn init_thread_registry() {
     let mut registry = THREAD_REGISTRY.lock();
@@ -41,6 +46,30 @@ pub fn init_thread_registry() {
     let mut request_map = THREAD_REQUEST_MAP.lock();
     if request_map.is_none() {
         *request_map = Some(Arc::new(RwLock::new(HashMap::new())));
+    }
+
+    let mut external_map = EXTERNAL_ORIGINATED_ENTRIES.lock();
+    if external_map.is_none() {
+        *external_map = Some(Arc::new(RwLock::new(HashMap::new())));
+    }
+}
+
+/// Mark an entry as originated from external system (won't be echoed back)
+fn mark_external_originated_entry(thread_id: String, entry_idx: usize) {
+    init_thread_registry();
+    let map = EXTERNAL_ORIGINATED_ENTRIES.lock();
+    if let Some(m) = map.as_ref() {
+        m.write().entry(thread_id).or_insert_with(HashSet::new).insert(entry_idx);
+    }
+}
+
+/// Check if entry originated from external system
+fn is_external_originated_entry(thread_id: &str, entry_idx: usize) -> bool {
+    let map = EXTERNAL_ORIGINATED_ENTRIES.lock();
+    if let Some(m) = map.as_ref() {
+        m.read().get(thread_id).map_or(false, |set| set.contains(&entry_idx))
+    } else {
+        false
     }
 }
 
@@ -246,6 +275,39 @@ fn create_new_thread_sync(
         cx.update(|cx| {
             cx.subscribe(&thread_entity, move |thread_entity, event, cx| {
                 match event {
+                    AcpThreadEvent::NewEntry => {
+                        eprintln!("🆕 [THREAD_SERVICE] NewEntry event received");
+                        // Check if the latest entry is a UserMessage (user typed in Zed)
+                        let thread = thread_entity.read(cx);
+                        let latest_idx = thread.entries().len().saturating_sub(1);
+
+                        // Skip if this entry originated from external system
+                        if is_external_originated_entry(&thread_id_for_events, latest_idx) {
+                            eprintln!("🔄 [THREAD_SERVICE] Entry {} from external system, skipping echo", latest_idx);
+                            return;
+                        }
+
+                        if let Some(entry) = thread.entries().get(latest_idx) {
+                            if let acp_thread::AgentThreadEntry::UserMessage(msg) = entry {
+                                let content = msg.content.to_markdown(cx).to_string();
+                                eprintln!("👤 [THREAD_SERVICE] User typed in Zed, syncing to external: {} chars", content.len());
+
+                                let event = SyncEvent::MessageAdded {
+                                    acp_thread_id: thread_id_for_events.clone(),
+                                    message_id: latest_idx.to_string(),
+                                    role: "user".to_string(),
+                                    content: content.clone(),
+                                    timestamp: chrono::Utc::now().timestamp(),
+                                };
+
+                                if let Err(e) = crate::send_websocket_event(event) {
+                                    eprintln!("❌ [THREAD_SERVICE] Failed to send user message: {}", e);
+                                } else {
+                                    eprintln!("📤 [THREAD_SERVICE] Sent user message (entry {}): {} chars", latest_idx, content.len());
+                                }
+                            }
+                        }
+                    }
                     AcpThreadEvent::EntryUpdated(entry_idx) => {
                         eprintln!("🔔 [THREAD_SERVICE] EntryUpdated event received for entry {}", entry_idx);
                         // Get the updated content
@@ -343,6 +405,13 @@ fn create_new_thread_sync(
             log::info!("📤 [THREAD_SERVICE] Sent thread_created: {}", acp_thread_id);
         }
 
+        // Mark the entry that will be created as external-originated (so we don't echo it back)
+        let entry_idx_to_mark = cx.update(|cx| {
+            thread_entity.read(cx).entries().len()
+        })?;
+        mark_external_originated_entry(acp_thread_id.clone(), entry_idx_to_mark);
+        eprintln!("🏷️ [THREAD_SERVICE] Marked entry {} as external-originated (won't echo back)", entry_idx_to_mark);
+
         // Send the initial message to the thread to trigger AI response
         eprintln!("🔧 [THREAD_SERVICE] About to send message to thread...");
         let send_task = cx.update(|cx| {
@@ -396,6 +465,13 @@ async fn handle_follow_up_message(
     set_thread_request_id(thread_id.clone(), request_id.clone());
     eprintln!("🔄 [THREAD_SERVICE] Updated request_id for thread {} to {}", thread_id, request_id);
     log::info!("🔄 [THREAD_SERVICE] Updated request_id for thread {} to {}", thread_id, request_id);
+
+    // Mark the entry that will be created as external-originated
+    let entry_idx_to_mark = cx.update(|cx| {
+        thread.update(cx, |thread, _| thread.entries().len())
+    })??;
+    mark_external_originated_entry(thread_id.clone(), entry_idx_to_mark);
+    eprintln!("🏷️ [THREAD_SERVICE] Marked entry {} as external-originated (follow-up)", entry_idx_to_mark);
 
     cx.update(|cx| {
         let send_task = thread.update(cx, |thread, cx| {
