@@ -310,27 +310,65 @@ fn create_new_thread_sync(
                     }
                     AcpThreadEvent::EntryUpdated(entry_idx) => {
                         eprintln!("🔔 [THREAD_SERVICE] EntryUpdated event received for entry {}", entry_idx);
-                        // Get the updated content
-                        let thread = thread_entity.read(cx);
-                        if let Some(entry) = thread.entries().get(*entry_idx) {
-                            // Extract content from AssistantMessage variant
-                            let content = match entry {
-                                acp_thread::AgentThreadEntry::AssistantMessage(msg) => {
-                                    // Use content_only() to avoid "## Assistant" heading in Helix UI
-                                    msg.content_only(cx)
-                                }
-                                _ => {
-                                    eprintln!("⚠️ [THREAD_SERVICE] Entry {} is not an AssistantMessage, skipping", entry_idx);
-                                    return; // Only send events for assistant messages
-                                }
-                            };
 
-                            // Send message_added event
+                        // CRITICAL FIX: Collect ALL assistant entries since last user message
+                        // An AI response can contain: AssistantMessage -> ToolCall -> AssistantMessage
+                        // We need to concatenate ALL of them to show complete response in Helix
+                        let thread = thread_entity.read(cx);
+                        let entries = thread.entries();
+
+                        // Find the start of the current assistant response (after last UserMessage)
+                        let mut start_idx = 0;
+                        for (idx, entry) in entries.iter().enumerate() {
+                            if matches!(entry, acp_thread::AgentThreadEntry::UserMessage(_)) {
+                                start_idx = idx + 1; // Start after the user message
+                            }
+                        }
+
+                        // Collect all content from start_idx to current entry_idx (inclusive)
+                        let mut full_content = String::new();
+                        for (idx, entry) in entries.iter().enumerate().skip(start_idx) {
+                            if idx > *entry_idx {
+                                break; // Stop at the updated entry
+                            }
+
+                            match entry {
+                                acp_thread::AgentThreadEntry::AssistantMessage(msg) => {
+                                    if !full_content.is_empty() {
+                                        full_content.push_str("\n\n");
+                                    }
+                                    full_content.push_str(&msg.content_only(cx));
+                                }
+                                acp_thread::AgentThreadEntry::ToolCall(tool) => {
+                                    if !full_content.is_empty() {
+                                        full_content.push_str("\n\n");
+                                    }
+                                    // Include tool calls in the response
+                                    // Format: **Tool Call: {label}**\nStatus: {status}\n\n{content}
+                                    full_content.push_str(&format!(
+                                        "**Tool Call: {}**\nStatus: {:?}\n\n",
+                                        tool.label.read(cx).source(),
+                                        tool.status
+                                    ));
+                                    for content in &tool.content {
+                                        full_content.push_str(&content.to_markdown(cx));
+                                        full_content.push_str("\n\n");
+                                    }
+                                }
+                                acp_thread::AgentThreadEntry::UserMessage(_) => {
+                                    // Skip user messages (shouldn't happen given our loop)
+                                }
+                            }
+                        }
+
+                        // Only send if we have content
+                        if !full_content.is_empty() {
+                            // Send message_added event with FULL accumulated content
                             let event = SyncEvent::MessageAdded {
                                 acp_thread_id: thread_id_for_events.clone(),
-                                message_id: entry_idx.to_string(),
+                                message_id: start_idx.to_string(), // Use start_idx as stable message_id
                                 role: "assistant".to_string(),
-                                content: content.clone(),
+                                content: full_content.clone(),
                                 timestamp: chrono::Utc::now().timestamp(),
                             };
 
@@ -338,8 +376,9 @@ fn create_new_thread_sync(
                                 eprintln!("❌ [THREAD_SERVICE] Failed to send message_added: {}", e);
                                 log::error!("❌ [THREAD_SERVICE] Failed to send message_added: {}", e);
                             } else {
-                                eprintln!("📤 [THREAD_SERVICE] Sent message_added chunk (entry {}): {} chars", entry_idx, content.len());
-                                log::debug!("📤 [THREAD_SERVICE] Sent message_added chunk (entry {})", entry_idx);
+                                eprintln!("📤 [THREAD_SERVICE] Sent message_added (entries {}-{}): {} chars",
+                                         start_idx, entry_idx, full_content.len());
+                                log::debug!("📤 [THREAD_SERVICE] Sent message_added (entries {}-{})", start_idx, entry_idx);
                             }
                         }
                     }
