@@ -202,7 +202,7 @@ impl Default for ServerSettings {
 }
 
 impl Settings for ExternalSyncSettings {
-    fn from_settings(_content: &settings::SettingsContent, _cx: &mut App) -> Self {
+    fn from_settings(_content: &settings::SettingsContent) -> Self {
         // Load settings from environment variables for containerized deployments
         let enabled = std::env::var("ZED_EXTERNAL_SYNC_ENABLED")
             .map(|v| v.parse().unwrap_or(false))

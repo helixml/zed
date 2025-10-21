@@ -147,7 +147,6 @@ function DownloadAMDGpuServices {
 }
 
 function DownloadConpty {
-    # If you update the Conpty version, please also update the version in `crates/zed/build.rs`.
     $url = "https://www.nuget.org/api/v2/package/CI.Microsoft.Windows.Console.ConPTY/1.22.250314001"
     $zipPath = ".\conpty.zip"
     Invoke-WebRequest -Uri $url -OutFile $zipPath
@@ -161,8 +160,8 @@ function CollectFiles {
     Move-Item -Path "$innoDir\zed.sh" -Destination "$innoDir\bin\zed" -Force
     Move-Item -Path "$innoDir\auto_update_helper.exe" -Destination "$innoDir\tools\auto_update_helper.exe" -Force
     Move-Item -Path ".\AGS_SDK-6.3.0\ags_lib\lib\amd_ags_x64.dll" -Destination "$innoDir\amd_ags_x64.dll" -Force
-    Move-Item -Path ".\conpty\build\native\runtimes\*" -Destination "$innoDir\bin" -Force
-    Move-Item -Path ".\conpty\runtimes\win10-x64\native\conpty.dll" -Destination "$innoDir\bin\conpty.dll" -Force
+    Move-Item -Path ".\conpty\build\native\runtimes\x64\OpenConsole.exe" -Destination "$innoDir\OpenConsole.exe" -Force
+    Move-Item -Path ".\conpty\runtimes\win10-x64\native\conpty.dll" -Destination "$innoDir\conpty.dll" -Force
 }
 
 function BuildInstaller {
@@ -173,7 +172,7 @@ function BuildInstaller {
             $appIconName = "app-icon"
             $appName = "Zed"
             $appDisplayName = "Zed"
-            $appSetupName = "ZedEditorUserSetup-x64-$env:RELEASE_VERSION"
+            $appSetupName = "Zed-x86_64"
             # The mutex name here should match the mutex name in crates\zed\src\zed\windows_only_instance.rs
             $appMutex = "Zed-Stable-Instance-Mutex"
             $appExeName = "Zed"
@@ -187,7 +186,7 @@ function BuildInstaller {
             $appIconName = "app-icon-preview"
             $appName = "Zed Preview"
             $appDisplayName = "Zed Preview"
-            $appSetupName = "ZedEditorUserSetup-x64-$env:RELEASE_VERSION-preview"
+            $appSetupName = "Zed-x86_64"
             # The mutex name here should match the mutex name in crates\zed\src\zed\windows_only_instance.rs
             $appMutex = "Zed-Preview-Instance-Mutex"
             $appExeName = "Zed"
@@ -201,7 +200,7 @@ function BuildInstaller {
             $appIconName = "app-icon-nightly"
             $appName = "Zed Nightly"
             $appDisplayName = "Zed Nightly"
-            $appSetupName = "ZedEditorUserSetup-x64-$env:RELEASE_VERSION-nightly"
+            $appSetupName = "Zed-x86_64"
             # The mutex name here should match the mutex name in crates\zed\src\zed\windows_only_instance.rs
             $appMutex = "Zed-Nightly-Instance-Mutex"
             $appExeName = "Zed"
@@ -215,7 +214,7 @@ function BuildInstaller {
             $appIconName = "app-icon-dev"
             $appName = "Zed Dev"
             $appDisplayName = "Zed Dev"
-            $appSetupName = "ZedEditorUserSetup-x64-$env:RELEASE_VERSION-dev"
+            $appSetupName = "Zed-x86_64"
             # The mutex name here should match the mutex name in crates\zed\src\zed\windows_only_instance.rs
             $appMutex = "Zed-Dev-Instance-Mutex"
             $appExeName = "Zed"

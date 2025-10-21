@@ -21,8 +21,8 @@ test-support = []
 acp_thread.workspace = true
 action_log.workspace = true
 agent-client-protocol.workspace = true
+agent.workspace = true
 agent_servers.workspace = true
-agent2.workspace = true
 anyhow.workspace = true
 assistant_context.workspace = true
 assistant_slash_command.workspace = true
@@ -59,8 +59,6 @@ url.workspace = true
 util.workspace = true
 uuid.workspace = true
 watch.workspace = true
-
-workspace-hack.workspace = true
 
 [dev-dependencies]
 env_logger.workspace = true

@@ -8,6 +8,7 @@ use anyhow::{Context, Result};
 use util::ResultExt;
 use assistant_context::{AssistantContext, ContextId, ContextStore, MessageId};
 use assistant_slash_command::SlashCommandWorkingSet;
+use clock::ReplicaId;
 use collections::HashMap;
 use futures::StreamExt;
 use gpui::{App, AsyncApp, Entity, EventEmitter, Global, Subscription};
@@ -441,7 +442,7 @@ impl ExternalWebSocketSync {
             }
 
             // Create a message ID (for now just use a placeholder)
-            MessageId(clock::Lamport::new(1))
+            MessageId(clock::Lamport::new(ReplicaId::new(1)))
         });
 
         // Notify via WebSocket

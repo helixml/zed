@@ -6,7 +6,7 @@
 use anyhow::Result;
 use acp_thread::{AcpThread, AcpThreadEvent};
 use action_log::ActionLog;
-use agent2::HistoryStore;
+use agent::HistoryStore;
 use agent_client_protocol::{ContentBlock, PromptCapabilities, SessionId, TextContent};
 use gpui::{App, Entity, EventEmitter, WeakEntity, prelude::*};
 use parking_lot::RwLock;

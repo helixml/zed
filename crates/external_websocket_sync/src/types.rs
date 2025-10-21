@@ -36,12 +36,12 @@ impl ExternalAgent {
     pub fn server(
         &self,
         fs: Arc<dyn fs::Fs>,
-        history: gpui::Entity<agent2::HistoryStore>,
+        history: gpui::Entity<agent::HistoryStore>,
     ) -> Rc<dyn agent_servers::AgentServer> {
         match self {
             Self::Gemini => Rc::new(agent_servers::Gemini),
             Self::ClaudeCode => Rc::new(agent_servers::ClaudeCode),
-            Self::NativeAgent => Rc::new(agent2::NativeAgentServer::new(fs, history)),
+            Self::NativeAgent => Rc::new(agent::NativeAgentServer::new(fs, history)),
             Self::Custom { name, command: _ } => {
                 Rc::new(agent_servers::CustomAgentServer::new(name.clone()))
             }

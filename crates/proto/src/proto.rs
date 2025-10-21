@@ -319,11 +319,14 @@ messages!(
     (GitClone, Background),
     (GitCloneResponse, Background),
     (ToggleLspLogs, Background),
+    (GetDirectoryEnvironment, Background),
+    (DirectoryEnvironment, Background),
     (GetAgentServerCommand, Background),
     (AgentServerCommand, Background),
     (ExternalAgentsUpdated, Background),
     (ExternalAgentLoadingStatusUpdated, Background),
     (NewExternalAgentVersionAvailable, Background),
+    (RemoteStarted, Background),
 );
 
 request_messages!(
@@ -496,8 +499,10 @@ request_messages!(
     (GetDefaultBranch, GetDefaultBranchResponse),
     (GitClone, GitCloneResponse),
     (ToggleLspLogs, Ack),
+    (GetDirectoryEnvironment, DirectoryEnvironment),
     (GetProcesses, GetProcessesResponse),
-    (GetAgentServerCommand, AgentServerCommand)
+    (GetAgentServerCommand, AgentServerCommand),
+    (RemoteStarted, Ack),
 );
 
 lsp_messages!(
@@ -632,6 +637,7 @@ entity_messages!(
     GitCheckoutFiles,
     SetIndexText,
     ToggleLspLogs,
+    GetDirectoryEnvironment,
 
     Push,
     Fetch,
