@@ -428,11 +428,13 @@ impl AcpThreadView {
             })
         });
 
+        let agent_server_store = project.read(cx).agent_server_store().clone();
         let subscriptions = [
-            cx.observe_global_in::<SettingsStore>(window, Self::agent_font_size_changed),
-            cx.observe_global_in::<AgentFontSize>(window, Self::agent_font_size_changed),
+            cx.observe_global_in::<SettingsStore>(window, Self::agent_ui_font_size_changed),
+            cx.observe_global_in::<AgentFontSize>(window, Self::agent_ui_font_size_changed),
             cx.subscribe_in(&message_editor, window, Self::handle_message_editor_event),
             cx.subscribe_in(&entry_view_state, window, Self::handle_entry_view_event),
+            cx.subscribe_in(&agent_server_store, window, Self::handle_agent_servers_updated),
         ];
 
         Self {
@@ -473,6 +475,7 @@ impl AcpThreadView {
             _cancel_task: None,
             focus_handle: cx.focus_handle(),
             new_server_version_available: None,
+            resume_thread_metadata: None,
         }
     }
 

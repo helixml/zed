@@ -53,7 +53,7 @@ use gpui::{
 };
 use language::LanguageRegistry;
 use language_model::{ConfigurationError, LanguageModelRegistry};
-use project::{Project, ProjectPath, Worktree};
+use project::{DisableAiSettings, Project, ProjectPath, Worktree};
 use prompt_store::{PromptBuilder, PromptStore, UserPromptId};
 use rules_library::{RulesLibrary, open_rules_library};
 use search::{BufferSearchBar, buffer_search};
@@ -437,8 +437,8 @@ pub struct AgentPanel {
 impl AgentPanel {
     /// Get the ACP history store (for WebSocket integration setup)
     #[cfg(feature = "external_websocket_sync")]
-    pub fn acp_history_store(&self) -> &Entity<agent2::HistoryStore> {
-        &self.acp_history_store
+    pub fn acp_history_store(&self) -> &Entity<agent::HistoryStore> {
+        &self.history_store
     }
 
     fn serialize(&mut self, cx: &mut Context<Self>) {
@@ -736,7 +736,7 @@ impl AgentPanel {
                                     notification.thread_entity.clone(),
                                     this.workspace.clone(),
                                     this.project.clone(),
-                                    this.acp_history_store.clone(),
+                                    this.acp_history_store().clone(),
                                     this.prompt_store.clone(),
                                     this.fs.clone(),
                                     window,
