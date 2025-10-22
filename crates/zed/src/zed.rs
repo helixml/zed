@@ -634,17 +634,6 @@ fn initialize_panels(
                         let have_panel = workspace.panel::<agent_ui::AgentPanel>(cx).is_some();
                         if !disable_ai && !have_panel {
                             workspace.add_panel(panel.clone(), window, cx);
-
-                            // Setup WebSocket thread handler for external sync
-                            #[cfg(feature = "external_websocket_sync")]
-                            {
-                                external_websocket_sync::setup_thread_handler(
-                                    workspace.project().clone(),
-                                    panel.read(cx).acp_history_store().clone(),
-                                    workspace.app_state().fs.clone(),
-                                    cx
-                                );
-                            }
                         }
                     })
                 }),
@@ -671,6 +660,50 @@ fn initialize_panels(
                 }
             })
             .detach();
+
+            // Setup WebSocket thread handler for external sync (if panel exists)
+            #[cfg(feature = "external_websocket_sync")]
+            {
+                if let Some(panel) = workspace.panel::<agent_ui::AgentPanel>(cx) {
+                    eprintln!("🔧 [ZED] Setting up WebSocket integration...");
+
+                    external_websocket_sync::setup_thread_handler(
+                        workspace.project().clone(),
+                        panel.read(cx).acp_history_store().clone(),
+                        workspace.app_state().fs.clone(),
+                        cx
+                    );
+                    eprintln!("✅ [ZED] WebSocket thread handler initialized");
+
+                    // Start WebSocket service if enabled in settings
+                    use external_websocket_sync::ExternalSyncSettings;
+                    use settings::Settings;
+
+                    eprintln!("🔧 [ZED] Checking WebSocket settings...");
+                    let settings = ExternalSyncSettings::get_global(cx);
+                    eprintln!("🔧 [ZED] Settings: enabled={}, websocket.enabled={}, url={}",
+                              settings.enabled, settings.websocket_sync.enabled, settings.websocket_sync.external_url);
+
+                    if settings.enabled && settings.websocket_sync.enabled {
+                        eprintln!("🔌 [ZED] WebSocket sync ENABLED - starting service");
+
+                        let config = external_websocket_sync::WebSocketSyncConfig {
+                            enabled: true,
+                            url: settings.websocket_sync.external_url.clone(),
+                            auth_token: settings.websocket_sync.auth_token.clone().unwrap_or_default(),
+                            use_tls: settings.websocket_sync.use_tls,
+                        };
+
+                        eprintln!("🔌 [ZED] Calling init_websocket_service()...");
+                        external_websocket_sync::init_websocket_service(config);
+                        eprintln!("✅ [ZED] WebSocket service init call completed");
+                    } else {
+                        eprintln!("⚠️  [ZED] WebSocket sync DISABLED in settings");
+                    }
+
+                    eprintln!("✅ [ZED] WebSocket integration setup complete");
+                }
+            }
 
             // Register the actions that are shared between `assistant` and `assistant2`.
             //

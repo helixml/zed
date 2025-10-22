@@ -281,7 +281,7 @@ impl ActiveView {
     pub fn native_agent(
         fs: Arc<dyn Fs>,
         prompt_store: Option<Entity<PromptStore>>,
-        history_store: Entity<agent::HistoryStore>,
+        acp_history_store: Entity<agent::HistoryStore>,
         project: Entity<Project>,
         workspace: WeakEntity<Workspace>,
         window: &mut Window,
@@ -289,12 +289,12 @@ impl ActiveView {
     ) -> Self {
         let thread_view = cx.new(|cx| {
             crate::acp::AcpThreadView::new(
-                ExternalAgent::NativeAgent.server(fs, history_store.clone()),
+                ExternalAgent::NativeAgent.server(fs, acp_history_store.clone()),
                 None,
                 None,
                 workspace,
                 project,
-                history_store,
+                acp_history_store,
                 prompt_store,
                 window,
                 cx,
@@ -413,7 +413,7 @@ pub struct AgentPanel {
     fs: Arc<dyn Fs>,
     language_registry: Arc<LanguageRegistry>,
     acp_history: Entity<AcpThreadHistory>,
-    history_store: Entity<agent::HistoryStore>,
+    acp_history_store: Entity<agent::HistoryStore>,
     text_thread_store: Entity<assistant_context::ContextStore>,
     prompt_store: Option<Entity<PromptStore>>,
     context_server_registry: Entity<ContextServerRegistry>,
@@ -438,7 +438,7 @@ impl AgentPanel {
     /// Get the ACP history store (for WebSocket integration setup)
     #[cfg(feature = "external_websocket_sync")]
     pub fn acp_history_store(&self) -> &Entity<agent::HistoryStore> {
-        &self.history_store
+        &self.acp_history_store
     }
 
     fn serialize(&mut self, cx: &mut Context<Self>) {
@@ -541,8 +541,8 @@ impl AgentPanel {
         let context_server_registry =
             cx.new(|cx| ContextServerRegistry::new(project.read(cx).context_server_store(), cx));
 
-        let history_store = cx.new(|cx| agent::HistoryStore::new(text_thread_store.clone(), cx));
-        let acp_history = cx.new(|cx| AcpThreadHistory::new(history_store.clone(), window, cx));
+        let acp_history_store = cx.new(|cx| agent::HistoryStore::new(text_thread_store.clone(), cx));
+        let acp_history = cx.new(|cx| AcpThreadHistory::new(acp_history_store.clone(), window, cx));
         cx.subscribe_in(
             &acp_history,
             window,
@@ -564,7 +564,7 @@ impl AgentPanel {
         )
         .detach();
 
-        cx.observe(&history_store, |_, _, cx| cx.notify()).detach();
+        cx.observe(&acp_history_store, |_, _, cx| cx.notify()).detach();
 
         // REMOVED: Dead WebSocket observer code - was unreliable because it depended on render()
         // Message completion now handled in TextThreadEditor which always runs
@@ -575,7 +575,7 @@ impl AgentPanel {
             DefaultView::Thread => ActiveView::native_agent(
                 fs.clone(),
                 prompt_store.clone(),
-                history_store.clone(),
+                acp_history_store.clone(),
                 project.clone(),
                 workspace.clone(),
                 window,
@@ -605,7 +605,7 @@ impl AgentPanel {
                 });
                 ActiveView::text_thread(
                     context_editor,
-                    history_store.clone(),
+                    acp_history_store.clone(),
                     language_registry.clone(),
                     window,
                     cx,
@@ -782,7 +782,7 @@ impl AgentPanel {
             pending_serialization: None,
             onboarding,
             acp_history,
-            history_store,
+            acp_history_store,
             selected_agent: AgentType::default(),
             loading: false,
         }
@@ -811,7 +811,7 @@ impl AgentPanel {
     }
 
     pub(crate) fn thread_store(&self) -> &Entity<HistoryStore> {
-        &self.history_store
+        &self.acp_history_store
     }
 
     pub(crate) fn context_server_registry(&self) -> &Entity<ContextServerRegistry> {
@@ -836,7 +836,7 @@ impl AgentPanel {
         cx: &mut Context<Self>,
     ) {
         let Some(thread) = self
-            .history_store
+            .acp_history_store
             .read(cx)
             .thread_from_session_id(&action.from_session_id)
         else {
@@ -884,7 +884,7 @@ impl AgentPanel {
         self.set_active_view(
             ActiveView::text_thread(
                 context_editor.clone(),
-                self.history_store.clone(),
+                self.acp_history_store.clone(),
                 self.language_registry.clone(),
                 window,
                 cx,
@@ -916,7 +916,7 @@ impl AgentPanel {
         }
 
         let loading = self.loading;
-        let history = self.history_store.clone();
+        let history = self.acp_history_store.clone();
 
         cx.spawn_in(window, async move |this, cx| {
             let ext_agent = match agent_choice {
@@ -977,7 +977,7 @@ impl AgentPanel {
                         summarize_thread,
                         workspace.clone(),
                         project,
-                        this.history_store.clone(),
+                        this.acp_history_store.clone(),
                         this.prompt_store.clone(),
                         window,
                         cx,
@@ -1032,7 +1032,7 @@ impl AgentPanel {
         cx: &mut Context<Self>,
     ) -> Task<Result<()>> {
         let context = self
-            .history_store
+            .acp_history_store
             .update(cx, |store, cx| store.load_text_thread(path, cx));
         cx.spawn_in(window, async move |this, cx| {
             let context = context.await?;
@@ -1071,7 +1071,7 @@ impl AgentPanel {
         self.set_active_view(
             ActiveView::text_thread(
                 editor,
-                self.history_store.clone(),
+                self.acp_history_store.clone(),
                 self.language_registry.clone(),
                 window,
                 cx,
@@ -1333,7 +1333,7 @@ impl AgentPanel {
 
         match &new_view {
             ActiveView::TextThread { context_editor, .. } => {
-                self.history_store.update(cx, |store, cx| {
+                self.acp_history_store.update(cx, |store, cx| {
                     if let Some(path) = context_editor.read(cx).context().read(cx).path() {
                         store.push_recently_opened_entry(
                             agent::HistoryEntryId::TextThread(path.clone()),
@@ -1367,7 +1367,7 @@ impl AgentPanel {
     ) -> ContextMenu {
         let entries = panel
             .read(cx)
-            .history_store
+            .acp_history_store
             .read(cx)
             .recently_opened_entries(cx);
 
@@ -1412,7 +1412,7 @@ impl AgentPanel {
                     move |_window, cx| {
                         panel
                             .update(cx, |this, cx| {
-                                this.history_store.update(cx, |history_store, cx| {
+                                this.acp_history_store.update(cx, |history_store, cx| {
                                     history_store.remove_recently_opened_entry(&id, cx);
                                 });
                             })
@@ -2250,7 +2250,7 @@ impl AgentPanel {
                 false
             }
             _ => {
-                let history_is_empty = self.history_store.read(cx).is_empty(cx);
+                let history_is_empty = self.acp_history_store.read(cx).is_empty(cx);
 
                 let has_configured_non_zed_providers = LanguageModelRegistry::try_read_global(cx)
                     .map(|registry| registry
