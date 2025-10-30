@@ -499,7 +499,7 @@ impl NotificationFrame {
     }
 
     /// Determines whether the given notification ID should be suppressible
-    /// Suppressed motifications will not be shown anymore
+    /// Suppressed notifications will not be shown anymore
     pub fn show_suppress_button(mut self, show: bool) -> Self {
         self.show_suppress_button = show;
         self
@@ -761,8 +761,8 @@ pub mod simple_message_notification {
             self
         }
 
-        /// Determines whether the given notification ID should be supressable
-        /// Suppressed motifications will not be shown anymor
+        /// Determines whether the given notification ID should be suppressible
+        /// Suppressed notifications will not be shown anymor
         pub fn show_suppress_button(mut self, show: bool) -> Self {
             self.show_suppress_button = show;
             self
@@ -1077,8 +1077,13 @@ where
             if let Err(err) = result.as_ref() {
                 log::error!("{err:?}");
                 if let Ok(prompt) = cx.update(|window, cx| {
+                    let mut display = format!("{err}");
+                    if !display.ends_with('\n') {
+                        display.push('.');
+                        display.push(' ')
+                    }
                     let detail =
-                        f(err, window, cx).unwrap_or_else(|| format!("{err}. Please try again."));
+                        f(err, window, cx).unwrap_or_else(|| format!("{display}Please try again."));
                     window.prompt(PromptLevel::Critical, &msg, Some(&detail), &["Ok"], cx)
                 }) {
                     prompt.await.ok();

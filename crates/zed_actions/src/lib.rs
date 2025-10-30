@@ -30,18 +30,26 @@ pub struct OpenZedUrl {
 actions!(
     zed,
     [
-        /// Opens the settings editor.
+        #[action(deprecated_aliases = ["zed_actions::OpenSettingsEditor"])]
         OpenSettings,
+        /// Opens the settings JSON file.
+        #[action(deprecated_aliases = ["zed_actions::OpenSettings"])]
+        OpenSettingsFile,
+        /// Opens the settings editor.
         /// Opens the default keymap file.
         OpenDefaultKeymap,
+        /// Opens the user keymap file.
+        #[action(deprecated_aliases = ["zed_actions::OpenKeymap"])]
+        OpenKeymapFile,
+        /// Opens the keymap editor.
+        #[action(deprecated_aliases = ["zed_actions::OpenKeymapEditor"])]
+        OpenKeymap,
         /// Opens account settings.
         OpenAccountSettings,
         /// Opens server settings.
         OpenServerSettings,
         /// Quits the application.
         Quit,
-        /// Opens the user keymap file.
-        OpenKeymap,
         /// Shows information about Zed.
         About,
         /// Opens the documentation website.
@@ -178,19 +186,9 @@ pub mod git {
             SelectRepo,
             /// Opens the git branch selector.
             #[action(deprecated_aliases = ["branches::OpenRecent"])]
-            Branch
-        ]
-    );
-}
-
-pub mod jj {
-    use gpui::actions;
-
-    actions!(
-        jj,
-        [
-            /// Opens the Jujutsu bookmark list.
-            BookmarkList
+            Branch,
+            /// Opens the git stash selector.
+            ViewStash
         ]
     );
 }
@@ -225,10 +223,12 @@ pub mod feedback {
     actions!(
         feedback,
         [
+            /// Opens email client to send feedback to Zed support.
+            EmailZed,
             /// Opens the bug report form.
             FileBugReport,
-            /// Opens the feedback form.
-            GiveFeedback
+            /// Opens the feature request form.
+            RequestFeature
         ]
     );
 }
@@ -286,6 +286,8 @@ pub mod agent {
             OpenOnboardingModal,
             /// Opens the ACP onboarding modal.
             OpenAcpOnboardingModal,
+            /// Opens the Claude Code onboarding modal.
+            OpenClaudeCodeOnboardingModal,
             /// Resets the agent onboarding state.
             ResetOnboarding,
             /// Starts a chat conversation with the agent.
@@ -491,3 +493,28 @@ actions!(
         OpenProjectDebugTasks,
     ]
 );
+
+#[cfg(target_os = "windows")]
+pub mod wsl_actions {
+    use gpui::Action;
+    use schemars::JsonSchema;
+    use serde::Deserialize;
+
+    /// Opens a folder inside Wsl.
+    #[derive(PartialEq, Clone, Deserialize, Default, JsonSchema, Action)]
+    #[action(namespace = projects)]
+    #[serde(deny_unknown_fields)]
+    pub struct OpenFolderInWsl {
+        #[serde(default)]
+        pub create_new_window: bool,
+    }
+
+    /// Open a wsl distro.
+    #[derive(PartialEq, Clone, Deserialize, Default, JsonSchema, Action)]
+    #[action(namespace = projects)]
+    #[serde(deny_unknown_fields)]
+    pub struct OpenWsl {
+        #[serde(default)]
+        pub create_new_window: bool,
+    }
+}

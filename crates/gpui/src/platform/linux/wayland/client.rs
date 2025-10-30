@@ -7,6 +7,7 @@ use std::{
     time::{Duration, Instant},
 };
 
+use ashpd::WindowIdentifier;
 use calloop::{
     EventLoop, LoopHandle,
     timer::{TimeoutAction, Timer},
@@ -75,8 +76,8 @@ use crate::{
     FileDropEvent, ForegroundExecutor, KeyDownEvent, KeyUpEvent, Keystroke, LinuxCommon,
     LinuxKeyboardLayout, Modifiers, ModifiersChangedEvent, MouseButton, MouseDownEvent,
     MouseExitEvent, MouseMoveEvent, MouseUpEvent, NavigationDirection, Pixels, PlatformDisplay,
-    PlatformInput, PlatformKeyboardLayout, Point, SCROLL_LINES, ScaledPixels, ScrollDelta,
-    ScrollWheelEvent, Size, TouchPhase, WindowParams, point, px, size,
+    PlatformInput, PlatformKeyboardLayout, Point, SCROLL_LINES, ScrollDelta, ScrollWheelEvent,
+    Size, TouchPhase, WindowParams, point, px, size,
 };
 use crate::{
     SharedString,
@@ -323,7 +324,7 @@ impl WaylandClientStatePtr {
         }
     }
 
-    pub fn update_ime_position(&self, bounds: Bounds<ScaledPixels>) {
+    pub fn update_ime_position(&self, bounds: Bounds<Pixels>) {
         let client = self.get_client();
         let mut state = client.borrow_mut();
         if state.composing || state.text_input.is_none() || state.pre_edit_text.is_some() {
@@ -694,6 +695,8 @@ impl LinuxClient for WaylandClient {
     ) -> anyhow::Result<Box<dyn PlatformWindow>> {
         let mut state = self.0.borrow_mut();
 
+        let parent = state.keyboard_focused_window.as_ref().map(|w| w.toplevel());
+
         let (window, surface_id) = WaylandWindow::new(
             handle,
             state.globals.clone(),
@@ -701,6 +704,7 @@ impl LinuxClient for WaylandClient {
             WaylandClientStatePtr(Rc::downgrade(&self.0)),
             params,
             state.common.appearance,
+            parent,
         )?;
         state.windows.insert(surface_id, window.0.clone());
 
@@ -857,6 +861,20 @@ impl LinuxClient for WaylandClient {
 
     fn compositor_name(&self) -> &'static str {
         "Wayland"
+    }
+
+    fn window_identifier(&self) -> impl Future<Output = Option<WindowIdentifier>> + Send + 'static {
+        async fn inner(surface: Option<wl_surface::WlSurface>) -> Option<WindowIdentifier> {
+            if let Some(surface) = surface {
+                ashpd::WindowIdentifier::from_wayland(&surface).await
+            } else {
+                None
+            }
+        }
+
+        let client_state = self.0.borrow();
+        let active_window = client_state.keyboard_focused_window.as_ref();
+        inner(active_window.map(|aw| aw.surface()))
     }
 }
 

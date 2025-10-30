@@ -63,11 +63,7 @@ impl Vim {
                 }
             });
 
-            if HelixModeSetting::get_global(cx).0 {
-                self.switch_mode(Mode::HelixNormal, false, window, cx);
-            } else {
-                self.switch_mode(Mode::Normal, false, window, cx);
-            }
+            self.switch_mode(Mode::Normal, false, window, cx);
             return;
         }
 
@@ -88,7 +84,7 @@ impl Vim {
         self.update_editor(cx, |_, editor, cx| {
             let snapshot = editor.buffer().read(cx).snapshot(cx);
             let mut edits = Vec::new();
-            for selection in editor.selections.all::<Point>(cx) {
+            for selection in editor.selections.all::<Point>(&editor.display_snapshot(cx)) {
                 let point = selection.head();
                 let new_row = match direction {
                     Direction::Next => point.row + 1,

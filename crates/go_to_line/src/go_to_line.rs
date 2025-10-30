@@ -3,7 +3,8 @@ pub mod cursor_position;
 use cursor_position::{LineIndicatorFormat, UserCaretPosition};
 use editor::{
     Anchor, Editor, MultiBufferSnapshot, RowHighlightOptions, SelectionEffects, ToOffset, ToPoint,
-    actions::Tab, scroll::Autoscroll,
+    actions::Tab,
+    scroll::{Autoscroll, ScrollOffset},
 };
 use gpui::{
     App, DismissEvent, Entity, EventEmitter, FocusHandle, Focusable, Render, SharedString, Styled,
@@ -26,7 +27,7 @@ pub struct GoToLine {
     line_editor: Entity<Editor>,
     active_editor: Entity<Editor>,
     current_text: SharedString,
-    prev_scroll_position: Option<gpui::Point<f32>>,
+    prev_scroll_position: Option<gpui::Point<ScrollOffset>>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -73,7 +74,9 @@ impl GoToLine {
     ) -> Self {
         let (user_caret, last_line, scroll_position) = active_editor.update(cx, |editor, cx| {
             let user_caret = UserCaretPosition::at_selection_end(
-                &editor.selections.last::<Point>(cx),
+                &editor
+                    .selections
+                    .last::<Point>(&editor.display_snapshot(cx)),
                 &editor.buffer().read(cx).snapshot(cx),
             );
 
@@ -103,17 +106,20 @@ impl GoToLine {
                             return;
                         };
                         editor.update(cx, |editor, cx| {
-                            if let Some(placeholder_text) = editor.placeholder_text()
+                            if let Some(placeholder_text) = editor.placeholder_text(cx)
                                 && editor.text(cx).is_empty()
                             {
-                                let placeholder_text = placeholder_text.to_string();
                                 editor.set_text(placeholder_text, window, cx);
                             }
                         });
                     }
                 })
                 .detach();
-            editor.set_placeholder_text(format!("{line}{FILE_ROW_COLUMN_DELIMITER}{column}"), cx);
+            editor.set_placeholder_text(
+                &format!("{line}{FILE_ROW_COLUMN_DELIMITER}{column}"),
+                window,
+                cx,
+            );
             editor
         });
         let line_editor_change = cx.subscribe_in(&line_editor, window, Self::on_line_editor_event);
@@ -308,7 +314,7 @@ mod tests {
     use project::{FakeFs, Project};
     use serde_json::json;
     use std::{num::NonZeroU32, sync::Arc, time::Duration};
-    use util::path;
+    use util::{path, rel_path::rel_path};
     use workspace::{AppState, Workspace};
 
     #[gpui::test]
@@ -353,7 +359,7 @@ mod tests {
             .unwrap();
         let editor = workspace
             .update_in(cx, |workspace, window, cx| {
-                workspace.open_path((worktree_id, "a.rs"), None, true, window, cx)
+                workspace.open_path((worktree_id, rel_path("a.rs")), None, true, window, cx)
             })
             .await
             .unwrap()
@@ -457,7 +463,7 @@ mod tests {
             .unwrap();
         let editor = workspace
             .update_in(cx, |workspace, window, cx| {
-                workspace.open_path((worktree_id, "a.rs"), None, true, window, cx)
+                workspace.open_path((worktree_id, rel_path("a.rs")), None, true, window, cx)
             })
             .await
             .unwrap()
@@ -542,7 +548,7 @@ mod tests {
             .unwrap();
         let editor = workspace
             .update_in(cx, |workspace, window, cx| {
-                workspace.open_path((worktree_id, "a.rs"), None, true, window, cx)
+                workspace.open_path((worktree_id, rel_path("a.rs")), None, true, window, cx)
             })
             .await
             .unwrap()
@@ -620,7 +626,7 @@ mod tests {
             .unwrap();
         let editor = workspace
             .update_in(cx, |workspace, window, cx| {
-                workspace.open_path((worktree_id, "a.rs"), None, true, window, cx)
+                workspace.open_path((worktree_id, rel_path("a.rs")), None, true, window, cx)
             })
             .await
             .unwrap()
@@ -691,11 +697,11 @@ mod tests {
         let go_to_line_view = open_go_to_line_view(workspace, cx);
         go_to_line_view.update(cx, |go_to_line_view, cx| {
             assert_eq!(
-                go_to_line_view
-                    .line_editor
-                    .read(cx)
-                    .placeholder_text()
-                    .expect("No placeholder text"),
+                go_to_line_view.line_editor.update(cx, |line_editor, cx| {
+                    line_editor
+                        .placeholder_text(cx)
+                        .expect("No placeholder text")
+                }),
                 format!(
                     "{}:{}",
                     expected_placeholder.line, expected_placeholder.character
@@ -735,7 +741,7 @@ mod tests {
         let selections = editor.update(cx, |editor, cx| {
             editor
                 .selections
-                .all::<rope::Point>(cx)
+                .all::<rope::Point>(&editor.display_snapshot(cx))
                 .into_iter()
                 .map(|s| s.start..s.end)
                 .collect::<Vec<_>>()

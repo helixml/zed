@@ -90,6 +90,9 @@ if [ "$local_arch" = true ]; then
     echo "Building for local target only."
     cargo build ${build_flag} --package zed --package cli --package remote_server
 else
+    rustup target add aarch64-apple-darwin
+    rustup target add x86_64-apple-darwin
+
     echo "Compiling zed binaries"
     cargo build ${build_flag} --package zed --package cli --target aarch64-apple-darwin --target x86_64-apple-darwin
     # Build remote_server in separate invocation to prevent feature unification from other crates
@@ -372,7 +375,7 @@ function upload_debug_info() {
     if [[ -n "${SENTRY_AUTH_TOKEN:-}" ]]; then
         echo "Uploading zed debug symbols to sentry..."
         # note: this uploads the unstripped binary which is needed because it contains
-        # .eh_frame data for stack unwinindg. see https://github.com/getsentry/symbolic/issues/783
+        # .eh_frame data for stack unwinding. see https://github.com/getsentry/symbolic/issues/783
         sentry-cli debug-files upload --include-sources --wait -p zed -o zed-dev \
             "target/${architecture}/${target_dir}/zed" \
             "target/${architecture}/${target_dir}/remote_server" \

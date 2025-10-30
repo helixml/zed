@@ -594,9 +594,10 @@ impl project::ProjectItem for NotebookItem {
                 };
 
                 let id = project
-                    .update(cx, |project, cx| project.entry_for_path(&path, cx))?
-                    .context("Entry not found")?
-                    .id;
+                    .update(cx, |project, cx| {
+                        project.entry_for_path(&path, cx).map(|entry| entry.id)
+                    })?
+                    .context("Entry not found")?;
 
                 cx.new(|_| NotebookItem {
                     path: abs_path,
@@ -708,11 +709,17 @@ impl Item for NotebookEditor {
         _workspace_id: Option<workspace::WorkspaceId>,
         window: &mut Window,
         cx: &mut Context<Self>,
-    ) -> Option<Entity<Self>>
+    ) -> Task<Option<Entity<Self>>>
     where
         Self: Sized,
     {
-        Some(cx.new(|cx| Self::new(self.project.clone(), self.notebook_item.clone(), window, cx)))
+        Task::ready(Some(cx.new(|cx| {
+            Self::new(self.project.clone(), self.notebook_item.clone(), window, cx)
+        })))
+    }
+
+    fn buffer_kind(&self, _: &App) -> workspace::item::ItemBufferKind {
+        workspace::item::ItemBufferKind::Singleton
     }
 
     fn for_each_project_item(
@@ -721,10 +728,6 @@ impl Item for NotebookEditor {
         f: &mut dyn FnMut(gpui::EntityId, &dyn project::ProjectItem),
     ) {
         f(self.notebook_item.entity_id(), self.notebook_item.read(cx))
-    }
-
-    fn is_singleton(&self, _cx: &App) -> bool {
-        true
     }
 
     fn tab_content(&self, params: TabContentParams, window: &Window, cx: &App) -> AnyElement {

@@ -8,7 +8,8 @@ use crate::{
 use anyhow::Context as _;
 use collections::HashMap;
 use editor::{
-    Anchor, Editor, EditorEvent, EditorSettings, MAX_TAB_TITLE_LEN, MultiBuffer, SelectionEffects,
+    Anchor, Editor, EditorEvent, EditorSettings, MAX_TAB_TITLE_LEN, MultiBuffer, PathKey,
+    SelectionEffects,
     actions::{Backtab, SelectAll, Tab},
     items::active_match_index,
     multibuffer_context_lines,
@@ -32,15 +33,11 @@ use std::{
     any::{Any, TypeId},
     mem,
     ops::{Not, Range},
-    path::Path,
     pin::pin,
     sync::Arc,
 };
-use ui::{
-    Icon, IconButton, IconButtonShape, IconName, KeyBinding, Label, LabelCommon, LabelSize,
-    Toggleable, Tooltip, h_flex, prelude::*, utils::SearchInputWidth, v_flex,
-};
-use util::{ResultExt as _, paths::PathMatcher};
+use ui::{IconButtonShape, KeyBinding, Toggleable, Tooltip, prelude::*, utils::SearchInputWidth};
+use util::{ResultExt as _, paths::PathMatcher, rel_path::RelPath};
 use workspace::{
     DeploySearch, ItemNavHistory, NewSearch, ToolbarItemEvent, ToolbarItemLocation,
     ToolbarItemView, Workspace, WorkspaceId,
@@ -157,7 +154,7 @@ pub fn init(cx: &mut App) {
 
         // Both on present and dismissed search, we need to unconditionally handle those actions to focus from the editor.
         workspace.register_action(move |workspace, action: &DeploySearch, window, cx| {
-            if workspace.has_active_modal(window, cx) {
+            if workspace.has_active_modal(window, cx) && !workspace.hide_modal(window, cx) {
                 cx.propagate();
                 return;
             }
@@ -165,7 +162,7 @@ pub fn init(cx: &mut App) {
             cx.notify();
         });
         workspace.register_action(move |workspace, action: &NewSearch, window, cx| {
-            if workspace.has_active_modal(window, cx) {
+            if workspace.has_active_modal(window, cx) && !workspace.hide_modal(window, cx) {
                 cx.propagate();
                 return;
             }
@@ -344,6 +341,7 @@ impl ProjectSearch {
                                 .into_iter()
                                 .map(|(buffer, ranges)| {
                                     excerpts.set_anchored_excerpts_for_path(
+                                        PathKey::for_buffer(&buffer, cx),
                                         buffer,
                                         ranges,
                                         multibuffer_context_lines(cx),
@@ -526,10 +524,6 @@ impl Item for ProjectSearchView {
         self.results_editor.for_each_project_item(cx, f)
     }
 
-    fn is_singleton(&self, _: &App) -> bool {
-        false
-    }
-
     fn can_save(&self, _: &App) -> bool {
         true
     }
@@ -578,12 +572,14 @@ impl Item for ProjectSearchView {
         _workspace_id: Option<WorkspaceId>,
         window: &mut Window,
         cx: &mut Context<Self>,
-    ) -> Option<Entity<Self>>
+    ) -> Task<Option<Entity<Self>>>
     where
         Self: Sized,
     {
         let model = self.entity.update(cx, |model, cx| model.clone(cx));
-        Some(cx.new(|cx| Self::new(self.workspace.clone(), model, window, cx, None)))
+        Task::ready(Some(cx.new(|cx| {
+            Self::new(self.workspace.clone(), model, window, cx, None)
+        })))
     }
 
     fn added_to_workspace(
@@ -682,7 +678,18 @@ impl ProjectSearchView {
         self.included_opened_only = !self.included_opened_only;
     }
 
+    pub fn replacement(&self, cx: &App) -> String {
+        self.replacement_editor.read(cx).text(cx)
+    }
+
     fn replace_next(&mut self, _: &ReplaceNext, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(last_search_query_text) = &self.entity.read(cx).last_search_query_text
+            && self.query_editor.read(cx).text(cx) != *last_search_query_text
+        {
+            // search query has changed, restart search and bail
+            self.search(cx);
+            return;
+        }
         if self.entity.read(cx).match_ranges.is_empty() {
             return;
         }
@@ -702,14 +709,17 @@ impl ProjectSearchView {
             self.select_match(Direction::Next, window, cx)
         }
     }
-    pub fn replacement(&self, cx: &App) -> String {
-        self.replacement_editor.read(cx).text(cx)
-    }
     fn replace_all(&mut self, _: &ReplaceAll, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(last_search_query_text) = &self.entity.read(cx).last_search_query_text
+            && self.query_editor.read(cx).text(cx) != *last_search_query_text
+        {
+            // search query has changed, restart search and bail
+            self.search(cx);
+            return;
+        }
         if self.active_match_index.is_none() {
             return;
         }
-
         let Some(query) = self.entity.read(cx).active_query.as_ref() else {
             return;
         };
@@ -769,7 +779,7 @@ impl ProjectSearchView {
 
         let query_editor = cx.new(|cx| {
             let mut editor = Editor::single_line(window, cx);
-            editor.set_placeholder_text("Search all files…", cx);
+            editor.set_placeholder_text("Search all files…", window, cx);
             editor.set_text(query_text, window, cx);
             editor
         });
@@ -792,7 +802,7 @@ impl ProjectSearchView {
         );
         let replacement_editor = cx.new(|cx| {
             let mut editor = Editor::single_line(window, cx);
-            editor.set_placeholder_text("Replace in project…", cx);
+            editor.set_placeholder_text("Replace in project…", window, cx);
             if let Some(text) = replacement_text {
                 editor.set_text(text, window, cx);
             }
@@ -818,7 +828,7 @@ impl ProjectSearchView {
 
         let included_files_editor = cx.new(|cx| {
             let mut editor = Editor::single_line(window, cx);
-            editor.set_placeholder_text("Include: crates/**/*.toml", cx);
+            editor.set_placeholder_text("Include: crates/**/*.toml", window, cx);
 
             editor
         });
@@ -831,7 +841,7 @@ impl ProjectSearchView {
 
         let excluded_files_editor = cx.new(|cx| {
             let mut editor = Editor::single_line(window, cx);
-            editor.set_placeholder_text("Exclude: vendor/*, *.lock", cx);
+            editor.set_placeholder_text("Exclude: vendor/*, *.lock", window, cx);
 
             editor
         });
@@ -897,13 +907,11 @@ impl ProjectSearchView {
 
     pub fn new_search_in_directory(
         workspace: &mut Workspace,
-        dir_path: &Path,
+        dir_path: &RelPath,
         window: &mut Window,
         cx: &mut Context<Workspace>,
     ) {
-        let Some(filter_str) = dir_path.to_str() else {
-            return;
-        };
+        let filter_str = dir_path.display(workspace.path_style(cx));
 
         let weak_workspace = cx.entity().downgrade();
 
@@ -947,7 +955,12 @@ impl ProjectSearchView {
             .and_then(|item| item.downcast::<ProjectSearchView>())
         {
             let new_query = search_view.update(cx, |search_view, cx| {
-                let new_query = search_view.build_search_query(cx);
+                let open_buffers = if search_view.included_opened_only {
+                    Some(search_view.open_buffers(cx, workspace))
+                } else {
+                    None
+                };
+                let new_query = search_view.build_search_query(cx, open_buffers);
                 if new_query.is_some()
                     && let Some(old_query) = search_view.entity.read(cx).active_query.clone()
                 {
@@ -1060,18 +1073,12 @@ impl ProjectSearchView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Task<anyhow::Result<()>> {
-        use workspace::AutosaveSetting;
-
         let project = self.entity.read(cx).project.clone();
 
         let can_autosave = self.results_editor.can_autosave(cx);
         let autosave_setting = self.results_editor.workspace_settings(cx).autosave;
 
-        let will_autosave = can_autosave
-            && matches!(
-                autosave_setting,
-                AutosaveSetting::OnFocusChange | AutosaveSetting::OnWindowChange
-            );
+        let will_autosave = can_autosave && autosave_setting.should_save_on_close();
 
         let is_dirty = self.is_dirty(cx);
 
@@ -1129,7 +1136,14 @@ impl ProjectSearchView {
     }
 
     fn search(&mut self, cx: &mut Context<Self>) {
-        if let Some(query) = self.build_search_query(cx) {
+        let open_buffers = if self.included_opened_only {
+            self.workspace
+                .update(cx, |workspace, cx| self.open_buffers(cx, workspace))
+                .ok()
+        } else {
+            None
+        };
+        if let Some(query) = self.build_search_query(cx, open_buffers) {
             self.entity.update(cx, |model, cx| model.search(query, cx));
         }
     }
@@ -1138,18 +1152,18 @@ impl ProjectSearchView {
         self.query_editor.read(cx).text(cx)
     }
 
-    fn build_search_query(&mut self, cx: &mut Context<Self>) -> Option<SearchQuery> {
+    fn build_search_query(
+        &mut self,
+        cx: &mut Context<Self>,
+        open_buffers: Option<Vec<Entity<Buffer>>>,
+    ) -> Option<SearchQuery> {
         // Do not bail early in this function, as we want to fill out `self.panels_with_errors`.
+
         let text = self.search_query_text(cx);
-        let open_buffers = if self.included_opened_only {
-            Some(self.open_buffers(cx))
-        } else {
-            None
-        };
         let included_files = self
             .filters_enabled
             .then(|| {
-                match Self::parse_path_matches(&self.included_files_editor.read(cx).text(cx)) {
+                match self.parse_path_matches(self.included_files_editor.read(cx).text(cx), cx) {
                     Ok(included_files) => {
                         let should_unmark_error =
                             self.panels_with_errors.remove(&InputPanel::Include);
@@ -1169,11 +1183,11 @@ impl ProjectSearchView {
                     }
                 }
             })
-            .unwrap_or_default();
+            .unwrap_or(PathMatcher::default());
         let excluded_files = self
             .filters_enabled
             .then(|| {
-                match Self::parse_path_matches(&self.excluded_files_editor.read(cx).text(cx)) {
+                match self.parse_path_matches(self.excluded_files_editor.read(cx).text(cx), cx) {
                     Ok(excluded_files) => {
                         let should_unmark_error =
                             self.panels_with_errors.remove(&InputPanel::Exclude);
@@ -1194,7 +1208,7 @@ impl ProjectSearchView {
                     }
                 }
             })
-            .unwrap_or_default();
+            .unwrap_or(PathMatcher::default());
 
         // If the project contains multiple visible worktrees, we match the
         // include/exclude patterns against full paths to allow them to be
@@ -1281,28 +1295,25 @@ impl ProjectSearchView {
         query
     }
 
-    fn open_buffers(&self, cx: &mut Context<Self>) -> Vec<Entity<Buffer>> {
+    fn open_buffers(&self, cx: &App, workspace: &Workspace) -> Vec<Entity<Buffer>> {
         let mut buffers = Vec::new();
-        self.workspace
-            .update(cx, |workspace, cx| {
-                for editor in workspace.items_of_type::<Editor>(cx) {
-                    if let Some(buffer) = editor.read(cx).buffer().read(cx).as_singleton() {
-                        buffers.push(buffer);
-                    }
-                }
-            })
-            .ok();
+        for editor in workspace.items_of_type::<Editor>(cx) {
+            if let Some(buffer) = editor.read(cx).buffer().read(cx).as_singleton() {
+                buffers.push(buffer);
+            }
+        }
         buffers
     }
 
-    fn parse_path_matches(text: &str) -> anyhow::Result<PathMatcher> {
+    fn parse_path_matches(&self, text: String, cx: &App) -> anyhow::Result<PathMatcher> {
+        let path_style = self.entity.read(cx).project.read(cx).path_style(cx);
         let queries = text
             .split(',')
             .map(str::trim)
             .filter(|maybe_glob_str| !maybe_glob_str.is_empty())
             .map(str::to_owned)
             .collect::<Vec<_>>();
-        Ok(PathMatcher::new(&queries)?)
+        Ok(PathMatcher::new(&queries, path_style)?)
     }
 
     fn select_match(&mut self, direction: Direction, window: &mut Window, cx: &mut Context<Self>) {
@@ -1384,6 +1395,9 @@ impl ProjectSearchView {
         let match_ranges = self.entity.read(cx).match_ranges.clone();
         if match_ranges.is_empty() {
             self.active_match_index = None;
+            self.results_editor.update(cx, |editor, cx| {
+                editor.clear_background_highlights::<Self>(cx);
+            });
         } else {
             self.active_match_index = Some(0);
             self.update_match_index(cx);
@@ -2271,7 +2285,7 @@ fn register_workspace_action<A: Action>(
     callback: fn(&mut ProjectSearchBar, &A, &mut Window, &mut Context<ProjectSearchBar>),
 ) {
     workspace.register_action(move |workspace, action: &A, window, cx| {
-        if workspace.has_active_modal(window, cx) {
+        if workspace.has_active_modal(window, cx) && !workspace.hide_modal(window, cx) {
             cx.propagate();
             return;
         }
@@ -2298,7 +2312,7 @@ fn register_workspace_action_for_present_search<A: Action>(
     callback: fn(&mut Workspace, &A, &mut Window, &mut Context<Workspace>),
 ) {
     workspace.register_action(move |workspace, action: &A, window, cx| {
-        if workspace.has_active_modal(window, cx) {
+        if workspace.has_active_modal(window, cx) && !workspace.hide_modal(window, cx) {
             cx.propagate();
             return;
         }
@@ -2338,7 +2352,7 @@ pub fn perform_project_search(
 
 #[cfg(test)]
 pub mod tests {
-    use std::{ops::Deref as _, sync::Arc};
+    use std::{ops::Deref as _, sync::Arc, time::Duration};
 
     use super::*;
     use editor::{DisplayPoint, display_map::DisplayRow};
@@ -2346,9 +2360,11 @@ pub mod tests {
     use project::FakeFs;
     use serde_json::json;
     use settings::SettingsStore;
-    use util::path;
+    use util::{path, paths::PathStyle, rel_path::rel_path};
+    use util_macros::perf;
     use workspace::DeploySearch;
 
+    #[perf]
     #[gpui::test]
     async fn test_project_search(cx: &mut TestAppContext) {
         init_test(cx);
@@ -2381,6 +2397,7 @@ pub mod tests {
                 "\n\nconst THREE: usize = one::ONE + two::TWO;\n\n\nconst TWO: usize = one::ONE + one::ONE;"
             );
             let match_background_color = cx.theme().colors().search_match_background;
+            let selection_background_color = cx.theme().colors().editor_document_highlight_bracket_background;
             assert_eq!(
                 search_view
                     .results_editor
@@ -2392,12 +2409,21 @@ pub mod tests {
                     ),
                     (
                         DisplayPoint::new(DisplayRow(2), 37)..DisplayPoint::new(DisplayRow(2), 40),
+                        selection_background_color
+                    ),
+                    (
+                        DisplayPoint::new(DisplayRow(2), 37)..DisplayPoint::new(DisplayRow(2), 40),
                         match_background_color
                     ),
                     (
                         DisplayPoint::new(DisplayRow(5), 6)..DisplayPoint::new(DisplayRow(5), 9),
+                        selection_background_color
+                    ),
+                    (
+                        DisplayPoint::new(DisplayRow(5), 6)..DisplayPoint::new(DisplayRow(5), 9),
                         match_background_color
-                    )
+                    ),
+
                 ]
             );
             assert_eq!(search_view.active_match_index, Some(0));
@@ -2476,6 +2502,7 @@ pub mod tests {
             .unwrap();
     }
 
+    #[perf]
     #[gpui::test]
     async fn test_deploy_project_search_focus(cx: &mut TestAppContext) {
         init_test(cx);
@@ -2716,6 +2743,7 @@ pub mod tests {
         }).unwrap();
     }
 
+    #[perf]
     #[gpui::test]
     async fn test_filters_consider_toggle_state(cx: &mut TestAppContext) {
         init_test(cx);
@@ -2836,6 +2864,7 @@ pub mod tests {
             .unwrap();
     }
 
+    #[perf]
     #[gpui::test]
     async fn test_new_project_search_focus(cx: &mut TestAppContext) {
         init_test(cx);
@@ -3131,6 +3160,7 @@ pub mod tests {
                 });}).unwrap();
     }
 
+    #[perf]
     #[gpui::test]
     async fn test_new_project_search_in_directory(cx: &mut TestAppContext) {
         init_test(cx);
@@ -3186,8 +3216,9 @@ pub mod tests {
                 .read(cx)
                 .project()
                 .read(cx)
-                .entry_for_path(&(worktree_id, "a").into(), cx)
+                .entry_for_path(&(worktree_id, rel_path("a")).into(), cx)
                 .expect("no entry for /a/ directory")
+                .clone()
         });
         assert!(a_dir_entry.is_dir());
         window
@@ -3223,7 +3254,7 @@ pub mod tests {
                     search_view.included_files_editor.update(cx, |editor, cx| {
                         assert_eq!(
                             editor.display_text(cx),
-                            a_dir_entry.path.to_str().unwrap(),
+                            a_dir_entry.path.display(PathStyle::local()),
                             "New search in directory should have included dir entry path"
                         );
                     });
@@ -3256,6 +3287,7 @@ pub mod tests {
             .unwrap();
     }
 
+    #[perf]
     #[gpui::test]
     async fn test_search_query_history(cx: &mut TestAppContext) {
         init_test(cx);
@@ -3586,6 +3618,7 @@ pub mod tests {
             .unwrap();
     }
 
+    #[perf]
     #[gpui::test]
     async fn test_search_query_history_with_multiple_views(cx: &mut TestAppContext) {
         init_test(cx);
@@ -3619,7 +3652,7 @@ pub mod tests {
         window
             .update(cx, |workspace, window, cx| {
                 workspace.open_path(
-                    (worktree_id, "one.rs"),
+                    (worktree_id, rel_path("one.rs")),
                     Some(first_pane.downgrade()),
                     true,
                     window,
@@ -3663,6 +3696,7 @@ pub mod tests {
                 )
             })
             .unwrap()
+            .await
             .unwrap();
         assert_eq!(cx.update(|cx| second_pane.read(cx).items_len()), 1);
 
@@ -3809,6 +3843,7 @@ pub mod tests {
         assert_eq!(active_query(&search_view_1, cx), "");
     }
 
+    #[perf]
     #[gpui::test]
     async fn test_deploy_search_with_multiple_panes(cx: &mut TestAppContext) {
         init_test(cx);
@@ -3836,7 +3871,7 @@ pub mod tests {
         window
             .update(cx, |workspace, window, cx| {
                 workspace.open_path(
-                    (worktree_id, "one.rs"),
+                    (worktree_id, rel_path("one.rs")),
                     Some(first_pane.downgrade()),
                     true,
                     window,
@@ -3857,6 +3892,7 @@ pub mod tests {
                 )
             })
             .unwrap()
+            .await
             .unwrap();
         assert_eq!(cx.update(|cx| second_pane.read(cx).items_len()), 1);
         assert!(
@@ -3968,6 +4004,7 @@ pub mod tests {
             .unwrap();
     }
 
+    #[perf]
     #[gpui::test]
     async fn test_scroll_search_results_to_top(cx: &mut TestAppContext) {
         init_test(cx);
@@ -4022,7 +4059,7 @@ pub mod tests {
 
                     // Scroll results all the way down
                     results_editor.scroll(
-                        Point::new(0., f32::MAX),
+                        Point::new(0., f64::MAX),
                         Some(Axis::Vertical),
                         window,
                         cx,
@@ -4048,6 +4085,7 @@ pub mod tests {
             .expect("unable to update search view");
     }
 
+    #[perf]
     #[gpui::test]
     async fn test_buffer_search_query_reused(cx: &mut TestAppContext) {
         init_test(cx);
@@ -4070,7 +4108,7 @@ pub mod tests {
 
         let editor = workspace
             .update_in(&mut cx, |workspace, window, cx| {
-                workspace.open_path((worktree_id, "one.rs"), None, true, window, cx)
+                workspace.open_path((worktree_id, rel_path("one.rs")), None, true, window, cx)
             })
             .await
             .unwrap()
@@ -4103,7 +4141,7 @@ pub mod tests {
         buffer_search_bar
             .update_in(&mut cx, |buffer_search_bar, window, cx| {
                 buffer_search_bar.focus_handle(cx).focus(window);
-                buffer_search_bar.search(buffer_search_query, None, window, cx)
+                buffer_search_bar.search(buffer_search_query, None, true, window, cx)
             })
             .await
             .unwrap();
@@ -4125,6 +4163,67 @@ pub mod tests {
                 "Project search should take the query from the buffer search bar since it got focused and had a query inside"
             );
         });
+    }
+
+    #[gpui::test]
+    async fn test_search_dismisses_modal(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let fs = FakeFs::new(cx.background_executor.clone());
+        fs.insert_tree(
+            path!("/dir"),
+            json!({
+                "one.rs": "const ONE: usize = 1;",
+            }),
+        )
+        .await;
+        let project = Project::test(fs.clone(), [path!("/dir").as_ref()], cx).await;
+        let window = cx.add_window(|window, cx| Workspace::test_new(project.clone(), window, cx));
+
+        struct EmptyModalView {
+            focus_handle: gpui::FocusHandle,
+        }
+        impl EventEmitter<gpui::DismissEvent> for EmptyModalView {}
+        impl Render for EmptyModalView {
+            fn render(&mut self, _: &mut Window, _: &mut Context<'_, Self>) -> impl IntoElement {
+                div()
+            }
+        }
+        impl Focusable for EmptyModalView {
+            fn focus_handle(&self, _cx: &App) -> gpui::FocusHandle {
+                self.focus_handle.clone()
+            }
+        }
+        impl workspace::ModalView for EmptyModalView {}
+
+        window
+            .update(cx, |workspace, window, cx| {
+                workspace.toggle_modal(window, cx, |_, cx| EmptyModalView {
+                    focus_handle: cx.focus_handle(),
+                });
+                assert!(workspace.has_active_modal(window, cx));
+            })
+            .unwrap();
+
+        cx.dispatch_action(window.into(), Deploy::find());
+
+        window
+            .update(cx, |workspace, window, cx| {
+                assert!(!workspace.has_active_modal(window, cx));
+                workspace.toggle_modal(window, cx, |_, cx| EmptyModalView {
+                    focus_handle: cx.focus_handle(),
+                });
+                assert!(workspace.has_active_modal(window, cx));
+            })
+            .unwrap();
+
+        cx.dispatch_action(window.into(), DeploySearch::find());
+
+        window
+            .update(cx, |workspace, window, cx| {
+                assert!(!workspace.has_active_modal(window, cx));
+            })
+            .unwrap();
     }
 
     fn init_test(cx: &mut TestAppContext) {
@@ -4156,6 +4255,10 @@ pub mod tests {
                 search_view.search(cx);
             })
             .unwrap();
+        // Ensure editor highlights appear after the search is done
+        cx.executor().advance_clock(
+            editor::SELECTION_HIGHLIGHT_DEBOUNCE_TIMEOUT + Duration::from_millis(100),
+        );
         cx.background_executor.run_until_parked();
     }
 }
