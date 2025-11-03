@@ -18,7 +18,7 @@ use tokio::sync::mpsc;
 use util::ResultExt;
 use watch;
 
-use crate::{ExternalAgent, ThreadCreationRequest, SyncEvent};
+use crate::{ExternalAgent, ThreadCreationRequest, ThreadOpenRequest, SyncEvent};
 
 /// Global registry of active ACP threads (service layer)
 /// Stores STRONG references to keep threads alive for follow-up messages
@@ -125,6 +125,21 @@ pub fn setup_thread_handler(
     crate::init_thread_creation_callback(callback_tx);
     log::info!("✅ [THREAD_SERVICE] Thread creation callback registered");
 
+    // Create callback channel for thread open requests
+    let (open_callback_tx, mut open_callback_rx) = mpsc::unbounded_channel::<ThreadOpenRequest>();
+
+    // Register open callback globally
+    crate::init_thread_open_callback(open_callback_tx);
+    log::info!("✅ [THREAD_SERVICE] Thread open callback registered");
+
+    // Clone resources for both spawned tasks
+    let project_for_create = project.clone();
+    let acp_history_store_for_create = acp_history_store.clone();
+    let fs_for_create = fs.clone();
+    let project_for_open = project.clone();
+    let acp_history_store_for_open = acp_history_store.clone();
+    let fs_for_open = fs.clone();
+
     // Spawn handler task to process thread creation requests
     cx.spawn(async move |cx| {
         eprintln!("🔧 [THREAD_SERVICE] Handler task started, waiting for requests...");
@@ -188,9 +203,9 @@ pub fn setup_thread_handler(
             log::info!("🆕 [THREAD_SERVICE] Creating new ACP thread for request: {}", request.request_id);
             if let Err(e) = cx.update(|cx| {
                 create_new_thread_sync(
-                    project.clone(),
-                    acp_history_store.clone(),
-                    fs.clone(),
+                    project_for_create.clone(),
+                    acp_history_store_for_create.clone(),
+                    fs_for_create.clone(),
                     request,
                     cx,
                 )
@@ -200,6 +215,40 @@ pub fn setup_thread_handler(
         }
 
         log::warn!("⚠️ [THREAD_SERVICE] Handler task exiting - callback channel closed");
+        anyhow::Ok(())
+    })
+    .detach();
+
+    // Spawn handler task to process thread open requests
+    cx.spawn(async move |cx| {
+        eprintln!("🔧 [THREAD_SERVICE] Open thread handler task started, waiting for requests...");
+        log::info!("🔧 [THREAD_SERVICE] Open thread handler task started, waiting for requests...");
+
+        while let Some(request) = open_callback_rx.recv().await {
+            eprintln!(
+                "📨 [THREAD_SERVICE] Received thread open request: acp_thread_id={}",
+                request.acp_thread_id
+            );
+            log::info!(
+                "📨 [THREAD_SERVICE] Received thread open request: acp_thread_id={}",
+                request.acp_thread_id
+            );
+
+            // Open the thread via agent (loads from database)
+            if let Err(e) = cx.update(|cx| {
+                open_existing_thread_sync(
+                    project_for_open.clone(),
+                    acp_history_store_for_open.clone(),
+                    fs_for_open.clone(),
+                    request,
+                    cx,
+                )
+            }) {
+                log::error!("❌ [THREAD_SERVICE] Failed to open thread: {}", e);
+            }
+        }
+
+        log::warn!("⚠️ [THREAD_SERVICE] Open thread handler task exiting - callback channel closed");
         anyhow::Ok(())
     })
     .detach();
@@ -491,5 +540,108 @@ async fn handle_follow_up_message(
     })??;
 
     log::info!("✅ [THREAD_SERVICE] Follow-up message sent successfully");
+    Ok(())
+}
+
+/// Open an existing ACP thread from database and display it (synchronous version)
+fn open_existing_thread_sync(
+    project: Entity<Project>,
+    acp_history_store: Entity<HistoryStore>,
+    fs: Arc<dyn Fs>,
+    request: ThreadOpenRequest,
+    cx: &mut App,
+) -> Result<()> {
+    eprintln!("📖 [THREAD_SERVICE] Opening existing ACP thread: {}", request.acp_thread_id);
+    log::info!("📖 [THREAD_SERVICE] Opening existing ACP thread: {}", request.acp_thread_id);
+
+    // Check if thread is already in registry
+    if let Some(_thread_weak) = get_thread(&request.acp_thread_id) {
+        eprintln!("✅ [THREAD_SERVICE] Thread already loaded in registry: {}", request.acp_thread_id);
+        log::info!("✅ [THREAD_SERVICE] Thread already loaded in registry: {}", request.acp_thread_id);
+        // TODO: Still need to notify AgentPanel to display it
+        return Ok(());
+    }
+
+    // Thread not in registry - need to load from database
+    // Create agent server
+    let agent = ExternalAgent::NativeAgent;
+    let server = agent.server(fs, acp_history_store.clone());
+
+    // Get agent server store from project
+    let agent_server_store = project.read(cx).agent_server_store().clone();
+
+    // Create delegate for connection
+    let delegate = agent_servers::AgentServerDelegate::new(
+        agent_server_store,
+        project.clone(),
+        None, // status_tx
+        None, // new_version_tx
+    );
+
+    // Connect to get AgentConnection with NativeAgent
+    let connection_task = server.connect(None, delegate, cx);
+
+    // Spawn async task to load the thread from database
+    let request_clone = request.clone();
+    cx.spawn(async move |cx| {
+        let (connection, _spawn_task) = connection_task
+            .await
+            .log_err()
+            .ok_or_else(|| anyhow::anyhow!("Failed to connect to agent"))?;
+
+        eprintln!("✅ [THREAD_SERVICE] Connected to agent server for thread loading");
+        log::info!("✅ [THREAD_SERVICE] Connected to agent server for thread loading");
+
+        // Downcast connection to NativeAgentConnection to access the agent
+        let native_connection = connection.into_any().downcast::<agent::NativeAgentConnection>()
+            .map_err(|_| anyhow::anyhow!("Connection is not a NativeAgentConnection"))?;
+
+        // Access the NativeAgent entity (field 0 of the tuple struct)
+        let native_agent = native_connection.0.clone();
+
+        eprintln!("🔨 [THREAD_SERVICE] Calling agent.open_thread() to load from database...");
+        log::info!("🔨 [THREAD_SERVICE] Calling agent.open_thread() to load from database...");
+
+        // Convert string to SessionId
+        let session_id = agent_client_protocol::SessionId(request_clone.acp_thread_id.clone().into());
+
+        let open_task = cx.update(|cx| {
+            native_agent.update(cx, |agent, cx| {
+                agent.open_thread(session_id, cx)
+            })
+        })?;
+
+        let thread_entity = open_task.await?;
+
+        let acp_thread_id = cx.update(|cx| {
+            let thread_id = thread_entity.entity_id().to_string();
+            eprintln!("✅ [THREAD_SERVICE] Opened ACP thread from database: {}", thread_id);
+            log::info!("✅ [THREAD_SERVICE] Opened ACP thread from database: {}", thread_id);
+            thread_id
+        })?;
+
+        // Register thread for future access (strong reference keeps it alive)
+        register_thread(acp_thread_id.clone(), thread_entity.clone());
+        eprintln!("📋 [THREAD_SERVICE] Registered thread: {} (strong reference)", acp_thread_id);
+        log::info!("📋 [THREAD_SERVICE] Registered thread: {} (strong reference)", acp_thread_id);
+
+        // Notify AgentPanel to display this thread (for auto-select in UI)
+        if let Err(e) = crate::notify_thread_display(crate::ThreadDisplayNotification {
+            thread_entity: thread_entity.clone(),
+            helix_session_id: acp_thread_id.clone(),
+        }) {
+            eprintln!("⚠️ [THREAD_SERVICE] Failed to notify thread display: {}", e);
+            log::warn!("⚠️ [THREAD_SERVICE] Failed to notify thread display: {}", e);
+        } else {
+            eprintln!("📤 [THREAD_SERVICE] Notified AgentPanel to display opened thread");
+            log::info!("📤 [THREAD_SERVICE] Notified AgentPanel to display opened thread");
+        }
+
+        eprintln!("✅ [THREAD_SERVICE] Thread opened and displayed successfully");
+        log::info!("✅ [THREAD_SERVICE] Thread opened and displayed successfully");
+
+        anyhow::Ok(())
+    }).detach();
+
     Ok(())
 }

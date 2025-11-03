@@ -71,12 +71,22 @@ static GLOBAL_THREAD_CREATION_CALLBACK: parking_lot::Mutex<Option<mpsc::Unbounde
 static GLOBAL_THREAD_DISPLAY_CALLBACK: parking_lot::Mutex<Option<mpsc::UnboundedSender<ThreadDisplayNotification>>> =
     parking_lot::Mutex::new(None);
 
+/// Static global for thread open callback (loads thread from database and displays it)
+static GLOBAL_THREAD_OPEN_CALLBACK: parking_lot::Mutex<Option<mpsc::UnboundedSender<ThreadOpenRequest>>> =
+    parking_lot::Mutex::new(None);
+
 /// Request to create ACP thread from external WebSocket message
 #[derive(Clone, Debug)]
 pub struct ThreadCreationRequest {
     pub acp_thread_id: Option<String>, // null = create new, Some(id) = use existing
     pub message: String,
     pub request_id: String,
+}
+
+/// Request to open existing ACP thread from database and display in UI
+#[derive(Clone, Debug)]
+pub struct ThreadOpenRequest {
+    pub acp_thread_id: String,
 }
 
 /// Notification to display a thread in AgentPanel (for auto-select)
@@ -128,6 +138,33 @@ pub fn init_thread_display_callback(sender: mpsc::UnboundedSender<ThreadDisplayN
     log::info!("🔧 [CALLBACK] init_thread_display_callback() called - registering global callback");
     *GLOBAL_THREAD_DISPLAY_CALLBACK.lock() = Some(sender);
     log::info!("✅ [CALLBACK] Global thread display callback registered");
+}
+
+/// Initialize the global thread open callback (called from thread_service)
+pub fn init_thread_open_callback(sender: mpsc::UnboundedSender<ThreadOpenRequest>) {
+    log::info!("🔧 [CALLBACK] init_thread_open_callback() called - registering global callback");
+    *GLOBAL_THREAD_OPEN_CALLBACK.lock() = Some(sender);
+    log::info!("✅ [CALLBACK] Global thread open callback registered");
+}
+
+/// Request opening a thread (called from WebSocket handler)
+pub fn request_thread_open(request: ThreadOpenRequest) -> Result<()> {
+    log::info!("🔧 [CALLBACK] request_thread_open() called: acp_thread_id={}", request.acp_thread_id);
+
+    let sender = GLOBAL_THREAD_OPEN_CALLBACK.lock().clone();
+    if let Some(sender) = sender {
+        log::info!("✅ [CALLBACK] Found global callback sender, sending request...");
+        sender.send(request)
+            .map_err(|e| {
+                log::error!("❌ [CALLBACK] Failed to send to channel: {:?}", e);
+                anyhow::anyhow!("Failed to send thread open request")
+            })?;
+        log::info!("✅ [CALLBACK] Request sent to callback channel successfully");
+        Ok(())
+    } else {
+        log::error!("❌ [CALLBACK] Thread open callback not initialized!");
+        Err(anyhow::anyhow!("Thread open callback not initialized"))
+    }
 }
 
 /// Notify AgentPanel to display a thread (for auto-select)
