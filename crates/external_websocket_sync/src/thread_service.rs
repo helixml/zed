@@ -584,17 +584,27 @@ fn open_existing_thread_sync(
     // Spawn async task to load the thread from database
     let request_clone = request.clone();
     cx.spawn(async move |cx| {
-        let (connection, _spawn_task) = connection_task
-            .await
-            .log_err()
-            .ok_or_else(|| anyhow::anyhow!("Failed to connect to agent"))?;
+        let (connection, _spawn_task) = match connection_task.await {
+            Ok(result) => result,
+            Err(e) => {
+                eprintln!("❌ [THREAD_SERVICE] Failed to connect to agent: {}", e);
+                log::error!("❌ [THREAD_SERVICE] Failed to connect to agent: {}", e);
+                return Err(e);
+            }
+        };
 
         eprintln!("✅ [THREAD_SERVICE] Connected to agent server for thread loading");
         log::info!("✅ [THREAD_SERVICE] Connected to agent server for thread loading");
 
         // Downcast connection to NativeAgentConnection to access the agent
-        let native_connection = connection.into_any().downcast::<agent::NativeAgentConnection>()
-            .map_err(|_| anyhow::anyhow!("Connection is not a NativeAgentConnection"))?;
+        let native_connection = match connection.into_any().downcast::<agent::NativeAgentConnection>() {
+            Ok(conn) => conn,
+            Err(_) => {
+                eprintln!("❌ [THREAD_SERVICE] Connection is not a NativeAgentConnection");
+                log::error!("❌ [THREAD_SERVICE] Connection is not a NativeAgentConnection");
+                return Err(anyhow::anyhow!("Connection is not a NativeAgentConnection"));
+            }
+        };
 
         // Access the NativeAgent entity (field 0 of the tuple struct)
         let native_agent = native_connection.0.clone();
@@ -605,13 +615,27 @@ fn open_existing_thread_sync(
         // Convert string to SessionId
         let session_id = agent_client_protocol::SessionId(request_clone.acp_thread_id.clone().into());
 
-        let open_task = cx.update(|cx| {
+        let open_task = match cx.update(|cx| {
             native_agent.update(cx, |agent, cx| {
                 agent.open_thread(session_id, cx)
             })
-        })?;
+        }) {
+            Ok(task) => task,
+            Err(e) => {
+                eprintln!("❌ [THREAD_SERVICE] Failed to call agent.open_thread(): {}", e);
+                log::error!("❌ [THREAD_SERVICE] Failed to call agent.open_thread(): {}", e);
+                return Err(e);
+            }
+        };
 
-        let thread_entity = open_task.await?;
+        let thread_entity = match open_task.await {
+            Ok(entity) => entity,
+            Err(e) => {
+                eprintln!("❌ [THREAD_SERVICE] agent.open_thread() failed: {}", e);
+                log::error!("❌ [THREAD_SERVICE] agent.open_thread() failed: {}", e);
+                return Err(e);
+            }
+        };
 
         let acp_thread_id = cx.update(|cx| {
             let thread_id = thread_entity.entity_id().to_string();
