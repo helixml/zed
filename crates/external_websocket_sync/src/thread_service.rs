@@ -307,9 +307,9 @@ fn create_new_thread_sync(
         let thread_entity = thread_creation_task.await?;
 
         let acp_thread_id = cx.update(|cx| {
-            let thread_id = thread_entity.entity_id().to_string();
-            eprintln!("✅ [THREAD_SERVICE] Created ACP thread: {}", thread_id);
-            log::info!("✅ [THREAD_SERVICE] Created ACP thread: {}", thread_id);
+            let thread_id = thread_entity.read(cx).session_id().to_string();
+            eprintln!("✅ [THREAD_SERVICE] Created ACP thread: {} (session_id)", thread_id);
+            log::info!("✅ [THREAD_SERVICE] Created ACP thread: {} (session_id)", thread_id);
             thread_id
         })?;
 
@@ -638,9 +638,9 @@ fn open_existing_thread_sync(
         };
 
         let acp_thread_id = cx.update(|cx| {
-            let thread_id = thread_entity.entity_id().to_string();
-            eprintln!("✅ [THREAD_SERVICE] Opened ACP thread from database: {}", thread_id);
-            log::info!("✅ [THREAD_SERVICE] Opened ACP thread from database: {}", thread_id);
+            let thread_id = thread_entity.read(cx).session_id().to_string();
+            eprintln!("✅ [THREAD_SERVICE] Opened ACP thread from database: {} (session_id)", thread_id);
+            log::info!("✅ [THREAD_SERVICE] Opened ACP thread from database: {} (session_id)", thread_id);
             thread_id
         })?;
 
