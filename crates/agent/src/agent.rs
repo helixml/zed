@@ -633,10 +633,15 @@ impl NativeAgent {
         let database_future = ThreadsDatabase::connect(cx);
         cx.spawn(async move |this, cx| {
             let database = database_future.await.map_err(|err| anyhow!(err))?;
+
+            log::info!("📖 [AGENT] load_thread() querying database for thread ID: {}", id.0);
+
             let db_thread = database
                 .load_thread(id.clone())
                 .await?
                 .with_context(|| format!("no thread found with ID: {id:?}"))?;
+
+            log::info!("✅ [AGENT] load_thread() successfully loaded thread from database: {}", id.0);
 
             this.update(cx, |this, cx| {
                 let summarization_model = LanguageModelRegistry::read_global(cx)
@@ -665,7 +670,14 @@ impl NativeAgent {
         id: acp::SessionId,
         cx: &mut Context<Self>,
     ) -> Task<Result<Entity<AcpThread>>> {
-        let task = self.load_thread(id, cx);
+        // DEBUG: Log requested thread ID and what threads are available
+        log::info!("📖 [AGENT] open_thread() called with ID: {}", id.0);
+        log::info!("📖 [AGENT] Currently registered sessions count: {}", self.sessions.len());
+        for (session_id, _session) in self.sessions.iter() {
+            log::info!("📖 [AGENT]   - Registered session ID: {}", session_id.0);
+        }
+
+        let task = self.load_thread(id.clone(), cx);
         cx.spawn(async move |this, cx| {
             let thread = task.await?;
             let acp_thread =

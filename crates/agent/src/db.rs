@@ -379,12 +379,28 @@ impl ThreadsDatabase {
 
         self.executor.spawn(async move {
             let connection = connection.lock();
+
+            // DEBUG: List all thread IDs in database for comparison
+            log::info!("📖 [DB] load_thread() looking for thread ID: {}", id.0);
+            let mut all_threads_query = connection.select_bound::<(), Arc<str>>(indoc! {"
+                SELECT id FROM threads
+            "})?;
+            let all_thread_ids = all_threads_query(())?;
+            log::info!("📖 [DB] Total threads in database: {}", all_thread_ids.len());
+            for thread_id in all_thread_ids.iter().take(10) {  // Only log first 10 to avoid spam
+                log::info!("📖 [DB]   - Database thread ID: {}", thread_id);
+                if thread_id.as_ref() == id.0.as_ref() {
+                    log::info!("📖 [DB]     ✅ MATCH! This is the thread we're looking for");
+                }
+            }
+
             let mut select = connection.select_bound::<Arc<str>, (DataType, Vec<u8>)>(indoc! {"
                 SELECT data_type, data FROM threads WHERE id = ? LIMIT 1
             "})?;
 
-            let rows = select(id.0)?;
+            let rows = select(id.0.clone())?;
             if let Some((data_type, data)) = rows.into_iter().next() {
+                log::info!("✅ [DB] Found thread in database: {}", id.0);
                 let json_data = match data_type {
                     DataType::Zstd => {
                         let decompressed = zstd::decode_all(&data[..])?;
@@ -395,6 +411,7 @@ impl ThreadsDatabase {
                 let thread = DbThread::from_json(json_data.as_bytes())?;
                 Ok(Some(thread))
             } else {
+                log::error!("❌ [DB] Thread NOT found in database: {}", id.0);
                 Ok(None)
             }
         })
