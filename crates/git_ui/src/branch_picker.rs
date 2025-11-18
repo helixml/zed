@@ -14,7 +14,6 @@ use project::project_settings::ProjectSettings;
 use settings::Settings;
 use std::sync::Arc;
 use time::OffsetDateTime;
-use time_format::format_local_timestamp;
 use ui::{HighlightedLabel, ListItem, ListItemSpacing, Tooltip, prelude::*};
 use util::ResultExt;
 use workspace::notifications::DetachAndPromptErr;
@@ -242,18 +241,10 @@ impl BranchListDelegate {
             return;
         };
         let new_branch_name = new_branch_name.to_string().replace(' ', "-");
+        let base_branch = from_branch.map(|b| b.to_string());
         cx.spawn(async move |_, cx| {
-            if let Some(based_branch) = from_branch {
-                repo.update(cx, |repo, _| repo.change_branch(based_branch.to_string()))?
-                    .await??;
-            }
-
             repo.update(cx, |repo, _| {
-                repo.create_branch(new_branch_name.to_string())
-            })?
-            .await??;
-            repo.update(cx, |repo, _| {
-                repo.change_branch(new_branch_name.to_string())
+                repo.create_branch(new_branch_name, base_branch)
             })?
             .await??;
 
@@ -447,9 +438,12 @@ impl PickerDelegate for BranchListDelegate {
                 let subject = commit.subject.clone();
                 let commit_time = OffsetDateTime::from_unix_timestamp(commit.commit_timestamp)
                     .unwrap_or_else(|_| OffsetDateTime::now_utc());
-                let formatted_time = format_local_timestamp(
+                let local_offset =
+                    time::UtcOffset::current_local_offset().unwrap_or(time::UtcOffset::UTC);
+                let formatted_time = time_format::format_localized_timestamp(
                     commit_time,
                     OffsetDateTime::now_utc(),
+                    local_offset,
                     time_format::TimestampFormat::Relative,
                 );
                 let author = commit.author_name.clone();
@@ -466,11 +460,10 @@ impl PickerDelegate for BranchListDelegate {
                         this.delegate.set_selected_index(ix, window, cx);
                         this.delegate.confirm(true, window, cx);
                     }))
-                    .tooltip(move |window, cx| {
+                    .tooltip(move |_window, cx| {
                         Tooltip::for_action(
                             format!("Create branch based off default: {default_branch}"),
                             &menu::SecondaryConfirm,
-                            window,
                             cx,
                         )
                     }),
@@ -494,8 +487,12 @@ impl PickerDelegate for BranchListDelegate {
                 )
                 .into_any_element()
         } else {
-            HighlightedLabel::new(entry.branch.name().to_owned(), entry.positions.clone())
-                .truncate()
+            h_flex()
+                .max_w_48()
+                .child(
+                    HighlightedLabel::new(entry.branch.name().to_owned(), entry.positions.clone())
+                        .truncate(),
+                )
                 .into_any_element()
         };
 

@@ -81,15 +81,13 @@ impl AgentServer for NativeAgentServer {
 mod tests {
     use super::*;
 
-    use assistant_context::ContextStore;
+    use assistant_text_thread::TextThreadStore;
     use gpui::AppContext;
 
     agent_servers::e2e_tests::common_e2e_tests!(
         async |fs, project, cx| {
             let auth = cx.update(|cx| {
                 prompt_store::init(cx);
-                terminal::init(cx);
-
                 let registry = language_model::LanguageModelRegistry::read_global(cx);
                 let auth = registry
                     .provider(&language_model::ANTHROPIC_PROVIDER_ID)
@@ -116,8 +114,9 @@ mod tests {
             });
 
             let history = cx.update(|cx| {
-                let context_store = cx.new(move |cx| ContextStore::fake(project.clone(), cx));
-                cx.new(move |cx| HistoryStore::new(context_store, cx))
+                let text_thread_store =
+                    cx.new(move |cx| TextThreadStore::fake(project.clone(), cx));
+                cx.new(move |cx| HistoryStore::new(text_thread_store, cx))
             });
 
             NativeAgentServer::new(fs.clone(), history)

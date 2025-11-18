@@ -161,6 +161,42 @@ async fn test_system_prompt(cx: &mut TestAppContext) {
 }
 
 #[gpui::test]
+async fn test_system_prompt_without_tools(cx: &mut TestAppContext) {
+    let ThreadTest { model, thread, .. } = setup(cx, TestModel::Fake).await;
+    let fake_model = model.as_fake();
+
+    thread
+        .update(cx, |thread, cx| {
+            thread.send(UserMessageId::new(), ["abc"], cx)
+        })
+        .unwrap();
+    cx.run_until_parked();
+    let mut pending_completions = fake_model.pending_completions();
+    assert_eq!(
+        pending_completions.len(),
+        1,
+        "unexpected pending completions: {:?}",
+        pending_completions
+    );
+
+    let pending_completion = pending_completions.pop().unwrap();
+    assert_eq!(pending_completion.messages[0].role, Role::System);
+
+    let system_message = &pending_completion.messages[0];
+    let system_prompt = system_message.content[0].to_str().unwrap();
+    assert!(
+        !system_prompt.contains("## Tool Use"),
+        "unexpected system message: {:?}",
+        system_message
+    );
+    assert!(
+        !system_prompt.contains("## Fixing Diagnostics"),
+        "unexpected system message: {:?}",
+        system_message
+    );
+}
+
+#[gpui::test]
 async fn test_prompt_caching(cx: &mut TestAppContext) {
     let ThreadTest { model, thread, .. } = setup(cx, TestModel::Fake).await;
     let fake_model = model.as_fake();
@@ -897,7 +933,7 @@ async fn test_profiles(cx: &mut TestAppContext) {
     // Test that test-1 profile (default) has echo and delay tools
     thread
         .update(cx, |thread, cx| {
-            thread.set_profile(AgentProfileId("test-1".into()));
+            thread.set_profile(AgentProfileId("test-1".into()), cx);
             thread.send(UserMessageId::new(), ["test"], cx)
         })
         .unwrap();
@@ -917,7 +953,7 @@ async fn test_profiles(cx: &mut TestAppContext) {
     // Switch to test-2 profile, and verify that it has only the infinite tool.
     thread
         .update(cx, |thread, cx| {
-            thread.set_profile(AgentProfileId("test-2".into()));
+            thread.set_profile(AgentProfileId("test-2".into()), cx);
             thread.send(UserMessageId::new(), ["test2"], cx)
         })
         .unwrap();
@@ -966,8 +1002,8 @@ async fn test_mcp_tools(cx: &mut TestAppContext) {
     )
     .await;
     cx.run_until_parked();
-    thread.update(cx, |thread, _| {
-        thread.set_profile(AgentProfileId("test".into()))
+    thread.update(cx, |thread, cx| {
+        thread.set_profile(AgentProfileId("test".into()), cx)
     });
 
     let mut mcp_tool_calls = setup_context_server(
@@ -1133,8 +1169,8 @@ async fn test_mcp_tool_truncation(cx: &mut TestAppContext) {
     .await;
     cx.run_until_parked();
 
-    thread.update(cx, |thread, _| {
-        thread.set_profile(AgentProfileId("test".into()));
+    thread.update(cx, |thread, cx| {
+        thread.set_profile(AgentProfileId("test".into()), cx);
         thread.add_tool(EchoTool);
         thread.add_tool(DelayTool);
         thread.add_tool(WordListTool);
@@ -1815,7 +1851,6 @@ async fn test_agent_connection(cx: &mut TestAppContext) {
     // Initialize language model system with test provider
     cx.update(|cx| {
         gpui_tokio::init(cx);
-        client::init_settings(cx);
 
         let http_client = FakeHttpClient::with_404_response();
         let clock = Arc::new(clock::FakeSystemClock::new());
@@ -1823,9 +1858,7 @@ async fn test_agent_connection(cx: &mut TestAppContext) {
         let user_store = cx.new(|cx| UserStore::new(client.clone(), cx));
         language_model::init(client.clone(), cx);
         language_models::init(user_store, client.clone(), cx);
-        Project::init_settings(cx);
         LanguageModelRegistry::test(cx);
-        agent_settings::init(cx);
     });
     cx.executor().forbid_parking();
 
@@ -1834,8 +1867,9 @@ async fn test_agent_connection(cx: &mut TestAppContext) {
     fake_fs.insert_tree(path!("/test"), json!({})).await;
     let project = Project::test(fake_fs.clone(), [Path::new("/test")], cx).await;
     let cwd = Path::new("/test");
-    let context_store = cx.new(|cx| assistant_context::ContextStore::fake(project.clone(), cx));
-    let history_store = cx.new(|cx| HistoryStore::new(context_store, cx));
+    let text_thread_store =
+        cx.new(|cx| assistant_text_thread::TextThreadStore::fake(project.clone(), cx));
+    let history_store = cx.new(|cx| HistoryStore::new(text_thread_store, cx));
 
     // Create agent and connection
     let agent = NativeAgent::new(
@@ -1995,7 +2029,7 @@ async fn test_tool_updates_to_completion(cx: &mut TestAppContext) {
             locations: vec![],
             raw_input: Some(json!({})),
             raw_output: None,
-            meta: None,
+            meta: Some(json!({ "tool_name": "thinking" })),
         }
     );
     let update = expect_tool_call_update_fields(&mut events).await;
@@ -2358,8 +2392,6 @@ async fn setup(cx: &mut TestAppContext, model: TestModel) -> ThreadTest {
 
     cx.update(|cx| {
         settings::init(cx);
-        Project::init_settings(cx);
-        agent_settings::init(cx);
 
         match model {
             TestModel::Fake => {}
@@ -2367,7 +2399,6 @@ async fn setup(cx: &mut TestAppContext, model: TestModel) -> ThreadTest {
                 gpui_tokio::init(cx);
                 let http_client = ReqwestClient::user_agent("agent tests").unwrap();
                 cx.set_http_client(Arc::new(http_client));
-                client::init_settings(cx);
                 let client = Client::production(cx);
                 let user_store = cx.new(|cx| UserStore::new(client.clone(), cx));
                 language_model::init(client.clone(), cx);

@@ -6,12 +6,12 @@
 
 use anyhow::{Context, Result};
 use util::ResultExt;
-use assistant_context::{AssistantContext, ContextId, ContextStore, MessageId};
+use assistant_text_thread::{TextThread, TextThreadId, TextThreadStore, MessageId};
 use assistant_slash_command::SlashCommandWorkingSet;
 use clock::ReplicaId;
 use collections::HashMap;
 use futures::StreamExt;
-use gpui::{App, AsyncApp, Entity, EventEmitter, Global, Subscription};
+use gpui::{App, AsyncApp, Entity, EventEmitter, Global, Subscription, Task};
 use tokio::sync::mpsc;
 
 use language_model;
@@ -46,6 +46,9 @@ pub use sync_settings::*;
 
 pub use websocket_sync::*;
 pub use tungstenite;
+
+/// Type alias for backwards compatibility with existing code
+pub type ContextId = TextThreadId;
 
 /// Global WebSocket sender for sending responses back to external system
 #[derive(Clone)]
@@ -193,10 +196,10 @@ pub type HelixIntegration = ExternalWebSocketSync;
 /// Main external WebSocket thread sync service
 pub struct ExternalWebSocketSync {
     session: Arc<AppSession>,
-    context_store: Option<Entity<ContextStore>>,
+    context_store: Option<Entity<TextThreadStore>>,
     project: Entity<Project>,
     prompt_builder: Arc<PromptBuilder>,
-    active_contexts: Arc<RwLock<HashMap<ContextId, Entity<AssistantContext>>>>,
+    active_contexts: Arc<RwLock<HashMap<TextThreadId, Entity<TextThread>>>>,
     websocket_sync: Option<WebSocketSync>,
     sync_clients: Arc<RwLock<Vec<String>>>,
     _subscriptions: Vec<Subscription>,
@@ -253,21 +256,21 @@ impl ExternalWebSocketSync {
     }
 
     /// Subscribe to context changes and emit sync events to Helix
-    pub fn subscribe_to_context_changes(&mut self, context: Entity<assistant_context::AssistantContext>, external_session_id: String, cx: &mut App) {
+    pub fn subscribe_to_text_thread_changes(&mut self, text_thread: Entity<TextThread>, external_session_id: String, cx: &mut App) {
         let session_id_clone = external_session_id.clone();
-        eprintln!("🔔 [SYNC] Subscribing to context changes for external session: {}", external_session_id);
-        
-        let subscription = cx.subscribe(&context, move |_context, _event, _cx| {
-            eprintln!("🔔 [SYNC] Context changed for session: {}", session_id_clone);
-            
-            // TODO: Extract context content and send sync event to Helix
-            eprintln!("✅ [SYNC] Sending context update to Helix for session: {}", session_id_clone);
+        eprintln!("🔔 [SYNC] Subscribing to text thread changes for external session: {}", external_session_id);
+
+        let subscription = cx.subscribe(&text_thread, move |_text_thread, _event, _cx| {
+            eprintln!("🔔 [SYNC] Text thread changed for session: {}", session_id_clone);
+
+            // TODO: Extract text thread content and send sync event to Helix
+            eprintln!("✅ [SYNC] Sending text thread update to Helix for session: {}", session_id_clone);
             // This is where we'll implement the sync back to Helix
             // We'll send the complete thread state back to Helix
         });
-        
+
         self._subscriptions.push(subscription);
-        eprintln!("✅ [SYNC] Successfully subscribed to context changes for session: {}", external_session_id);
+        eprintln!("✅ [SYNC] Successfully subscribed to text thread changes for session: {}", external_session_id);
     }
 
     /// Initialize context store with project
@@ -280,41 +283,24 @@ impl ExternalWebSocketSync {
         let prompt_builder = self.prompt_builder.clone();
         // let slash_commands = Arc::new(SlashCommandWorkingSet::default());
 
-        log::info!("Initializing context store for Helix integration");
-        
+        log::info!("Initializing text thread store for Helix integration");
+
         let slash_commands = Arc::new(SlashCommandWorkingSet::default());
-        match ContextStore::new(project, prompt_builder, slash_commands, cx).await {
-            Ok(context_store) => {
-                self.context_store = Some(context_store);
-                log::info!("Context store initialized successfully");
-                Ok(())
-            }
-            Err(e) => {
-                log::error!("Failed to initialize context store: {}", e);
-                Err(e)
-            }
-        }
+        let text_thread_store = TextThreadStore::new(project, prompt_builder, slash_commands, cx).await?;
+        self.context_store = Some(text_thread_store);
+        log::info!("Text thread store initialized successfully");
+        Ok(())
     }
 
-    /// Initialize context store synchronously
-    pub fn init_context_store_sync(&mut self, cx: &mut App) -> Result<()> {
-        if self.context_store.is_some() {
-            return Ok(());
-        }
-
+    /// Initialize text thread store and return a task
+    pub fn init_text_thread_store_task(&self, cx: &mut App) -> Task<Result<Entity<TextThreadStore>>> {
         let project = self.project.clone();
         let prompt_builder = self.prompt_builder.clone();
 
-        log::info!("Initializing context store for Helix integration");
-        
+        log::info!("Initializing text thread store for Helix integration");
+
         let slash_commands = Arc::new(SlashCommandWorkingSet::default());
-        
-        // Create context store task but don't await it here
-        let context_store_task = ContextStore::new(project, prompt_builder, slash_commands, cx);
-        
-        // Store the task for later awaiting if needed
-        log::info!("Context store creation task started");
-        Ok(())
+        TextThreadStore::new(project, prompt_builder, slash_commands, cx)
     }
 
     /// Start the sync service (DEPRECATED - use init_websocket_service instead)
@@ -436,10 +422,10 @@ impl ExternalWebSocketSync {
                 content: "placeholder message content".to_string(), // TODO: Get actual message content from buffer
                 created_at: chrono::Utc::now(), // TODO: Get actual timestamp from message
                 status: match message.status {
-                    assistant_context::MessageStatus::Pending => "pending".to_string(),
-                    assistant_context::MessageStatus::Done => "done".to_string(),
-                    assistant_context::MessageStatus::Error(_) => "error".to_string(),
-                    assistant_context::MessageStatus::Canceled => "canceled".to_string(),
+                    assistant_text_thread::MessageStatus::Pending => "pending".to_string(),
+                    assistant_text_thread::MessageStatus::Done => "done".to_string(),
+                    assistant_text_thread::MessageStatus::Error(_) => "error".to_string(),
+                    assistant_text_thread::MessageStatus::Canceled => "canceled".to_string(),
                 },
                 metadata: std::collections::HashMap::new(),
             })
@@ -663,7 +649,7 @@ pub async fn with_sync_service_async<T>(
 }
 
 /// Subscribe to context changes for an external session (called from AgentPanel)
-pub fn subscribe_to_context_changes_global(context: Entity<assistant_context::AssistantContext>, external_session_id: String, cx: &mut App) {
+pub fn subscribe_to_context_changes_global(context: Entity<TextThread>, external_session_id: String, cx: &mut App) {
     let session_id_clone = external_session_id.clone();
     eprintln!("🔔 [SYNC_GLOBAL] Setting up global context subscription for session: {}", external_session_id);
     

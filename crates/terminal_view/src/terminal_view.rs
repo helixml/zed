@@ -95,7 +95,6 @@ actions!(
 pub fn init(cx: &mut App) {
     assistant_slash_command::init(cx);
     terminal_panel::init(cx);
-    terminal::init(cx);
 
     register_serializable_item::<TerminalView>(cx);
 
@@ -520,7 +519,12 @@ impl TerminalView {
                 return;
             }
         }
-        self.terminal.update(cx, |term, _| term.scroll_wheel(event));
+        self.terminal.update(cx, |term, cx| {
+            term.scroll_wheel(
+                event,
+                TerminalSettings::get_global(cx).scroll_multiplier.max(0.01),
+            )
+        });
     }
 
     fn scroll_line_up(&mut self, _: &ScrollLineUp, _: &mut Window, cx: &mut Context<Self>) {
@@ -840,9 +844,7 @@ impl TerminalView {
                 .size(ButtonSize::Compact)
                 .icon_color(Color::Default)
                 .shape(ui::IconButtonShape::Square)
-                .tooltip(move |window, cx| {
-                    Tooltip::for_action("Rerun task", &RerunTask, window, cx)
-                })
+                .tooltip(move |_window, cx| Tooltip::for_action("Rerun task", &RerunTask, cx))
                 .on_click(move |_, window, cx| {
                     window.dispatch_action(Box::new(terminal_rerun_override(&task_id)), cx);
                 }),
@@ -1143,7 +1145,8 @@ impl Item for TerminalView {
         let pid = terminal.pid_getter()?.fallback_pid();
 
         Some(TabTooltipContent::Custom(Box::new(move |_window, cx| {
-            cx.new(|_| TerminalTooltip::new(title.clone(), pid)).into()
+            cx.new(|_| TerminalTooltip::new(title.clone(), pid.as_u32()))
+                .into()
         })))
     }
 
@@ -1213,6 +1216,10 @@ impl Item for TerminalView {
 
     fn buffer_kind(&self, _: &App) -> workspace::item::ItemBufferKind {
         workspace::item::ItemBufferKind::Singleton
+    }
+
+    fn can_split(&self) -> bool {
+        true
     }
 
     fn clone_on_split(
@@ -1688,10 +1695,7 @@ mod tests {
     pub async fn init_test(cx: &mut TestAppContext) -> (Entity<Project>, Entity<Workspace>) {
         let params = cx.update(AppState::test);
         cx.update(|cx| {
-            terminal::init(cx);
             theme::init(theme::LoadThemes::JustBase, cx);
-            Project::init_settings(cx);
-            language::init(cx);
         });
 
         let project = Project::test(params.fs.clone(), [], cx).await;

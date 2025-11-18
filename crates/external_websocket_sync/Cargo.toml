@@ -24,7 +24,7 @@ agent-client-protocol.workspace = true
 agent.workspace = true
 agent_servers.workspace = true
 anyhow.workspace = true
-assistant_context.workspace = true
+assistant_text_thread.workspace = true
 assistant_slash_command.workspace = true
 axum = { version = "0.7", optional = true, features = ["ws"] }
 chrono.workspace = true

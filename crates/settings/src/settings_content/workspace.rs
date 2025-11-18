@@ -7,7 +7,8 @@ use serde_with::skip_serializing_none;
 use settings_macros::MergeFrom;
 
 use crate::{
-    DelayMs, DockPosition, DockSide, InactiveOpacity, ScrollbarSettingsContent, ShowIndentGuides,
+    CenteredPaddingSettings, DelayMs, DockPosition, DockSide, InactiveOpacity,
+    ScrollbarSettingsContent, ShowIndentGuides, serialize_optional_f32_with_two_decimal_places,
 };
 
 #[skip_serializing_none]
@@ -58,6 +59,7 @@ pub struct WorkspaceSettingsContent {
     /// Given as a fraction that will be multiplied by the smaller dimension of the workspace.
     ///
     /// Default: `0.2` (20% of the smaller dimension of the workspace)
+    #[serde(serialize_with = "serialize_optional_f32_with_two_decimal_places")]
     pub drop_target_size: Option<f32>,
     /// Whether to close the window when using 'close active item' on a workspace with no tabs
     ///
@@ -251,6 +253,7 @@ pub struct ActivePaneModifiers {
     /// The border is drawn inset.
     ///
     /// Default: `0.0`
+    #[serde(serialize_with = "crate::serialize_optional_f32_with_two_decimal_places")]
     pub border_size: Option<f32>,
     /// Opacity of inactive panels.
     /// When set to 1.0, the inactive panes have the same opacity as the active one.
@@ -460,20 +463,20 @@ pub enum PaneSplitDirectionVertical {
     Right,
 }
 
-#[skip_serializing_none]
 #[derive(Copy, Clone, Debug, Serialize, Deserialize, JsonSchema, MergeFrom, PartialEq, Default)]
 #[serde(rename_all = "snake_case")]
+#[skip_serializing_none]
 pub struct CenteredLayoutSettings {
     /// The relative width of the left padding of the central pane from the
     /// workspace when the centered layout is used.
     ///
     /// Default: 0.2
-    pub left_padding: Option<f32>,
+    pub left_padding: Option<CenteredPaddingSettings>,
     // The relative width of the right padding of the central pane from the
     // workspace when the centered layout is used.
     ///
     /// Default: 0.2
-    pub right_padding: Option<f32>,
+    pub right_padding: Option<CenteredPaddingSettings>,
 }
 
 #[derive(
@@ -509,6 +512,23 @@ impl OnLastWindowClosed {
 
 #[skip_serializing_none]
 #[derive(Clone, PartialEq, Default, Serialize, Deserialize, JsonSchema, MergeFrom, Debug)]
+pub struct ProjectPanelAutoOpenSettings {
+    /// Whether to automatically open newly created files in the editor.
+    ///
+    /// Default: true
+    pub on_create: Option<bool>,
+    /// Whether to automatically open files after pasting or duplicating them.
+    ///
+    /// Default: true
+    pub on_paste: Option<bool>,
+    /// Whether to automatically open files dropped from external sources.
+    ///
+    /// Default: true
+    pub on_drop: Option<bool>,
+}
+
+#[skip_serializing_none]
+#[derive(Clone, PartialEq, Default, Serialize, Deserialize, JsonSchema, MergeFrom, Debug)]
 pub struct ProjectPanelSettingsContent {
     /// Whether to show the project panel button in the status bar.
     ///
@@ -521,6 +541,7 @@ pub struct ProjectPanelSettingsContent {
     /// Customize default width (in pixels) taken by project panel
     ///
     /// Default: 240
+    #[serde(serialize_with = "crate::serialize_optional_f32_with_two_decimal_places")]
     pub default_width: Option<f32>,
     /// The position of project panel
     ///
@@ -545,6 +566,7 @@ pub struct ProjectPanelSettingsContent {
     /// Amount of indentation (in pixels) for nested items.
     ///
     /// Default: 20
+    #[serde(serialize_with = "serialize_optional_f32_with_two_decimal_places")]
     pub indent_size: Option<f32>,
     /// Whether to reveal it in the project panel automatically,
     /// when a corresponding project entry becomes active.
@@ -585,10 +607,12 @@ pub struct ProjectPanelSettingsContent {
     ///
     /// Default: true
     pub drag_and_drop: Option<bool>,
-    /// Whether to automatically open files when pasting them in the project panel.
+    /// Settings for automatically opening files.
+    pub auto_open: Option<ProjectPanelAutoOpenSettings>,
+    /// How to order sibling entries in the project panel.
     ///
-    /// Default: true
-    pub open_file_on_paste: Option<bool>,
+    /// Default: directories_first
+    pub sort_mode: Option<ProjectPanelSortMode>,
 }
 
 #[derive(
@@ -612,6 +636,31 @@ pub enum ProjectPanelEntrySpacing {
     Comfortable,
     /// The standard spacing of entries.
     Standard,
+}
+
+#[derive(
+    Copy,
+    Clone,
+    Debug,
+    Default,
+    Serialize,
+    Deserialize,
+    JsonSchema,
+    MergeFrom,
+    PartialEq,
+    Eq,
+    strum::VariantArray,
+    strum::VariantNames,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum ProjectPanelSortMode {
+    /// Show directories first, then files
+    #[default]
+    DirectoriesFirst,
+    /// Mix directories and files together
+    Mixed,
+    /// Show files first, then directories
+    FilesFirst,
 }
 
 #[skip_serializing_none]

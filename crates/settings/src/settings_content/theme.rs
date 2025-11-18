@@ -9,6 +9,8 @@ use std::{fmt::Display, sync::Arc};
 
 use serde_with::skip_serializing_none;
 
+use crate::serialize_f32_with_two_decimal_places;
+
 /// Settings for rendering text in UI and text buffers.
 
 #[skip_serializing_none]
@@ -16,6 +18,7 @@ use serde_with::skip_serializing_none;
 pub struct ThemeSettingsContent {
     /// The default font size for text in the UI.
     #[serde(default)]
+    #[serde(serialize_with = "crate::serialize_optional_f32_with_two_decimal_places")]
     pub ui_font_size: Option<f32>,
     /// The name of a font to use for rendering in the UI.
     #[serde(default)]
@@ -42,6 +45,7 @@ pub struct ThemeSettingsContent {
     pub buffer_font_fallbacks: Option<Vec<FontFamilyName>>,
     /// The default font size for rendering in text buffers.
     #[serde(default)]
+    #[serde(serialize_with = "crate::serialize_optional_f32_with_two_decimal_places")]
     pub buffer_font_size: Option<f32>,
     /// The weight of the editor font in CSS units from 100 to 900.
     #[serde(default)]
@@ -56,9 +60,11 @@ pub struct ThemeSettingsContent {
     pub buffer_font_features: Option<FontFeatures>,
     /// The font size for agent responses in the agent panel. Falls back to the UI font size if unset.
     #[serde(default)]
+    #[serde(serialize_with = "crate::serialize_optional_f32_with_two_decimal_places")]
     pub agent_ui_font_size: Option<f32>,
     /// The font size for user messages in the agent panel.
     #[serde(default)]
+    #[serde(serialize_with = "crate::serialize_optional_f32_with_two_decimal_places")]
     pub agent_buffer_font_size: Option<f32>,
     /// The name of the Zed theme to use.
     #[serde(default)]
@@ -104,7 +110,7 @@ pub struct ThemeSettingsContent {
     derive_more::FromStr,
 )]
 #[serde(transparent)]
-pub struct CodeFade(pub f32);
+pub struct CodeFade(#[serde(serialize_with = "serialize_f32_with_two_decimal_places")] pub f32);
 
 impl Display for CodeFade {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -151,7 +157,7 @@ pub enum ThemeSelection {
     Dynamic {
         /// The mode used to determine which theme to use.
         #[serde(default)]
-        mode: ThemeMode,
+        mode: ThemeAppearanceMode,
         /// The theme to use for light mode.
         light: ThemeName,
         /// The theme to use for dark mode.
@@ -180,7 +186,7 @@ pub enum IconThemeSelection {
     Dynamic {
         /// The mode used to determine which theme to use.
         #[serde(default)]
-        mode: ThemeMode,
+        mode: ThemeAppearanceMode,
         /// The icon theme to use for light mode.
         light: IconThemeName,
         /// The icon theme to use for dark mode.
@@ -188,7 +194,6 @@ pub enum IconThemeSelection {
     },
 }
 
-// TODO: Rename ThemeMode -> ThemeAppearanceMode
 /// The mode use to select a theme.
 ///
 /// `Light` and `Dark` will select their respective themes.
@@ -209,7 +214,7 @@ pub enum IconThemeSelection {
     strum::VariantNames,
 )]
 #[serde(rename_all = "snake_case")]
-pub enum ThemeMode {
+pub enum ThemeAppearanceMode {
     /// Use the specified `light` theme.
     Light,
 

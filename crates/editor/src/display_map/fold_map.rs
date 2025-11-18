@@ -1,4 +1,4 @@
-use crate::{InlayId, display_map::inlay_map::InlayChunk};
+use crate::display_map::inlay_map::InlayChunk;
 
 use super::{
     Highlights,
@@ -9,6 +9,7 @@ use language::{Edit, HighlightId, Point, TextSummary};
 use multi_buffer::{
     Anchor, AnchorRangeExt, MultiBufferRow, MultiBufferSnapshot, RowInfo, ToOffset,
 };
+use project::InlayId;
 use std::{
     any::TypeId,
     cmp::{self, Ordering},
@@ -627,6 +628,14 @@ pub struct FoldSnapshot {
     folds: SumTree<Fold>,
     fold_metadata_by_id: TreeMap<FoldId, FoldMetadata>,
     pub version: usize,
+}
+
+impl Deref for FoldSnapshot {
+    type Target = InlaySnapshot;
+
+    fn deref(&self) -> &Self::Target {
+        &self.inlay_snapshot
+    }
 }
 
 impl FoldSnapshot {
@@ -1436,14 +1445,15 @@ impl<'a> Iterator for FoldChunks<'a> {
             let transform_end = self.transform_cursor.end().1;
             let chunk_end = buffer_chunk_end.min(transform_end);
 
-            chunk.text = &chunk.text
-                [(self.inlay_offset - buffer_chunk_start).0..(chunk_end - buffer_chunk_start).0];
+            let bit_start = (self.inlay_offset - buffer_chunk_start).0;
+            let bit_end = (chunk_end - buffer_chunk_start).0;
+            chunk.text = &chunk.text[bit_start..bit_end];
 
             let bit_end = (chunk_end - buffer_chunk_start).0;
             let mask = 1u128.unbounded_shl(bit_end as u32).wrapping_sub(1);
 
-            chunk.tabs = (chunk.tabs >> (self.inlay_offset - buffer_chunk_start).0) & mask;
-            chunk.chars = (chunk.chars >> (self.inlay_offset - buffer_chunk_start).0) & mask;
+            chunk.tabs = (chunk.tabs >> bit_start) & mask;
+            chunk.chars = (chunk.chars >> bit_start) & mask;
 
             if chunk_end == transform_end {
                 self.transform_cursor.next();

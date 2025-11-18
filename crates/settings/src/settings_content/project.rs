@@ -64,6 +64,12 @@ pub struct WorktreeSettingsContent {
     #[serde(skip_serializing_if = "Maybe::is_unset")]
     pub project_name: Maybe<String>,
 
+    /// Whether to prevent this project from being shared in public channels.
+    ///
+    /// Default: false
+    #[serde(default)]
+    pub prevent_sharing_in_public_channels: bool,
+
     /// Completely ignore files matching globs from `file_scan_exclusions`. Overrides
     /// `file_scan_inclusions`.
     ///
@@ -91,6 +97,10 @@ pub struct WorktreeSettingsContent {
     /// Treat the files matching these globs as `.env` files.
     /// Default: ["**/.env*", "**/*.pem", "**/*.key", "**/*.cert", "**/*.crt", "**/secrets.yml"]
     pub private_files: Option<ExtendingVec<String>>,
+
+    /// Treat the files matching these globs as hidden files. You can hide hidden files in the project panel.
+    /// Default: ["**/.*"]
+    pub hidden_files: Option<Vec<String>>,
 }
 
 #[skip_serializing_none]
@@ -98,7 +108,17 @@ pub struct WorktreeSettingsContent {
 #[serde(rename_all = "snake_case")]
 pub struct LspSettings {
     pub binary: Option<BinarySettings>,
+    /// Options passed to the language server at startup.
+    ///
+    /// Ref: https://microsoft.github.io/language-server-protocol/specifications/lsp/3.17/specification/#initialize
+    ///
+    /// Consult the documentation for the specific language server to see which settings are supported.
     pub initialization_options: Option<serde_json::Value>,
+    /// Language server settings.
+    ///
+    /// Ref: https://microsoft.github.io/language-server-protocol/specifications/lsp/3.17/specification/#workspace_configuration
+    ///
+    /// Consult the documentation for the specific language server to see which settings are supported.
     pub settings: Option<serde_json::Value>,
     /// If the server supports sending tasks over LSP extensions,
     /// this setting can be used to enable or disable them in Zed.
@@ -176,7 +196,7 @@ pub struct SessionSettingsContent {
 }
 
 #[derive(Deserialize, Serialize, Clone, PartialEq, Eq, JsonSchema, MergeFrom, Debug)]
-#[serde(tag = "source", rename_all = "snake_case")]
+#[serde(untagged, rename_all = "snake_case")]
 pub enum ContextServerSettingsContent {
     Custom {
         /// Whether the context server is enabled.
@@ -185,6 +205,16 @@ pub enum ContextServerSettingsContent {
 
         #[serde(flatten)]
         command: ContextServerCommand,
+    },
+    Http {
+        /// Whether the context server is enabled.
+        #[serde(default = "default_true")]
+        enabled: bool,
+        /// The URL of the remote context server.
+        url: String,
+        /// Optional headers to send.
+        #[serde(skip_serializing_if = "HashMap::is_empty", default)]
+        headers: HashMap<String, String>,
     },
     Extension {
         /// Whether the context server is enabled.
@@ -197,19 +227,24 @@ pub enum ContextServerSettingsContent {
         settings: serde_json::Value,
     },
 }
+
 impl ContextServerSettingsContent {
     pub fn set_enabled(&mut self, enabled: bool) {
         match self {
             ContextServerSettingsContent::Custom {
                 enabled: custom_enabled,
-                command: _,
+                ..
             } => {
                 *custom_enabled = enabled;
             }
             ContextServerSettingsContent::Extension {
                 enabled: ext_enabled,
-                settings: _,
+                ..
             } => *ext_enabled = enabled,
+            ContextServerSettingsContent::Http {
+                enabled: remote_enabled,
+                ..
+            } => *remote_enabled = enabled,
         }
     }
 }
