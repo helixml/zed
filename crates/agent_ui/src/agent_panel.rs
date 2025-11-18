@@ -629,7 +629,7 @@ impl AgentPanel {
                 });
                 ActiveView::text_thread(
                     text_thread_editor,
-                    history_store.clone(),
+                    acp_history_store.clone(),
                     language_registry.clone(),
                     window,
                     cx,
@@ -823,7 +823,7 @@ impl AgentPanel {
             pending_serialization: None,
             onboarding,
             acp_history,
-            history_store,
+            history_store: acp_history_store,
             selected_agent: AgentType::default(),
             loading: false,
         };

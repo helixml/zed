@@ -1516,7 +1516,9 @@ impl Workspace {
             scheduled_tasks: Vec::new(),
             last_open_dock_positions: Vec::new(),
             removing: false,
-        }
+        };
+
+        workspace
     }
 
     pub fn new_local(

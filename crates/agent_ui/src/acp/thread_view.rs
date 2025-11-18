@@ -460,6 +460,7 @@ impl AcpThreadView {
             list_state,
             thread_retry_status: None,
             thread_error: None,
+            thread_error_markdown: None,
             thread_feedback: Default::default(),
             auth_task: None,
             expanded_tool_calls: HashSet::default(),
@@ -479,6 +480,7 @@ impl AcpThreadView {
             focus_handle: cx.focus_handle(),
             new_server_version_available: None,
             resume_thread_metadata: None,
+            show_codex_windows_warning: false,
         }
     }
 
