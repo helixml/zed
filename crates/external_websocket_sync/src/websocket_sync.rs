@@ -226,7 +226,7 @@ impl WebSocketSync {
         Ok(Self { outgoing_tx })
     }
 
-    /// Handle incoming chat_message from external system
+    /// Handle incoming messages from external system (chat_message or open_thread)
     async fn handle_incoming_message(text: &str) -> Result<()> {
         eprintln!("🔧 [WEBSOCKET-IN] handle_incoming_message() called with: {}", text);
         log::info!("🔧 [WEBSOCKET-IN] handle_incoming_message() called with: {}", text);
@@ -236,7 +236,7 @@ impl WebSocketSync {
         struct Command {
             #[serde(rename = "type")]
             command_type: String,
-            data: IncomingChatMessage,
+            data: serde_json::Value,
         }
 
         let command: Command = match serde_json::from_str(text) {
@@ -252,30 +252,40 @@ impl WebSocketSync {
         eprintln!("✅ [WEBSOCKET-IN] Parsed command type: {}", command.command_type);
         log::info!("✅ [WEBSOCKET-IN] Parsed command type: {}", command.command_type);
 
-        if command.command_type != "chat_message" {
-            eprintln!("⚠️  [WEBSOCKET-IN] Ignoring non-chat command: {}", command.command_type);
-            log::warn!("⚠️  [WEBSOCKET-IN] Ignoring non-chat command: {}", command.command_type);
-            return Ok(());
+        match command.command_type.as_str() {
+            "chat_message" => Self::handle_chat_message(command.data).await,
+            "open_thread" => Self::handle_open_thread(command.data).await,
+            _ => {
+                eprintln!("⚠️  [WEBSOCKET-IN] Ignoring unknown command: {}", command.command_type);
+                log::warn!("⚠️  [WEBSOCKET-IN] Ignoring unknown command: {}", command.command_type);
+                Ok(())
+            }
         }
+    }
+
+    /// Handle chat_message command (create/send to thread)
+    async fn handle_chat_message(data: serde_json::Value) -> Result<()> {
+        let chat_msg: IncomingChatMessage = serde_json::from_value(data)
+            .context("Failed to parse chat_message data")?;
 
         // CRITICAL: Ignore echoed user messages from Helix (they have role="user")
         // Helix broadcasts user messages back via WebSocket for UI sync, but we already processed the original
-        if command.data.role.as_deref() == Some("user") {
+        if chat_msg.role.as_deref() == Some("user") {
             eprintln!("🔄 [WEBSOCKET-IN] Ignoring echoed user message (role=user) - already processed original");
             log::info!("🔄 [WEBSOCKET-IN] Ignoring echoed user message (role=user) - already processed original");
             return Ok(());
         }
 
         eprintln!("💬 [WEBSOCKET-IN] Processing chat_message: acp_thread_id={:?}, request_id={}, message_len={}",
-                   command.data.acp_thread_id, command.data.request_id, command.data.message.len());
+                   chat_msg.acp_thread_id, chat_msg.request_id, chat_msg.message.len());
         log::info!("💬 [WEBSOCKET-IN] Processing chat_message: acp_thread_id={:?}, request_id={}, message_len={}",
-                   command.data.acp_thread_id, command.data.request_id, command.data.message.len());
+                   chat_msg.acp_thread_id, chat_msg.request_id, chat_msg.message.len());
 
         // Request thread creation via callback
         let request = ThreadCreationRequest {
-            acp_thread_id: command.data.acp_thread_id.clone(),
-            message: command.data.message.clone(),
-            request_id: command.data.request_id.clone(),
+            acp_thread_id: chat_msg.acp_thread_id.clone(),
+            message: chat_msg.message.clone(),
+            request_id: chat_msg.request_id.clone(),
         };
 
         eprintln!("🎯 [WEBSOCKET-IN] Calling request_thread_creation()...");
@@ -283,6 +293,33 @@ impl WebSocketSync {
         crate::request_thread_creation(request)?;
         eprintln!("✅ [WEBSOCKET-IN] request_thread_creation() succeeded");
         log::info!("✅ [WEBSOCKET-IN] request_thread_creation() succeeded");
+
+        Ok(())
+    }
+
+    /// Handle open_thread command (open existing thread in UI)
+    async fn handle_open_thread(data: serde_json::Value) -> Result<()> {
+        #[derive(Deserialize)]
+        struct OpenThreadData {
+            acp_thread_id: String,
+        }
+
+        let open_data: OpenThreadData = serde_json::from_value(data)
+            .context("Failed to parse open_thread data")?;
+
+        eprintln!("📖 [WEBSOCKET-IN] Processing open_thread command: acp_thread_id={}", open_data.acp_thread_id);
+        log::info!("📖 [WEBSOCKET-IN] Processing open_thread command: acp_thread_id={}", open_data.acp_thread_id);
+
+        // Request thread opening via callback (will load from database and display)
+        let request = crate::ThreadOpenRequest {
+            acp_thread_id: open_data.acp_thread_id.clone(),
+        };
+
+        eprintln!("🎯 [WEBSOCKET-IN] Calling request_thread_open()...");
+        log::info!("🎯 [WEBSOCKET-IN] Calling request_thread_open()...");
+        crate::request_thread_open(request)?;
+        eprintln!("✅ [WEBSOCKET-IN] request_thread_open() succeeded");
+        log::info!("✅ [WEBSOCKET-IN] request_thread_open() succeeded");
 
         Ok(())
     }

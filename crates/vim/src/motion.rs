@@ -3083,7 +3083,7 @@ mod test {
         state::Mode,
         test::{NeovimBackedTestContext, VimTestContext},
     };
-    use editor::display_map::Inlay;
+    use editor::Inlay;
     use indoc::indoc;
     use language::Point;
     use multi_buffer::MultiBufferRow;
@@ -3301,6 +3301,96 @@ mod test {
         cx.set_shared_state("(\n    {()} ˇ\n)").await;
         cx.simulate_shared_keystrokes("[ (").await;
         cx.shared_state().await.assert_eq("ˇ(\n    {()} \n)");
+    }
+
+    #[gpui::test]
+    async fn test_unmatched_forward_markdown(cx: &mut gpui::TestAppContext) {
+        let mut cx = NeovimBackedTestContext::new_markdown_with_rust(cx).await;
+
+        cx.neovim.exec("set filetype=markdown").await;
+
+        cx.set_shared_state(indoc! {r"
+            ```rs
+            impl Worktree {
+                pub async fn open_buffers(&self, path: &Path) -> impl Iterator<&Buffer> {
+            ˇ    }
+            }
+            ```
+        "})
+            .await;
+        cx.simulate_shared_keystrokes("] }").await;
+        cx.shared_state().await.assert_eq(indoc! {r"
+            ```rs
+            impl Worktree {
+                pub async fn open_buffers(&self, path: &Path) -> impl Iterator<&Buffer> {
+                ˇ}
+            }
+            ```
+        "});
+
+        cx.set_shared_state(indoc! {r"
+            ```rs
+            impl Worktree {
+                pub async fn open_buffers(&self, path: &Path) -> impl Iterator<&Buffer> {
+                }   ˇ
+            }
+            ```
+        "})
+            .await;
+        cx.simulate_shared_keystrokes("] }").await;
+        cx.shared_state().await.assert_eq(indoc! {r"
+            ```rs
+            impl Worktree {
+                pub async fn open_buffers(&self, path: &Path) -> impl Iterator<&Buffer> {
+                }  •
+            ˇ}
+            ```
+        "});
+    }
+
+    #[gpui::test]
+    async fn test_unmatched_backward_markdown(cx: &mut gpui::TestAppContext) {
+        let mut cx = NeovimBackedTestContext::new_markdown_with_rust(cx).await;
+
+        cx.neovim.exec("set filetype=markdown").await;
+
+        cx.set_shared_state(indoc! {r"
+            ```rs
+            impl Worktree {
+                pub async fn open_buffers(&self, path: &Path) -> impl Iterator<&Buffer> {
+            ˇ    }
+            }
+            ```
+        "})
+            .await;
+        cx.simulate_shared_keystrokes("[ {").await;
+        cx.shared_state().await.assert_eq(indoc! {r"
+            ```rs
+            impl Worktree {
+                pub async fn open_buffers(&self, path: &Path) -> impl Iterator<&Buffer> ˇ{
+                }
+            }
+            ```
+        "});
+
+        cx.set_shared_state(indoc! {r"
+            ```rs
+            impl Worktree {
+                pub async fn open_buffers(&self, path: &Path) -> impl Iterator<&Buffer> {
+                }   ˇ
+            }
+            ```
+        "})
+            .await;
+        cx.simulate_shared_keystrokes("[ {").await;
+        cx.shared_state().await.assert_eq(indoc! {r"
+            ```rs
+            impl Worktree ˇ{
+                pub async fn open_buffers(&self, path: &Path) -> impl Iterator<&Buffer> {
+                }  •
+            }
+            ```
+        "});
     }
 
     #[gpui::test]

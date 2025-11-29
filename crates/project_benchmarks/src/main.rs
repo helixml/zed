@@ -24,7 +24,7 @@ struct Args {
     #[clap(long)]
     whole_word: bool,
     /// Make matching case-sensitive.
-    #[clap(long, default_value_t = true)]
+    #[clap(long, default_value_t = false)]
     case_sensitive: bool,
     /// Include gitignored files in the search.
     #[clap(long)]
@@ -59,9 +59,6 @@ fn main() -> Result<(), anyhow::Error> {
     }?;
     Application::headless().run(|cx| {
         settings::init(cx);
-        client::init_settings(cx);
-        language::init(cx);
-        Project::init_settings(cx);
         let client = Client::production(cx);
         let http_client = FakeHttpClient::with_200_response();
         let (_, rx) = watch::channel(None);
@@ -118,6 +115,8 @@ fn main() -> Result<(), anyhow::Error> {
                     if let SearchResult::Buffer { ranges, .. } = match_result {
                         matched_files += 1;
                         matched_chunks += ranges.len();
+                    } else {
+                        break;
                     }
                 }
                 let elapsed = timer.elapsed();

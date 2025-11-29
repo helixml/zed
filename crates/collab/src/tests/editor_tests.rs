@@ -17,12 +17,14 @@ use editor::{
 use fs::Fs;
 use futures::{SinkExt, StreamExt, channel::mpsc, lock::Mutex};
 use git::repository::repo_path;
-use gpui::{App, Rgba, TestAppContext, UpdateGlobal, VisualContext, VisualTestContext};
+use gpui::{
+    App, Rgba, SharedString, TestAppContext, UpdateGlobal, VisualContext, VisualTestContext,
+};
 use indoc::indoc;
 use language::FakeLspAdapter;
 use lsp::LSP_REQUEST_TIMEOUT;
 use project::{
-    ProjectPath, SERVER_PROGRESS_THROTTLE_TIMEOUT,
+    ProgressToken, ProjectPath, SERVER_PROGRESS_THROTTLE_TIMEOUT,
     lsp_store::lsp_ext_command::{ExpandedMacro, LspExtExpandMacro},
 };
 use recent_projects::disconnected_overlay::DisconnectedOverlay;
@@ -37,6 +39,7 @@ use std::{
         Arc,
         atomic::{self, AtomicBool, AtomicUsize},
     },
+    time::Duration,
 };
 use text::Point;
 use util::{path, rel_path::rel_path, uri};
@@ -285,7 +288,7 @@ async fn test_newline_above_or_below_does_not_move_guest_cursor(
     "});
 }
 
-#[gpui::test(iterations = 10)]
+#[gpui::test]
 async fn test_collaborating_with_completion(cx_a: &mut TestAppContext, cx_b: &mut TestAppContext) {
     let mut server = TestServer::start(cx_a.executor()).await;
     let client_a = server.create_client(cx_a, "user_a").await;
@@ -304,17 +307,35 @@ async fn test_collaborating_with_completion(cx_a: &mut TestAppContext, cx_b: &mu
         ..lsp::ServerCapabilities::default()
     };
     client_a.language_registry().add(rust_lang());
-    let mut fake_language_servers = client_a.language_registry().register_fake_lsp(
+    let mut fake_language_servers = [
+        client_a.language_registry().register_fake_lsp(
+            "Rust",
+            FakeLspAdapter {
+                capabilities: capabilities.clone(),
+                ..FakeLspAdapter::default()
+            },
+        ),
+        client_a.language_registry().register_fake_lsp(
+            "Rust",
+            FakeLspAdapter {
+                name: "fake-analyzer",
+                capabilities: capabilities.clone(),
+                ..FakeLspAdapter::default()
+            },
+        ),
+    ];
+    client_b.language_registry().add(rust_lang());
+    client_b.language_registry().register_fake_lsp_adapter(
         "Rust",
         FakeLspAdapter {
             capabilities: capabilities.clone(),
             ..FakeLspAdapter::default()
         },
     );
-    client_b.language_registry().add(rust_lang());
     client_b.language_registry().register_fake_lsp_adapter(
         "Rust",
         FakeLspAdapter {
+            name: "fake-analyzer",
             capabilities,
             ..FakeLspAdapter::default()
         },
@@ -349,7 +370,8 @@ async fn test_collaborating_with_completion(cx_a: &mut TestAppContext, cx_b: &mu
         Editor::for_buffer(buffer_b.clone(), Some(project_b.clone()), window, cx)
     });
 
-    let fake_language_server = fake_language_servers.next().await.unwrap();
+    let fake_language_server = fake_language_servers[0].next().await.unwrap();
+    let second_fake_language_server = fake_language_servers[1].next().await.unwrap();
     cx_a.background_executor.run_until_parked();
 
     buffer_b.read_with(cx_b, |buffer, _| {
@@ -408,6 +430,11 @@ async fn test_collaborating_with_completion(cx_a: &mut TestAppContext, cx_b: &mu
                 },
             ])))
         })
+        .next()
+        .await
+        .unwrap();
+    second_fake_language_server
+        .set_request_handler::<lsp::request::Completion, _, _>(|_, _| async move { Ok(None) })
         .next()
         .await
         .unwrap();
@@ -519,6 +546,10 @@ async fn test_collaborating_with_completion(cx_a: &mut TestAppContext, cx_b: &mu
             ])))
         });
 
+    // Second language server also needs to handle the request (returns None)
+    let mut second_completion_response = second_fake_language_server
+        .set_request_handler::<lsp::request::Completion, _, _>(|_, _| async move { Ok(None) });
+
     // The completion now gets a new `text_edit.new_text` when resolving the completion item
     let mut resolve_completion_response = fake_language_server
         .set_request_handler::<lsp::request::ResolveCompletionItem, _, _>(|params, _| async move {
@@ -542,6 +573,7 @@ async fn test_collaborating_with_completion(cx_a: &mut TestAppContext, cx_b: &mu
     cx_b.executor().run_until_parked();
 
     completion_response.next().await.unwrap();
+    second_completion_response.next().await.unwrap();
 
     editor_b.update_in(cx_b, |editor, window, cx| {
         assert!(editor.context_menu_visible());
@@ -558,6 +590,77 @@ async fn test_collaborating_with_completion(cx_a: &mut TestAppContext, cx_b: &mu
         assert_eq!(
             editor.text(cx),
             "use d::SomeTrait;\nfn main() { a.first_method(); a.third_method(, , ) }"
+        );
+    });
+
+    // Ensure buffer is synced before proceeding with the next test
+    cx_a.executor().run_until_parked();
+    cx_b.executor().run_until_parked();
+
+    // Test completions from the second fake language server
+    // Add another completion trigger to test the second language server
+    editor_b.update_in(cx_b, |editor, window, cx| {
+        editor.change_selections(SelectionEffects::no_scroll(), window, cx, |s| {
+            s.select_ranges([68..68])
+        });
+        editor.handle_input("; b", window, cx);
+        editor.handle_input(".", window, cx);
+    });
+
+    buffer_b.read_with(cx_b, |buffer, _| {
+        assert_eq!(
+            buffer.text(),
+            "use d::SomeTrait;\nfn main() { a.first_method(); a.third_method(, , ); b. }"
+        );
+    });
+
+    // Set up completion handlers for both language servers
+    let mut first_lsp_completion = fake_language_server
+        .set_request_handler::<lsp::request::Completion, _, _>(|_, _| async move { Ok(None) });
+
+    let mut second_lsp_completion = second_fake_language_server
+        .set_request_handler::<lsp::request::Completion, _, _>(|params, _| async move {
+            assert_eq!(
+                params.text_document_position.text_document.uri,
+                lsp::Uri::from_file_path(path!("/a/main.rs")).unwrap(),
+            );
+            assert_eq!(
+                params.text_document_position.position,
+                lsp::Position::new(1, 54),
+            );
+
+            Ok(Some(lsp::CompletionResponse::Array(vec![
+                lsp::CompletionItem {
+                    label: "analyzer_method(…)".into(),
+                    detail: Some("fn(&self) -> Result<T>".into()),
+                    text_edit: Some(lsp::CompletionTextEdit::Edit(lsp::TextEdit {
+                        new_text: "analyzer_method()".to_string(),
+                        range: lsp::Range::new(
+                            lsp::Position::new(1, 54),
+                            lsp::Position::new(1, 54),
+                        ),
+                    })),
+                    insert_text_format: Some(lsp::InsertTextFormat::SNIPPET),
+                    ..Default::default()
+                },
+            ])))
+        });
+
+    cx_b.executor().run_until_parked();
+
+    // Await both language server responses
+    first_lsp_completion.next().await.unwrap();
+    second_lsp_completion.next().await.unwrap();
+
+    cx_b.executor().run_until_parked();
+
+    // Confirm the completion from the second language server works
+    editor_b.update_in(cx_b, |editor, window, cx| {
+        assert!(editor.context_menu_visible());
+        editor.confirm_completion(&ConfirmCompletion { item_ix: Some(0) }, window, cx);
+        assert_eq!(
+            editor.text(cx),
+            "use d::SomeTrait;\nfn main() { a.first_method(); a.third_method(, , ); b.analyzer_method() }"
         );
     });
 }
@@ -1283,12 +1386,14 @@ async fn test_language_server_statuses(cx_a: &mut TestAppContext, cx_b: &mut Tes
     });
     executor.run_until_parked();
 
+    let token = ProgressToken::String(SharedString::from("the-token"));
+
     project_a.read_with(cx_a, |project, cx| {
         let status = project.language_server_statuses(cx).next().unwrap().1;
         assert_eq!(status.name.0, "the-language-server");
         assert_eq!(status.pending_work.len(), 1);
         assert_eq!(
-            status.pending_work["the-token"].message.as_ref().unwrap(),
+            status.pending_work[&token].message.as_ref().unwrap(),
             "the-message"
         );
     });
@@ -1322,7 +1427,7 @@ async fn test_language_server_statuses(cx_a: &mut TestAppContext, cx_b: &mut Tes
         assert_eq!(status.name.0, "the-language-server");
         assert_eq!(status.pending_work.len(), 1);
         assert_eq!(
-            status.pending_work["the-token"].message.as_ref().unwrap(),
+            status.pending_work[&token].message.as_ref().unwrap(),
             "the-message-2"
         );
     });
@@ -1332,7 +1437,7 @@ async fn test_language_server_statuses(cx_a: &mut TestAppContext, cx_b: &mut Tes
         assert_eq!(status.name.0, "the-language-server");
         assert_eq!(status.pending_work.len(), 1);
         assert_eq!(
-            status.pending_work["the-token"].message.as_ref().unwrap(),
+            status.pending_work[&token].message.as_ref().unwrap(),
             "the-message-2"
         );
     });
@@ -1813,14 +1918,7 @@ async fn test_mutual_editor_inlay_hint_cache_update(
                 settings.project.all_languages.defaults.inlay_hints =
                     Some(InlayHintSettingsContent {
                         enabled: Some(true),
-                        show_value_hints: Some(true),
-                        edit_debounce_ms: Some(0),
-                        scroll_debounce_ms: Some(0),
-                        show_type_hints: Some(true),
-                        show_parameter_hints: Some(false),
-                        show_other_hints: Some(true),
-                        show_background: Some(false),
-                        toggle_on_modifiers_press: None,
+                        ..InlayHintSettingsContent::default()
                     })
             });
         });
@@ -1830,15 +1928,8 @@ async fn test_mutual_editor_inlay_hint_cache_update(
             store.update_user_settings(cx, |settings| {
                 settings.project.all_languages.defaults.inlay_hints =
                     Some(InlayHintSettingsContent {
-                        show_value_hints: Some(true),
                         enabled: Some(true),
-                        edit_debounce_ms: Some(0),
-                        scroll_debounce_ms: Some(0),
-                        show_type_hints: Some(true),
-                        show_parameter_hints: Some(false),
-                        show_other_hints: Some(true),
-                        show_background: Some(false),
-                        toggle_on_modifiers_press: None,
+                        ..InlayHintSettingsContent::default()
                     })
             });
         });
@@ -1849,10 +1940,40 @@ async fn test_mutual_editor_inlay_hint_cache_update(
         ..lsp::ServerCapabilities::default()
     };
     client_a.language_registry().add(rust_lang());
+
+    // Set up the language server to return an additional inlay hint on each request.
+    let edits_made = Arc::new(AtomicUsize::new(0));
+    let closure_edits_made = Arc::clone(&edits_made);
     let mut fake_language_servers = client_a.language_registry().register_fake_lsp(
         "Rust",
         FakeLspAdapter {
             capabilities: capabilities.clone(),
+            initializer: Some(Box::new(move |fake_language_server| {
+                let closure_edits_made = closure_edits_made.clone();
+                fake_language_server.set_request_handler::<lsp::request::InlayHintRequest, _, _>(
+                    move |params, _| {
+                        let edits_made_2 = Arc::clone(&closure_edits_made);
+                        async move {
+                            assert_eq!(
+                                params.text_document.uri,
+                                lsp::Uri::from_file_path(path!("/a/main.rs")).unwrap(),
+                            );
+                            let edits_made =
+                                AtomicUsize::load(&edits_made_2, atomic::Ordering::Acquire);
+                            Ok(Some(vec![lsp::InlayHint {
+                                position: lsp::Position::new(0, edits_made as u32),
+                                label: lsp::InlayHintLabel::String(edits_made.to_string()),
+                                kind: None,
+                                text_edits: None,
+                                tooltip: None,
+                                padding_left: None,
+                                padding_right: None,
+                                data: None,
+                            }]))
+                        }
+                    },
+                );
+            })),
             ..FakeLspAdapter::default()
         },
     );
@@ -1894,61 +2015,21 @@ async fn test_mutual_editor_inlay_hint_cache_update(
         .unwrap();
 
     let (workspace_a, cx_a) = client_a.build_workspace(&project_a, cx_a);
-    executor.start_waiting();
 
     // The host opens a rust file.
-    let _buffer_a = project_a
-        .update(cx_a, |project, cx| {
-            project.open_local_buffer(path!("/a/main.rs"), cx)
-        })
-        .await
-        .unwrap();
-    let editor_a = workspace_a
-        .update_in(cx_a, |workspace, window, cx| {
-            workspace.open_path((worktree_id, rel_path("main.rs")), None, true, window, cx)
-        })
-        .await
-        .unwrap()
-        .downcast::<Editor>()
-        .unwrap();
-
+    let file_a = workspace_a.update_in(cx_a, |workspace, window, cx| {
+        workspace.open_path((worktree_id, rel_path("main.rs")), None, true, window, cx)
+    });
     let fake_language_server = fake_language_servers.next().await.unwrap();
-
-    // Set up the language server to return an additional inlay hint on each request.
-    let edits_made = Arc::new(AtomicUsize::new(0));
-    let closure_edits_made = Arc::clone(&edits_made);
-    fake_language_server
-        .set_request_handler::<lsp::request::InlayHintRequest, _, _>(move |params, _| {
-            let edits_made_2 = Arc::clone(&closure_edits_made);
-            async move {
-                assert_eq!(
-                    params.text_document.uri,
-                    lsp::Uri::from_file_path(path!("/a/main.rs")).unwrap(),
-                );
-                let edits_made = AtomicUsize::load(&edits_made_2, atomic::Ordering::Acquire);
-                Ok(Some(vec![lsp::InlayHint {
-                    position: lsp::Position::new(0, edits_made as u32),
-                    label: lsp::InlayHintLabel::String(edits_made.to_string()),
-                    kind: None,
-                    text_edits: None,
-                    tooltip: None,
-                    padding_left: None,
-                    padding_right: None,
-                    data: None,
-                }]))
-            }
-        })
-        .next()
-        .await
-        .unwrap();
-
+    let editor_a = file_a.await.unwrap().downcast::<Editor>().unwrap();
+    executor.advance_clock(Duration::from_millis(100));
     executor.run_until_parked();
 
     let initial_edit = edits_made.load(atomic::Ordering::Acquire);
-    editor_a.update(cx_a, |editor, _| {
+    editor_a.update(cx_a, |editor, cx| {
         assert_eq!(
             vec![initial_edit.to_string()],
-            extract_hint_labels(editor),
+            extract_hint_labels(editor, cx),
             "Host should get its first hints when opens an editor"
         );
     });
@@ -1962,11 +2043,12 @@ async fn test_mutual_editor_inlay_hint_cache_update(
         .downcast::<Editor>()
         .unwrap();
 
+    executor.advance_clock(Duration::from_millis(100));
     executor.run_until_parked();
-    editor_b.update(cx_b, |editor, _| {
+    editor_b.update(cx_b, |editor, cx| {
         assert_eq!(
             vec![initial_edit.to_string()],
-            extract_hint_labels(editor),
+            extract_hint_labels(editor, cx),
             "Client should get its first hints when opens an editor"
         );
     });
@@ -1980,17 +2062,18 @@ async fn test_mutual_editor_inlay_hint_cache_update(
     });
     cx_b.focus(&editor_b);
 
+    executor.advance_clock(Duration::from_secs(1));
     executor.run_until_parked();
-    editor_a.update(cx_a, |editor, _| {
+    editor_a.update(cx_a, |editor, cx| {
         assert_eq!(
             vec![after_client_edit.to_string()],
-            extract_hint_labels(editor),
+            extract_hint_labels(editor, cx),
         );
     });
-    editor_b.update(cx_b, |editor, _| {
+    editor_b.update(cx_b, |editor, cx| {
         assert_eq!(
             vec![after_client_edit.to_string()],
-            extract_hint_labels(editor),
+            extract_hint_labels(editor, cx),
         );
     });
 
@@ -2003,17 +2086,18 @@ async fn test_mutual_editor_inlay_hint_cache_update(
     });
     cx_a.focus(&editor_a);
 
+    executor.advance_clock(Duration::from_secs(1));
     executor.run_until_parked();
-    editor_a.update(cx_a, |editor, _| {
+    editor_a.update(cx_a, |editor, cx| {
         assert_eq!(
             vec![after_host_edit.to_string()],
-            extract_hint_labels(editor),
+            extract_hint_labels(editor, cx),
         );
     });
-    editor_b.update(cx_b, |editor, _| {
+    editor_b.update(cx_b, |editor, cx| {
         assert_eq!(
             vec![after_host_edit.to_string()],
-            extract_hint_labels(editor),
+            extract_hint_labels(editor, cx),
         );
     });
 
@@ -2024,27 +2108,24 @@ async fn test_mutual_editor_inlay_hint_cache_update(
         .into_response()
         .expect("inlay refresh request failed");
 
+    executor.advance_clock(Duration::from_secs(1));
     executor.run_until_parked();
-    editor_a.update(cx_a, |editor, _| {
+    editor_a.update(cx_a, |editor, cx| {
         assert_eq!(
             vec![after_special_edit_for_refresh.to_string()],
-            extract_hint_labels(editor),
+            extract_hint_labels(editor, cx),
             "Host should react to /refresh LSP request"
         );
     });
-    editor_b.update(cx_b, |editor, _| {
+    editor_b.update(cx_b, |editor, cx| {
         assert_eq!(
             vec![after_special_edit_for_refresh.to_string()],
-            extract_hint_labels(editor),
+            extract_hint_labels(editor, cx),
             "Guest should get a /refresh LSP request propagated by host"
         );
     });
 }
 
-// This test started hanging on seed 2 after the theme settings
-// PR. The hypothesis is that it's been buggy for a while, but got lucky
-// on seeds.
-#[ignore]
 #[gpui::test(iterations = 10)]
 async fn test_inlay_hint_refresh_is_forwarded(
     cx_a: &mut TestAppContext,
@@ -2188,16 +2269,28 @@ async fn test_inlay_hint_refresh_is_forwarded(
                 } else {
                     "initial hint"
                 };
-                Ok(Some(vec![lsp::InlayHint {
-                    position: lsp::Position::new(0, character),
-                    label: lsp::InlayHintLabel::String(label.to_string()),
-                    kind: None,
-                    text_edits: None,
-                    tooltip: None,
-                    padding_left: None,
-                    padding_right: None,
-                    data: None,
-                }]))
+                Ok(Some(vec![
+                    lsp::InlayHint {
+                        position: lsp::Position::new(0, character),
+                        label: lsp::InlayHintLabel::String(label.to_string()),
+                        kind: None,
+                        text_edits: None,
+                        tooltip: None,
+                        padding_left: None,
+                        padding_right: None,
+                        data: None,
+                    },
+                    lsp::InlayHint {
+                        position: lsp::Position::new(1090, 1090),
+                        label: lsp::InlayHintLabel::String("out-of-bounds hint".to_string()),
+                        kind: None,
+                        text_edits: None,
+                        tooltip: None,
+                        padding_left: None,
+                        padding_right: None,
+                        data: None,
+                    },
+                ]))
             }
         })
         .next()
@@ -2206,18 +2299,18 @@ async fn test_inlay_hint_refresh_is_forwarded(
     executor.finish_waiting();
 
     executor.run_until_parked();
-    editor_a.update(cx_a, |editor, _| {
+    editor_a.update(cx_a, |editor, cx| {
         assert!(
-            extract_hint_labels(editor).is_empty(),
+            extract_hint_labels(editor, cx).is_empty(),
             "Host should get no hints due to them turned off"
         );
     });
 
     executor.run_until_parked();
-    editor_b.update(cx_b, |editor, _| {
+    editor_b.update(cx_b, |editor, cx| {
         assert_eq!(
             vec!["initial hint".to_string()],
-            extract_hint_labels(editor),
+            extract_hint_labels(editor, cx),
             "Client should get its first hints when opens an editor"
         );
     });
@@ -2229,18 +2322,18 @@ async fn test_inlay_hint_refresh_is_forwarded(
         .into_response()
         .expect("inlay refresh request failed");
     executor.run_until_parked();
-    editor_a.update(cx_a, |editor, _| {
+    editor_a.update(cx_a, |editor, cx| {
         assert!(
-            extract_hint_labels(editor).is_empty(),
+            extract_hint_labels(editor, cx).is_empty(),
             "Host should get no hints due to them turned off, even after the /refresh"
         );
     });
 
     executor.run_until_parked();
-    editor_b.update(cx_b, |editor, _| {
+    editor_b.update(cx_b, |editor, cx| {
         assert_eq!(
             vec!["other hint".to_string()],
-            extract_hint_labels(editor),
+            extract_hint_labels(editor, cx),
             "Guest should get a /refresh LSP request propagated by host despite host hints are off"
         );
     });
@@ -2600,7 +2693,7 @@ async fn test_lsp_pull_diagnostics(
             capabilities: capabilities.clone(),
             initializer: Some(Box::new(move |fake_language_server| {
                 let expected_workspace_diagnostic_token = lsp::ProgressToken::String(format!(
-                    "workspace/diagnostic-{}-1",
+                    "workspace/diagnostic/{}/1",
                     fake_language_server.server.server_id()
                 ));
                 let closure_workspace_diagnostics_pulls_result_ids = closure_workspace_diagnostics_pulls_result_ids.clone();
@@ -4217,15 +4310,35 @@ fn tab_undo_assert(
     cx_b.assert_editor_state(expected_initial);
 }
 
-fn extract_hint_labels(editor: &Editor) -> Vec<String> {
-    let mut labels = Vec::new();
-    for hint in editor.inlay_hint_cache().hints() {
-        match hint.label {
-            project::InlayHintLabel::String(s) => labels.push(s),
-            _ => unreachable!(),
-        }
+fn extract_hint_labels(editor: &Editor, cx: &mut App) -> Vec<String> {
+    let lsp_store = editor.project().unwrap().read(cx).lsp_store();
+
+    let mut all_cached_labels = Vec::new();
+    let mut all_fetched_hints = Vec::new();
+    for buffer in editor.buffer().read(cx).all_buffers() {
+        lsp_store.update(cx, |lsp_store, cx| {
+            let hints = &lsp_store.latest_lsp_data(&buffer, cx).inlay_hints();
+            all_cached_labels.extend(hints.all_cached_hints().into_iter().map(|hint| {
+                let mut label = hint.text().to_string();
+                if hint.padding_left {
+                    label.insert(0, ' ');
+                }
+                if hint.padding_right {
+                    label.push_str(" ");
+                }
+                label
+            }));
+            all_fetched_hints.extend(hints.all_fetched_hints());
+        });
     }
-    labels
+
+    assert!(
+        all_fetched_hints.is_empty(),
+        "Did not expect background hints fetch tasks, but got {} of them",
+        all_fetched_hints.len()
+    );
+
+    all_cached_labels
 }
 
 #[track_caller]

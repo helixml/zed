@@ -1,11 +1,9 @@
 use std::{
     io::{BufRead, BufReader},
+    ops::Range,
     path::Path,
     pin::pin,
-    sync::{
-        Arc,
-        atomic::{AtomicUsize, Ordering},
-    },
+    sync::Arc,
 };
 
 use anyhow::Context;
@@ -164,7 +162,7 @@ impl Search {
             } else if let Some(entry_id) = buffer.entry_id(cx) {
                 open_buffers.insert(entry_id);
             } else {
-                self.limit -= self.limit.saturating_sub(1);
+                self.limit = self.limit.saturating_sub(1);
                 unnamed_buffers.push(handle)
             };
         }
@@ -268,7 +266,10 @@ impl Search {
                             .spawn(async move |cx| {
                                 let _ = maybe!(async move {
                                     let response = request.await?;
-
+                                    log::error!(
+                                        "Received {} match candidates for a project search",
+                                        response.buffer_ids.len()
+                                    );
                                     for buffer_id in response.buffer_ids {
                                         let buffer_id = BufferId::new(buffer_id)?;
                                         let buffer = buffer_store
@@ -293,8 +294,7 @@ impl Search {
                     }
                 };
 
-                let matches_count = AtomicUsize::new(0);
-                let matched_buffer_count = AtomicUsize::new(0);
+                let should_find_all_matches = !tx.is_closed();
 
                 let worker_pool = executor.scoped(|scope| {
                     let num_cpus = executor.num_cpus();
@@ -304,27 +304,53 @@ impl Search {
                         let worker = Worker {
                             query: &query,
                             open_buffers: &open_buffers,
-                            matched_buffer_count: &matched_buffer_count,
-                            matches_count: &matches_count,
                             candidates: candidate_searcher.clone(),
                             find_all_matches_rx: find_all_matches_rx.clone(),
-                            publish_matches: tx.clone(),
                         };
                         scope.spawn(worker.run());
                     }
-                    drop(tx);
+
                     drop(find_all_matches_rx);
                     drop(candidate_searcher);
                 });
 
-                let buffer_snapshots = Self::grab_buffer_snapshots(
-                    grab_buffer_snapshot_rx,
-                    find_all_matches_tx,
-                    cx.clone(),
-                );
+                let (sorted_matches_tx, sorted_matches_rx) = unbounded();
+                // The caller of `into_handle` decides whether they're interested in all matches (files that matched + all matching ranges) or
+                // just the files. *They are using the same stream as the guts of the project search do*.
+                // This means that we cannot grab values off of that stream unless it's strictly needed for making a progress in project search.
+                //
+                // Grabbing buffer snapshots is only necessary when we're looking for all matches. If the caller decided that they're not interested
+                // in all matches, running that task unconditionally would hinder caller's ability to observe all matching file paths.
+                let buffer_snapshots = if should_find_all_matches {
+                    Some(
+                        Self::grab_buffer_snapshots(
+                            grab_buffer_snapshot_rx,
+                            find_all_matches_tx,
+                            sorted_matches_tx,
+                            cx.clone(),
+                        )
+                        .boxed_local(),
+                    )
+                } else {
+                    drop(find_all_matches_tx);
+
+                    None
+                };
+                let ensure_matches_are_reported_in_order = if should_find_all_matches {
+                    Some(
+                        Self::ensure_matched_ranges_are_reported_in_order(sorted_matches_rx, tx)
+                            .boxed_local(),
+                    )
+                } else {
+                    drop(tx);
+                    None
+                };
+
                 futures::future::join_all(
-                    [worker_pool.boxed_local(), buffer_snapshots.boxed_local()]
+                    [worker_pool.boxed_local()]
                         .into_iter()
+                        .chain(buffer_snapshots)
+                        .chain(ensure_matches_are_reported_in_order)
                         .chain(tasks),
                 )
                 .await;
@@ -413,7 +439,7 @@ impl Search {
         let mut matched = 0;
         while let Some(mut next_path_result) = rx.next().await {
             let Some(successful_path) = next_path_result.next().await else {
-                // This math did not produce a match, hence skip it.
+                // This file did not produce a match, hence skip it.
                 continue;
             };
             if paths_for_full_scan.send(successful_path).await.is_err() {
@@ -456,15 +482,52 @@ impl Search {
 
     async fn grab_buffer_snapshots(
         rx: Receiver<Entity<Buffer>>,
-        find_all_matches_tx: Sender<(Entity<Buffer>, BufferSnapshot)>,
+        find_all_matches_tx: Sender<(
+            Entity<Buffer>,
+            BufferSnapshot,
+            oneshot::Sender<(Entity<Buffer>, Vec<Range<language::Anchor>>)>,
+        )>,
+        results: Sender<oneshot::Receiver<(Entity<Buffer>, Vec<Range<language::Anchor>>)>>,
         mut cx: AsyncApp,
     ) {
         _ = maybe!(async move {
             while let Ok(buffer) = rx.recv().await {
                 let snapshot = buffer.read_with(&mut cx, |this, _| this.snapshot())?;
-                find_all_matches_tx.send((buffer, snapshot)).await?;
+                let (tx, rx) = oneshot::channel();
+                find_all_matches_tx.send((buffer, snapshot, tx)).await?;
+                results.send(rx).await?;
             }
+            debug_assert!(rx.is_empty());
             Result::<_, anyhow::Error>::Ok(())
+        })
+        .await;
+    }
+
+    async fn ensure_matched_ranges_are_reported_in_order(
+        rx: Receiver<oneshot::Receiver<(Entity<Buffer>, Vec<Range<language::Anchor>>)>>,
+        tx: Sender<SearchResult>,
+    ) {
+        use postage::stream::Stream;
+        _ = maybe!(async move {
+            let mut matched_buffers = 0;
+            let mut matches = 0;
+            while let Ok(mut next_buffer_matches) = rx.recv().await {
+                let Some((buffer, ranges)) = next_buffer_matches.recv().await else {
+                    continue;
+                };
+
+                if matched_buffers > Search::MAX_SEARCH_RESULT_FILES
+                    || matches > Search::MAX_SEARCH_RESULT_RANGES
+                {
+                    _ = tx.send(SearchResult::LimitReached).await;
+                    break;
+                }
+                matched_buffers += 1;
+                matches += ranges.len();
+
+                _ = tx.send(SearchResult::Buffer { buffer, ranges }).await?;
+            }
+            anyhow::Ok(())
         })
         .await;
     }
@@ -511,18 +574,19 @@ impl Search {
 
 struct Worker<'search> {
     query: &'search SearchQuery,
-    matched_buffer_count: &'search AtomicUsize,
-    matches_count: &'search AtomicUsize,
     open_buffers: &'search HashSet<ProjectEntryId>,
     candidates: FindSearchCandidates,
     /// Ok, we're back in background: run full scan & find all matches in a given buffer snapshot.
-    find_all_matches_rx: Receiver<(Entity<Buffer>, BufferSnapshot)>,
-    /// Cool, we have results; let's share them with the world.
-    publish_matches: Sender<SearchResult>,
+    /// Then, when you're done, share them via the channel you were given.
+    find_all_matches_rx: Receiver<(
+        Entity<Buffer>,
+        BufferSnapshot,
+        oneshot::Sender<(Entity<Buffer>, Vec<Range<language::Anchor>>)>,
+    )>,
 }
 
 impl Worker<'_> {
-    async fn run(mut self) {
+    async fn run(self) {
         let (
             input_paths_rx,
             confirm_contents_will_match_rx,
@@ -551,6 +615,8 @@ impl Worker<'_> {
                 None,
             ),
         };
+        // WorkerA: grabs a request for "find all matches in file/a" <- takes 5 minutes
+        // right after: WorkerB: grabs a request for "find all matches in file/b" <- takes 5 seconds
         let mut find_all_matches = pin!(self.find_all_matches_rx.fuse());
         let mut find_first_match = pin!(confirm_contents_will_match_rx.fuse());
         let mut scan_path = pin!(input_paths_rx.fuse());
@@ -560,11 +626,8 @@ impl Worker<'_> {
                 query: self.query,
                 open_entries: &self.open_buffers,
                 fs: fs.as_deref(),
-                matched_buffer_count: self.matched_buffer_count,
-                matches_count: self.matches_count,
                 confirm_contents_will_match_tx: &confirm_contents_will_match_tx,
                 get_buffer_for_full_scan_tx: &get_buffer_for_full_scan_tx,
-                publish_matches: &self.publish_matches,
             };
             // Whenever we notice that some step of a pipeline is closed, we don't want to close subsequent
             // steps straight away. Another worker might be about to produce a value that will
@@ -572,20 +635,10 @@ impl Worker<'_> {
             // That way, we'll only ever close a next-stage channel when ALL workers do so.
             select_biased! {
                 find_all_matches = find_all_matches.next() => {
-
-                    if self.publish_matches.is_closed() {
-                        break;
-                    }
                     let Some(matches) = find_all_matches else {
-                        self.publish_matches = bounded(1).0;
                         continue;
                     };
-                    let result = handler.handle_find_all_matches(matches).await;
-                    if let Some(_should_bail) = result {
-
-                        self.publish_matches = bounded(1).0;
-                        continue;
-                    }
+                    handler.handle_find_all_matches(matches).await;
                 },
                 find_first_match = find_first_match.next() => {
                     if let Some(buffer_with_at_least_one_match) = find_first_match {
@@ -617,21 +670,19 @@ struct RequestHandler<'worker> {
     query: &'worker SearchQuery,
     fs: Option<&'worker dyn Fs>,
     open_entries: &'worker HashSet<ProjectEntryId>,
-    matched_buffer_count: &'worker AtomicUsize,
-    matches_count: &'worker AtomicUsize,
-
     confirm_contents_will_match_tx: &'worker Sender<MatchingEntry>,
     get_buffer_for_full_scan_tx: &'worker Sender<ProjectPath>,
-    publish_matches: &'worker Sender<SearchResult>,
 }
-
-struct LimitReached;
 
 impl RequestHandler<'_> {
     async fn handle_find_all_matches(
         &self,
-        (buffer, snapshot): (Entity<Buffer>, BufferSnapshot),
-    ) -> Option<LimitReached> {
+        (buffer, snapshot, mut report_matches): (
+            Entity<Buffer>,
+            BufferSnapshot,
+            oneshot::Sender<(Entity<Buffer>, Vec<Range<language::Anchor>>)>,
+        ),
+    ) {
         let ranges = self
             .query
             .search(&snapshot, None)
@@ -640,24 +691,9 @@ impl RequestHandler<'_> {
             .map(|range| snapshot.anchor_before(range.start)..snapshot.anchor_after(range.end))
             .collect::<Vec<_>>();
 
-        let matched_ranges = ranges.len();
-        if self.matched_buffer_count.fetch_add(1, Ordering::Release)
-            > Search::MAX_SEARCH_RESULT_FILES
-            || self
-                .matches_count
-                .fetch_add(matched_ranges, Ordering::Release)
-                > Search::MAX_SEARCH_RESULT_RANGES
-        {
-            _ = self.publish_matches.send(SearchResult::LimitReached).await;
-            Some(LimitReached)
-        } else {
-            _ = self
-                .publish_matches
-                .send(SearchResult::Buffer { buffer, ranges })
-                .await;
-            None
-        }
+        _ = report_matches.send((buffer, ranges)).await;
     }
+
     async fn handle_find_first_match(&self, mut entry: MatchingEntry) {
         _=maybe!(async move {
             let abs_path = entry.worktree_root.join(entry.path.path.as_std_path());

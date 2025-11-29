@@ -15,14 +15,9 @@ pub use settings::{
     Formatter, FormatterList, InlayHintKind, LanguageSettingsContent, LspInsertMode,
     RewrapBehavior, ShowWhitespaceSetting, SoftWrap, WordsCompletionMode,
 };
-use settings::{Settings, SettingsLocation, SettingsStore};
+use settings::{RegisterSetting, Settings, SettingsLocation, SettingsStore};
 use shellexpand;
 use std::{borrow::Cow, num::NonZeroU32, path::Path, sync::Arc};
-
-/// Initializes the language settings.
-pub fn init(cx: &mut App) {
-    AllLanguageSettings::register(cx);
-}
 
 /// Returns the settings for the specified language from the provided file.
 pub fn language_settings<'a>(
@@ -50,7 +45,7 @@ pub fn all_language_settings<'a>(
 }
 
 /// The settings for all languages.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, RegisterSetting)]
 pub struct AllLanguageSettings {
     /// The edit prediction settings.
     pub edit_predictions: EditPredictionSettings,
@@ -420,6 +415,8 @@ pub struct CodestralSettings {
     pub model: Option<String>,
     /// Maximum tokens to generate.
     pub max_tokens: Option<u32>,
+    /// Custom API URL to use for Codestral.
+    pub api_url: Option<String>,
 }
 
 impl AllLanguageSettings {
@@ -636,6 +633,7 @@ impl settings::Settings for AllLanguageSettings {
         let codestral_settings = CodestralSettings {
             model: codestral.model,
             max_tokens: codestral.max_tokens,
+            api_url: codestral.api_url,
         };
 
         let enabled_in_text_threads = edit_predictions.enabled_in_text_threads.unwrap();

@@ -210,11 +210,10 @@ impl TerminalPanel {
                             .on_click(cx.listener(|pane, _, window, cx| {
                                 pane.toggle_zoom(&workspace::ToggleZoom, window, cx);
                             }))
-                            .tooltip(move |window, cx| {
+                            .tooltip(move |_window, cx| {
                                 Tooltip::for_action(
                                     if zoomed { "Zoom Out" } else { "Zoom In" },
                                     &ToggleZoom,
-                                    window,
                                     cx,
                                 )
                             })
@@ -1739,14 +1738,8 @@ impl Render for InlineAssistTabBarButton {
             .on_click(cx.listener(|_, _, window, cx| {
                 window.dispatch_action(InlineAssist::default().boxed_clone(), cx);
             }))
-            .tooltip(move |window, cx| {
-                Tooltip::for_action_in(
-                    "Inline Assist",
-                    &InlineAssist::default(),
-                    &focus_handle,
-                    window,
-                    cx,
-                )
+            .tooltip(move |_window, cx| {
+                Tooltip::for_action_in("Inline Assist", &InlineAssist::default(), &focus_handle, cx)
             })
     }
 }
@@ -1978,10 +1971,6 @@ mod tests {
             let store = SettingsStore::test(cx);
             cx.set_global(store);
             theme::init(theme::LoadThemes::JustBase, cx);
-            client::init_settings(cx);
-            language::init(cx);
-            Project::init_settings(cx);
-            workspace::init_settings(cx);
             editor::init(cx);
             crate::init(cx);
         });

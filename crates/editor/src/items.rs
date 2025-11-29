@@ -1,7 +1,7 @@
 use crate::{
-    Anchor, Autoscroll, Editor, EditorEvent, EditorSettings, ExcerptId, ExcerptRange, FormatTarget,
-    MultiBuffer, MultiBufferSnapshot, NavigationData, ReportEditorEvent, SearchWithinRange,
-    SelectionEffects, ToPoint as _,
+    Anchor, Autoscroll, BufferSerialization, Editor, EditorEvent, EditorSettings, ExcerptId,
+    ExcerptRange, FormatTarget, MultiBuffer, MultiBufferSnapshot, NavigationData,
+    ReportEditorEvent, SearchWithinRange, SelectionEffects, ToPoint as _,
     display_map::HighlightKey,
     editor_settings::SeedQuerySetting,
     persistence::{DB, SerializedEditor},
@@ -42,7 +42,7 @@ use ui::{IconDecorationKind, prelude::*};
 use util::{ResultExt, TryFutureExt, paths::PathExt};
 use workspace::{
     CollaboratorId, ItemId, ItemNavHistory, ToolbarItemLocation, ViewId, Workspace, WorkspaceId,
-    invalid_buffer_view::InvalidBufferView,
+    invalid_item_view::InvalidItemView,
     item::{FollowableItem, Item, ItemBufferKind, ItemEvent, ProjectItem, SaveOptions},
     searchable::{
         Direction, FilteredSearchRange, SearchEvent, SearchableItem, SearchableItemHandle,
@@ -226,7 +226,7 @@ impl FollowableItem for Editor {
 
         Some(proto::view::Variant::Editor(proto::view::Editor {
             singleton: buffer.is_singleton(),
-            title: (!buffer.is_singleton()).then(|| buffer.title(cx).into()),
+            title: buffer.explicit_title().map(ToOwned::to_owned),
             excerpts,
             scroll_top_anchor: Some(serialize_anchor(&scroll_anchor.anchor, &snapshot)),
             scroll_x: scroll_anchor.offset.x,
@@ -757,6 +757,10 @@ impl Item for Editor {
         self.buffer.read(cx).is_singleton()
     }
 
+    fn can_split(&self) -> bool {
+        true
+    }
+
     fn clone_on_split(
         &self,
         _workspace_id: Option<WorkspaceId>,
@@ -938,8 +942,9 @@ impl Item for Editor {
     fn breadcrumbs(&self, variant: &Theme, cx: &App) -> Option<Vec<BreadcrumbText>> {
         let cursor = self.selections.newest_anchor().head();
         let multibuffer = &self.buffer().read(cx);
-        let (buffer_id, symbols) =
-            multibuffer.symbols_containing(cursor, Some(variant.syntax()), cx)?;
+        let (buffer_id, symbols) = multibuffer
+            .read(cx)
+            .symbols_containing(cursor, Some(variant.syntax()))?;
         let buffer = multibuffer.buffer(buffer_id)?;
 
         let buffer = buffer.read(cx);
@@ -1251,17 +1256,15 @@ impl SerializableItem for Editor {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Option<Task<Result<()>>> {
-        if self.mode.is_minimap() {
-            return None;
-        }
-        let mut serialize_dirty_buffers = self.serialize_dirty_buffers;
-
+        let buffer_serialization = self.buffer_serialization?;
         let project = self.project.clone()?;
-        if project.read(cx).visible_worktrees(cx).next().is_none() {
+
+        let serialize_dirty_buffers = match buffer_serialization {
             // If we don't have a worktree, we don't serialize, because
             // projects without worktrees aren't deserialized.
-            serialize_dirty_buffers = false;
-        }
+            BufferSerialization::All => project.read(cx).visible_worktrees(cx).next().is_some(),
+            BufferSerialization::NonDirtyBuffers => false,
+        };
 
         if closing && !serialize_dirty_buffers {
             return None;
@@ -1318,10 +1321,11 @@ impl SerializableItem for Editor {
     }
 
     fn should_serialize(&self, event: &Self::Event) -> bool {
-        matches!(
-            event,
-            EditorEvent::Saved | EditorEvent::DirtyChanged | EditorEvent::BufferEdited
-        )
+        self.should_serialize_buffer()
+            && matches!(
+                event,
+                EditorEvent::Saved | EditorEvent::DirtyChanged | EditorEvent::BufferEdited
+            )
     }
 }
 
@@ -1392,8 +1396,8 @@ impl ProjectItem for Editor {
         e: &anyhow::Error,
         window: &mut Window,
         cx: &mut App,
-    ) -> Option<InvalidBufferView> {
-        Some(InvalidBufferView::new(abs_path, is_local, e, window, cx))
+    ) -> Option<InvalidItemView> {
+        Some(InvalidItemView::new(abs_path, is_local, e, window, cx))
     }
 }
 
@@ -1587,7 +1591,12 @@ impl SearchableItem for Editor {
     ) {
         self.unfold_ranges(&[matches[index].clone()], false, true, cx);
         let range = self.range_for_match(&matches[index]);
-        self.change_selections(Default::default(), window, cx, |s| {
+        let autoscroll = if EditorSettings::get_global(cx).search.center_on_match {
+            Autoscroll::center()
+        } else {
+            Autoscroll::fit()
+        };
+        self.change_selections(SelectionEffects::scroll(autoscroll), window, cx, |s| {
             s.select_ranges([range]);
         })
     }
@@ -1785,6 +1794,14 @@ impl SearchableItem for Editor {
 
     fn search_bar_visibility_changed(&mut self, _: bool, _: &mut Window, _: &mut Context<Self>) {
         self.expect_bounds_change = self.last_bounds;
+    }
+
+    fn set_search_is_case_sensitive(
+        &mut self,
+        case_sensitive: Option<bool>,
+        _cx: &mut Context<Self>,
+    ) {
+        self.select_next_is_case_sensitive = case_sensitive;
     }
 }
 

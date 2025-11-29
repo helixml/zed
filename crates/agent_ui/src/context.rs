@@ -1,5 +1,5 @@
 use agent::outline;
-use assistant_context::AssistantContext;
+use assistant_text_thread::TextThread;
 use futures::future;
 use futures::{FutureExt, future::Shared};
 use gpui::{App, AppContext as _, ElementId, Entity, SharedString, Task};
@@ -581,7 +581,7 @@ impl Display for ThreadContext {
 
 #[derive(Debug, Clone)]
 pub struct TextThreadContextHandle {
-    pub context: Entity<AssistantContext>,
+    pub text_thread: Entity<TextThread>,
     pub context_id: ContextId,
 }
 
@@ -595,20 +595,20 @@ pub struct TextThreadContext {
 impl TextThreadContextHandle {
     // pub fn lookup_key() ->
     pub fn eq_for_key(&self, other: &Self) -> bool {
-        self.context == other.context
+        self.text_thread == other.text_thread
     }
 
     pub fn hash_for_key<H: Hasher>(&self, state: &mut H) {
-        self.context.hash(state)
+        self.text_thread.hash(state)
     }
 
     pub fn title(&self, cx: &App) -> SharedString {
-        self.context.read(cx).summary().or_default()
+        self.text_thread.read(cx).summary().or_default()
     }
 
     fn load(self, cx: &App) -> Task<Option<AgentContext>> {
         let title = self.title(cx);
-        let text = self.context.read(cx).to_xml(cx);
+        let text = self.text_thread.read(cx).to_xml(cx);
         let context = AgentContext::TextThread(TextThreadContext {
             title,
             text: text.into(),
@@ -620,8 +620,18 @@ impl TextThreadContextHandle {
 
 impl Display for TextThreadContext {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
-        // TODO: escape title?
-        writeln!(f, "<text_thread title=\"{}\">", self.title)?;
+        write!(f, "<text_thread title=\"")?;
+        for c in self.title.chars() {
+            match c {
+                '&' => write!(f, "&amp;")?,
+                '<' => write!(f, "&lt;")?,
+                '>' => write!(f, "&gt;")?,
+                '"' => write!(f, "&quot;")?,
+                '\'' => write!(f, "&apos;")?,
+                _ => write!(f, "{}", c)?,
+            }
+        }
+        writeln!(f, "\">")?;
         write!(f, "{}", self.text.trim())?;
         write!(f, "\n</text_thread>")
     }
@@ -1065,8 +1075,6 @@ mod tests {
         cx.update(|cx| {
             let settings_store = SettingsStore::test(cx);
             cx.set_global(settings_store);
-            language::init(cx);
-            Project::init_settings(cx);
         });
     }
 
@@ -1081,7 +1089,7 @@ mod tests {
     }
 
     #[gpui::test]
-    async fn test_large_file_uses_outline(cx: &mut TestAppContext) {
+    async fn test_large_file_uses_fallback(cx: &mut TestAppContext) {
         init_test_settings(cx);
 
         // Create a large file that exceeds AUTO_OUTLINE_SIZE
@@ -1093,16 +1101,16 @@ mod tests {
 
         let file_context = load_context_for("file.txt", large_content, cx).await;
 
+        // Should contain some of the actual file content
         assert!(
-            file_context
-                .text
-                .contains(&format!("# File outline for {}", path!("test/file.txt"))),
-            "Large files should not get an outline"
+            file_context.text.contains(LINE),
+            "Should contain some of the file content"
         );
 
+        // Should be much smaller than original
         assert!(
-            file_context.text.len() < content_len,
-            "Outline should be smaller than original content"
+            file_context.text.len() < content_len / 10,
+            "Should be significantly smaller than original content"
         );
     }
 
