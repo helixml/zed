@@ -10,7 +10,7 @@ use futures::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use tokio::sync::mpsc;
-use tokio_tungstenite::{connect_async, tungstenite::Message};
+use tokio_tungstenite::{connect_async_tls_with_config, tungstenite::Message, Connector};
 use url::Url;
 
 use crate::types::{IncomingChatMessage, SyncEvent};
@@ -94,8 +94,17 @@ impl WebSocketSync {
         eprintln!("🔧 [WEBSOCKET] Built WebSocket request with headers");
         log::info!("🔧 [WEBSOCKET] Built WebSocket request with headers");
 
-        // Connect to WebSocket
-        let (ws_stream, response) = match connect_async(request).await {
+        // Connect to WebSocket with TLS using platform-native certificates
+        // This ensures we trust the system CA store (e.g., Let's Encrypt certs)
+        let tls_connector = if config.use_tls {
+            eprintln!("🔐 [WEBSOCKET] Configuring TLS with platform-native certificates");
+            log::info!("🔐 [WEBSOCKET] Configuring TLS with platform-native certificates");
+            Some(Connector::Rustls(Arc::new(http_client_tls::tls_config())))
+        } else {
+            None
+        };
+
+        let (ws_stream, response) = match connect_async_tls_with_config(request, None, false, tls_connector).await {
             Ok(result) => {
                 eprintln!("✅ [WEBSOCKET] connect_async() succeeded");
                 log::info!("✅ [WEBSOCKET] connect_async() succeeded");
