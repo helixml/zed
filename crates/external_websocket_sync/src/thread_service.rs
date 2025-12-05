@@ -317,6 +317,34 @@ fn create_new_thread_sync(
         eprintln!("✅ [THREAD_SERVICE] Connected to agent server");
         log::info!("✅ [THREAD_SERVICE] Connected to agent server");
 
+        // Check and log available auth methods
+        let auth_methods = connection.auth_methods();
+        eprintln!("🔐 [THREAD_SERVICE] Agent auth_methods: {:?}", auth_methods.iter().map(|m| &m.id).collect::<Vec<_>>());
+        log::info!("🔐 [THREAD_SERVICE] Agent auth_methods: {:?}", auth_methods.iter().map(|m| &m.id).collect::<Vec<_>>());
+
+        // If auth is required, authenticate with first available method
+        if !auth_methods.is_empty() {
+            let first_method = auth_methods[0].id.clone();
+            eprintln!("🔐 [THREAD_SERVICE] Authenticating with method: {:?}", first_method);
+            log::info!("🔐 [THREAD_SERVICE] Authenticating with method: {:?}", first_method);
+
+            let auth_task = cx.update(|cx| {
+                connection.authenticate(first_method.clone(), cx)
+            })?;
+
+            match auth_task.await {
+                Ok(()) => {
+                    eprintln!("✅ [THREAD_SERVICE] Authentication succeeded with method: {:?}", first_method);
+                    log::info!("✅ [THREAD_SERVICE] Authentication succeeded with method: {:?}", first_method);
+                }
+                Err(e) => {
+                    eprintln!("❌ [THREAD_SERVICE] Authentication failed: {}", e);
+                    log::error!("❌ [THREAD_SERVICE] Authentication failed: {}", e);
+                    // Continue anyway - some auth methods may not actually require action
+                }
+            }
+        }
+
         // Create thread using connection's new_thread method (properly registers session)
         eprintln!("🔨 [THREAD_SERVICE] Calling connection.new_thread()...");
         log::info!("🔨 [THREAD_SERVICE] Calling connection.new_thread()...");
