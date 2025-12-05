@@ -319,12 +319,30 @@ fn create_new_thread_sync(
 
         // Create thread using connection's new_thread method (properly registers session)
         eprintln!("🔨 [THREAD_SERVICE] Calling connection.new_thread()...");
-        let cwd = std::path::Path::new("/workspace");
+        log::info!("🔨 [THREAD_SERVICE] Calling connection.new_thread()...");
+
+        // Use home directory as cwd - /workspace doesn't exist in the sandbox
+        let cwd = std::path::Path::new("/home/retro/work");
         let thread_creation_task = cx.update(|cx| {
+            eprintln!("🔧 [THREAD_SERVICE] Inside cx.update for new_thread");
+            log::info!("🔧 [THREAD_SERVICE] Inside cx.update for new_thread");
             connection.new_thread(project_clone.clone(), cwd, cx)
         })?;
 
-        let thread_entity = thread_creation_task.await?;
+        eprintln!("🔧 [THREAD_SERVICE] Got thread_creation_task, now awaiting...");
+        log::info!("🔧 [THREAD_SERVICE] Got thread_creation_task, now awaiting...");
+        let thread_entity = match thread_creation_task.await {
+            Ok(entity) => {
+                eprintln!("✅ [THREAD_SERVICE] thread_creation_task.await succeeded");
+                log::info!("✅ [THREAD_SERVICE] thread_creation_task.await succeeded");
+                entity
+            }
+            Err(e) => {
+                eprintln!("❌ [THREAD_SERVICE] thread_creation_task.await FAILED: {}", e);
+                log::error!("❌ [THREAD_SERVICE] thread_creation_task.await FAILED: {}", e);
+                return Err(e);
+            }
+        };
 
         let acp_thread_id = cx.update(|cx| {
             let thread_id = thread_entity.read(cx).session_id().to_string();
