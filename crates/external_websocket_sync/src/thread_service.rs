@@ -267,8 +267,28 @@ fn create_new_thread_sync(
     eprintln!("🔨 [THREAD_SERVICE] Creating ACP thread...");
     log::info!("🔨 [THREAD_SERVICE] Creating ACP thread...");
 
-    // Create agent server
-    let agent = ExternalAgent::NativeAgent;
+    // Log which agent was requested
+    eprintln!("🔧 [THREAD_SERVICE] Requested agent_name: {:?}", request.agent_name);
+    log::info!("🔧 [THREAD_SERVICE] Requested agent_name: {:?}", request.agent_name);
+
+    // Determine which agent to use based on agent_name from Helix
+    // - "zed-agent" or None -> NativeAgent (Zed's built-in agent)
+    // - Any other name (e.g., "qwen") -> CustomAgentServer (looks up command from settings.json)
+    let agent = match request.agent_name.as_deref() {
+        Some("zed-agent") | None => ExternalAgent::NativeAgent,
+        Some(name) => {
+            eprintln!("🔧 [THREAD_SERVICE] Using custom agent: {}", name);
+            log::info!("🔧 [THREAD_SERVICE] Using custom agent: {}", name);
+            ExternalAgent::Custom {
+                name: gpui::SharedString::from(name.to_string()),
+                command: project::agent_server_store::AgentServerCommand {
+                    path: std::path::PathBuf::new(), // Not used - CustomAgentServer looks it up from agent_server_store
+                    args: vec![],
+                    env: None,
+                },
+            }
+        }
+    };
     let server = agent.server(fs, acp_history_store.clone());
 
     // Get agent server store from project

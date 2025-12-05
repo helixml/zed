@@ -84,6 +84,7 @@ pub struct ThreadCreationRequest {
     pub acp_thread_id: Option<String>, // null = create new, Some(id) = use existing
     pub message: String,
     pub request_id: String,
+    pub agent_name: Option<String>, // Which agent to use (zed-agent or qwen) - defaults to zed-agent
 }
 
 /// Request to open existing ACP thread from database and display in UI

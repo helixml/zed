@@ -263,6 +263,8 @@ pub struct IncomingChatMessage {
     pub role: Option<String>,  // Optional role field from API (can be ignored)
     #[serde(default)]
     pub session_id: Option<String>,  // Optional session_id field from API (can be ignored)
+    #[serde(default)]
+    pub agent_name: Option<String>,  // Which agent to use (zed-agent or qwen) - defaults to zed-agent
 }
 
 /// Response for health check endpoint
