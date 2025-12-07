@@ -286,6 +286,7 @@ impl WebSocketSync {
             acp_thread_id: chat_msg.acp_thread_id.clone(),
             message: chat_msg.message.clone(),
             request_id: chat_msg.request_id.clone(),
+            agent_name: chat_msg.agent_name.clone(),
         };
 
         eprintln!("🎯 [WEBSOCKET-IN] Calling request_thread_creation()...");

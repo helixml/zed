@@ -264,11 +264,19 @@ fn create_new_thread_sync(
     request: ThreadCreationRequest,
     cx: &mut App,
 ) -> Result<()> {
-    eprintln!("🔨 [THREAD_SERVICE] Creating ACP thread...");
-    log::info!("🔨 [THREAD_SERVICE] Creating ACP thread...");
+    log::info!("[THREAD_SERVICE] Creating ACP thread with agent: {:?}", request.agent_name);
 
-    // Create agent server
-    let agent = ExternalAgent::NativeAgent;
+    let agent = match request.agent_name.as_deref() {
+        Some("zed-agent") | None => ExternalAgent::NativeAgent,
+        Some(name) => ExternalAgent::Custom {
+            name: gpui::SharedString::from(name.to_string()),
+            command: project::agent_server_store::AgentServerCommand {
+                path: std::path::PathBuf::new(),
+                args: vec![],
+                env: None,
+            },
+        },
+    };
     let server = agent.server(fs, acp_history_store.clone());
 
     // Get agent server store from project
@@ -294,22 +302,29 @@ fn create_new_thread_sync(
             .log_err()
             .ok_or_else(|| anyhow::anyhow!("Failed to connect to agent"))?;
 
-        eprintln!("✅ [THREAD_SERVICE] Connected to agent server");
-        log::info!("✅ [THREAD_SERVICE] Connected to agent server");
+        // Authenticate if required
+        let auth_methods = connection.auth_methods();
+        if let Some(first_method) = auth_methods.first() {
+            let auth_task = cx.update(|cx| {
+                connection.authenticate(first_method.id.clone(), cx)
+            })?;
+            if let Err(e) = auth_task.await {
+                log::warn!("[THREAD_SERVICE] Authentication failed (continuing): {}", e);
+            }
+        }
 
-        // Create thread using connection's new_thread method (properly registers session)
-        eprintln!("🔨 [THREAD_SERVICE] Calling connection.new_thread()...");
-        let cwd = std::path::Path::new("/workspace");
-        let thread_creation_task = cx.update(|cx| {
-            connection.new_thread(project_clone.clone(), cwd, cx)
+        let cwd = cx.update(|cx| {
+            project_clone.read(cx).worktrees(cx).next()
+                .map(|wt| wt.read(cx).abs_path().to_path_buf())
+                .unwrap_or_else(|| std::env::current_dir().unwrap_or_default())
         })?;
-
-        let thread_entity = thread_creation_task.await?;
+        let thread_entity = cx.update(|cx| {
+            connection.new_thread(project_clone.clone(), &cwd, cx)
+        })?.await?;
 
         let acp_thread_id = cx.update(|cx| {
             let thread_id = thread_entity.read(cx).session_id().to_string();
-            eprintln!("✅ [THREAD_SERVICE] Created ACP thread: {} (session_id)", thread_id);
-            log::info!("✅ [THREAD_SERVICE] Created ACP thread: {} (session_id)", thread_id);
+            log::info!("[THREAD_SERVICE] Created ACP thread: {}", thread_id);
             thread_id
         })?;
 

@@ -351,7 +351,9 @@ impl AcpThreadView {
         let prompt_capabilities = Rc::new(RefCell::new(thread.read(cx).prompt_capabilities()));
         let available_commands = Rc::new(RefCell::new(vec![]));
 
-        let placeholder = format!("Message {} — @ to include context", agent.name());
+        let thread_title = thread.read(cx).title();
+        let agent_name = if thread_title.is_empty() { agent.name() } else { thread_title };
+        let placeholder = format!("Message {} — @ to include context", agent_name);
 
         let message_editor = cx.new(|cx| {
             MessageEditor::new(
@@ -361,7 +363,7 @@ impl AcpThreadView {
                 prompt_store.clone(),
                 prompt_capabilities.clone(),
                 available_commands.clone(),
-                agent.name(),
+                agent_name.clone(),
                 &placeholder,
                 editor::EditorMode::AutoHeight {
                     min_lines: AgentSettings::get_global(cx).message_editor_min_lines,
@@ -381,7 +383,7 @@ impl AcpThreadView {
                 prompt_store.clone(),
                 prompt_capabilities.clone(),
                 available_commands.clone(),
-                agent.name(),
+                agent_name.clone(),
             )
         });
 
