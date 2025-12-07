@@ -264,30 +264,18 @@ fn create_new_thread_sync(
     request: ThreadCreationRequest,
     cx: &mut App,
 ) -> Result<()> {
-    eprintln!("🔨 [THREAD_SERVICE] Creating ACP thread...");
-    log::info!("🔨 [THREAD_SERVICE] Creating ACP thread...");
+    log::info!("[THREAD_SERVICE] Creating ACP thread with agent: {:?}", request.agent_name);
 
-    // Log which agent was requested
-    eprintln!("🔧 [THREAD_SERVICE] Requested agent_name: {:?}", request.agent_name);
-    log::info!("🔧 [THREAD_SERVICE] Requested agent_name: {:?}", request.agent_name);
-
-    // Determine which agent to use based on agent_name from Helix
-    // - "zed-agent" or None -> NativeAgent (Zed's built-in agent)
-    // - Any other name (e.g., "qwen") -> CustomAgentServer (looks up command from settings.json)
     let agent = match request.agent_name.as_deref() {
         Some("zed-agent") | None => ExternalAgent::NativeAgent,
-        Some(name) => {
-            eprintln!("🔧 [THREAD_SERVICE] Using custom agent: {}", name);
-            log::info!("🔧 [THREAD_SERVICE] Using custom agent: {}", name);
-            ExternalAgent::Custom {
-                name: gpui::SharedString::from(name.to_string()),
-                command: project::agent_server_store::AgentServerCommand {
-                    path: std::path::PathBuf::new(), // Not used - CustomAgentServer looks it up from agent_server_store
-                    args: vec![],
-                    env: None,
-                },
-            }
-        }
+        Some(name) => ExternalAgent::Custom {
+            name: gpui::SharedString::from(name.to_string()),
+            command: project::agent_server_store::AgentServerCommand {
+                path: std::path::PathBuf::new(),
+                args: vec![],
+                env: None,
+            },
+        },
     };
     let server = agent.server(fs, acp_history_store.clone());
 
@@ -314,68 +302,29 @@ fn create_new_thread_sync(
             .log_err()
             .ok_or_else(|| anyhow::anyhow!("Failed to connect to agent"))?;
 
-        eprintln!("✅ [THREAD_SERVICE] Connected to agent server");
-        log::info!("✅ [THREAD_SERVICE] Connected to agent server");
-
-        // Check and log available auth methods
+        // Authenticate if required
         let auth_methods = connection.auth_methods();
-        eprintln!("🔐 [THREAD_SERVICE] Agent auth_methods: {:?}", auth_methods.iter().map(|m| &m.id).collect::<Vec<_>>());
-        log::info!("🔐 [THREAD_SERVICE] Agent auth_methods: {:?}", auth_methods.iter().map(|m| &m.id).collect::<Vec<_>>());
-
-        // If auth is required, authenticate with first available method
-        if !auth_methods.is_empty() {
-            let first_method = auth_methods[0].id.clone();
-            eprintln!("🔐 [THREAD_SERVICE] Authenticating with method: {:?}", first_method);
-            log::info!("🔐 [THREAD_SERVICE] Authenticating with method: {:?}", first_method);
-
+        if let Some(first_method) = auth_methods.first() {
             let auth_task = cx.update(|cx| {
-                connection.authenticate(first_method.clone(), cx)
+                connection.authenticate(first_method.id.clone(), cx)
             })?;
-
-            match auth_task.await {
-                Ok(()) => {
-                    eprintln!("✅ [THREAD_SERVICE] Authentication succeeded with method: {:?}", first_method);
-                    log::info!("✅ [THREAD_SERVICE] Authentication succeeded with method: {:?}", first_method);
-                }
-                Err(e) => {
-                    eprintln!("❌ [THREAD_SERVICE] Authentication failed: {}", e);
-                    log::error!("❌ [THREAD_SERVICE] Authentication failed: {}", e);
-                    // Continue anyway - some auth methods may not actually require action
-                }
+            if let Err(e) = auth_task.await {
+                log::warn!("[THREAD_SERVICE] Authentication failed (continuing): {}", e);
             }
         }
 
-        // Create thread using connection's new_thread method (properly registers session)
-        eprintln!("🔨 [THREAD_SERVICE] Calling connection.new_thread()...");
-        log::info!("🔨 [THREAD_SERVICE] Calling connection.new_thread()...");
-
-        // Use home directory as cwd - /workspace doesn't exist in the sandbox
-        let cwd = std::path::Path::new("/home/retro/work");
-        let thread_creation_task = cx.update(|cx| {
-            eprintln!("🔧 [THREAD_SERVICE] Inside cx.update for new_thread");
-            log::info!("🔧 [THREAD_SERVICE] Inside cx.update for new_thread");
-            connection.new_thread(project_clone.clone(), cwd, cx)
+        let cwd = cx.update(|cx| {
+            project_clone.read(cx).worktrees(cx).next()
+                .map(|wt| wt.read(cx).abs_path().to_path_buf())
+                .unwrap_or_else(|| std::env::current_dir().unwrap_or_default())
         })?;
-
-        eprintln!("🔧 [THREAD_SERVICE] Got thread_creation_task, now awaiting...");
-        log::info!("🔧 [THREAD_SERVICE] Got thread_creation_task, now awaiting...");
-        let thread_entity = match thread_creation_task.await {
-            Ok(entity) => {
-                eprintln!("✅ [THREAD_SERVICE] thread_creation_task.await succeeded");
-                log::info!("✅ [THREAD_SERVICE] thread_creation_task.await succeeded");
-                entity
-            }
-            Err(e) => {
-                eprintln!("❌ [THREAD_SERVICE] thread_creation_task.await FAILED: {}", e);
-                log::error!("❌ [THREAD_SERVICE] thread_creation_task.await FAILED: {}", e);
-                return Err(e);
-            }
-        };
+        let thread_entity = cx.update(|cx| {
+            connection.new_thread(project_clone.clone(), &cwd, cx)
+        })?.await?;
 
         let acp_thread_id = cx.update(|cx| {
             let thread_id = thread_entity.read(cx).session_id().to_string();
-            eprintln!("✅ [THREAD_SERVICE] Created ACP thread: {} (session_id)", thread_id);
-            log::info!("✅ [THREAD_SERVICE] Created ACP thread: {} (session_id)", thread_id);
+            log::info!("[THREAD_SERVICE] Created ACP thread: {}", thread_id);
             thread_id
         })?;
 

@@ -351,14 +351,8 @@ impl AcpThreadView {
         let prompt_capabilities = Rc::new(RefCell::new(thread.read(cx).prompt_capabilities()));
         let available_commands = Rc::new(RefCell::new(vec![]));
 
-        // Use the thread's title as the agent name (ACP threads are titled with server_name)
-        // Fall back to agent.name() if title is empty
         let thread_title = thread.read(cx).title();
-        let agent_name = if thread_title.is_empty() {
-            agent.name()
-        } else {
-            thread_title
-        };
+        let agent_name = if thread_title.is_empty() { agent.name() } else { thread_title };
         let placeholder = format!("Message {} — @ to include context", agent_name);
 
         let message_editor = cx.new(|cx| {
