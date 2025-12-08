@@ -23,6 +23,7 @@ use crate::application_menu::{
 use auto_update::AutoUpdateStatus;
 use call::ActiveCall;
 use client::{Client, UserStore, zed_urls};
+use external_websocket_sync::{WebSocketConnectionStatus, get_websocket_connection_status};
 use cloud_llm_client::{Plan, PlanV1, PlanV2};
 use gpui::{
     Action, AnyElement, App, Context, Corner, Element, Entity, Focusable, InteractiveElement,
@@ -200,6 +201,7 @@ impl Render for TitleBar {
                 .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                 .children(self.render_call_controls(window, cx))
                 .children(self.render_connection_status(status, cx))
+                .children(self.render_helix_connection_status(cx))
                 .when(
                     user.is_none() && TitleBarSettings::get_global(cx).show_sign_in,
                     |el| el.child(self.render_sign_in_button(cx)),
@@ -659,6 +661,55 @@ impl TitleBar {
                     })
                     .detach();
             })
+    }
+
+    /// Render Helix WebSocket connection status indicator
+    fn render_helix_connection_status(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let status = get_websocket_connection_status();
+
+        // Only show indicator if WebSocket is initialized (i.e., running in Helix sandbox)
+        if status == WebSocketConnectionStatus::NotInitialized {
+            return None;
+        }
+
+        let (indicator_color, icon_color, tooltip_text) = match status {
+            WebSocketConnectionStatus::Connected => (
+                Color::Success,
+                Color::Success,
+                "Helix: Connected",
+            ),
+            WebSocketConnectionStatus::Reconnecting => (
+                Color::Warning,
+                Color::Warning,
+                "Helix: Reconnecting...",
+            ),
+            WebSocketConnectionStatus::Disconnected => (
+                Color::Error,
+                Color::Error,
+                "Helix: Disconnected",
+            ),
+            WebSocketConnectionStatus::NotInitialized => {
+                // Already handled above
+                return None;
+            }
+        };
+
+        Some(
+            ButtonLike::new("helix-connection-status")
+                .child(
+                    h_flex()
+                        .gap_1()
+                        .child(
+                            IconWithIndicator::new(
+                                Icon::new(IconName::Server).size(IconSize::Small).color(icon_color),
+                                Some(Indicator::dot().color(indicator_color)),
+                            )
+                            .indicator_border_color(Some(cx.theme().colors().title_bar_background)),
+                        ),
+                )
+                .tooltip(Tooltip::text(tooltip_text))
+                .into_any_element(),
+        )
     }
 
     pub fn render_app_menu_button(&mut self, cx: &mut Context<Self>) -> impl Element {

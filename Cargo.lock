@@ -17633,6 +17633,7 @@ dependencies = [
  "cloud_llm_client",
  "collections",
  "db",
+ "external_websocket_sync",
  "gpui",
  "http_client",
  "notifications",

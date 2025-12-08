@@ -447,6 +447,7 @@ fn create_new_thread_sync(
         if let Err(e) = crate::notify_thread_display(crate::ThreadDisplayNotification {
             thread_entity: thread_entity.clone(),
             helix_session_id: request_clone.request_id.clone(),
+            agent_name: request_clone.agent_name.clone(), // Pass agent name for correct UI label
         }) {
             eprintln!("⚠️ [THREAD_SERVICE] Failed to notify thread display: {}", e);
             log::warn!("⚠️ [THREAD_SERVICE] Failed to notify thread display: {}", e);
@@ -665,9 +666,12 @@ fn open_existing_thread_sync(
         log::info!("📋 [THREAD_SERVICE] Registered thread: {} (strong reference)", acp_thread_id);
 
         // Notify AgentPanel to display this thread (for auto-select in UI)
+        // Note: For opened threads, we don't have agent_name info - the thread was created earlier
+        // TODO: Store agent_name in thread metadata so it can be retrieved on open
         if let Err(e) = crate::notify_thread_display(crate::ThreadDisplayNotification {
             thread_entity: thread_entity.clone(),
             helix_session_id: acp_thread_id.clone(),
+            agent_name: None, // Opened threads don't have agent_name context
         }) {
             eprintln!("⚠️ [THREAD_SERVICE] Failed to notify thread display: {}", e);
             log::warn!("⚠️ [THREAD_SERVICE] Failed to notify thread display: {}", e);

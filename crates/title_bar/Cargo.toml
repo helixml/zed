@@ -35,6 +35,7 @@ chrono.workspace = true
 client.workspace = true
 cloud_llm_client.workspace = true
 db.workspace = true
+external_websocket_sync.workspace = true
 gpui = { workspace = true, features = ["screen-capture"] }
 notifications.workspace = true
 project.workspace = true

@@ -342,11 +342,27 @@ impl AcpThreadView {
         history_store: Entity<HistoryStore>,
         prompt_store: Option<Entity<PromptStore>>,
         fs: Arc<dyn Fs>,
+        external_agent_name: Option<String>, // Which agent created this thread (e.g., "qwen")
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
-        // Create a server (will be used for capabilities, not for the thread itself)
-        let agent = crate::ExternalAgent::NativeAgent.server(fs.clone(), history_store.clone());
+        // Create correct agent server based on external_agent_name
+        let agent = match external_agent_name.as_deref() {
+            Some("zed-agent") | None => {
+                crate::ExternalAgent::NativeAgent.server(fs.clone(), history_store.clone())
+            }
+            Some(name) => {
+                // Custom agent (e.g., "qwen")
+                crate::ExternalAgent::Custom {
+                    name: gpui::SharedString::from(name.to_string()),
+                    command: project::agent_server_store::AgentServerCommand {
+                        path: std::path::PathBuf::new(),
+                        args: vec![],
+                        env: None,
+                    },
+                }.server(fs.clone(), history_store.clone())
+            }
+        };
 
         let prompt_capabilities = Rc::new(RefCell::new(thread.read(cx).prompt_capabilities()));
         let available_commands = Rc::new(RefCell::new(vec![]));

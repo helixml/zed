@@ -754,6 +754,7 @@ impl AgentPanel {
                         }
 
                         // Create view directly from existing thread entity (avoids agent instance mismatch)
+                        let agent_name = notification.agent_name.clone();
                         this.update_in(cx, |this, window, cx| {
                             let thread_view = cx.new(|cx| {
                                 crate::acp::AcpThreadView::from_existing_thread(
@@ -763,6 +764,7 @@ impl AgentPanel {
                                     this.history_store.clone(),
                                     this.prompt_store.clone(),
                                     this.fs.clone(),
+                                    agent_name, // Pass agent name for correct UI label (e.g., "qwen")
                                     window,
                                     cx,
                                 )

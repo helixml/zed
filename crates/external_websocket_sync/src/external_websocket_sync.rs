@@ -98,6 +98,7 @@ pub struct ThreadOpenRequest {
 pub struct ThreadDisplayNotification {
     pub thread_entity: gpui::Entity<acp_thread::AcpThread>,
     pub helix_session_id: String,
+    pub agent_name: Option<String>, // Which agent created this thread (e.g., "qwen") - None means Zed Agent
 }
 
 /// Global callback for thread creation from WebSocket (set by agent_panel)

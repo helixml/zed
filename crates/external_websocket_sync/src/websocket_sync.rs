@@ -394,6 +394,16 @@ impl WebSocketSync {
         self.outgoing_tx.send(event)
             .map_err(|_| anyhow::anyhow!("Failed to send event"))
     }
+
+    /// Check if WebSocket is currently connected
+    pub fn is_connected(&self) -> bool {
+        self.is_connected.load(Ordering::SeqCst)
+    }
+
+    /// Get the current reconnect delay (indicates we're reconnecting if > initial)
+    pub fn get_reconnect_delay_ms(&self) -> u64 {
+        self.reconnect_delay_ms.load(Ordering::SeqCst)
+    }
 }
 
 /// Global WebSocket service instance
@@ -483,5 +493,37 @@ pub fn send_websocket_event(event: SyncEvent) -> Result<()> {
     } else {
         eprintln!("❌ [WEBSOCKET] WebSocket service not initialized!");
         Err(anyhow::anyhow!("WebSocket service not initialized"))
+    }
+}
+
+/// WebSocket connection status for UI display
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WebSocketConnectionStatus {
+    /// WebSocket service not initialized (no HELIX_SESSION_ID, etc.)
+    NotInitialized,
+    /// Connected to Helix
+    Connected,
+    /// Reconnecting to Helix (connection was lost)
+    Reconnecting,
+    /// Disconnected from Helix
+    Disconnected,
+}
+
+/// Get the current WebSocket connection status for UI display
+pub fn get_websocket_connection_status() -> WebSocketConnectionStatus {
+    match get_websocket_service() {
+        Some(service) => {
+            if service.is_connected() {
+                WebSocketConnectionStatus::Connected
+            } else {
+                // If reconnect delay > initial, we're actively trying to reconnect
+                if service.get_reconnect_delay_ms() > INITIAL_RECONNECT_DELAY_MS {
+                    WebSocketConnectionStatus::Reconnecting
+                } else {
+                    WebSocketConnectionStatus::Disconnected
+                }
+            }
+        }
+        None => WebSocketConnectionStatus::NotInitialized,
     }
 }

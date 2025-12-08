@@ -421,7 +421,8 @@
     // Whether to show user picture in the titlebar.
     "show_user_picture": true,
     // Whether to show the sign in button in the titlebar.
-    "show_sign_in": true,
+    // Disabled by default for on-prem/self-hosted deployments.
+    "show_sign_in": false,
     // Whether to show the menus in the titlebar.
     "show_menus": false
   },
