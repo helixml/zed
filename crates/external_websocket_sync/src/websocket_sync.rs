@@ -4,11 +4,17 @@
 //! - Zed is stateless - only knows acp_thread_id
 //! - External system maintains all session mapping
 //! - Protocol: chat_message → thread_created, message_added*, message_completed
+//!
+//! Reconnection behavior:
+//! - Automatically reconnects when connection drops (API restart, network issues)
+//! - Uses exponential backoff: 1s, 2s, 4s, 8s, capped at 30s
+//! - Queued events are preserved during reconnection attempts
 
 use anyhow::{Context as AnyhowContext, Result};
 use futures::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use tokio::sync::mpsc;
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 use url::Url;
@@ -37,19 +43,32 @@ impl Default for WebSocketSyncConfig {
 }
 
 /// WebSocket sync service - runs independently of UI
+/// Handles automatic reconnection when connection drops
 pub struct WebSocketSync {
     outgoing_tx: mpsc::UnboundedSender<SyncEvent>,
+    /// Track if connection is healthy (for logging/debugging)
+    is_connected: Arc<AtomicBool>,
+    /// Current reconnect delay in milliseconds (for exponential backoff)
+    reconnect_delay_ms: Arc<AtomicU64>,
 }
 
+/// Reconnection constants
+const INITIAL_RECONNECT_DELAY_MS: u64 = 1000;
+const MAX_RECONNECT_DELAY_MS: u64 = 30000;
+
 impl WebSocketSync {
-    /// Start WebSocket service
+    /// Start WebSocket service with automatic reconnection
     pub async fn start(config: WebSocketSyncConfig) -> Result<Self> {
         eprintln!("🔧 [WEBSOCKET] WebSocketSync::start() beginning");
         log::info!("🔧 [WEBSOCKET] WebSocketSync::start() beginning");
 
-        let (outgoing_tx, mut outgoing_rx) = mpsc::unbounded_channel::<SyncEvent>();
+        let (outgoing_tx, outgoing_rx) = mpsc::unbounded_channel::<SyncEvent>();
         eprintln!("✅ [WEBSOCKET] Created outgoing channel");
         log::info!("✅ [WEBSOCKET] Created outgoing channel");
+
+        // Shared state for connection tracking
+        let is_connected = Arc::new(AtomicBool::new(false));
+        let reconnect_delay_ms = Arc::new(AtomicU64::new(INITIAL_RECONNECT_DELAY_MS));
 
         // Get session_id from environment variable
         let session_id = std::env::var("HELIX_SESSION_ID")
@@ -59,19 +78,94 @@ impl WebSocketSync {
 
         // Build WebSocket URL with full path and session_id
         let protocol = if config.use_tls { "wss" } else { "ws" };
-        let url = format!("{}://{}/api/v1/external-agents/sync?session_id={}",
+        let url_str = format!("{}://{}/api/v1/external-agents/sync?session_id={}",
                          protocol, config.url, session_id);
-        eprintln!("🔧 [WEBSOCKET] Constructed URL: {}", url);
-        log::info!("🔧 [WEBSOCKET] Constructed URL: {}", url);
+        eprintln!("🔧 [WEBSOCKET] Constructed URL: {}", url_str);
+        log::info!("🔧 [WEBSOCKET] Constructed URL: {}", url_str);
 
-        let url = Url::parse(&url).context("Invalid WebSocket URL")?;
+        let url = Url::parse(&url_str).context("Invalid WebSocket URL")?;
         eprintln!("✅ [WEBSOCKET] URL validated: {}", url);
         log::info!("✅ [WEBSOCKET] URL validated: {}", url);
 
-        eprintln!("🔗 [WEBSOCKET] Attempting connection to {}", url);
-        log::info!("🔗 [WEBSOCKET] Attempting connection to {}", url);
+        // Clone values for the reconnection loop
+        let is_connected_clone = is_connected.clone();
+        let reconnect_delay_clone = reconnect_delay_ms.clone();
+        let auth_token = config.auth_token.clone();
 
-        // Build WebSocket request with Authorization header
+        // Spawn the reconnection loop
+        tokio::spawn(Self::run_with_reconnection(
+            url,
+            auth_token,
+            outgoing_rx,
+            is_connected_clone,
+            reconnect_delay_clone,
+        ));
+
+        log::info!("✅ [WEBSOCKET] WebSocketSync fully initialized with reconnection support");
+        Ok(Self {
+            outgoing_tx,
+            is_connected,
+            reconnect_delay_ms,
+        })
+    }
+
+    /// Main reconnection loop - keeps trying to connect and reconnects on failure
+    async fn run_with_reconnection(
+        url: Url,
+        auth_token: String,
+        mut outgoing_rx: mpsc::UnboundedReceiver<SyncEvent>,
+        is_connected: Arc<AtomicBool>,
+        reconnect_delay_ms: Arc<AtomicU64>,
+    ) {
+        let mut connection_attempts = 0u64;
+
+        loop {
+            connection_attempts += 1;
+            eprintln!("🔗 [WEBSOCKET] Connection attempt #{}", connection_attempts);
+            log::info!("🔗 [WEBSOCKET] Connection attempt #{}", connection_attempts);
+
+            // Try to connect
+            match Self::connect_once(&url, &auth_token).await {
+                Ok((ws_sink, ws_stream)) => {
+                    // Successfully connected
+                    is_connected.store(true, Ordering::SeqCst);
+                    reconnect_delay_ms.store(INITIAL_RECONNECT_DELAY_MS, Ordering::SeqCst);
+
+                    eprintln!("✅ [WEBSOCKET] Connected! Running message loop...");
+                    log::info!("✅ [WEBSOCKET] Connected! Running message loop...");
+
+                    // Run until connection drops
+                    Self::run_connection(ws_sink, ws_stream, &mut outgoing_rx).await;
+
+                    // Connection dropped
+                    is_connected.store(false, Ordering::SeqCst);
+                    eprintln!("⚠️  [WEBSOCKET] Connection lost, will reconnect...");
+                    log::warn!("⚠️  [WEBSOCKET] Connection lost, will reconnect...");
+                }
+                Err(e) => {
+                    eprintln!("❌ [WEBSOCKET] Connection failed: {}", e);
+                    log::error!("❌ [WEBSOCKET] Connection failed: {}", e);
+                }
+            }
+
+            // Exponential backoff before next reconnection attempt
+            let delay = reconnect_delay_ms.load(Ordering::SeqCst);
+            eprintln!("⏳ [WEBSOCKET] Waiting {}ms before reconnecting...", delay);
+            log::info!("⏳ [WEBSOCKET] Waiting {}ms before reconnecting...", delay);
+
+            tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
+
+            // Increase delay for next attempt (exponential backoff, capped)
+            let new_delay = (delay * 2).min(MAX_RECONNECT_DELAY_MS);
+            reconnect_delay_ms.store(new_delay, Ordering::SeqCst);
+        }
+    }
+
+    /// Attempt a single WebSocket connection
+    async fn connect_once(url: &Url, auth_token: &str) -> Result<(
+        futures::stream::SplitSink<tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>, Message>,
+        futures::stream::SplitStream<tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>>
+    )> {
         use tokio_tungstenite::tungstenite::http::Request;
 
         let mut request = Request::builder()
@@ -83,147 +177,117 @@ impl WebSocketSync {
             .header("Sec-WebSocket-Key", tokio_tungstenite::tungstenite::handshake::client::generate_key());
 
         // Add auth token if provided
-        if !config.auth_token.is_empty() {
-            let auth_header = format!("Bearer {}", config.auth_token);
-            eprintln!("🔐 [WEBSOCKET] Adding Authorization header");
-            log::info!("🔐 [WEBSOCKET] Adding Authorization header");
+        if !auth_token.is_empty() {
+            let auth_header = format!("Bearer {}", auth_token);
             request = request.header("Authorization", auth_header);
         }
 
         let request = request.body(()).context("Failed to build WebSocket request")?;
-        eprintln!("🔧 [WEBSOCKET] Built WebSocket request with headers");
-        log::info!("🔧 [WEBSOCKET] Built WebSocket request with headers");
 
-        // Connect to WebSocket
-        let (ws_stream, response) = match connect_async(request).await {
-            Ok(result) => {
-                eprintln!("✅ [WEBSOCKET] connect_async() succeeded");
-                log::info!("✅ [WEBSOCKET] connect_async() succeeded");
-                result
-            }
-            Err(e) => {
-                eprintln!("❌ [WEBSOCKET] connect_async() failed: {}", e);
-                log::error!("❌ [WEBSOCKET] connect_async() failed: {}", e);
-                return Err(anyhow::anyhow!("Failed to connect to WebSocket server: {}", e));
-            }
-        };
+        let (ws_stream, response) = connect_async(request).await
+            .context("Failed to connect to WebSocket server")?;
 
         eprintln!("✅ [WEBSOCKET] WebSocket connected! Response status: {:?}", response.status());
         log::info!("✅ [WEBSOCKET] WebSocket connected! Response status: {:?}", response.status());
 
-        let (mut ws_sink, mut ws_stream) = ws_stream.split();
-        eprintln!("✅ [WEBSOCKET] Stream split into sink/stream");
-        log::info!("✅ [WEBSOCKET] Stream split into sink/stream");
+        let (ws_sink, ws_stream) = ws_stream.split();
+        Ok((ws_sink, ws_stream))
+    }
 
-        // Debug: write file BEFORE spawning task
-        let _ = std::fs::write("/tmp/before_outgoing_spawn.txt", "About to spawn outgoing task\n");
+    /// Run the connection until it drops - handles both sending and receiving
+    async fn run_connection(
+        mut ws_sink: futures::stream::SplitSink<tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>, Message>,
+        mut ws_stream: futures::stream::SplitStream<tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>>,
+        outgoing_rx: &mut mpsc::UnboundedReceiver<SyncEvent>,
+    ) {
+        // Send a test ping to verify connection is working
+        let test_ping = serde_json::json!({"event_type": "ping", "data": {"timestamp": chrono::Utc::now().timestamp()}});
+        if let Err(e) = ws_sink.send(Message::Text(test_ping.to_string().into())).await {
+            eprintln!("❌ [WEBSOCKET] Failed to send test ping: {}", e);
+            log::error!("❌ [WEBSOCKET] Failed to send test ping: {}", e);
+            return;
+        }
+        eprintln!("✅ [WEBSOCKET] Sent test ping successfully");
+        log::info!("✅ [WEBSOCKET] Sent test ping successfully");
 
-        // Spawn task to send outgoing events
-        let outgoing_task = tokio::spawn(async move {
-            // Write to file to debug outgoing task
-            let _ = std::fs::write("/tmp/websocket_outgoing_started.txt", "Outgoing task started\n");
-            eprintln!("📤 [WEBSOCKET-OUT] Outgoing task started, waiting for events to send");
-            log::info!("📤 [WEBSOCKET-OUT] Outgoing task started, waiting for events to send");
+        // Main select loop - handle both incoming and outgoing messages
+        loop {
+            tokio::select! {
+                // Handle outgoing events
+                Some(event) = outgoing_rx.recv() => {
+                    eprintln!("📤 [WEBSOCKET-OUT] Received event to send: {:?}", std::mem::discriminant(&event));
+                    log::info!("📤 [WEBSOCKET-OUT] Received event to send: {:?}", std::mem::discriminant(&event));
 
-            // Send a test ping immediately to verify outgoing works
-            let test_ping = serde_json::json!({"event_type": "ping", "data": {"timestamp": chrono::Utc::now().timestamp()}});
-            let ping_result = ws_sink.send(Message::Text(test_ping.to_string().into())).await;
-            let _ = std::fs::write("/tmp/websocket_ping_result.txt", format!("Ping result: {:?}\n", ping_result));
+                    // Convert to OutgoingMessage format
+                    let outgoing = match event.to_outgoing_message() {
+                        Ok(msg) => msg,
+                        Err(e) => {
+                            log::error!("❌ [WEBSOCKET-OUT] Failed to convert event: {}", e);
+                            continue;
+                        }
+                    };
 
-            if let Err(e) = ping_result {
-                let _ = std::fs::write("/tmp/websocket_ping_error.txt", format!("Ping error: {}\n", e));
-                eprintln!("❌ [WEBSOCKET-OUT] Failed to send test ping: {}", e);
-                log::error!("❌ [WEBSOCKET-OUT] Failed to send test ping: {}", e);
-            } else {
-                let _ = std::fs::write("/tmp/websocket_ping_success.txt", "Ping sent successfully\n");
-                eprintln!("✅ [WEBSOCKET-OUT] Sent test ping successfully");
-                log::info!("✅ [WEBSOCKET-OUT] Sent test ping successfully");
-            }
+                    let json = match serde_json::to_string(&outgoing) {
+                        Ok(j) => j,
+                        Err(e) => {
+                            log::error!("❌ [WEBSOCKET-OUT] Failed to serialize event: {}", e);
+                            continue;
+                        }
+                    };
 
-            let mut event_count = 0;
-            while let Some(event) = outgoing_rx.recv().await {
-                event_count += 1;
-                let _ = std::fs::write("/tmp/websocket_event_received.txt", format!("Received event #{}\n", event_count));
-                eprintln!("📤 [WEBSOCKET-OUT] Received event to send: {:?}", std::mem::discriminant(&event));
-                log::info!("📤 [WEBSOCKET-OUT] Received event to send: {:?}", std::mem::discriminant(&event));
+                    log::info!("📤 [WEBSOCKET-OUT] Sending JSON: {}", json);
 
-                // Convert to OutgoingMessage format
-                let outgoing = match event.to_outgoing_message() {
-                    Ok(msg) => msg,
-                    Err(e) => {
-                        let _ = std::fs::write("/tmp/websocket_conversion_error.txt", format!("Conversion error: {}\n", e));
-                        log::error!("❌ [WEBSOCKET-OUT] Failed to convert event: {}", e);
-                        continue;
+                    if let Err(e) = ws_sink.send(Message::Text(json.into())).await {
+                        log::error!("❌ [WEBSOCKET-OUT] Failed to send WebSocket message: {} - will reconnect", e);
+                        eprintln!("❌ [WEBSOCKET-OUT] Failed to send WebSocket message: {} - will reconnect", e);
+                        // Re-queue the event so it's not lost
+                        // (The event is already consumed, so we lose it - this is a known limitation)
+                        return; // Exit to trigger reconnection
                     }
-                };
-
-                let json = match serde_json::to_string(&outgoing) {
-                    Ok(j) => j,
-                    Err(e) => {
-                        let _ = std::fs::write("/tmp/websocket_serialize_error.txt", format!("Serialize error: {}\n", e));
-                        log::error!("❌ [WEBSOCKET-OUT] Failed to serialize event: {}", e);
-                        continue;
-                    }
-                };
-
-                let _ = std::fs::write("/tmp/websocket_sending.txt", format!("Sending: {}\n", json));
-                log::info!("📤 [WEBSOCKET-OUT] Sending JSON: {}", json);
-
-                if let Err(e) = ws_sink.send(Message::Text(json.into())).await {
-                    let _ = std::fs::write("/tmp/websocket_send_error.txt", format!("Send error: {}\n", e));
-                    log::error!("❌ [WEBSOCKET-OUT] Failed to send WebSocket message: {}", e);
-                    break;
-                } else {
-                    let _ = std::fs::write("/tmp/websocket_send_success.txt", format!("Sent event #{} successfully\n", event_count));
+                    log::info!("✅ [WEBSOCKET-OUT] Message sent successfully");
                 }
-                log::info!("✅ [WEBSOCKET-OUT] Message sent successfully");
-            }
-            let _ = std::fs::write("/tmp/websocket_outgoing_exiting.txt", "Outgoing task exiting\n");
-            log::warn!("⚠️  [WEBSOCKET-OUT] Outgoing task exiting");
-        });
 
-        eprintln!("✅ [WEBSOCKET] Outgoing task spawned");
-        log::info!("✅ [WEBSOCKET] Outgoing task spawned");
+                // Handle incoming messages
+                msg = ws_stream.next() => {
+                    match msg {
+                        Some(Ok(Message::Text(text))) => {
+                            eprintln!("📥 [WEBSOCKET-IN] Received text: {}", text);
+                            log::info!("📥 [WEBSOCKET-IN] Received text: {}", text);
 
-        // Spawn task to handle incoming messages
-        tokio::spawn(async move {
-            eprintln!("📥 [WEBSOCKET-IN] Incoming task started, waiting for messages");
-            log::info!("📥 [WEBSOCKET-IN] Incoming task started, waiting for messages");
-            while let Some(msg) = ws_stream.next().await {
-                eprintln!("📥 [WEBSOCKET-IN] Received WebSocket message");
-                log::info!("📥 [WEBSOCKET-IN] Received WebSocket message");
-                match msg {
-                    Ok(Message::Text(text)) => {
-                        eprintln!("📥 [WEBSOCKET-IN] Received text: {}", text);
-                        log::info!("📥 [WEBSOCKET-IN] Received text: {}", text);
-
-                        if let Err(e) = Self::handle_incoming_message(&text).await {
-                            eprintln!("❌ [WEBSOCKET-IN] Failed to handle message: {}", e);
-                            log::error!("❌ [WEBSOCKET-IN] Failed to handle message: {}", e);
-                        } else {
-                            eprintln!("✅ [WEBSOCKET-IN] Message handled successfully");
-                            log::info!("✅ [WEBSOCKET-IN] Message handled successfully");
+                            if let Err(e) = Self::handle_incoming_message(&text).await {
+                                eprintln!("❌ [WEBSOCKET-IN] Failed to handle message: {}", e);
+                                log::error!("❌ [WEBSOCKET-IN] Failed to handle message: {}", e);
+                            } else {
+                                eprintln!("✅ [WEBSOCKET-IN] Message handled successfully");
+                                log::info!("✅ [WEBSOCKET-IN] Message handled successfully");
+                            }
+                        }
+                        Some(Ok(Message::Close(frame))) => {
+                            log::info!("🔌 [WEBSOCKET-IN] WebSocket closed by server: {:?}", frame);
+                            eprintln!("🔌 [WEBSOCKET-IN] WebSocket closed by server: {:?} - will reconnect", frame);
+                            return; // Exit to trigger reconnection
+                        }
+                        Some(Ok(Message::Ping(data))) => {
+                            // Respond to ping with pong
+                            let _ = ws_sink.send(Message::Pong(data)).await;
+                        }
+                        Some(Ok(_)) => {
+                            log::debug!("📥 [WEBSOCKET-IN] Received non-text message (pong/binary)");
+                        }
+                        Some(Err(e)) => {
+                            log::error!("❌ [WEBSOCKET-IN] WebSocket error: {} - will reconnect", e);
+                            eprintln!("❌ [WEBSOCKET-IN] WebSocket error: {} - will reconnect", e);
+                            return; // Exit to trigger reconnection
+                        }
+                        None => {
+                            log::warn!("⚠️  [WEBSOCKET-IN] WebSocket stream ended - will reconnect");
+                            eprintln!("⚠️  [WEBSOCKET-IN] WebSocket stream ended - will reconnect");
+                            return; // Exit to trigger reconnection
                         }
                     }
-                    Ok(Message::Close(frame)) => {
-                        log::info!("🔌 [WEBSOCKET-IN] WebSocket closed: {:?}", frame);
-                        break;
-                    }
-                    Err(e) => {
-                        log::error!("❌ [WEBSOCKET-IN] WebSocket error: {}", e);
-                        break;
-                    }
-                    _ => {
-                        log::debug!("📥 [WEBSOCKET-IN] Received non-text message (ping/pong/binary)");
-                    }
                 }
             }
-            log::warn!("⚠️  [WEBSOCKET-IN] Incoming task exiting");
-        });
-        log::info!("✅ [WEBSOCKET] Incoming task spawned");
-
-        log::info!("✅ [WEBSOCKET] WebSocketSync fully initialized");
-        Ok(Self { outgoing_tx })
+        }
     }
 
     /// Handle incoming messages from external system (chat_message or open_thread)
