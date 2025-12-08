@@ -54,7 +54,7 @@ tokio = { version = "1.0", features = ["full"] }
 tokio-tungstenite = { version = "0.26", features = ["__rustls-tls"] }
 tokio-rustls = "0.26"
 rustls.workspace = true
-rustls-pki-types = "1"
+http_client_tls.workspace = true
 tower = { version = "0.4", optional = true }
 tower-http = { version = "0.5", features = ["fs", "trace", "cors"], optional = true }
 tungstenite = "0.26"
