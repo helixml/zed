@@ -129,6 +129,7 @@ mod tests {
             url: format!("localhost:{}", addr.port()),
             auth_token: String::new(),
             use_tls: false,
+            skip_tls_verify: false,
         };
 
         let _service = super::super::websocket_sync::WebSocketSync::start(config).await?;
@@ -320,6 +321,7 @@ mod tests {
             url: format!("localhost:{}", addr.port()),
             auth_token: String::new(),
             use_tls: false,
+            skip_tls_verify: false,
         };
 
         let _service = super::super::websocket_sync::WebSocketSync::start(config).await?;

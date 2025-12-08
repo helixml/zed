@@ -29,27 +29,32 @@ pub struct WebSocketSyncSettings {
     /// Enable WebSocket sync with external service
     #[serde(default)]
     pub enabled: bool,
-    
+
     /// External server URL (without protocol)
     #[serde(default = "default_external_url")]
     pub external_url: String,
-    
+
     /// Authentication token for external service API
     #[serde(default)]
     pub auth_token: Option<String>,
-    
+
     /// Use TLS for WebSocket connection
     #[serde(default)]
     pub use_tls: bool,
-    
+
+    /// Skip TLS certificate verification (DANGEROUS - for enterprise internal CAs only)
+    /// Set ZED_HELIX_SKIP_TLS_VERIFY=true to enable
+    #[serde(default)]
+    pub skip_tls_verify: bool,
+
     /// Auto-reconnect on connection failure
     #[serde(default = "default_true")]
     pub auto_reconnect: bool,
-    
+
     /// Reconnect delay in seconds
     #[serde(default = "default_reconnect_delay")]
     pub reconnect_delay_seconds: u64,
-    
+
     /// Maximum reconnect attempts (0 = unlimited)
     #[serde(default = "default_max_reconnect_attempts")]
     pub max_reconnect_attempts: u32,
@@ -171,6 +176,7 @@ impl Default for WebSocketSyncSettings {
             external_url: default_external_url(),
             auth_token: None,
             use_tls: false,
+            skip_tls_verify: false,
             auto_reconnect: default_true(),
             reconnect_delay_seconds: default_reconnect_delay(),
             max_reconnect_attempts: default_max_reconnect_attempts(),
@@ -221,6 +227,11 @@ impl Settings for ExternalSyncSettings {
             .map(|v| v.parse().unwrap_or(false))
             .unwrap_or(false);
 
+        // Skip TLS verification for enterprise internal CAs (DANGEROUS)
+        let skip_tls_verify = std::env::var("ZED_HELIX_SKIP_TLS_VERIFY")
+            .map(|v| v.parse().unwrap_or(false))
+            .unwrap_or(false);
+
         Self {
             enabled,
             websocket_sync: WebSocketSyncSettings {
@@ -228,6 +239,7 @@ impl Settings for ExternalSyncSettings {
                 external_url,
                 auth_token,
                 use_tls,
+                skip_tls_verify,
                 auto_reconnect: true,
                 reconnect_delay_seconds: 5,
                 max_reconnect_attempts: 10,

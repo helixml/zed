@@ -338,6 +338,7 @@ impl ExternalWebSocketSync {
                 url: settings.websocket_sync.external_url.clone(),
                 auth_token: settings.websocket_sync.auth_token.clone().unwrap_or_default(),
                 use_tls: settings.websocket_sync.use_tls,
+                skip_tls_verify: settings.websocket_sync.skip_tls_verify,
             },
             mcp: McpConfig {
                 enabled: settings.mcp.enabled,

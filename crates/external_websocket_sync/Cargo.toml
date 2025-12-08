@@ -51,7 +51,10 @@ ui.workspace = true
 smol.workspace = true
 telemetry_events.workspace = true
 tokio = { version = "1.0", features = ["full"] }
-tokio-tungstenite = "0.26"
+tokio-tungstenite = { version = "0.26", features = ["__rustls-tls"] }
+tokio-rustls = "0.26"
+rustls.workspace = true
+rustls-pki-types = "1"
 tower = { version = "0.4", optional = true }
 tower-http = { version = "0.5", features = ["fs", "trace", "cors"], optional = true }
 tungstenite = "0.26"

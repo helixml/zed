@@ -16,11 +16,65 @@ use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use tokio::sync::mpsc;
-use tokio_tungstenite::{connect_async, tungstenite::Message};
+use tokio_tungstenite::{connect_async_tls_with_config, tungstenite::Message, Connector};
 use url::Url;
 
 use crate::types::{IncomingChatMessage, SyncEvent};
 use crate::ThreadCreationRequest;
+
+/// Dangerous certificate verifier that accepts ALL certificates without validation.
+/// ONLY for enterprise deployments with internal CAs or self-signed certificates.
+/// This bypasses all TLS security - use only on trusted networks!
+#[derive(Debug)]
+struct NoCertVerifier;
+
+impl rustls::client::danger::ServerCertVerifier for NoCertVerifier {
+    fn verify_server_cert(
+        &self,
+        _end_entity: &rustls_pki_types::CertificateDer<'_>,
+        _intermediates: &[rustls_pki_types::CertificateDer<'_>],
+        _server_name: &rustls_pki_types::ServerName<'_>,
+        _ocsp_response: &[u8],
+        _now: rustls_pki_types::UnixTime,
+    ) -> std::result::Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+        // Accept ALL certificates - DANGEROUS but needed for enterprise internal CAs
+        Ok(rustls::client::danger::ServerCertVerified::assertion())
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        _message: &[u8],
+        _cert: &rustls_pki_types::CertificateDer<'_>,
+        _dss: &rustls::DigitallySignedStruct,
+    ) -> std::result::Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        _message: &[u8],
+        _cert: &rustls_pki_types::CertificateDer<'_>,
+        _dss: &rustls::DigitallySignedStruct,
+    ) -> std::result::Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+        // Support all common signature schemes
+        vec![
+            rustls::SignatureScheme::RSA_PKCS1_SHA256,
+            rustls::SignatureScheme::RSA_PKCS1_SHA384,
+            rustls::SignatureScheme::RSA_PKCS1_SHA512,
+            rustls::SignatureScheme::ECDSA_NISTP256_SHA256,
+            rustls::SignatureScheme::ECDSA_NISTP384_SHA384,
+            rustls::SignatureScheme::ECDSA_NISTP521_SHA512,
+            rustls::SignatureScheme::RSA_PSS_SHA256,
+            rustls::SignatureScheme::RSA_PSS_SHA384,
+            rustls::SignatureScheme::RSA_PSS_SHA512,
+            rustls::SignatureScheme::ED25519,
+        ]
+    }
+}
 
 /// WebSocket configuration
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -29,6 +83,10 @@ pub struct WebSocketSyncConfig {
     pub url: String,
     pub auth_token: String,
     pub use_tls: bool,
+    /// Skip TLS certificate verification (DANGEROUS - for enterprise internal CAs only)
+    /// Set ZED_HELIX_SKIP_TLS_VERIFY=true to enable
+    #[serde(default)]
+    pub skip_tls_verify: bool,
 }
 
 impl Default for WebSocketSyncConfig {
@@ -38,8 +96,20 @@ impl Default for WebSocketSyncConfig {
             url: "localhost:8080".to_string(),
             auth_token: String::new(),
             use_tls: false,
+            skip_tls_verify: false,
         }
     }
+}
+
+/// Create a TLS connector that skips certificate verification
+/// DANGEROUS: Only use for enterprise deployments with internal CAs
+fn create_insecure_tls_connector() -> Connector {
+    let config = rustls::ClientConfig::builder()
+        .dangerous()
+        .with_custom_certificate_verifier(Arc::new(NoCertVerifier))
+        .with_no_client_auth();
+
+    Connector::Rustls(Arc::new(config))
 }
 
 /// WebSocket sync service - runs independently of UI
@@ -91,11 +161,18 @@ impl WebSocketSync {
         let is_connected_clone = is_connected.clone();
         let reconnect_delay_clone = reconnect_delay_ms.clone();
         let auth_token = config.auth_token.clone();
+        let skip_tls_verify = config.skip_tls_verify;
+
+        if skip_tls_verify {
+            log::warn!("⚠️  [WEBSOCKET] TLS certificate verification DISABLED - only use for enterprise internal CAs!");
+            eprintln!("⚠️  [WEBSOCKET] TLS certificate verification DISABLED - only use for enterprise internal CAs!");
+        }
 
         // Spawn the reconnection loop
         tokio::spawn(Self::run_with_reconnection(
             url,
             auth_token,
+            skip_tls_verify,
             outgoing_rx,
             is_connected_clone,
             reconnect_delay_clone,
@@ -113,6 +190,7 @@ impl WebSocketSync {
     async fn run_with_reconnection(
         url: Url,
         auth_token: String,
+        skip_tls_verify: bool,
         mut outgoing_rx: mpsc::UnboundedReceiver<SyncEvent>,
         is_connected: Arc<AtomicBool>,
         reconnect_delay_ms: Arc<AtomicU64>,
@@ -125,7 +203,7 @@ impl WebSocketSync {
             log::info!("🔗 [WEBSOCKET] Connection attempt #{}", connection_attempts);
 
             // Try to connect
-            match Self::connect_once(&url, &auth_token).await {
+            match Self::connect_once(&url, &auth_token, skip_tls_verify).await {
                 Ok((ws_sink, ws_stream)) => {
                     // Successfully connected
                     is_connected.store(true, Ordering::SeqCst);
@@ -162,7 +240,7 @@ impl WebSocketSync {
     }
 
     /// Attempt a single WebSocket connection
-    async fn connect_once(url: &Url, auth_token: &str) -> Result<(
+    async fn connect_once(url: &Url, auth_token: &str, skip_tls_verify: bool) -> Result<(
         futures::stream::SplitSink<tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>, Message>,
         futures::stream::SplitStream<tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>>
     )> {
@@ -184,7 +262,20 @@ impl WebSocketSync {
 
         let request = request.body(()).context("Failed to build WebSocket request")?;
 
-        let (ws_stream, response) = connect_async(request).await
+        // Choose connector based on skip_tls_verify setting
+        // When skip_tls_verify is true, use insecure connector for enterprise internal CAs
+        let connector = if skip_tls_verify {
+            Some(create_insecure_tls_connector())
+        } else {
+            None // Use default TLS verification
+        };
+
+        let (ws_stream, response) = connect_async_tls_with_config(
+            request,
+            None,  // WebSocket config
+            false, // disable_nagle (keep TCP_NODELAY behavior)
+            connector,
+        ).await
             .context("Failed to connect to WebSocket server")?;
 
         eprintln!("✅ [WEBSOCKET] WebSocket connected! Response status: {:?}", response.status());
