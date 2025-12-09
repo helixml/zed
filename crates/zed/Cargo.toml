@@ -12,6 +12,7 @@ workspace = true
 
 [features]
 tracy = ["ztracing/tracy"]
+external_websocket_sync = ["agent_ui/external_websocket_sync", "dep:external_websocket_sync"]
 
 [[bin]]
 name = "zed"
@@ -196,9 +197,6 @@ terminal_view = { workspace = true, features = ["test-support"] }
 tree-sitter-md.workspace = true
 tree-sitter-rust.workspace = true
 workspace = { workspace = true, features = ["test-support"] }
-
-[features]
-external_websocket_sync = ["agent_ui/external_websocket_sync", "dep:external_websocket_sync"]
 
 [package.metadata.bundle-dev]
 icon = ["resources/app-icon-dev@2x.png", "resources/app-icon-dev.png"]
