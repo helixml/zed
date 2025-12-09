@@ -86,6 +86,29 @@ pub trait AgentConnection {
         None
     }
 
+    /// Returns whether the agent supports loading previous sessions.
+    fn supports_session_load(&self) -> bool {
+        false
+    }
+
+    /// Loads an existing session from the agent.
+    /// Returns the session ID if available for resumption.
+    fn get_last_session_id(&self, _cwd: &Path) -> Option<acp::SessionId> {
+        None
+    }
+
+    /// Loads a thread from a previous session by ID.
+    /// Only works if `supports_session_load()` returns true.
+    fn load_thread(
+        self: Rc<Self>,
+        _session_id: acp::SessionId,
+        _project: Entity<Project>,
+        _cwd: &Path,
+        _cx: &mut App,
+    ) -> Task<Result<Entity<AcpThread>>> {
+        Task::ready(Err(anyhow::anyhow!("Session loading not supported by this agent")))
+    }
+
     fn into_any(self: Rc<Self>) -> Rc<dyn Any>;
 }
 

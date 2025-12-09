@@ -8,7 +8,7 @@ use futures::AsyncBufReadExt as _;
 use futures::io::BufReader;
 use project::Project;
 use project::agent_server_store::AgentServerCommand;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use util::ResultExt as _;
 
 use std::path::PathBuf;
@@ -301,6 +301,7 @@ impl AgentConnection for AcpConnection {
             };
 
         cx.spawn(async move |cx| {
+            let cwd_for_save = cwd.clone();
             let response = conn
                 .new_session(acp::NewSessionRequest { mcp_servers, cwd, meta: None })
                 .await
@@ -389,7 +390,10 @@ impl AgentConnection for AcpConnection {
                 session_modes: modes,
                 models,
             };
-            sessions.borrow_mut().insert(session_id, session);
+            sessions.borrow_mut().insert(session_id.clone(), session);
+
+            // Save session ID to file for later resumption
+            save_session_id(&cwd_for_save, &name, &session_id);
 
             Ok(thread)
         })
@@ -533,8 +537,215 @@ impl AgentConnection for AcpConnection {
         }
     }
 
+    fn supports_session_load(&self) -> bool {
+        self.agent_capabilities.load_session
+    }
+
+    fn get_last_session_id(&self, cwd: &Path) -> Option<acp::SessionId> {
+        let session_file = cwd.join(".zed").join(format!("acp-session-{}.json", self.server_name));
+        if session_file.exists() {
+            if let Ok(content) = std::fs::read_to_string(&session_file) {
+                if let Ok(session_info) = serde_json::from_str::<SavedSessionInfo>(&content) {
+                    return Some(session_info.session_id);
+                }
+            }
+        }
+        None
+    }
+
+    fn load_thread(
+        self: Rc<Self>,
+        session_id: acp::SessionId,
+        project: Entity<Project>,
+        cwd: &Path,
+        cx: &mut App,
+    ) -> Task<Result<Entity<AcpThread>>> {
+        if !self.agent_capabilities.load_session {
+            return Task::ready(Err(anyhow::anyhow!("Agent does not support session loading")));
+        }
+
+        let name = self.server_name.clone();
+        let conn = self.connection.clone();
+        let sessions = self.sessions.clone();
+        let default_mode = self.default_mode.clone();
+        let cwd = cwd.to_path_buf();
+        let context_server_store = project.read(cx).context_server_store().read(cx);
+        let mcp_servers =
+            if project.read(cx).is_local() {
+                context_server_store
+                    .configured_server_ids()
+                    .iter()
+                    .filter_map(|id| {
+                        let configuration = context_server_store.configuration_for_server(id)?;
+                        match &*configuration {
+                        project::context_server_store::ContextServerConfiguration::Custom {
+                            command,
+                            ..
+                        }
+                        | project::context_server_store::ContextServerConfiguration::Extension {
+                            command,
+                            ..
+                        } => Some(acp::McpServer::Stdio {
+                            name: id.0.to_string(),
+                            command: command.path.clone(),
+                            args: command.args.clone(),
+                            env: if let Some(env) = command.env.as_ref() {
+                                env.iter()
+                                    .map(|(name, value)| acp::EnvVariable {
+                                        name: name.clone(),
+                                        value: value.clone(),
+                                        meta: None,
+                                    })
+                                    .collect()
+                            } else {
+                                vec![]
+                            },
+                        }),
+                        project::context_server_store::ContextServerConfiguration::Http {
+                            url,
+                            headers,
+                        } => Some(acp::McpServer::Http {
+                            name: id.0.to_string(),
+                            url: url.to_string(),
+                            headers: headers.iter().map(|(name, value)| acp::HttpHeader {
+                                name: name.clone(),
+                                value: value.clone(),
+                                meta: None,
+                            }).collect(),
+                        }),
+                    }
+                    })
+                    .collect()
+            } else {
+                Vec::new()
+            };
+
+        cx.spawn(async move |cx| {
+            let response = conn
+                .load_session(acp::LoadSessionRequest {
+                    session_id: session_id.clone(),
+                    cwd: cwd.clone(),
+                    mcp_servers,
+                    meta: None,
+                })
+                .await
+                .map_err(|err| {
+                    if err.code == acp::ErrorCode::AUTH_REQUIRED.code {
+                        let mut error = AuthRequired::new();
+                        if err.message != acp::ErrorCode::AUTH_REQUIRED.message {
+                            error = error.with_description(err.message);
+                        }
+                        anyhow!(error)
+                    } else {
+                        anyhow!(err)
+                    }
+                })?;
+
+            let modes = response.modes.map(|modes| Rc::new(RefCell::new(modes)));
+            let models = response.models.map(|models| Rc::new(RefCell::new(models)));
+
+            if let Some(default_mode) = default_mode {
+                if let Some(modes) = modes.as_ref() {
+                    let mut modes_ref = modes.borrow_mut();
+                    let has_mode = modes_ref.available_modes.iter().any(|mode| mode.id == default_mode);
+
+                    if has_mode {
+                        let initial_mode_id = modes_ref.current_mode_id.clone();
+
+                        cx.spawn({
+                            let default_mode = default_mode.clone();
+                            let session_id = session_id.clone();
+                            let modes = modes.clone();
+                            async move |_| {
+                                let result = conn.set_session_mode(acp::SetSessionModeRequest {
+                                    session_id,
+                                    mode_id: default_mode,
+                                    meta: None,
+                                })
+                                .await.log_err();
+
+                                if result.is_none() {
+                                    modes.borrow_mut().current_mode_id = initial_mode_id;
+                                }
+                            }
+                        }).detach();
+
+                        modes_ref.current_mode_id = default_mode;
+                    } else {
+                        let available_modes = modes_ref
+                            .available_modes
+                            .iter()
+                            .map(|mode| format!("- `{}`: {}", mode.id, mode.name))
+                            .collect::<Vec<_>>()
+                            .join("\n");
+
+                        log::warn!(
+                            "`{default_mode}` is not valid {name} mode. Available options:\n{available_modes}",
+                        );
+                    }
+                } else {
+                    log::warn!(
+                        "`{name}` does not support modes, but `default_mode` was set in settings.",
+                    );
+                }
+            }
+
+            let action_log = cx.new(|_| ActionLog::new(project.clone()))?;
+            let thread = cx.new(|cx| {
+                AcpThread::new(
+                    self.server_name.clone(),
+                    self.clone(),
+                    project,
+                    action_log,
+                    session_id.clone(),
+                    watch::Receiver::constant(self.agent_capabilities.prompt_capabilities.clone()),
+                    cx,
+                )
+            })?;
+
+            let session = AcpSession {
+                thread: thread.downgrade(),
+                suppress_abort_err: false,
+                session_modes: modes,
+                models,
+            };
+            sessions.borrow_mut().insert(session_id, session);
+
+            Ok(thread)
+        })
+    }
+
     fn into_any(self: Rc<Self>) -> Rc<dyn Any> {
         self
+    }
+}
+
+/// Saved session info for ACP agents
+#[derive(Serialize, Deserialize)]
+struct SavedSessionInfo {
+    session_id: acp::SessionId,
+    agent_name: String,
+    cwd: PathBuf,
+    created_at: String,
+}
+
+fn save_session_id(cwd: &Path, agent_name: &str, session_id: &acp::SessionId) {
+    let zed_dir = cwd.join(".zed");
+    if std::fs::create_dir_all(&zed_dir).is_ok() {
+        let session_file = zed_dir.join(format!("acp-session-{}.json", agent_name));
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let session_info = SavedSessionInfo {
+            session_id: session_id.clone(),
+            agent_name: agent_name.to_string(),
+            cwd: cwd.to_path_buf(),
+            created_at: timestamp.to_string(),
+        };
+        if let Ok(json) = serde_json::to_string_pretty(&session_info) {
+            let _ = std::fs::write(session_file, json);
+        }
     }
 }
 
