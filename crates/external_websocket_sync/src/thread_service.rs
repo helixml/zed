@@ -482,11 +482,9 @@ fn create_new_thread_sync(
         let send_task = cx.update(|cx| {
             eprintln!("🔧 [THREAD_SERVICE] Updating thread entity to send message...");
             let send_task = thread_entity.update(cx, |thread, cx| {
-                let message = vec![ContentBlock::Text(TextContent {
-                    text: request_clone.message.clone(),
-                    annotations: None,
-                    meta: None,
-                })];
+                let message = vec![ContentBlock::Text(
+                    TextContent::new(request_clone.message.clone())
+                )];
                 eprintln!("🔧 [THREAD_SERVICE] Calling thread.send() with message: {}", request_clone.message);
                 thread.send(message, cx)
             });
@@ -540,11 +538,9 @@ async fn handle_follow_up_message(
 
     cx.update(|cx| {
         let send_task = thread.update(cx, |thread, cx| {
-            let message = vec![ContentBlock::Text(TextContent {
-                text: message.clone(),
-                annotations: None,
-                meta: None,
-            })];
+            let message = vec![ContentBlock::Text(
+                TextContent::new(message.clone())
+            )];
             thread.send(message, cx)
         })?;
         // Spawn the send task
@@ -629,7 +625,7 @@ fn open_existing_thread_sync(
         log::info!("🔨 [THREAD_SERVICE] Calling agent.open_thread() to load from database...");
 
         // Convert string to SessionId
-        let session_id = agent_client_protocol::SessionId(request_clone.acp_thread_id.clone().into());
+        let session_id = agent_client_protocol::SessionId::new(request_clone.acp_thread_id.clone());
 
         let open_task = match cx.update(|cx| {
             native_agent.update(cx, |agent, cx| {

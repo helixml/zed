@@ -145,16 +145,6 @@ pub enum ContextServerSettings {
         /// are supported.
         settings: serde_json::Value,
     },
-    Http {
-        /// Whether the context server is enabled.
-        #[serde(default = "default_true")]
-        enabled: bool,
-        /// The URL of the remote context server.
-        url: String,
-        /// Optional authentication configuration for the remote server.
-        #[serde(skip_serializing_if = "HashMap::is_empty", default)]
-        headers: HashMap<String, String>,
-    },
 }
 
 impl From<settings::ContextServerSettingsContent> for ContextServerSettings {
@@ -213,7 +203,6 @@ impl ContextServerSettings {
             ContextServerSettings::Stdio { enabled, .. } => *enabled,
             ContextServerSettings::Http { enabled, .. } => *enabled,
             ContextServerSettings::Extension { enabled, .. } => *enabled,
-            ContextServerSettings::Http { enabled, .. } => *enabled,
         }
     }
 
@@ -222,7 +211,6 @@ impl ContextServerSettings {
             ContextServerSettings::Stdio { enabled: e, .. } => *e = enabled,
             ContextServerSettings::Http { enabled: e, .. } => *e = enabled,
             ContextServerSettings::Extension { enabled: e, .. } => *e = enabled,
-            ContextServerSettings::Http { enabled: e, .. } => *e = enabled,
         }
     }
 }

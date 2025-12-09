@@ -10,6 +10,7 @@ use project::{
 use serde::{Deserialize, Serialize};
 use settings::{
     DefaultAgentView as DefaultView, LanguageModelProviderSetting, LanguageModelSelection,
+    SettingsStore,
 };
 
 use zed_actions::agent::{OpenClaudeCodeOnboardingModal, ReauthenticateAgent};

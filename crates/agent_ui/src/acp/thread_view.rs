@@ -775,14 +775,17 @@ impl AcpThreadView {
                                 eprintln!("📤 [ZED-UI] User created new thread with content: {}, title: {:?}, entries: {}", acp_thread_id, title_opt, entry_count);
                                 log::info!("📤 [ZED-UI] User created new thread with content: {}, title: {:?}, entries: {}", acp_thread_id, title_opt, entry_count);
 
-                                if let Err(e) = external_websocket_sync::send_websocket_event(
-                                    external_websocket_sync::SyncEvent::UserCreatedThread {
-                                        acp_thread_id,
-                                        title: title_opt,
+                                #[cfg(feature = "external_websocket_sync")]
+                                {
+                                    if let Err(e) = external_websocket_sync::send_websocket_event(
+                                        external_websocket_sync::SyncEvent::UserCreatedThread {
+                                            acp_thread_id,
+                                            title: title_opt,
+                                        }
+                                    ) {
+                                        eprintln!("❌ [ZED-UI] Failed to send user_created_thread event: {}", e);
+                                        log::error!("❌ [ZED-UI] Failed to send user_created_thread event: {}", e);
                                     }
-                                ) {
-                                    eprintln!("❌ [ZED-UI] Failed to send user_created_thread event: {}", e);
-                                    log::error!("❌ [ZED-UI] Failed to send user_created_thread event: {}", e);
                                 }
                             } else {
                                 eprintln!("🔄 [ZED-UI] Thread empty, not sending UserCreatedThread yet", );
@@ -1681,14 +1684,17 @@ impl AcpThreadView {
                 eprintln!("📤 [ZED-UI] Thread title changed: {} -> '{}'", acp_thread_id, title_str);
                 log::info!("📤 [ZED-UI] Thread title changed: {} -> '{}'", acp_thread_id, title_str);
 
-                if let Err(e) = external_websocket_sync::send_websocket_event(
-                    external_websocket_sync::SyncEvent::ThreadTitleChanged {
-                        acp_thread_id,
-                        title: title_str,
+                #[cfg(feature = "external_websocket_sync")]
+                {
+                    if let Err(e) = external_websocket_sync::send_websocket_event(
+                        external_websocket_sync::SyncEvent::ThreadTitleChanged {
+                            acp_thread_id,
+                            title: title_str,
+                        }
+                    ) {
+                        eprintln!("❌ [ZED-UI] Failed to send thread_title_changed event: {}", e);
+                        log::error!("❌ [ZED-UI] Failed to send thread_title_changed event: {}", e);
                     }
-                ) {
-                    eprintln!("❌ [ZED-UI] Failed to send thread_title_changed event: {}", e);
-                    log::error!("❌ [ZED-UI] Failed to send thread_title_changed event: {}", e);
                 }
             }
             AcpThreadEvent::PromptCapabilitiesUpdated => {

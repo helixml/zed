@@ -611,34 +611,28 @@ impl AgentConnection for AcpConnection {
                         | project::context_server_store::ContextServerConfiguration::Extension {
                             command,
                             ..
-                        } => Some(acp::McpServer::Stdio {
-                            name: id.0.to_string(),
-                            command: command.path.clone(),
-                            args: command.args.clone(),
-                            env: if let Some(env) = command.env.as_ref() {
-                                env.iter()
-                                    .map(|(name, value)| acp::EnvVariable {
-                                        name: name.clone(),
-                                        value: value.clone(),
-                                        meta: None,
-                                    })
-                                    .collect()
-                            } else {
-                                vec![]
-                            },
-                        }),
+                        } => Some(acp::McpServer::Stdio(
+                            acp::McpServerStdio::new(id.0.to_string(), &command.path)
+                                .args(command.args.clone())
+                                .env(if let Some(env) = command.env.as_ref() {
+                                    env.iter()
+                                        .map(|(name, value)| acp::EnvVariable::new(name, value))
+                                        .collect()
+                                } else {
+                                    vec![]
+                                }),
+                        )),
                         project::context_server_store::ContextServerConfiguration::Http {
                             url,
                             headers,
-                        } => Some(acp::McpServer::Http {
-                            name: id.0.to_string(),
-                            url: url.to_string(),
-                            headers: headers.iter().map(|(name, value)| acp::HttpHeader {
-                                name: name.clone(),
-                                value: value.clone(),
-                                meta: None,
-                            }).collect(),
-                        }),
+                        } => Some(acp::McpServer::Http(
+                            acp::McpServerHttp::new(id.0.to_string(), url.to_string()).headers(
+                                headers
+                                    .iter()
+                                    .map(|(name, value)| acp::HttpHeader::new(name, value))
+                                    .collect(),
+                            ),
+                        )),
                     }
                     })
                     .collect()
@@ -648,17 +642,15 @@ impl AgentConnection for AcpConnection {
 
         cx.spawn(async move |cx| {
             let response = conn
-                .load_session(acp::LoadSessionRequest {
-                    session_id: session_id.clone(),
-                    cwd: cwd.clone(),
-                    mcp_servers,
-                    meta: None,
-                })
+                .load_session(
+                    acp::LoadSessionRequest::new(session_id.clone(), cwd.clone())
+                        .mcp_servers(mcp_servers)
+                )
                 .await
                 .map_err(|err| {
-                    if err.code == acp::ErrorCode::AUTH_REQUIRED.code {
+                    if err.code == acp::ErrorCode::AuthRequired {
                         let mut error = AuthRequired::new();
-                        if err.message != acp::ErrorCode::AUTH_REQUIRED.message {
+                        if err.message != acp::ErrorCode::AuthRequired.to_string() {
                             error = error.with_description(err.message);
                         }
                         anyhow!(error)
@@ -683,11 +675,9 @@ impl AgentConnection for AcpConnection {
                             let session_id = session_id.clone();
                             let modes = modes.clone();
                             async move |_| {
-                                let result = conn.set_session_mode(acp::SetSessionModeRequest {
-                                    session_id,
-                                    mode_id: default_mode,
-                                    meta: None,
-                                })
+                                let result = conn.set_session_mode(
+                                    acp::SetSessionModeRequest::new(session_id, default_mode)
+                                )
                                 .await.log_err();
 
                                 if result.is_none() {
