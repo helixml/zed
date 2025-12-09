@@ -41,3 +41,6 @@ xcuserdata/
 .env.secret.toml
 
 *.log
+
+# `nix build` output
+/result
