@@ -569,12 +569,26 @@ impl AgentConnection for AcpConnection {
 
     fn get_last_session_id(&self, cwd: &Path) -> Option<acp::SessionId> {
         let session_file = cwd.join(".zed").join(format!("acp-session-{}.json", self.server_name));
+        log::info!("🔍 [ACP SESSION] Looking for session file at: {:?}", session_file);
+        eprintln!("🔍 [ACP SESSION] Looking for session file at: {:?}", session_file);
         if session_file.exists() {
+            log::info!("🔍 [ACP SESSION] Session file exists, reading...");
+            eprintln!("🔍 [ACP SESSION] Session file exists, reading...");
             if let Ok(content) = std::fs::read_to_string(&session_file) {
+                log::info!("🔍 [ACP SESSION] Read content: {}", content);
+                eprintln!("🔍 [ACP SESSION] Read content: {}", content);
                 if let Ok(session_info) = serde_json::from_str::<SavedSessionInfo>(&content) {
+                    log::info!("✅ [ACP SESSION] Found session ID: {}", session_info.session_id);
+                    eprintln!("✅ [ACP SESSION] Found session ID: {}", session_info.session_id);
                     return Some(session_info.session_id);
+                } else {
+                    log::warn!("❌ [ACP SESSION] Failed to parse session file");
+                    eprintln!("❌ [ACP SESSION] Failed to parse session file");
                 }
             }
+        } else {
+            log::info!("❌ [ACP SESSION] Session file does not exist");
+            eprintln!("❌ [ACP SESSION] Session file does not exist");
         }
         None
     }
@@ -767,6 +781,8 @@ struct SavedSessionInfo {
 }
 
 fn save_session_id(cwd: &Path, agent_name: &str, session_id: &acp::SessionId) {
+    log::info!("💾 [ACP SESSION] Saving session ID {} to cwd {:?}", session_id, cwd);
+    eprintln!("💾 [ACP SESSION] Saving session ID {} to cwd {:?}", session_id, cwd);
     let zed_dir = cwd.join(".zed");
     if std::fs::create_dir_all(&zed_dir).is_ok() {
         let session_file = zed_dir.join(format!("acp-session-{}.json", agent_name));
@@ -781,8 +797,17 @@ fn save_session_id(cwd: &Path, agent_name: &str, session_id: &acp::SessionId) {
             created_at: timestamp.to_string(),
         };
         if let Ok(json) = serde_json::to_string_pretty(&session_info) {
-            let _ = std::fs::write(session_file, json);
+            if std::fs::write(&session_file, &json).is_ok() {
+                log::info!("✅ [ACP SESSION] Saved session file: {:?}", session_file);
+                eprintln!("✅ [ACP SESSION] Saved session file: {:?}", session_file);
+            } else {
+                log::error!("❌ [ACP SESSION] Failed to write session file: {:?}", session_file);
+                eprintln!("❌ [ACP SESSION] Failed to write session file: {:?}", session_file);
+            }
         }
+    } else {
+        log::error!("❌ [ACP SESSION] Failed to create .zed directory at {:?}", zed_dir);
+        eprintln!("❌ [ACP SESSION] Failed to create .zed directory at {:?}", zed_dir);
     }
 }
 
