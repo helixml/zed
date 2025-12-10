@@ -762,7 +762,7 @@ impl AgentPanel {
                                 )
                             });
 
-                            this.set_active_view(ActiveView::ExternalAgentThread { thread_view }, window, cx);
+                            this.set_active_view(ActiveView::ExternalAgentThread { thread_view }, true, window, cx);
                             eprintln!("✅ [AGENT_PANEL] Auto-opened existing headless thread in UI");
                             log::info!("✅ [AGENT_PANEL] Auto-opened existing headless thread in UI");
                         }).log_err();

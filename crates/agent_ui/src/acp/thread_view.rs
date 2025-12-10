@@ -439,9 +439,13 @@ impl AcpThreadView {
         AgentDiff::set_active_thread(&workspace, thread.clone(), window, cx);
 
         let model_selector = thread.read(cx).connection().model_selector(thread.read(cx).session_id()).map(|selector| {
+            let agent_server = agent.clone();
+            let fs = project.read(cx).fs().clone();
             cx.new(|cx| {
                 AcpModelSelectorPopover::new(
                     selector,
+                    agent_server,
+                    fs,
                     PopoverMenuHandle::default(),
                     cx.focus_handle(),
                     window,
@@ -500,6 +504,7 @@ impl AcpThreadView {
             new_server_version_available: None,
             resume_thread_metadata: None,
             show_codex_windows_warning: false,
+            in_flight_prompt: None,
         }
     }
 
@@ -697,19 +702,43 @@ impl AcpThreadView {
                 }
             };
 
+            let root_dir = root_dir.unwrap_or(paths::home_dir().as_path().into());
+
             let result = if let Some(native_agent) = connection
                 .clone()
                 .downcast::<agent::NativeAgentConnection>()
                 && let Some(resume) = resume_thread.clone()
             {
+                // NativeAgent: Resume from database
                 cx.update(|_, cx| {
                     native_agent
                         .0
                         .update(cx, |agent, cx| agent.open_thread(resume.id, cx))
                 })
                 .log_err()
+            } else if connection.supports_session_load() {
+                // ACP agent (e.g., Qwen Code): Check for saved session to resume
+                if let Some(session_id) = connection.get_last_session_id(&root_dir) {
+                    log::info!("🔄 [ACP SESSION] Found saved session for agent, attempting to resume: {:?}", session_id);
+                    eprintln!("🔄 [ACP SESSION] Found saved session for agent, attempting to resume: {:?}", session_id);
+                    cx.update(|_, cx| {
+                        connection
+                            .clone()
+                            .load_thread(session_id.clone(), project.clone(), &root_dir, cx)
+                    })
+                    .log_err()
+                } else {
+                    log::info!("🆕 [ACP SESSION] No saved session found, creating new thread");
+                    eprintln!("🆕 [ACP SESSION] No saved session found, creating new thread");
+                    cx.update(|_, cx| {
+                        connection
+                            .clone()
+                            .new_thread(project.clone(), &root_dir, cx)
+                    })
+                    .log_err()
+                }
             } else {
-                let root_dir = root_dir.unwrap_or(paths::home_dir().as_path().into());
+                // Agent doesn't support session loading, create new thread
                 cx.update(|_, cx| {
                     connection
                         .clone()

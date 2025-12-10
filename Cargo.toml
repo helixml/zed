@@ -1,6 +1,7 @@
 [workspace]
 resolver = "2"
 members = [
+    "crates/acp_runtime",
     "crates/acp_tools",
     "crates/acp_thread",
     "crates/action_log",
@@ -438,13 +439,15 @@ ztracing_macro = { path = "crates/ztracing_macro" }
 # External crates
 #
 
-agent-client-protocol = { version = "=0.9.0", features = ["unstable"] }
+agent-client-protocol = { path = "crates/acp_runtime", features = ["unstable"] }
+agent-client-protocol-schema = { version = "0.10", features = ["unstable"] }
 aho-corasick = "1.1"
 alacritty_terminal = "0.25.1-rc1"
 any_vec = "0.14"
 anyhow = "1.0.86"
 arrayvec = { version = "0.7.4", features = ["serde"] }
 ashpd = { version = "0.11", default-features = false, features = ["async-std"] }
+async-broadcast = "0.7"
 async-compat = "0.2.1"
 async-compression = { version = "0.4", features = ["gzip", "futures-io"] }
 async-dispatcher = "0.1"

@@ -109,6 +109,17 @@ pub trait AgentConnection {
         Task::ready(Err(anyhow::anyhow!("Session loading not supported by this agent")))
     }
 
+    /// Lists all available sessions from the agent for a given working directory.
+    /// Returns session metadata for display in history UI.
+    /// Only works if `supports_session_load()` returns true.
+    fn list_sessions(
+        &self,
+        _cwd: &Path,
+        _cx: &mut App,
+    ) -> Task<Result<Vec<acp::SessionInfo>>> {
+        Task::ready(Ok(Vec::new()))
+    }
+
     fn into_any(self: Rc<Self>) -> Rc<dyn Any>;
 }
 

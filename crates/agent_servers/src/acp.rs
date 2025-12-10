@@ -731,6 +731,27 @@ impl AgentConnection for AcpConnection {
         })
     }
 
+    fn list_sessions(
+        &self,
+        cwd: &Path,
+        cx: &mut App,
+    ) -> Task<Result<Vec<acp::SessionInfo>>> {
+        // Check if the agent supports session listing via session_capabilities.list
+        if self.agent_capabilities.session_capabilities.list.is_none() {
+            return Task::ready(Ok(Vec::new()));
+        }
+
+        let conn = self.connection.clone();
+        let cwd = cwd.to_path_buf();
+
+        cx.spawn(async move |_| {
+            let response = conn
+                .list_sessions(acp::ListSessionsRequest::new().cwd(cwd))
+                .await?;
+            Ok(response.sessions)
+        })
+    }
+
     fn into_any(self: Rc<Self>) -> Rc<dyn Any> {
         self
     }
