@@ -2826,7 +2826,6 @@ impl Render for AgentPanel {
             .child(self.render_toolbar(window, cx))
             .children(self.render_onboarding(window, cx))
             .map(|parent| {
-                log::error!("🎯 [CRASH_DEBUG] About to match on active_view: {:?}", std::mem::discriminant(&self.active_view));
                 match &self.active_view {
                 ActiveView::ExternalAgentThread { thread_view, .. } => parent
                     .child(thread_view.clone())
