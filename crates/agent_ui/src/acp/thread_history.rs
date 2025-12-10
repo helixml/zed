@@ -329,6 +329,15 @@ impl AcpThreadHistory {
             HistoryEntry::TextThread(text_thread) => self.history_store.update(cx, |this, cx| {
                 this.delete_text_thread(text_thread.path.clone(), cx)
             }),
+            HistoryEntry::AcpAgentSession(_session) => {
+                // ACP agent sessions are stored on the agent side, not in our database.
+                // For now, just remove from recently opened entries.
+                let entry_id = entry.id();
+                self.history_store.update(cx, |this, cx| {
+                    this.remove_recently_opened_entry(&entry_id, cx);
+                });
+                return;
+            }
         };
         task.detach_and_log_err(cx);
     }
@@ -724,6 +733,19 @@ impl RenderOnce for AcpHistoryEntryElement {
                                                 cx,
                                             )
                                             .detach_and_log_err(cx);
+                                    });
+                                }
+                            }
+                            HistoryEntry::AcpAgentSession(session) => {
+                                if let Some(panel) = workspace.read(cx).panel::<AgentPanel>(cx) {
+                                    panel.update(cx, |panel, cx| {
+                                        panel.load_acp_agent_session(
+                                            session.agent_name.clone(),
+                                            session.session_id.clone(),
+                                            session.cwd.clone(),
+                                            window,
+                                            cx,
+                                        );
                                     });
                                 }
                             }

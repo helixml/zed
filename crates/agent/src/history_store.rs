@@ -47,10 +47,44 @@ pub fn load_agent_thread(
     })
 }
 
+/// Metadata for an ACP agent session (e.g., Qwen Code session)
+#[derive(Clone, Debug)]
+pub struct AcpAgentSessionMetadata {
+    pub agent_name: SharedString,
+    pub session_id: acp::SessionId,
+    pub title: SharedString,
+    pub updated_at: DateTime<Utc>,
+    pub cwd: std::path::PathBuf,
+}
+
+impl AcpAgentSessionMetadata {
+    /// Create from ACP SessionInfo
+    pub fn from_session_info(agent_name: &str, info: &acp::SessionInfo) -> Self {
+        let updated_at = info
+            .updated_at
+            .as_ref()
+            .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
+            .map(|dt| dt.with_timezone(&Utc))
+            .unwrap_or_else(Utc::now);
+
+        Self {
+            agent_name: SharedString::from(agent_name.to_string()),
+            session_id: info.session_id.clone(),
+            title: info.title.clone().map(SharedString::from).unwrap_or_default(),
+            updated_at,
+            cwd: info.cwd.clone(),
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub enum HistoryEntry {
+    /// NativeAgent thread stored in Zed's SQLite database
     AcpThread(DbThreadMetadata),
+    /// Text thread stored as markdown file
     TextThread(SavedTextThreadMetadata),
+    /// ACP agent session (e.g., Qwen Code) stored on the agent side
+    AcpAgentSession(AcpAgentSessionMetadata),
 }
 
 impl HistoryEntry {
@@ -58,6 +92,7 @@ impl HistoryEntry {
         match self {
             HistoryEntry::AcpThread(thread) => thread.updated_at,
             HistoryEntry::TextThread(text_thread) => text_thread.mtime.to_utc(),
+            HistoryEntry::AcpAgentSession(session) => session.updated_at,
         }
     }
 
@@ -66,6 +101,9 @@ impl HistoryEntry {
             HistoryEntry::AcpThread(thread) => HistoryEntryId::AcpThread(thread.id.clone()),
             HistoryEntry::TextThread(text_thread) => {
                 HistoryEntryId::TextThread(text_thread.path.clone())
+            }
+            HistoryEntry::AcpAgentSession(session) => {
+                HistoryEntryId::AcpAgentSession(session.agent_name.clone(), session.session_id.clone())
             }
         }
     }
@@ -80,6 +118,10 @@ impl HistoryEntry {
                 path: text_thread.path.as_ref().to_owned(),
                 name: text_thread.title.to_string(),
             },
+            HistoryEntry::AcpAgentSession(session) => MentionUri::Thread {
+                id: session.session_id.clone(),
+                name: session.title.to_string(),
+            },
         }
     }
 
@@ -93,6 +135,21 @@ impl HistoryEntry {
                 }
             }
             HistoryEntry::TextThread(text_thread) => &text_thread.title,
+            HistoryEntry::AcpAgentSession(session) => {
+                if session.title.is_empty() {
+                    DEFAULT_TITLE
+                } else {
+                    &session.title
+                }
+            }
+        }
+    }
+
+    /// Returns the agent name if this is an ACP agent session
+    pub fn agent_name(&self) -> Option<&SharedString> {
+        match self {
+            HistoryEntry::AcpAgentSession(session) => Some(&session.agent_name),
+            _ => None,
         }
     }
 }
@@ -102,6 +159,8 @@ impl HistoryEntry {
 pub enum HistoryEntryId {
     AcpThread(acp::SessionId),
     TextThread(Arc<Path>),
+    /// ACP agent session: (agent_name, session_id)
+    AcpAgentSession(SharedString, acp::SessionId),
 }
 
 impl Into<ElementId> for HistoryEntryId {
@@ -109,6 +168,9 @@ impl Into<ElementId> for HistoryEntryId {
         match self {
             HistoryEntryId::AcpThread(session_id) => ElementId::Name(session_id.0.into()),
             HistoryEntryId::TextThread(path) => ElementId::Path(path),
+            HistoryEntryId::AcpAgentSession(agent_name, session_id) => {
+                ElementId::Name(format!("{}:{}", agent_name, session_id.0).into())
+            }
         }
     }
 }
@@ -117,6 +179,8 @@ impl Into<ElementId> for HistoryEntryId {
 enum SerializedRecentOpen {
     AcpThread(String),
     TextThread(String),
+    /// ACP agent session: (agent_name, session_id)
+    AcpAgentSession(String, String),
 }
 
 pub struct HistoryStore {
@@ -124,6 +188,8 @@ pub struct HistoryStore {
     entries: Vec<HistoryEntry>,
     text_thread_store: Entity<assistant_text_thread::TextThreadStore>,
     recently_opened_entries: VecDeque<HistoryEntryId>,
+    /// ACP agent sessions fetched via session/list from external agents (e.g., Qwen Code)
+    acp_agent_sessions: Vec<AcpAgentSessionMetadata>,
     _subscriptions: Vec<gpui::Subscription>,
     _save_recently_opened_entries_task: Task<()>,
 }
@@ -154,6 +220,7 @@ impl HistoryStore {
             recently_opened_entries: VecDeque::default(),
             threads: Vec::default(),
             entries: Vec::default(),
+            acp_agent_sessions: Vec::default(),
             _subscriptions: subscriptions,
             _save_recently_opened_entries_task: Task::ready(()),
         }
@@ -258,10 +325,50 @@ impl HistoryStore {
                 .cloned()
                 .map(HistoryEntry::TextThread),
         );
+        // Include ACP agent sessions from external agents (e.g., Qwen Code)
+        history_entries.extend(
+            self.acp_agent_sessions
+                .iter()
+                .cloned()
+                .map(HistoryEntry::AcpAgentSession),
+        );
 
         history_entries.sort_unstable_by_key(|entry| std::cmp::Reverse(entry.updated_at()));
         self.entries = history_entries;
         cx.notify()
+    }
+
+    /// Set ACP agent sessions fetched from an external agent via session/list.
+    /// This replaces any existing sessions for the given agent.
+    pub fn set_acp_agent_sessions(
+        &mut self,
+        agent_name: &str,
+        sessions: Vec<acp::SessionInfo>,
+        cx: &mut Context<Self>,
+    ) {
+        // Remove existing sessions for this agent
+        self.acp_agent_sessions
+            .retain(|s| s.agent_name.as_ref() != agent_name);
+
+        // Add the new sessions
+        self.acp_agent_sessions.extend(
+            sessions
+                .iter()
+                .map(|info| AcpAgentSessionMetadata::from_session_info(agent_name, info)),
+        );
+
+        self.update_entries(cx);
+    }
+
+    /// Get an ACP agent session by agent name and session ID
+    pub fn get_acp_agent_session(
+        &self,
+        agent_name: &str,
+        session_id: &acp::SessionId,
+    ) -> Option<&AcpAgentSessionMetadata> {
+        self.acp_agent_sessions
+            .iter()
+            .find(|s| s.agent_name.as_ref() == agent_name && &s.session_id == session_id)
     }
 
     pub fn is_empty(&self, _cx: &App) -> bool {
@@ -322,6 +429,12 @@ impl HistoryStore {
                 HistoryEntryId::AcpThread(id) => {
                     Some(SerializedRecentOpen::AcpThread(id.to_string()))
                 }
+                HistoryEntryId::AcpAgentSession(agent_name, session_id) => {
+                    Some(SerializedRecentOpen::AcpAgentSession(
+                        agent_name.to_string(),
+                        session_id.to_string(),
+                    ))
+                }
             })
             .collect::<Vec<_>>();
 
@@ -359,6 +472,12 @@ impl HistoryStore {
                     }
                     SerializedRecentOpen::TextThread(file_name) => Some(
                         HistoryEntryId::TextThread(text_threads_dir().join(file_name).into()),
+                    ),
+                    SerializedRecentOpen::AcpAgentSession(agent_name, session_id) => Some(
+                        HistoryEntryId::AcpAgentSession(
+                            SharedString::from(agent_name),
+                            acp::SessionId::new(session_id.as_str()),
+                        ),
                     ),
                 })
                 .collect();

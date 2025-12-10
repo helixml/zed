@@ -514,6 +514,34 @@ impl AcpThreadView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
+        Self::new_with_acp_session(
+            agent,
+            resume_thread,
+            summarize_thread,
+            None, // No specific ACP session to load
+            workspace,
+            project,
+            history_store,
+            prompt_store,
+            window,
+            cx,
+        )
+    }
+
+    /// Create a new thread view with an optional specific ACP session to load.
+    /// Used when opening an ACP agent session from history.
+    pub fn new_with_acp_session(
+        agent: Rc<dyn AgentServer>,
+        resume_thread: Option<DbThreadMetadata>,
+        summarize_thread: Option<DbThreadMetadata>,
+        acp_session_to_load: Option<acp::SessionId>,
+        workspace: WeakEntity<Workspace>,
+        project: Entity<Project>,
+        history_store: Entity<HistoryStore>,
+        prompt_store: Option<Entity<PromptStore>>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
         let prompt_capabilities = Rc::new(RefCell::new(acp::PromptCapabilities::default()));
         let available_commands = Rc::new(RefCell::new(vec![]));
 
@@ -580,6 +608,7 @@ impl AcpThreadView {
             thread_state: Self::initial_state(
                 agent.clone(),
                 resume_thread.clone(),
+                acp_session_to_load,
                 workspace.clone(),
                 project.clone(),
                 window,
@@ -624,6 +653,7 @@ impl AcpThreadView {
         self.thread_state = Self::initial_state(
             self.agent.clone(),
             self.resume_thread_metadata.clone(),
+            None, // No specific ACP session to load on reset
             self.workspace.clone(),
             self.project.clone(),
             window,
@@ -637,6 +667,7 @@ impl AcpThreadView {
     fn initial_state(
         agent: Rc<dyn AgentServer>,
         resume_thread: Option<DbThreadMetadata>,
+        acp_session_to_load: Option<acp::SessionId>,
         workspace: WeakEntity<Workspace>,
         project: Entity<Project>,
         window: &mut Window,
@@ -712,10 +743,14 @@ impl AcpThreadView {
                 })
                 .log_err()
             } else if connection.supports_session_load() {
-                // ACP agent (e.g., Qwen Code): Check for saved session to resume
-                if let Some(session_id) = connection.get_last_session_id(&root_dir) {
-                    log::info!("🔄 [ACP SESSION] Found saved session for agent, attempting to resume: {:?}", session_id);
-                    eprintln!("🔄 [ACP SESSION] Found saved session for agent, attempting to resume: {:?}", session_id);
+                // ACP agent (e.g., Qwen Code): Check for session to load
+                // Priority: 1) acp_session_to_load (from history), 2) saved session from file
+                let session_id = acp_session_to_load.clone()
+                    .or_else(|| connection.get_last_session_id(&root_dir));
+
+                if let Some(session_id) = session_id {
+                    log::info!("🔄 [ACP SESSION] Loading session for agent: {:?}", session_id);
+                    eprintln!("🔄 [ACP SESSION] Loading session for agent: {:?}", session_id);
                     cx.update(|_, cx| {
                         connection
                             .clone()
@@ -723,8 +758,8 @@ impl AcpThreadView {
                     })
                     .log_err()
                 } else {
-                    log::info!("🆕 [ACP SESSION] No saved session found, creating new thread");
-                    eprintln!("🆕 [ACP SESSION] No saved session found, creating new thread");
+                    log::info!("🆕 [ACP SESSION] No session to load, creating new thread");
+                    eprintln!("🆕 [ACP SESSION] No session to load, creating new thread");
                     cx.update(|_, cx| {
                         connection
                             .clone()
@@ -906,6 +941,29 @@ impl AcpThreadView {
                 };
             })
             .log_err();
+
+            // Fetch ACP sessions from agent and update history store
+            // This runs after thread is created, regardless of success/failure
+            if connection.supports_session_load() {
+                let agent_name: SharedString = agent.name();
+                let root_dir_clone = root_dir.clone();
+
+                // Fetch sessions list from the ACP agent
+                let sessions_task = cx.update(|_, cx| {
+                    connection.list_sessions(&root_dir_clone, cx)
+                });
+
+                if let Ok(sessions_task) = sessions_task {
+                    if let Ok(sessions) = sessions_task.await {
+                        log::info!("📋 [ACP SESSIONS] Fetched {} sessions from agent {}", sessions.len(), agent_name);
+                        this.update(cx, |this, cx| {
+                            this.history_store.update(cx, |store, cx| {
+                                store.set_acp_agent_sessions(agent_name.as_ref(), sessions, cx);
+                            });
+                        }).log_err();
+                    }
+                }
+            }
         });
 
         cx.spawn(async move |this, cx| {
@@ -1934,7 +1992,8 @@ impl AcpThreadView {
                     this.update(cx, |this, cx| {
                         this.thread_state = Self::initial_state(
                             agent,
-                            None,
+                            None, // resume_thread
+                            None, // acp_session_to_load
                             this.workspace.clone(),
                             this.project.clone(),
                             window,
@@ -6055,7 +6114,7 @@ impl AcpThreadView {
     }
 
     pub fn delete_history_entry(&mut self, entry: HistoryEntry, cx: &mut Context<Self>) {
-        let task = match entry {
+        let task = match &entry {
             HistoryEntry::AcpThread(thread) => self.history_store.update(cx, |history, cx| {
                 history.delete_thread(thread.id.clone(), cx)
             }),
@@ -6063,6 +6122,15 @@ impl AcpThreadView {
                 self.history_store.update(cx, |history, cx| {
                     history.delete_text_thread(text_thread.path.clone(), cx)
                 })
+            }
+            HistoryEntry::AcpAgentSession(_session) => {
+                // ACP agent sessions are stored on the agent side, not in our database.
+                // Just remove from recently opened entries.
+                let entry_id = entry.id();
+                self.history_store.update(cx, |history, cx| {
+                    history.remove_recently_opened_entry(&entry_id, cx);
+                });
+                return;
             }
         };
         task.detach_and_log_err(cx);

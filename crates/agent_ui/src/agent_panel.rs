@@ -573,6 +573,15 @@ impl AgentPanel {
                     this.open_saved_text_thread(thread.path.clone(), window, cx)
                         .detach_and_log_err(cx);
                 }
+                ThreadHistoryEvent::Open(HistoryEntry::AcpAgentSession(session)) => {
+                    this.load_acp_agent_session(
+                        session.agent_name.clone(),
+                        session.session_id.clone(),
+                        session.cwd.clone(),
+                        window,
+                        cx,
+                    );
+                }
             },
         )
         .detach();
@@ -1491,6 +1500,15 @@ impl AgentPanel {
                                 agent::HistoryEntry::TextThread(entry) => this
                                     .open_saved_text_thread(entry.path.clone(), window, cx)
                                     .detach_and_log_err(cx),
+                                agent::HistoryEntry::AcpAgentSession(session) => {
+                                    this.load_acp_agent_session(
+                                        session.agent_name.clone(),
+                                        session.session_id.clone(),
+                                        session.cwd.clone(),
+                                        window,
+                                        cx,
+                                    );
+                                }
                             })
                             .ok();
                     }
@@ -1606,6 +1624,67 @@ impl AgentPanel {
             window,
             cx,
         );
+    }
+
+    /// Load an ACP agent session from history.
+    /// This routes to the correct ACP agent and loads the specific session.
+    pub fn load_acp_agent_session(
+        &mut self,
+        agent_name: SharedString,
+        session_id: agent_client_protocol::SessionId,
+        _cwd: std::path::PathBuf,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let workspace = self.workspace.clone();
+        let project = self.project.clone();
+        let fs = self.fs.clone();
+        let history_store = self.history_store.clone();
+        let prompt_store = self.prompt_store.clone();
+        let loading = self.loading;
+
+        // Get the correct agent for this session
+        let ext_agent = ExternalAgent::Custom { name: agent_name.clone() };
+
+        cx.spawn_in(window, async move |this, cx| {
+            let server = ext_agent.server(fs, history_store.clone());
+
+            if !loading {
+                telemetry::event!("Agent Thread Started", agent = server.telemetry_id());
+            }
+
+            this.update_in(cx, |this, window, cx| {
+                let selected_agent = ext_agent.into();
+                if this.selected_agent != selected_agent {
+                    this.selected_agent = selected_agent;
+                    this.serialize(cx);
+                }
+
+                // Create thread view with specific ACP session to load
+                let thread_view = cx.new(|cx| {
+                    crate::acp::AcpThreadView::new_with_acp_session(
+                        server,
+                        None, // No DbThreadMetadata for ACP sessions
+                        None, // No summarize thread
+                        Some(session_id), // The specific ACP session to load
+                        workspace.clone(),
+                        project,
+                        history_store.clone(),
+                        prompt_store.clone(),
+                        window,
+                        cx,
+                    )
+                });
+
+                this.set_active_view(
+                    ActiveView::ExternalAgentThread { thread_view },
+                    !loading,
+                    window,
+                    cx,
+                );
+            })
+        })
+        .detach_and_log_err(cx);
     }
 }
 
