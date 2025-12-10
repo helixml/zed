@@ -356,11 +356,6 @@ impl AcpThreadView {
                 // Custom agent (e.g., "qwen")
                 crate::ExternalAgent::Custom {
                     name: gpui::SharedString::from(name.to_string()),
-                    command: project::agent_server_store::AgentServerCommand {
-                        path: std::path::PathBuf::new(),
-                        args: vec![],
-                        env: None,
-                    },
                 }.server(fs.clone(), history_store.clone())
             }
         };
@@ -375,7 +370,7 @@ impl AcpThreadView {
         let message_editor = cx.new(|cx| {
             MessageEditor::new(
                 workspace.clone(),
-                project.clone(),
+                project.downgrade(),
                 history_store.clone(),
                 prompt_store.clone(),
                 prompt_capabilities.clone(),
@@ -395,7 +390,7 @@ impl AcpThreadView {
         let entry_view_state = cx.new(|_| {
             EntryViewState::new(
                 workspace.clone(),
-                project.clone(),
+                project.downgrade(),
                 history_store.clone(),
                 prompt_store.clone(),
                 prompt_capabilities.clone(),
