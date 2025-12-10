@@ -797,7 +797,8 @@ impl AcpThreadView {
                             // This filters out empty "New Thread" templates and external-created threads
                             let entry_count = thread.read(cx).entries().len();
                             if entry_count > 0 {
-                                let acp_thread_id = thread.entity_id().to_string();
+                                // Use session_id (stable across restarts) not entity_id (ephemeral)
+                                let acp_thread_id = thread.read(cx).session_id().to_string();
                                 let title = thread.read(cx).title().to_string();
                                 let title_opt = if title.is_empty() { None } else { Some(title) };
 
@@ -1707,7 +1708,8 @@ impl AcpThreadView {
                 }
 
                 // Notify Helix of title change
-                let acp_thread_id = thread.entity_id().to_string();
+                // Use session_id (stable across restarts) not entity_id (ephemeral)
+                let acp_thread_id = thread.read(cx).session_id().to_string();
                 let title_str = title.to_string();
 
                 eprintln!("📤 [ZED-UI] Thread title changed: {} -> '{}'", acp_thread_id, title_str);
