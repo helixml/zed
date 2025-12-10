@@ -91,6 +91,9 @@ pub struct ThreadCreationRequest {
 #[derive(Clone, Debug)]
 pub struct ThreadOpenRequest {
     pub acp_thread_id: String,
+    /// Which ACP agent to use (e.g., "qwen", "claude", "gemini", "codex").
+    /// None or empty means use NativeAgent (Zed's built-in agent).
+    pub agent_name: Option<String>,
 }
 
 /// Notification to display a thread in AgentPanel (for auto-select)

@@ -563,8 +563,10 @@ fn open_existing_thread_sync(
     request: ThreadOpenRequest,
     cx: &mut App,
 ) -> Result<()> {
-    eprintln!("📖 [THREAD_SERVICE] Opening existing ACP thread: {}", request.acp_thread_id);
-    log::info!("📖 [THREAD_SERVICE] Opening existing ACP thread: {}", request.acp_thread_id);
+    eprintln!("📖 [THREAD_SERVICE] Opening existing ACP thread: {}, agent_name: {:?}",
+              request.acp_thread_id, request.agent_name);
+    log::info!("📖 [THREAD_SERVICE] Opening existing ACP thread: {}, agent_name: {:?}",
+               request.acp_thread_id, request.agent_name);
 
     // Check if thread is already in registry
     if let Some(_thread_weak) = get_thread(&request.acp_thread_id) {
@@ -574,9 +576,22 @@ fn open_existing_thread_sync(
         return Ok(());
     }
 
-    // Thread not in registry - need to load from database
-    // Create agent server
-    let agent = ExternalAgent::NativeAgent;
+    // Thread not in registry - need to load from agent
+    // Select agent based on agent_name (same logic as create_new_thread_sync)
+    let agent = match request.agent_name.as_deref() {
+        Some("zed-agent") | Some("") | None => ExternalAgent::NativeAgent,
+        Some(name) => ExternalAgent::Custom {
+            name: gpui::SharedString::from(name.to_string()),
+            command: project::agent_server_store::AgentServerCommand {
+                path: std::path::PathBuf::new(),
+                args: vec![],
+                env: None,
+            },
+        },
+    };
+    eprintln!("🔧 [THREAD_SERVICE] Selected agent: {:?}", agent);
+    log::info!("🔧 [THREAD_SERVICE] Selected agent: {:?}", agent);
+
     let server = agent.server(fs, acp_history_store.clone());
 
     // Get agent server store from project
@@ -590,11 +605,17 @@ fn open_existing_thread_sync(
         None, // new_version_tx
     );
 
-    // Connect to get AgentConnection with NativeAgent
+    // Connect to get AgentConnection
     let connection_task = server.connect(None, delegate, cx);
 
-    // Spawn async task to load the thread from database
+    // Get cwd for load_thread
+    let cwd = project.read(cx).worktrees(cx).next()
+        .map(|wt| wt.read(cx).abs_path().to_path_buf())
+        .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
+
+    // Spawn async task to load the thread from agent
     let request_clone = request.clone();
+    let project_clone = project.clone();
     cx.spawn(async move |cx| {
         let (connection, _spawn_task) = match connection_task.await {
             Ok(result) => result,
@@ -608,51 +629,38 @@ fn open_existing_thread_sync(
         eprintln!("✅ [THREAD_SERVICE] Connected to agent server for thread loading");
         log::info!("✅ [THREAD_SERVICE] Connected to agent server for thread loading");
 
-        // Downcast connection to NativeAgentConnection to access the agent
-        let native_connection = match connection.into_any().downcast::<agent::NativeAgentConnection>() {
-            Ok(conn) => conn,
-            Err(_) => {
-                eprintln!("❌ [THREAD_SERVICE] Connection is not a NativeAgentConnection");
-                log::error!("❌ [THREAD_SERVICE] Connection is not a NativeAgentConnection");
-                return Err(anyhow::anyhow!("Connection is not a NativeAgentConnection"));
-            }
-        };
+        // Check if agent supports session loading
+        if !connection.supports_session_load() {
+            eprintln!("⚠️ [THREAD_SERVICE] Agent does not support session loading");
+            log::warn!("⚠️ [THREAD_SERVICE] Agent does not support session loading");
+            return Err(anyhow::anyhow!("Agent does not support session loading"));
+        }
 
-        // Access the NativeAgent entity (field 0 of the tuple struct)
-        let native_agent = native_connection.0.clone();
-
-        eprintln!("🔨 [THREAD_SERVICE] Calling agent.open_thread() to load from database...");
-        log::info!("🔨 [THREAD_SERVICE] Calling agent.open_thread() to load from database...");
+        eprintln!("🔨 [THREAD_SERVICE] Calling connection.load_thread() to load from agent...");
+        log::info!("🔨 [THREAD_SERVICE] Calling connection.load_thread() to load from agent...");
 
         // Convert string to SessionId
         let session_id = agent_client_protocol::SessionId::new(request_clone.acp_thread_id.clone());
 
-        let open_task = match cx.update(|cx| {
-            native_agent.update(cx, |agent, cx| {
-                agent.open_thread(session_id, cx)
-            })
-        }) {
-            Ok(task) => task,
-            Err(e) => {
-                eprintln!("❌ [THREAD_SERVICE] Failed to call agent.open_thread(): {}", e);
-                log::error!("❌ [THREAD_SERVICE] Failed to call agent.open_thread(): {}", e);
-                return Err(e);
-            }
-        };
+        // Use the generic AgentConnection::load_thread() method
+        // This works for both NativeAgent (from local DB) and ACP agents (via session/load protocol)
+        let load_task = cx.update(|cx| {
+            connection.load_thread(session_id, project_clone, &cwd, cx)
+        })?;
 
-        let thread_entity = match open_task.await {
+        let thread_entity = match load_task.await {
             Ok(entity) => entity,
             Err(e) => {
-                eprintln!("❌ [THREAD_SERVICE] agent.open_thread() failed: {}", e);
-                log::error!("❌ [THREAD_SERVICE] agent.open_thread() failed: {}", e);
+                eprintln!("❌ [THREAD_SERVICE] connection.load_thread() failed: {}", e);
+                log::error!("❌ [THREAD_SERVICE] connection.load_thread() failed: {}", e);
                 return Err(e);
             }
         };
 
         let acp_thread_id = cx.update(|cx| {
             let thread_id = thread_entity.read(cx).session_id().to_string();
-            eprintln!("✅ [THREAD_SERVICE] Opened ACP thread from database: {} (session_id)", thread_id);
-            log::info!("✅ [THREAD_SERVICE] Opened ACP thread from database: {} (session_id)", thread_id);
+            eprintln!("✅ [THREAD_SERVICE] Loaded ACP thread from agent: {} (session_id)", thread_id);
+            log::info!("✅ [THREAD_SERVICE] Loaded ACP thread from agent: {} (session_id)", thread_id);
             thread_id
         })?;
 
@@ -662,12 +670,10 @@ fn open_existing_thread_sync(
         log::info!("📋 [THREAD_SERVICE] Registered thread: {} (strong reference)", acp_thread_id);
 
         // Notify AgentPanel to display this thread (for auto-select in UI)
-        // Note: For opened threads, we don't have agent_name info - the thread was created earlier
-        // TODO: Store agent_name in thread metadata so it can be retrieved on open
         if let Err(e) = crate::notify_thread_display(crate::ThreadDisplayNotification {
             thread_entity: thread_entity.clone(),
             helix_session_id: acp_thread_id.clone(),
-            agent_name: None, // Opened threads don't have agent_name context
+            agent_name: request_clone.agent_name.clone(),
         }) {
             eprintln!("⚠️ [THREAD_SERVICE] Failed to notify thread display: {}", e);
             log::warn!("⚠️ [THREAD_SERVICE] Failed to notify thread display: {}", e);

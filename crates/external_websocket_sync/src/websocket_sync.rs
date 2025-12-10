@@ -407,17 +407,23 @@ impl WebSocketSync {
         #[derive(Deserialize)]
         struct OpenThreadData {
             acp_thread_id: String,
+            /// Which ACP agent to use (e.g., "qwen", "claude", "gemini", "codex").
+            /// None or empty means use NativeAgent (Zed's built-in agent).
+            agent_name: Option<String>,
         }
 
         let open_data: OpenThreadData = serde_json::from_value(data)
             .context("Failed to parse open_thread data")?;
 
-        eprintln!("📖 [WEBSOCKET-IN] Processing open_thread command: acp_thread_id={}", open_data.acp_thread_id);
-        log::info!("📖 [WEBSOCKET-IN] Processing open_thread command: acp_thread_id={}", open_data.acp_thread_id);
+        eprintln!("📖 [WEBSOCKET-IN] Processing open_thread command: acp_thread_id={}, agent_name={:?}",
+                  open_data.acp_thread_id, open_data.agent_name);
+        log::info!("📖 [WEBSOCKET-IN] Processing open_thread command: acp_thread_id={}, agent_name={:?}",
+                   open_data.acp_thread_id, open_data.agent_name);
 
         // Request thread opening via callback (will load from database and display)
         let request = crate::ThreadOpenRequest {
             acp_thread_id: open_data.acp_thread_id.clone(),
+            agent_name: open_data.agent_name.clone(),
         };
 
         eprintln!("🎯 [WEBSOCKET-IN] Calling request_thread_open()...");
