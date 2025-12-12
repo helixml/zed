@@ -135,14 +135,16 @@ impl AcpConnection {
         let io_task = cx.background_spawn(io_task);
 
         let stderr_task = cx.background_spawn(async move {
+            log::error!("🔧 [ACP STDERR READER] Starting stderr reader task for agent");
             let mut stderr = BufReader::new(stderr);
             let mut line = String::new();
             while let Ok(n) = stderr.read_line(&mut line).await
                 && n > 0
             {
-                log::warn!("agent stderr: {}", line.trim());
+                log::error!("🔧 [AGENT STDERR] {}", line.trim());
                 line.clear();
             }
+            log::error!("🔧 [ACP STDERR READER] Stderr reader task ended");
             Ok(())
         });
 
