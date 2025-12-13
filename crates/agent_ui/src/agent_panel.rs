@@ -832,7 +832,146 @@ impl AgentPanel {
 
         // Initial sync of agent servers from extensions
         panel.sync_agent_servers_from_extensions(cx);
+
+        // Load ACP sessions from configured external agents at startup
+        panel.load_acp_sessions_from_agents(cx);
+
         panel
+    }
+
+    /// Load ACP sessions from all configured external agents at startup.
+    /// This fetches session lists from agents that support the ACP session/list protocol
+    /// and populates the history store so users can see and resume sessions.
+    fn load_acp_sessions_from_agents(&self, cx: &mut Context<Self>) {
+        log::info!("📋 [AGENT_PANEL] Loading ACP sessions from configured agents at startup...");
+        eprintln!("📋 [AGENT_PANEL] Loading ACP sessions from configured agents at startup...");
+
+        let fs = self.fs.clone();
+        let project = self.project.clone();
+        let history_store = self.history_store.clone();
+
+        // Get configured external agents from the agent server store
+        let external_agent_names: Vec<SharedString> = project.read(cx)
+            .agent_server_store()
+            .read(cx)
+            .external_agents()
+            .map(|name| name.0.clone())
+            .collect();
+
+        log::info!("📋 [AGENT_PANEL] Found {} external agents: {:?}", external_agent_names.len(), external_agent_names);
+        eprintln!("📋 [AGENT_PANEL] Found {} external agents: {:?}", external_agent_names.len(), external_agent_names);
+
+        // Get root_dir from project worktrees
+        let root_dir = project.read(cx).visible_worktrees(cx)
+            .filter_map(|worktree| {
+                if worktree.read(cx).is_single_file() {
+                    Some(worktree.read(cx).abs_path().parent()?.into())
+                } else {
+                    Some(worktree.read(cx).abs_path())
+                }
+            })
+            .next()
+            .unwrap_or_else(|| paths::home_dir().as_path().into());
+
+        // Spawn async task to load sessions from each agent
+        for agent_name in external_agent_names {
+            let fs = fs.clone();
+            let project = project.clone();
+            let history_store = history_store.clone();
+            let root_dir = root_dir.clone();
+            let agent_name_clone = agent_name.clone();
+
+            cx.spawn(async move |_this, mut cx| {
+                if let Err(e) = Self::load_sessions_from_agent(
+                    agent_name_clone.clone(),
+                    fs,
+                    project,
+                    history_store,
+                    root_dir,
+                    &mut cx,
+                ).await {
+                    log::warn!("📋 [AGENT_PANEL] Failed to load sessions from agent {}: {}", agent_name_clone, e);
+                }
+                anyhow::Ok(())
+            }).detach();
+        }
+    }
+
+    /// Load sessions from a single ACP agent
+    async fn load_sessions_from_agent(
+        agent_name: SharedString,
+        fs: Arc<dyn Fs>,
+        project: Entity<Project>,
+        history_store: Entity<HistoryStore>,
+        root_dir: Arc<Path>,
+        cx: &mut gpui::AsyncApp,
+    ) -> Result<()> {
+        log::info!("📋 [AGENT_PANEL] Loading sessions from agent: {}", agent_name);
+        eprintln!("📋 [AGENT_PANEL] Loading sessions from agent: {}", agent_name);
+
+        // Create agent server for this external agent
+        let ext_agent = ExternalAgent::Custom { name: agent_name.clone() };
+        let server = ext_agent.server(fs, history_store.clone());
+
+        // Create delegate for connection
+        let delegate = cx.update(|cx| {
+            agent_servers::AgentServerDelegate::new(
+                project.read(cx).agent_server_store().clone(),
+                project.clone(),
+                None, // no status_tx
+                None, // no new_version_tx
+            )
+        })?;
+
+        // Connect to agent
+        let connect_task = cx.update(|cx| {
+            server.connect(Some(&root_dir), delegate, cx)
+        })?;
+
+        let (connection, _login) = match connect_task.await {
+            Ok(result) => result,
+            Err(e) => {
+                log::warn!("📋 [AGENT_PANEL] Failed to connect to agent {}: {}", agent_name, e);
+                eprintln!("📋 [AGENT_PANEL] Failed to connect to agent {}: {}", agent_name, e);
+                return Err(e);
+            }
+        };
+
+        log::info!("📋 [AGENT_PANEL] Connected to agent: {}", agent_name);
+        eprintln!("📋 [AGENT_PANEL] Connected to agent: {}", agent_name);
+
+        // Check if agent supports session loading
+        if !connection.supports_session_load() {
+            log::info!("📋 [AGENT_PANEL] Agent {} does not support session loading", agent_name);
+            eprintln!("📋 [AGENT_PANEL] Agent {} does not support session loading", agent_name);
+            return Ok(());
+        }
+
+        // Fetch sessions list from the agent
+        let sessions_task = cx.update(|cx| {
+            connection.list_sessions(&root_dir, cx)
+        })?;
+
+        match sessions_task.await {
+            Ok(sessions) => {
+                log::info!("📋 [AGENT_PANEL] Fetched {} sessions from agent {} at startup", sessions.len(), agent_name);
+                eprintln!("📋 [AGENT_PANEL] Fetched {} sessions from agent {} at startup", sessions.len(), agent_name);
+
+                // Store sessions in history store
+                cx.update(|cx| {
+                    history_store.update(cx, |store, cx| {
+                        store.set_acp_agent_sessions(agent_name.as_ref(), sessions, cx);
+                    });
+                })?;
+
+                Ok(())
+            }
+            Err(e) => {
+                log::warn!("📋 [AGENT_PANEL] Failed to list sessions from agent {}: {}", agent_name, e);
+                eprintln!("📋 [AGENT_PANEL] Failed to list sessions from agent {}: {}", agent_name, e);
+                Err(e)
+            }
+        }
     }
 
     pub fn toggle_focus(
