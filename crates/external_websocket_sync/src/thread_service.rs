@@ -187,14 +187,61 @@ pub fn setup_thread_handler(
                     }
                     continue;
                 } else {
+                    // Thread not in registry - try to load from agent first
                     eprintln!(
-                        "⚠️ [THREAD_SERVICE] Thread {} not found, creating new thread",
+                        "🔄 [THREAD_SERVICE] Thread {} not in registry, attempting to load from agent...",
                         existing_thread_id
                     );
-                    log::warn!(
-                        "⚠️ [THREAD_SERVICE] Thread {} not found, creating new thread",
+                    log::info!(
+                        "🔄 [THREAD_SERVICE] Thread {} not in registry, attempting to load from agent...",
                         existing_thread_id
                     );
+
+                    // Try to load the session from the agent
+                    let load_result = load_thread_from_agent(
+                        project_for_create.clone(),
+                        acp_history_store_for_create.clone(),
+                        fs_for_create.clone(),
+                        existing_thread_id.clone(),
+                        request.agent_name.clone(),
+                        cx.clone(),
+                    ).await;
+
+                    match load_result {
+                        Ok(thread) => {
+                            eprintln!(
+                                "✅ [THREAD_SERVICE] Successfully loaded thread {} from agent, sending message",
+                                existing_thread_id
+                            );
+                            log::info!(
+                                "✅ [THREAD_SERVICE] Successfully loaded thread {} from agent, sending message",
+                                existing_thread_id
+                            );
+                            // Send the message to the loaded thread
+                            if let Err(e) = handle_follow_up_message(
+                                thread,
+                                existing_thread_id.clone(),
+                                request.request_id.clone(),
+                                request.message,
+                                cx.clone()
+                            ).await {
+                                eprintln!("❌ [THREAD_SERVICE] Failed to send message to loaded thread: {}", e);
+                                log::error!("❌ [THREAD_SERVICE] Failed to send message to loaded thread: {}", e);
+                            }
+                            continue;
+                        }
+                        Err(e) => {
+                            eprintln!(
+                                "⚠️ [THREAD_SERVICE] Failed to load thread {} from agent: {}, creating new thread",
+                                existing_thread_id, e
+                            );
+                            log::warn!(
+                                "⚠️ [THREAD_SERVICE] Failed to load thread {} from agent: {}, creating new thread",
+                                existing_thread_id, e
+                            );
+                            // Fall through to create new thread
+                        }
+                    }
                 }
             }
 
@@ -553,6 +600,167 @@ async fn handle_follow_up_message(
 
     log::info!("✅ [THREAD_SERVICE] Follow-up message sent successfully");
     Ok(())
+}
+
+/// Load an existing thread from the agent (async version for use in message handler)
+/// This connects to the agent, loads the session via ACP protocol, registers it, and returns a weak reference.
+async fn load_thread_from_agent(
+    project: Entity<Project>,
+    acp_history_store: Entity<HistoryStore>,
+    fs: Arc<dyn Fs>,
+    acp_thread_id: String,
+    agent_name: Option<String>,
+    cx: gpui::AsyncApp,
+) -> Result<WeakEntity<AcpThread>> {
+    eprintln!("📂 [THREAD_SERVICE] load_thread_from_agent: {} (agent: {:?})", acp_thread_id, agent_name);
+    log::info!("📂 [THREAD_SERVICE] load_thread_from_agent: {} (agent: {:?})", acp_thread_id, agent_name);
+
+    // Select agent based on agent_name
+    let agent = match agent_name.as_deref() {
+        Some("zed-agent") | Some("") | None => ExternalAgent::NativeAgent,
+        Some(name) => ExternalAgent::Custom {
+            name: gpui::SharedString::from(name.to_string()),
+            command: project::agent_server_store::AgentServerCommand {
+                path: std::path::PathBuf::new(),
+                args: vec![],
+                env: None,
+            },
+        },
+    };
+
+    let server = agent.server(fs, acp_history_store.clone());
+
+    // Get agent server store and create connection
+    let (connection_task, cwd) = cx.update(|cx| {
+        let agent_server_store = project.read(cx).agent_server_store().clone();
+        let delegate = agent_servers::AgentServerDelegate::new(
+            agent_server_store,
+            project.clone(),
+            None,
+            None,
+        );
+        let connection_task = server.connect(None, delegate, cx);
+        let cwd = project.read(cx).worktrees(cx).next()
+            .map(|wt| wt.read(cx).abs_path().to_path_buf())
+            .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
+        (connection_task, cwd)
+    })?;
+
+    let (connection, _spawn_task) = connection_task.await?;
+
+    eprintln!("✅ [THREAD_SERVICE] Connected to agent for loading thread");
+    log::info!("✅ [THREAD_SERVICE] Connected to agent for loading thread");
+
+    // Check if agent supports session loading
+    if !connection.supports_session_load() {
+        let err = anyhow::anyhow!("Agent does not support session loading");
+        eprintln!("⚠️ [THREAD_SERVICE] {}", err);
+        log::warn!("⚠️ [THREAD_SERVICE] {}", err);
+        return Err(err);
+    }
+
+    // Load the thread from agent
+    let session_id = agent_client_protocol::SessionId::new(acp_thread_id.clone());
+    let project_clone = project.clone();
+    let load_task = cx.update(|cx| {
+        connection.load_thread(session_id, project_clone, &cwd, cx)
+    })?;
+
+    let thread_entity = load_task.await?;
+
+    let loaded_thread_id = cx.update(|cx| {
+        thread_entity.read(cx).session_id().to_string()
+    })?;
+
+    eprintln!("✅ [THREAD_SERVICE] Loaded thread from agent: {}", loaded_thread_id);
+    log::info!("✅ [THREAD_SERVICE] Loaded thread from agent: {}", loaded_thread_id);
+
+    // Subscribe to thread events for streaming responses (same as create_new_thread_sync)
+    let thread_id_for_events = loaded_thread_id.clone();
+    cx.update(|cx| {
+        cx.subscribe(&thread_entity, move |thread_entity, event, cx| {
+            match event {
+                AcpThreadEvent::NewEntry => {
+                    eprintln!("🆕 [THREAD_SERVICE] NewEntry event received (loaded thread)");
+                    let thread = thread_entity.read(cx);
+                    let latest_idx = thread.entries().len().saturating_sub(1);
+                    if is_external_originated_entry(&thread_id_for_events, latest_idx) {
+                        eprintln!("🔄 [THREAD_SERVICE] Entry {} from external system, skipping echo", latest_idx);
+                        return;
+                    }
+                    if let Some(entry) = thread.entries().get(latest_idx) {
+                        if let acp_thread::AgentThreadEntry::UserMessage(msg) = entry {
+                            let content = msg.content.to_markdown(cx).to_string();
+                            eprintln!("👤 [THREAD_SERVICE] User typed in Zed (loaded thread), syncing: {} chars", content.len());
+                            let event = SyncEvent::MessageAdded {
+                                acp_thread_id: thread_id_for_events.clone(),
+                                message_id: latest_idx.to_string(),
+                                role: "user".to_string(),
+                                content: content.clone(),
+                                timestamp: chrono::Utc::now().timestamp(),
+                            };
+                            if let Err(e) = crate::send_websocket_event(event) {
+                                eprintln!("❌ [THREAD_SERVICE] Failed to send user message: {}", e);
+                            }
+                        }
+                    }
+                }
+                AcpThreadEvent::EntryUpdated(entry_idx) => {
+                    eprintln!("🔔 [THREAD_SERVICE] EntryUpdated event for entry {} (loaded thread)", entry_idx);
+                    let thread = thread_entity.read(cx);
+                    if let Some(entry) = thread.entries().get(*entry_idx) {
+                        let content = match entry {
+                            acp_thread::AgentThreadEntry::AssistantMessage(msg) => {
+                                msg.content_only(cx)
+                            }
+                            _ => return,
+                        };
+                        let event = SyncEvent::MessageAdded {
+                            acp_thread_id: thread_id_for_events.clone(),
+                            message_id: entry_idx.to_string(),
+                            role: "assistant".to_string(),
+                            content: content.clone(),
+                            timestamp: chrono::Utc::now().timestamp(),
+                        };
+                        if let Err(e) = crate::send_websocket_event(event) {
+                            eprintln!("❌ [THREAD_SERVICE] Failed to send message_added: {}", e);
+                        }
+                    }
+                }
+                AcpThreadEvent::Stopped => {
+                    eprintln!("🛑 [THREAD_SERVICE] Thread Stopped event (loaded thread)");
+                    let current_request_id = get_thread_request_id(&thread_id_for_events)
+                        .unwrap_or_default();
+                    let event = SyncEvent::MessageCompleted {
+                        acp_thread_id: thread_id_for_events.clone(),
+                        message_id: "0".to_string(),
+                        request_id: current_request_id.clone(),
+                    };
+                    if let Err(e) = crate::send_websocket_event(event) {
+                        eprintln!("❌ [THREAD_SERVICE] Failed to send message_completed: {}", e);
+                    }
+                }
+                _ => {}
+            }
+        })
+        .detach();
+    })?;
+
+    // Register thread for future access
+    register_thread(loaded_thread_id.clone(), thread_entity.clone());
+    eprintln!("📋 [THREAD_SERVICE] Registered loaded thread: {}", loaded_thread_id);
+    log::info!("📋 [THREAD_SERVICE] Registered loaded thread: {}", loaded_thread_id);
+
+    // Notify AgentPanel to display this thread
+    if let Err(e) = crate::notify_thread_display(crate::ThreadDisplayNotification {
+        thread_entity: thread_entity.clone(),
+        helix_session_id: loaded_thread_id.clone(),
+        agent_name: agent_name.clone(),
+    }) {
+        eprintln!("⚠️ [THREAD_SERVICE] Failed to notify thread display: {}", e);
+    }
+
+    Ok(thread_entity.downgrade())
 }
 
 /// Open an existing ACP thread from database and display it (synchronous version)
