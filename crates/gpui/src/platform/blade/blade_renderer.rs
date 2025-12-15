@@ -16,6 +16,24 @@ use std::sync::Arc;
 
 const MAX_FRAME_TIME_MS: u32 = 10000;
 
+/// Gets the display sync mode from environment variable ZED_DISPLAY_SYNC.
+/// - "block" or "vsync" → DisplaySync::Block (FIFO, waits for vsync)
+/// - "recent" or "mailbox" → DisplaySync::Recent (triple buffer, no vsync wait)
+/// - "tear" or "immediate" → DisplaySync::Tear (no sync, may tear)
+/// Default is "recent" for maximum responsiveness.
+fn get_display_sync_from_env() -> gpu::DisplaySync {
+    match std::env::var("ZED_DISPLAY_SYNC")
+        .unwrap_or_default()
+        .to_lowercase()
+        .as_str()
+    {
+        "block" | "vsync" | "fifo" => gpu::DisplaySync::Block,
+        "tear" | "immediate" => gpu::DisplaySync::Tear,
+        // Default to Recent for backward compatibility
+        _ => gpu::DisplaySync::Recent,
+    }
+}
+
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
 struct GlobalParams {
@@ -353,7 +371,7 @@ impl BladeRenderer {
         let surface_config = gpu::SurfaceConfig {
             size: config.size,
             usage: gpu::TextureUsage::TARGET,
-            display_sync: gpu::DisplaySync::Recent,
+            display_sync: get_display_sync_from_env(),
             color_space: gpu::ColorSpace::Srgb,
             allow_exclusive_full_screen: false,
             transparent: config.transparent,
