@@ -932,7 +932,11 @@ impl BladeRenderer {
         self.instance_belt.flush(&sync_point);
         self.atlas.after_frame(&sync_point);
 
-        self.wait_for_gpu();
+        // Store sync point for resource cleanup operations (resize, destroy).
+        // We do NOT wait synchronously here - the swapchain's acquire_frame()
+        // handles frame pacing, and BufferBelt/Atlas use non-blocking polls
+        // for memory reclamation. Waiting here would block the main thread
+        // and cause scroll/input lag on X11/XWayland.
         self.last_sync_point = Some(sync_point);
     }
 }
