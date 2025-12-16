@@ -680,24 +680,12 @@ impl AcpThreadView {
                 "External agents are not yet supported in shared projects.".into(),
             ));
         }
-        let mut worktrees = project.read(cx).visible_worktrees(cx).collect::<Vec<_>>();
-        // Pick the first non-single-file worktree for the root directory if there are any,
-        // and otherwise the parent of a single-file worktree, falling back to $HOME if there are no visible worktrees.
-        worktrees.sort_by(|l, r| {
-            l.read(cx)
-                .is_single_file()
-                .cmp(&r.read(cx).is_single_file())
-        });
-        let root_dir = worktrees
-            .into_iter()
-            .filter_map(|worktree| {
-                if worktree.read(cx).is_single_file() {
-                    Some(worktree.read(cx).abs_path().parent()?.into())
-                } else {
-                    Some(worktree.read(cx).abs_path())
-                }
-            })
-            .next();
+        // Use ZED_WORK_DIR if set, otherwise fall back to $HOME/work.
+        // This ensures ACP session storage is always at a consistent location.
+        let root_dir: Option<std::sync::Arc<std::path::Path>> = std::env::var("ZED_WORK_DIR")
+            .ok()
+            .or_else(|| std::env::var("HOME").ok().map(|home| format!("{}/work", home)))
+            .map(|dir| std::sync::Arc::from(std::path::Path::new(&dir).to_path_buf()));
         let (status_tx, mut status_rx) = watch::channel("Loading…".into());
         let (new_version_available_tx, mut new_version_available_rx) = watch::channel(None);
         let delegate = AgentServerDelegate::new(
@@ -749,8 +737,8 @@ impl AcpThreadView {
                     .or_else(|| connection.get_last_session_id(&root_dir));
 
                 if let Some(session_id) = session_id {
-                    log::info!("🔄 [ACP SESSION] Loading session for agent: {:?}", session_id);
-                    eprintln!("🔄 [ACP SESSION] Loading session for agent: {:?}", session_id);
+                    log::info!("🔄 [ACP SESSION] Loading session {:?} with cwd: {:?}", session_id, root_dir);
+                    eprintln!("🔄 [ACP SESSION] Loading session {:?} with cwd: {:?}", session_id, root_dir);
                     cx.update(|_, cx| {
                         connection
                             .clone()
