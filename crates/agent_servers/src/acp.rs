@@ -569,8 +569,12 @@ impl AgentConnection for AcpConnection {
         self.agent_capabilities.load_session
     }
 
-    fn get_last_session_id(&self, cwd: &Path) -> Option<acp::SessionId> {
-        let session_file = cwd.join(".zed").join(format!("acp-session-{}.json", self.server_name));
+    fn get_last_session_id(&self, _cwd: &Path) -> Option<acp::SessionId> {
+        // Store in $HOME/.zed/ to avoid polluting project git repos
+        let home_dir = std::env::var("HOME").ok()?;
+        let session_file = std::path::PathBuf::from(home_dir)
+            .join(".zed")
+            .join(format!("acp-session-{}.json", self.server_name));
         log::info!("🔍 [ACP SESSION] Looking for session file at: {:?}", session_file);
         eprintln!("🔍 [ACP SESSION] Looking for session file at: {:?}", session_file);
         if session_file.exists() {
@@ -783,9 +787,18 @@ struct SavedSessionInfo {
 }
 
 fn save_session_id(cwd: &Path, agent_name: &str, session_id: &acp::SessionId) {
-    log::info!("💾 [ACP SESSION] Saving session ID {} to cwd {:?}", session_id, cwd);
-    eprintln!("💾 [ACP SESSION] Saving session ID {} to cwd {:?}", session_id, cwd);
-    let zed_dir = cwd.join(".zed");
+    // Store in $HOME/.zed/ to avoid polluting project git repos
+    let home_dir = match std::env::var("HOME") {
+        Ok(h) => h,
+        Err(_) => {
+            log::error!("❌ [ACP SESSION] HOME environment variable not set");
+            eprintln!("❌ [ACP SESSION] HOME environment variable not set");
+            return;
+        }
+    };
+    let zed_dir = std::path::PathBuf::from(home_dir).join(".zed");
+    log::info!("💾 [ACP SESSION] Saving session ID {} to {:?}", session_id, zed_dir);
+    eprintln!("💾 [ACP SESSION] Saving session ID {} to {:?}", session_id, zed_dir);
     if std::fs::create_dir_all(&zed_dir).is_ok() {
         let session_file = zed_dir.join(format!("acp-session-{}.json", agent_name));
         let timestamp = std::time::SystemTime::now()
