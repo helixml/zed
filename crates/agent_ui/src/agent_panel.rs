@@ -861,16 +861,13 @@ impl AgentPanel {
         log::info!("📋 [AGENT_PANEL] Found {} external agents: {:?}", external_agent_names.len(), external_agent_names);
         eprintln!("📋 [AGENT_PANEL] Found {} external agents: {:?}", external_agent_names.len(), external_agent_names);
 
-        // Get root_dir from project worktrees
-        let root_dir = project.read(cx).visible_worktrees(cx)
-            .filter_map(|worktree| {
-                if worktree.read(cx).is_single_file() {
-                    Some(worktree.read(cx).abs_path().parent()?.into())
-                } else {
-                    Some(worktree.read(cx).abs_path())
-                }
-            })
-            .next()
+        // Use ZED_WORK_DIR if set, otherwise fall back to $HOME/work.
+        // This ensures ACP session storage is always at a consistent location,
+        // matching the logic in thread_view.rs for session creation.
+        let root_dir: Arc<Path> = std::env::var("ZED_WORK_DIR")
+            .ok()
+            .or_else(|| std::env::var("HOME").ok().map(|home| format!("{}/work", home)))
+            .map(|dir| Arc::from(std::path::Path::new(&dir).to_path_buf()))
             .unwrap_or_else(|| paths::home_dir().as_path().into());
 
         // Spawn async task to load sessions from each agent
