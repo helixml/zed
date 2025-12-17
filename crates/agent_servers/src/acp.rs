@@ -32,6 +32,10 @@ pub struct AcpConnection {
     telemetry_id: &'static str,
     connection: Rc<acp::ClientSideConnection>,
     sessions: Rc<RefCell<HashMap<acp::SessionId, AcpSession>>>,
+    /// Buffer for session updates that arrive before the session is registered.
+    /// This handles the race condition where the agent sends updates via setImmediate
+    /// after responding to load_session, but before Zed finishes processing the response.
+    pending_updates: Rc<RefCell<HashMap<acp::SessionId, Vec<acp::SessionNotification>>>>,
     auth_methods: Vec<acp::AuthMethod>,
     agent_capabilities: acp::AgentCapabilities,
     default_mode: Option<acp::SessionModeId>,
@@ -112,6 +116,7 @@ impl AcpConnection {
         log::trace!("Spawned (pid: {})", child.id());
 
         let sessions = Rc::new(RefCell::new(HashMap::default()));
+        let pending_updates = Rc::new(RefCell::new(HashMap::default()));
 
         let (release_channel, version) = cx.update(|cx| {
             (
@@ -123,6 +128,7 @@ impl AcpConnection {
 
         let client = ClientDelegate {
             sessions: sessions.clone(),
+            pending_updates: pending_updates.clone(),
             cx: cx.clone(),
         };
         let (connection, io_task) = acp::ClientSideConnection::new(client, stdin, stdout, {
@@ -208,6 +214,7 @@ impl AcpConnection {
             server_name,
             telemetry_id,
             sessions,
+            pending_updates,
             agent_capabilities: response.agent_capabilities,
             default_mode,
             default_model,
@@ -428,7 +435,25 @@ impl AgentConnection for AcpConnection {
                 session_modes: modes,
                 models,
             };
+
+            // Extract any pending updates before inserting session
+            let pending = self.pending_updates.borrow_mut().remove(&session_id);
+
             sessions.borrow_mut().insert(session_id.clone(), session);
+
+            // Replay any pending updates that arrived before the session was registered
+            if let Some(notifications) = pending {
+                log::debug!(
+                    "Replaying {} buffered updates for session: {:?}",
+                    notifications.len(),
+                    session_id
+                );
+                for notification in notifications {
+                    thread.update(&mut cx.clone(), |thread, cx| {
+                        thread.handle_session_update(notification.update, cx)
+                    })??;
+                }
+            }
 
             // Save session ID to file for later resumption
             save_session_id(&cwd_for_save, &name, &session_id);
@@ -745,7 +770,24 @@ impl AgentConnection for AcpConnection {
                 session_modes: modes,
                 models,
             };
+
+            // Extract any pending updates before session_id is moved
+            let pending = self.pending_updates.borrow_mut().remove(&session_id);
+
             sessions.borrow_mut().insert(session_id, session);
+
+            // Replay any pending updates that arrived before the session was registered
+            if let Some(notifications) = pending {
+                log::debug!(
+                    "Replaying {} buffered updates for session",
+                    notifications.len()
+                );
+                for notification in notifications {
+                    thread.update(&mut cx.clone(), |thread, cx| {
+                        thread.handle_session_update(notification.update, cx)
+                    })??;
+                }
+            }
 
             Ok(thread)
         })
@@ -941,6 +983,7 @@ impl acp_thread::AgentModelSelector for AcpModelSelector {
 
 struct ClientDelegate {
     sessions: Rc<RefCell<HashMap<acp::SessionId, AcpSession>>>,
+    pending_updates: Rc<RefCell<HashMap<acp::SessionId, Vec<acp::SessionNotification>>>>,
     cx: AsyncApp,
 }
 
@@ -1014,9 +1057,25 @@ impl acp::Client for ClientDelegate {
         notification: acp::SessionNotification,
     ) -> Result<(), acp::Error> {
         let sessions = self.sessions.borrow();
-        let session = sessions
-            .get(&notification.session_id)
-            .context("Failed to get session")?;
+        let session = match sessions.get(&notification.session_id) {
+            Some(session) => session,
+            None => {
+                // Session not yet registered - buffer the update for later replay.
+                // This handles the race condition where agents send updates via setImmediate
+                // after responding to load_session, before Zed finishes processing the response.
+                drop(sessions); // Release borrow before mutating pending_updates
+                log::debug!(
+                    "Buffering update for pending session: {:?}",
+                    notification.session_id
+                );
+                self.pending_updates
+                    .borrow_mut()
+                    .entry(notification.session_id.clone())
+                    .or_default()
+                    .push(notification);
+                return Ok(());
+            }
+        };
 
         if let acp::SessionUpdate::CurrentModeUpdate(acp::CurrentModeUpdate {
             current_mode_id,

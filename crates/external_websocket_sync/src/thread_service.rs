@@ -360,11 +360,20 @@ fn create_new_thread_sync(
             }
         }
 
-        let cwd = cx.update(|cx| {
-            project_clone.read(cx).worktrees(cx).next()
-                .map(|wt| wt.read(cx).abs_path().to_path_buf())
-                .unwrap_or_else(|| std::env::current_dir().unwrap_or_default())
-        })?;
+        // Use ZED_WORK_DIR for consistency with agent_panel.rs and thread_view.rs
+        // This ensures sessions created here can be found when listing/loading sessions
+        // from the UI (which also uses ZED_WORK_DIR as the cwd for project hash calculation)
+        let cwd = std::env::var("ZED_WORK_DIR")
+            .ok()
+            .map(|dir| std::path::PathBuf::from(dir))
+            .unwrap_or_else(|| {
+                // Fallback to first worktree if ZED_WORK_DIR not set
+                cx.update(|cx| {
+                    project_clone.read(cx).worktrees(cx).next()
+                        .map(|wt| wt.read(cx).abs_path().to_path_buf())
+                        .unwrap_or_else(|| std::env::current_dir().unwrap_or_default())
+                }).unwrap_or_else(|_| std::env::current_dir().unwrap_or_default())
+            });
         let thread_entity = cx.update(|cx| {
             connection.new_thread(project_clone.clone(), &cwd, cx)
         })?.await?;
@@ -640,9 +649,15 @@ async fn load_thread_from_agent(
             None,
         );
         let connection_task = server.connect(None, delegate, cx);
-        let cwd = project.read(cx).worktrees(cx).next()
-            .map(|wt| wt.read(cx).abs_path().to_path_buf())
-            .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
+        // Use ZED_WORK_DIR for consistency with session storage
+        let cwd = std::env::var("ZED_WORK_DIR")
+            .ok()
+            .map(|dir| std::path::PathBuf::from(dir))
+            .unwrap_or_else(|| {
+                project.read(cx).worktrees(cx).next()
+                    .map(|wt| wt.read(cx).abs_path().to_path_buf())
+                    .unwrap_or_else(|| std::env::current_dir().unwrap_or_default())
+            });
         (connection_task, cwd)
     })?;
 
@@ -816,10 +831,15 @@ fn open_existing_thread_sync(
     // Connect to get AgentConnection
     let connection_task = server.connect(None, delegate, cx);
 
-    // Get cwd for load_thread
-    let cwd = project.read(cx).worktrees(cx).next()
-        .map(|wt| wt.read(cx).abs_path().to_path_buf())
-        .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
+    // Use ZED_WORK_DIR for consistency with session storage
+    let cwd = std::env::var("ZED_WORK_DIR")
+        .ok()
+        .map(|dir| std::path::PathBuf::from(dir))
+        .unwrap_or_else(|| {
+            project.read(cx).worktrees(cx).next()
+                .map(|wt| wt.read(cx).abs_path().to_path_buf())
+                .unwrap_or_else(|| std::env::current_dir().unwrap_or_default())
+        });
 
     // Spawn async task to load the thread from agent
     let request_clone = request.clone();
