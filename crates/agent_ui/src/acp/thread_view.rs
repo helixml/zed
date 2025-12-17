@@ -680,8 +680,7 @@ impl AcpThreadView {
                 "External agents are not yet supported in shared projects.".into(),
             ));
         }
-        // Use ZED_WORK_DIR if set (always set in Helix sandbox via wolf_executor.go).
-        // This ensures ACP session storage is always at a consistent location.
+        // Use ZED_WORK_DIR if set to ensure ACP session storage uses a consistent location.
         let root_dir: Option<std::sync::Arc<std::path::Path>> = std::env::var("ZED_WORK_DIR")
             .ok()
             .map(|dir| std::sync::Arc::from(std::path::Path::new(&dir).to_path_buf()));
