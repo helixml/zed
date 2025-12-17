@@ -861,12 +861,11 @@ impl AgentPanel {
         log::info!("📋 [AGENT_PANEL] Found {} external agents: {:?}", external_agent_names.len(), external_agent_names);
         eprintln!("📋 [AGENT_PANEL] Found {} external agents: {:?}", external_agent_names.len(), external_agent_names);
 
-        // Use ZED_WORK_DIR if set, otherwise fall back to $HOME/work.
+        // Use ZED_WORK_DIR if set (always set in Helix sandbox via wolf_executor.go).
         // This ensures ACP session storage is always at a consistent location,
         // matching the logic in thread_view.rs for session creation.
         let root_dir: Arc<Path> = std::env::var("ZED_WORK_DIR")
             .ok()
-            .or_else(|| std::env::var("HOME").ok().map(|home| format!("{}/work", home)))
             .map(|dir| Arc::from(std::path::Path::new(&dir).to_path_buf()))
             .unwrap_or_else(|| paths::home_dir().as_path().into());
 
