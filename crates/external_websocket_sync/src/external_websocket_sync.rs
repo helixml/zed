@@ -70,6 +70,15 @@ impl Global for WebSocketSender {}
 static GLOBAL_THREAD_CREATION_CALLBACK: parking_lot::Mutex<Option<mpsc::UnboundedSender<ThreadCreationRequest>>> =
     parking_lot::Mutex::new(None);
 
+/// Pending thread creation requests that arrived before callback was initialized
+/// These get replayed when init_thread_creation_callback is called
+static PENDING_THREAD_CREATION_REQUESTS: parking_lot::Mutex<Vec<ThreadCreationRequest>> =
+    parking_lot::Mutex::new(Vec::new());
+
+/// Pending thread open requests that arrived before callback was initialized
+static PENDING_THREAD_OPEN_REQUESTS: parking_lot::Mutex<Vec<ThreadOpenRequest>> =
+    parking_lot::Mutex::new(Vec::new());
+
 /// Static global for thread display callback (notifies AgentPanel to auto-select thread)
 static GLOBAL_THREAD_DISPLAY_CALLBACK: parking_lot::Mutex<Option<mpsc::UnboundedSender<ThreadDisplayNotification>>> =
     parking_lot::Mutex::new(None);
@@ -113,8 +122,12 @@ pub struct ThreadCreationCallback {
 impl Global for ThreadCreationCallback {}
 
 /// Send thread creation request to agent_panel via callback
+/// If callback is not yet initialized (Zed restart race condition), queue the request
+/// and replay when init_thread_creation_callback is called
 pub fn request_thread_creation(request: ThreadCreationRequest) -> Result<()> {
     log::info!("🔧 [CALLBACK] request_thread_creation() called: acp_thread_id={:?}, request_id={}",
+               request.acp_thread_id, request.request_id);
+    eprintln!("🔧 [CALLBACK] request_thread_creation() called: acp_thread_id={:?}, request_id={}",
                request.acp_thread_id, request.request_id);
 
     let sender = GLOBAL_THREAD_CREATION_CALLBACK.lock().clone();
@@ -128,17 +141,44 @@ pub fn request_thread_creation(request: ThreadCreationRequest) -> Result<()> {
         log::info!("✅ [CALLBACK] Request sent to callback channel successfully");
         Ok(())
     } else {
-        log::error!("❌ [CALLBACK] Thread creation callback not initialized!");
-        log::error!("❌ [CALLBACK] This means setup_thread_handler() was never called");
-        Err(anyhow::anyhow!("Thread creation callback not initialized"))
+        // Queue the request for later - this handles Zed restart race condition
+        // where WebSocket reconnects before workspace/thread_service is initialized
+        log::warn!("⏳ [CALLBACK] Thread creation callback not yet initialized - queueing request for later replay");
+        eprintln!("⏳ [CALLBACK] Thread creation callback not yet initialized - queueing request_id={} for later replay", request.request_id);
+        PENDING_THREAD_CREATION_REQUESTS.lock().push(request);
+        log::info!("✅ [CALLBACK] Request queued successfully (will replay when callback is registered)");
+        eprintln!("✅ [CALLBACK] Request queued successfully (will replay when callback is registered)");
+        Ok(())
     }
 }
 
 /// Initialize the global callback sender (called from thread_service or tests)
+/// Also replays any pending requests that arrived before callback was initialized
 pub fn init_thread_creation_callback(sender: mpsc::UnboundedSender<ThreadCreationRequest>) {
     log::info!("🔧 [CALLBACK] init_thread_creation_callback() called - registering global callback");
-    *GLOBAL_THREAD_CREATION_CALLBACK.lock() = Some(sender);
+    eprintln!("🔧 [CALLBACK] init_thread_creation_callback() called - registering global callback");
+
+    // Store the callback
+    *GLOBAL_THREAD_CREATION_CALLBACK.lock() = Some(sender.clone());
     log::info!("✅ [CALLBACK] Global thread creation callback registered");
+    eprintln!("✅ [CALLBACK] Global thread creation callback registered");
+
+    // Replay any pending requests that arrived before callback was ready
+    let pending: Vec<ThreadCreationRequest> = std::mem::take(&mut *PENDING_THREAD_CREATION_REQUESTS.lock());
+    if !pending.is_empty() {
+        log::info!("🔄 [CALLBACK] Replaying {} pending thread creation requests", pending.len());
+        eprintln!("🔄 [CALLBACK] Replaying {} pending thread creation requests", pending.len());
+        for request in pending {
+            log::info!("🔄 [CALLBACK] Replaying request_id={}", request.request_id);
+            eprintln!("🔄 [CALLBACK] Replaying request_id={}", request.request_id);
+            if let Err(e) = sender.send(request) {
+                log::error!("❌ [CALLBACK] Failed to replay pending request: {:?}", e);
+                eprintln!("❌ [CALLBACK] Failed to replay pending request: {:?}", e);
+            }
+        }
+        log::info!("✅ [CALLBACK] Finished replaying pending requests");
+        eprintln!("✅ [CALLBACK] Finished replaying pending requests");
+    }
 }
 
 /// Initialize the global thread display callback (called from agent_panel)
@@ -149,15 +189,39 @@ pub fn init_thread_display_callback(sender: mpsc::UnboundedSender<ThreadDisplayN
 }
 
 /// Initialize the global thread open callback (called from thread_service)
+/// Also replays any pending requests that arrived before callback was initialized
 pub fn init_thread_open_callback(sender: mpsc::UnboundedSender<ThreadOpenRequest>) {
     log::info!("🔧 [CALLBACK] init_thread_open_callback() called - registering global callback");
-    *GLOBAL_THREAD_OPEN_CALLBACK.lock() = Some(sender);
+    eprintln!("🔧 [CALLBACK] init_thread_open_callback() called - registering global callback");
+
+    // Store the callback
+    *GLOBAL_THREAD_OPEN_CALLBACK.lock() = Some(sender.clone());
     log::info!("✅ [CALLBACK] Global thread open callback registered");
+    eprintln!("✅ [CALLBACK] Global thread open callback registered");
+
+    // Replay any pending requests that arrived before callback was ready
+    let pending: Vec<ThreadOpenRequest> = std::mem::take(&mut *PENDING_THREAD_OPEN_REQUESTS.lock());
+    if !pending.is_empty() {
+        log::info!("🔄 [CALLBACK] Replaying {} pending thread open requests", pending.len());
+        eprintln!("🔄 [CALLBACK] Replaying {} pending thread open requests", pending.len());
+        for request in pending {
+            log::info!("🔄 [CALLBACK] Replaying thread open for acp_thread_id={}", request.acp_thread_id);
+            eprintln!("🔄 [CALLBACK] Replaying thread open for acp_thread_id={}", request.acp_thread_id);
+            if let Err(e) = sender.send(request) {
+                log::error!("❌ [CALLBACK] Failed to replay pending open request: {:?}", e);
+                eprintln!("❌ [CALLBACK] Failed to replay pending open request: {:?}", e);
+            }
+        }
+        log::info!("✅ [CALLBACK] Finished replaying pending open requests");
+        eprintln!("✅ [CALLBACK] Finished replaying pending open requests");
+    }
 }
 
 /// Request opening a thread (called from WebSocket handler)
+/// If callback is not yet initialized (Zed restart race condition), queue the request
 pub fn request_thread_open(request: ThreadOpenRequest) -> Result<()> {
     log::info!("🔧 [CALLBACK] request_thread_open() called: acp_thread_id={}", request.acp_thread_id);
+    eprintln!("🔧 [CALLBACK] request_thread_open() called: acp_thread_id={}", request.acp_thread_id);
 
     let sender = GLOBAL_THREAD_OPEN_CALLBACK.lock().clone();
     if let Some(sender) = sender {
@@ -170,8 +234,13 @@ pub fn request_thread_open(request: ThreadOpenRequest) -> Result<()> {
         log::info!("✅ [CALLBACK] Request sent to callback channel successfully");
         Ok(())
     } else {
-        log::error!("❌ [CALLBACK] Thread open callback not initialized!");
-        Err(anyhow::anyhow!("Thread open callback not initialized"))
+        // Queue the request for later - this handles Zed restart race condition
+        log::warn!("⏳ [CALLBACK] Thread open callback not yet initialized - queueing request for later replay");
+        eprintln!("⏳ [CALLBACK] Thread open callback not yet initialized - queueing acp_thread_id={} for later replay", request.acp_thread_id);
+        PENDING_THREAD_OPEN_REQUESTS.lock().push(request);
+        log::info!("✅ [CALLBACK] Open request queued successfully (will replay when callback is registered)");
+        eprintln!("✅ [CALLBACK] Open request queued successfully (will replay when callback is registered)");
+        Ok(())
     }
 }
 
