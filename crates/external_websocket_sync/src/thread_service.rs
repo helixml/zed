@@ -450,15 +450,19 @@ fn create_new_thread_sync(
                         // Get the updated content
                         let thread = thread_entity.read(cx);
                         if let Some(entry) = thread.entries().get(*entry_idx) {
-                            // Extract content from AssistantMessage variant
+                            // Extract content from entry - handle both AssistantMessage and ToolCall
                             let content = match entry {
                                 acp_thread::AgentThreadEntry::AssistantMessage(msg) => {
                                     // Use content_only() to avoid "## Assistant" heading in Helix UI
                                     msg.content_only(cx)
                                 }
-                                _ => {
-                                    eprintln!("⚠️ [THREAD_SERVICE] Entry {} is not an AssistantMessage, skipping", entry_idx);
-                                    return; // Only send events for assistant messages
+                                acp_thread::AgentThreadEntry::ToolCall(tool_call) => {
+                                    // Serialize tool call (includes diffs) to markdown
+                                    tool_call.to_markdown(cx)
+                                }
+                                acp_thread::AgentThreadEntry::UserMessage(_) => {
+                                    eprintln!("⚠️ [THREAD_SERVICE] Entry {} is a UserMessage, skipping", entry_idx);
+                                    return; // Don't echo user messages back
                                 }
                             };
 
@@ -741,11 +745,15 @@ async fn load_thread_from_agent(
                     eprintln!("🔔 [THREAD_SERVICE] EntryUpdated event for entry {} (loaded thread)", entry_idx);
                     let thread = thread_entity.read(cx);
                     if let Some(entry) = thread.entries().get(*entry_idx) {
+                        // Handle both AssistantMessage and ToolCall (which contains diffs)
                         let content = match entry {
                             acp_thread::AgentThreadEntry::AssistantMessage(msg) => {
                                 msg.content_only(cx)
                             }
-                            _ => return,
+                            acp_thread::AgentThreadEntry::ToolCall(tool_call) => {
+                                tool_call.to_markdown(cx)
+                            }
+                            acp_thread::AgentThreadEntry::UserMessage(_) => return,
                         };
                         let event = SyncEvent::MessageAdded {
                             acp_thread_id: thread_id_for_events.clone(),

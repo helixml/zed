@@ -2,7 +2,6 @@ use anyhow::Result;
 use buffer_diff::{BufferDiff, BufferDiffSnapshot};
 use editor::{MultiBuffer, PathKey, multibuffer_context_lines};
 use gpui::{App, AppContext, AsyncApp, Context, Entity, Subscription, Task};
-use itertools::Itertools;
 use language::{
     Anchor, Buffer, Capability, LanguageRegistry, OffsetRangeExt as _, Point, Rope, TextBuffer,
 };
@@ -142,27 +141,47 @@ impl Diff {
     }
 
     pub fn to_markdown(&self, cx: &App) -> String {
-        let buffer_text = self
-            .multibuffer()
-            .read(cx)
-            .all_buffers()
-            .iter()
-            .map(|buffer| buffer.read(cx).text())
-            .join("\n");
-        let path = match self {
+        let (base_text, new_text, path) = match self {
             Diff::Pending(PendingDiff {
-                new_buffer: buffer, ..
-            }) => buffer
-                .read(cx)
-                .file()
-                .map(|file| file.path().display(file.path_style(cx))),
-            Diff::Finalized(FinalizedDiff { path, .. }) => Some(path.as_str().into()),
+                base_text,
+                new_buffer,
+                ..
+            }) => {
+                let path = new_buffer
+                    .read(cx)
+                    .file()
+                    .map(|file| file.path().display(file.path_style(cx)));
+                (base_text.as_str().to_string(), new_buffer.read(cx).text(), path)
+            }
+            Diff::Finalized(FinalizedDiff {
+                base_text,
+                new_buffer,
+                path,
+                ..
+            }) => {
+                (base_text.to_string(), new_buffer.read(cx).text(), Some(path.as_str().into()))
+            }
         };
-        format!(
-            "Diff: {}\n```\n{}\n```\n",
-            path.unwrap_or("untitled".into()),
-            buffer_text
-        )
+
+        // Generate proper unified diff format
+        let unified = language::unified_diff(&base_text, &new_text);
+        let path_display = path.unwrap_or("untitled".into());
+
+        if unified.is_empty() {
+            // No changes - show the file content as-is
+            format!(
+                "File: {}\n```\n{}\n```\n",
+                path_display,
+                new_text
+            )
+        } else {
+            // Show unified diff
+            format!(
+                "Diff: {}\n```diff\n{}\n```\n",
+                path_display,
+                unified
+            )
+        }
     }
 
     pub fn has_revealed_range(&self, cx: &App) -> bool {

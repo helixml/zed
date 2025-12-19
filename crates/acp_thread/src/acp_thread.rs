@@ -338,7 +338,8 @@ impl ToolCall {
         })
     }
 
-    fn to_markdown(&self, cx: &App) -> String {
+    /// Serialize tool call to markdown (for external sync to Helix)
+    pub fn to_markdown(&self, cx: &App) -> String {
         let mut markdown = format!(
             "**Tool Call: {}**\nStatus: {}\n\n",
             self.label.read(cx).source(),
