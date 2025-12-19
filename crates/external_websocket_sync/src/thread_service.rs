@@ -231,15 +231,32 @@ pub fn setup_thread_handler(
                             continue;
                         }
                         Err(e) => {
+                            // CRITICAL: Do NOT create a new thread when we have a valid acp_thread_id!
+                            // The thread likely exists but was loaded via UI (agent_panel clicked the session),
+                            // so it's not in our THREAD_REGISTRY. Creating a new thread would cause:
+                            // 1. Duplicate sessions with different acp_thread_ids
+                            // 2. message_completed sent with wrong acp_thread_id
+                            // 3. Helix text box never clears (waiting for original acp_thread_id)
                             eprintln!(
-                                "⚠️ [THREAD_SERVICE] Failed to load thread {} from agent: {}, creating new thread",
+                                "❌ [THREAD_SERVICE] Failed to load thread {} from agent: {} - NOT creating new thread (thread may be active via UI)",
                                 existing_thread_id, e
                             );
-                            log::warn!(
-                                "⚠️ [THREAD_SERVICE] Failed to load thread {} from agent: {}, creating new thread",
+                            log::error!(
+                                "❌ [THREAD_SERVICE] Failed to load thread {} from agent: {} - NOT creating new thread",
                                 existing_thread_id, e
                             );
-                            // Fall through to create new thread
+
+                            // Send error event back to Helix so user knows something went wrong
+                            let error_event = SyncEvent::ThreadLoadError {
+                                acp_thread_id: existing_thread_id.clone(),
+                                request_id: request.request_id.clone(),
+                                error: format!("Failed to load thread: {}", e),
+                            };
+                            if let Err(send_err) = crate::send_websocket_event(error_event) {
+                                eprintln!("❌ [THREAD_SERVICE] Failed to send error event: {}", send_err);
+                            }
+
+                            continue; // Do NOT fall through to create_new_thread_sync!
                         }
                     }
                 }

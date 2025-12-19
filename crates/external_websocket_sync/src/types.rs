@@ -201,6 +201,13 @@ pub enum SyncEvent {
         message_id: String,
         request_id: String,
     },
+    /// Sent when thread loading fails (e.g., session already active via UI)
+    #[serde(rename = "thread_load_error")]
+    ThreadLoadError {
+        acp_thread_id: String,
+        request_id: String,
+        error: String,
+    },
 }
 
 impl SyncEvent {
@@ -244,6 +251,14 @@ impl SyncEvent {
                     "acp_thread_id": acp_thread_id,
                     "message_id": message_id,
                     "request_id": request_id,
+                })
+            ),
+            SyncEvent::ThreadLoadError { acp_thread_id, request_id, error } => (
+                "thread_load_error".to_string(),
+                serde_json::json!({
+                    "acp_thread_id": acp_thread_id,
+                    "request_id": request_id,
+                    "error": error,
                 })
             ),
         };
