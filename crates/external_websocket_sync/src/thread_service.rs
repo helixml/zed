@@ -64,7 +64,7 @@ fn mark_external_originated_entry(thread_id: String, entry_idx: usize) {
 }
 
 /// Check if entry originated from external system
-fn is_external_originated_entry(thread_id: &str, entry_idx: usize) -> bool {
+pub fn is_external_originated_entry(thread_id: &str, entry_idx: usize) -> bool {
     let map = EXTERNAL_ORIGINATED_ENTRIES.lock();
     if let Some(m) = map.as_ref() {
         m.read().get(thread_id).map_or(false, |set| set.contains(&entry_idx))
@@ -407,113 +407,8 @@ fn create_new_thread_sync(
         // Store the current request_id for this thread (so message_completed uses correct ID)
         set_thread_request_id(acp_thread_id.clone(), request_clone.request_id.clone());
 
-        // Subscribe to thread events for streaming responses
-        let thread_id_for_events = acp_thread_id.clone();
-        cx.update(|cx| {
-            cx.subscribe(&thread_entity, move |thread_entity, event, cx| {
-                match event {
-                    AcpThreadEvent::NewEntry => {
-                        eprintln!("🆕 [THREAD_SERVICE] NewEntry event received");
-                        // Check if the latest entry is a UserMessage (user typed in Zed)
-                        let thread = thread_entity.read(cx);
-                        let latest_idx = thread.entries().len().saturating_sub(1);
-
-                        // Skip if this entry originated from external system
-                        if is_external_originated_entry(&thread_id_for_events, latest_idx) {
-                            eprintln!("🔄 [THREAD_SERVICE] Entry {} from external system, skipping echo", latest_idx);
-                            return;
-                        }
-
-                        if let Some(entry) = thread.entries().get(latest_idx) {
-                            if let acp_thread::AgentThreadEntry::UserMessage(msg) = entry {
-                                let content = msg.content.to_markdown(cx).to_string();
-                                eprintln!("👤 [THREAD_SERVICE] User typed in Zed, syncing to external: {} chars", content.len());
-
-                                let event = SyncEvent::MessageAdded {
-                                    acp_thread_id: thread_id_for_events.clone(),
-                                    message_id: latest_idx.to_string(),
-                                    role: "user".to_string(),
-                                    content: content.clone(),
-                                    timestamp: chrono::Utc::now().timestamp(),
-                                };
-
-                                if let Err(e) = crate::send_websocket_event(event) {
-                                    eprintln!("❌ [THREAD_SERVICE] Failed to send user message: {}", e);
-                                } else {
-                                    eprintln!("📤 [THREAD_SERVICE] Sent user message (entry {}): {} chars", latest_idx, content.len());
-                                }
-                            }
-                        }
-                    }
-                    AcpThreadEvent::EntryUpdated(entry_idx) => {
-                        eprintln!("🔔 [THREAD_SERVICE] EntryUpdated event received for entry {}", entry_idx);
-                        // Get the updated content
-                        let thread = thread_entity.read(cx);
-                        if let Some(entry) = thread.entries().get(*entry_idx) {
-                            // Extract content from entry - handle both AssistantMessage and ToolCall
-                            let content = match entry {
-                                acp_thread::AgentThreadEntry::AssistantMessage(msg) => {
-                                    // Use content_only() to avoid "## Assistant" heading in Helix UI
-                                    msg.content_only(cx)
-                                }
-                                acp_thread::AgentThreadEntry::ToolCall(tool_call) => {
-                                    // Serialize tool call (includes diffs) to markdown
-                                    tool_call.to_markdown(cx)
-                                }
-                                acp_thread::AgentThreadEntry::UserMessage(_) => {
-                                    eprintln!("⚠️ [THREAD_SERVICE] Entry {} is a UserMessage, skipping", entry_idx);
-                                    return; // Don't echo user messages back
-                                }
-                            };
-
-                            // Send message_added event
-                            let event = SyncEvent::MessageAdded {
-                                acp_thread_id: thread_id_for_events.clone(),
-                                message_id: entry_idx.to_string(),
-                                role: "assistant".to_string(),
-                                content: content.clone(),
-                                timestamp: chrono::Utc::now().timestamp(),
-                            };
-
-                            if let Err(e) = crate::send_websocket_event(event) {
-                                eprintln!("❌ [THREAD_SERVICE] Failed to send message_added: {}", e);
-                                log::error!("❌ [THREAD_SERVICE] Failed to send message_added: {}", e);
-                            } else {
-                                eprintln!("📤 [THREAD_SERVICE] Sent message_added chunk (entry {}): {} chars", entry_idx, content.len());
-                                log::debug!("📤 [THREAD_SERVICE] Sent message_added chunk (entry {})", entry_idx);
-                            }
-                        }
-                    }
-                    AcpThreadEvent::Stopped => {
-                        eprintln!("🛑 [THREAD_SERVICE] Thread Stopped event received");
-
-                        // Get the CURRENT request_id for this thread (not the first one!)
-                        let current_request_id = get_thread_request_id(&thread_id_for_events)
-                            .unwrap_or_else(|| {
-                                eprintln!("⚠️ [THREAD_SERVICE] No request_id found for thread {}, using empty string", thread_id_for_events);
-                                String::new()
-                            });
-
-                        // Send message_completed event with CORRECT request_id
-                        let event = SyncEvent::MessageCompleted {
-                            acp_thread_id: thread_id_for_events.clone(),
-                            message_id: "0".to_string(), // TODO: track actual message ID
-                            request_id: current_request_id.clone(),
-                        };
-
-                        if let Err(e) = crate::send_websocket_event(event) {
-                            eprintln!("❌ [THREAD_SERVICE] Failed to send message_completed: {}", e);
-                            log::error!("❌ [THREAD_SERVICE] Failed to send message_completed: {}", e);
-                        } else {
-                            eprintln!("📤 [THREAD_SERVICE] Sent message_completed for request: {}", current_request_id);
-                            log::info!("📤 [THREAD_SERVICE] Sent message_completed for request: {}", current_request_id);
-                        }
-                    }
-                    _ => {}
-                }
-            })
-            .detach();
-        })?;
+        // NOTE: WebSocket event sending is now handled centrally in ThreadView.handle_thread_event
+        // This avoids duplicate events when thread is both created here and displayed in UI via from_existing_thread
 
         // Register thread for follow-up messages (strong reference keeps it alive)
         register_thread(acp_thread_id.clone(), thread_entity.clone());

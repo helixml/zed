@@ -1681,6 +1681,37 @@ impl AcpThreadView {
                             .and_then(|entry| entry.focus_handle(cx))],
                     );
                 });
+
+                // Send WebSocket event for user messages typed in Zed
+                #[cfg(feature = "external_websocket_sync")]
+                {
+                    let thread_read = thread.read(cx);
+                    let acp_thread_id = thread_read.session_id().to_string();
+
+                    // Skip if this entry originated from external system (prevents echo)
+                    if !external_websocket_sync::is_external_originated_entry(&acp_thread_id, index) {
+                        if let Some(entry) = thread_read.entries().get(index) {
+                            // Only sync user messages (assistant messages are handled via EntryUpdated)
+                            if let acp_thread::AgentThreadEntry::UserMessage(msg) = entry {
+                                let content = msg.content.to_markdown(cx).to_string();
+                                eprintln!("📤 [ZED-UI] NewEntry {} (user) -> MessageAdded ({} chars)", index, content.len());
+                                log::info!("📤 [ZED-UI] NewEntry {} (user) -> MessageAdded ({} chars)", index, content.len());
+                                if let Err(e) = external_websocket_sync::send_websocket_event(
+                                    external_websocket_sync::SyncEvent::MessageAdded {
+                                        acp_thread_id,
+                                        message_id: index.to_string(),
+                                        role: "user".to_string(),
+                                        content,
+                                        timestamp: chrono::Utc::now().timestamp(),
+                                    }
+                                ) {
+                                    eprintln!("❌ [ZED-UI] Failed to send user message: {}", e);
+                                    log::error!("❌ [ZED-UI] Failed to send user message: {}", e);
+                                }
+                            }
+                        }
+                    }
+                }
             }
             AcpThreadEvent::EntryUpdated(index) => {
                 self.entry_view_state.update(cx, |view_state, cx| {
