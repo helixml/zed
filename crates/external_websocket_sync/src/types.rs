@@ -208,6 +208,15 @@ pub enum SyncEvent {
         request_id: String,
         error: String,
     },
+    /// Sent when the agent (e.g., qwen-code) has finished initialization and is ready to receive prompts
+    /// This prevents race conditions where Helix sends prompts before the agent is ready
+    #[serde(rename = "agent_ready")]
+    AgentReady {
+        /// Name of the agent that became ready (e.g., "qwen", "zed-agent")
+        agent_name: String,
+        /// Optional thread ID if a thread was loaded from session
+        thread_id: Option<String>,
+    },
 }
 
 impl SyncEvent {
@@ -259,6 +268,13 @@ impl SyncEvent {
                     "acp_thread_id": acp_thread_id,
                     "request_id": request_id,
                     "error": error,
+                })
+            ),
+            SyncEvent::AgentReady { agent_name, thread_id } => (
+                "agent_ready".to_string(),
+                serde_json::json!({
+                    "agent_name": agent_name,
+                    "thread_id": thread_id,
                 })
             ),
         };

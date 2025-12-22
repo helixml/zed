@@ -520,6 +520,11 @@ fn create_new_thread_sync(
         eprintln!("📋 [THREAD_SERVICE] Registered thread: {} (strong reference)", acp_thread_id);
         log::info!("📋 [THREAD_SERVICE] Registered thread: {} (strong reference)", acp_thread_id);
 
+        // Send agent_ready event to Helix (signals that agent is ready to receive prompts)
+        // This prevents race conditions where Helix sends continue prompts before agent is initialized
+        let agent_name_for_ready = request_clone.agent_name.clone().unwrap_or_else(|| "zed-agent".to_string());
+        crate::send_agent_ready(agent_name_for_ready, Some(acp_thread_id.clone()));
+
         // Notify AgentPanel to display this thread (for auto-select in UI)
         if let Err(e) = crate::notify_thread_display(crate::ThreadDisplayNotification {
             thread_entity: thread_entity.clone(),
@@ -791,6 +796,10 @@ async fn load_thread_from_agent(
     eprintln!("📋 [THREAD_SERVICE] Registered loaded thread: {}", loaded_thread_id);
     log::info!("📋 [THREAD_SERVICE] Registered loaded thread: {}", loaded_thread_id);
 
+    // Send agent_ready event to Helix (signals that agent is ready to receive prompts)
+    let agent_name_for_ready = agent_name.clone().unwrap_or_else(|| "zed-agent".to_string());
+    crate::send_agent_ready(agent_name_for_ready, Some(loaded_thread_id.clone()));
+
     // Notify AgentPanel to display this thread
     if let Err(e) = crate::notify_thread_display(crate::ThreadDisplayNotification {
         thread_entity: thread_entity.clone(),
@@ -921,6 +930,10 @@ fn open_existing_thread_sync(
         register_thread(acp_thread_id.clone(), thread_entity.clone());
         eprintln!("📋 [THREAD_SERVICE] Registered thread: {} (strong reference)", acp_thread_id);
         log::info!("📋 [THREAD_SERVICE] Registered thread: {} (strong reference)", acp_thread_id);
+
+        // Send agent_ready event to Helix (signals that agent is ready to receive prompts)
+        let agent_name_for_ready = request_clone.agent_name.clone().unwrap_or_else(|| "zed-agent".to_string());
+        crate::send_agent_ready(agent_name_for_ready, Some(acp_thread_id.clone()));
 
         // Notify AgentPanel to display this thread (for auto-select in UI)
         if let Err(e) = crate::notify_thread_display(crate::ThreadDisplayNotification {

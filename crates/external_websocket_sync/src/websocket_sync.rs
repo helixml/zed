@@ -542,6 +542,30 @@ pub fn send_websocket_event(event: SyncEvent) -> Result<()> {
     }
 }
 
+/// Notify Helix that the agent is ready to receive prompts
+/// This should be called after the agent process (e.g., qwen-code) has initialized via ACP
+/// It prevents race conditions where Helix sends prompts before the agent is ready
+pub fn send_agent_ready(agent_name: String, thread_id: Option<String>) {
+    log::info!("🚀 [WEBSOCKET] Sending agent_ready event: agent_name={}, thread_id={:?}",
+               agent_name, thread_id);
+    eprintln!("🚀 [WEBSOCKET] Sending agent_ready event: agent_name={}, thread_id={:?}",
+              agent_name, thread_id);
+
+    match send_websocket_event(SyncEvent::AgentReady {
+        agent_name: agent_name.clone(),
+        thread_id: thread_id.clone(),
+    }) {
+        Ok(_) => {
+            log::info!("✅ [WEBSOCKET] agent_ready event sent successfully");
+            eprintln!("✅ [WEBSOCKET] agent_ready event sent successfully");
+        }
+        Err(e) => {
+            log::warn!("⚠️ [WEBSOCKET] Failed to send agent_ready event (may not be connected): {}", e);
+            eprintln!("⚠️ [WEBSOCKET] Failed to send agent_ready event (may not be connected): {}", e);
+        }
+    }
+}
+
 /// WebSocket connection status for UI display
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WebSocketConnectionStatus {
