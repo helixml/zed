@@ -1682,7 +1682,7 @@ impl AcpThreadView {
                     );
                 });
 
-                // Send WebSocket event for user messages typed in Zed
+                // Send WebSocket event for new entries
                 #[cfg(feature = "external_websocket_sync")]
                 {
                     let thread_read = thread.read(cx);
@@ -1691,22 +1691,63 @@ impl AcpThreadView {
                     // Skip if this entry originated from external system (prevents echo)
                     if !external_websocket_sync::is_external_originated_entry(&acp_thread_id, index) {
                         if let Some(entry) = thread_read.entries().get(index) {
-                            // Only sync user messages (assistant messages are handled via EntryUpdated)
-                            if let acp_thread::AgentThreadEntry::UserMessage(msg) = entry {
-                                let content = msg.content.to_markdown(cx).to_string();
-                                eprintln!("📤 [ZED-UI] NewEntry {} (user) -> MessageAdded ({} chars)", index, content.len());
-                                log::info!("📤 [ZED-UI] NewEntry {} (user) -> MessageAdded ({} chars)", index, content.len());
-                                if let Err(e) = external_websocket_sync::send_websocket_event(
-                                    external_websocket_sync::SyncEvent::MessageAdded {
-                                        acp_thread_id,
-                                        message_id: index.to_string(),
-                                        role: "user".to_string(),
-                                        content,
-                                        timestamp: chrono::Utc::now().timestamp(),
+                            match entry {
+                                acp_thread::AgentThreadEntry::UserMessage(msg) => {
+                                    // User messages get their own message_id (for proper display)
+                                    let content = msg.content.to_markdown(cx).to_string();
+                                    eprintln!("📤 [ZED-UI] NewEntry {} (user) -> MessageAdded ({} chars)", index, content.len());
+                                    log::info!("📤 [ZED-UI] NewEntry {} (user) -> MessageAdded ({} chars)", index, content.len());
+                                    if let Err(e) = external_websocket_sync::send_websocket_event(
+                                        external_websocket_sync::SyncEvent::MessageAdded {
+                                            acp_thread_id,
+                                            message_id: index.to_string(),
+                                            role: "user".to_string(),
+                                            content,
+                                            timestamp: chrono::Utc::now().timestamp(),
+                                        }
+                                    ) {
+                                        eprintln!("❌ [ZED-UI] Failed to send user message: {}", e);
+                                        log::error!("❌ [ZED-UI] Failed to send user message: {}", e);
                                     }
-                                ) {
-                                    eprintln!("❌ [ZED-UI] Failed to send user message: {}", e);
-                                    log::error!("❌ [ZED-UI] Failed to send user message: {}", e);
+                                }
+                                acp_thread::AgentThreadEntry::AssistantMessage(_) |
+                                acp_thread::AgentThreadEntry::ToolCall(_) => {
+                                    // For assistant/tool entries, send cumulative content immediately
+                                    // so Helix sees new tool calls when they start (before any output)
+                                    let mut cumulative_content = String::new();
+                                    for e in thread_read.entries().iter() {
+                                        let entry_content = match e {
+                                            acp_thread::AgentThreadEntry::AssistantMessage(msg) => {
+                                                Some(msg.content_only(cx))
+                                            }
+                                            acp_thread::AgentThreadEntry::ToolCall(tool_call) => {
+                                                Some(tool_call.to_markdown(cx))
+                                            }
+                                            acp_thread::AgentThreadEntry::UserMessage(_) => None,
+                                        };
+                                        if let Some(content) = entry_content {
+                                            if !cumulative_content.is_empty() {
+                                                cumulative_content.push_str("\n\n");
+                                            }
+                                            cumulative_content.push_str(&content);
+                                        }
+                                    }
+                                    if !cumulative_content.is_empty() {
+                                        eprintln!("📤 [ZED-UI] NewEntry {} (assistant/tool) -> MessageAdded (cumulative: {} chars)", index, cumulative_content.len());
+                                        log::info!("📤 [ZED-UI] NewEntry {} (assistant/tool) -> MessageAdded (cumulative: {} chars)", index, cumulative_content.len());
+                                        if let Err(e) = external_websocket_sync::send_websocket_event(
+                                            external_websocket_sync::SyncEvent::MessageAdded {
+                                                acp_thread_id,
+                                                message_id: "response".to_string(),
+                                                role: "assistant".to_string(),
+                                                content: cumulative_content,
+                                                timestamp: chrono::Utc::now().timestamp(),
+                                            }
+                                        ) {
+                                            eprintln!("❌ [ZED-UI] Failed to send assistant/tool message: {}", e);
+                                            log::error!("❌ [ZED-UI] Failed to send assistant/tool message: {}", e);
+                                        }
+                                    }
                                 }
                             }
                         }
@@ -1719,13 +1760,18 @@ impl AcpThreadView {
                 });
 
                 // Send WebSocket event directly from ThreadView (bypasses subscription issues)
+                // IMPORTANT: We send ALL entries' content (cumulative) on every update.
+                // This ensures Helix always has the complete current state, even if entries
+                // update out of order (e.g., entry 1 streaming while entry 2 is added).
                 #[cfg(feature = "external_websocket_sync")]
                 {
                     let thread_read = thread.read(cx);
                     let acp_thread_id = thread_read.session_id().to_string();
-                    if let Some(entry) = thread_read.entries().get(*index) {
-                        // Only sync assistant messages and tool calls (not user messages)
-                        let content = match entry {
+
+                    // Collect ALL non-user entries into cumulative content
+                    let mut cumulative_content = String::new();
+                    for entry in thread_read.entries().iter() {
+                        let entry_content = match entry {
                             acp_thread::AgentThreadEntry::AssistantMessage(msg) => {
                                 Some(msg.content_only(cx))
                             }
@@ -1734,21 +1780,29 @@ impl AcpThreadView {
                             }
                             acp_thread::AgentThreadEntry::UserMessage(_) => None,
                         };
-                        if let Some(content) = content {
-                            eprintln!("📤 [ZED-UI] EntryUpdated {} -> MessageAdded ({} chars)", index, content.len());
-                            log::info!("📤 [ZED-UI] EntryUpdated {} -> MessageAdded ({} chars)", index, content.len());
-                            if let Err(e) = external_websocket_sync::send_websocket_event(
-                                external_websocket_sync::SyncEvent::MessageAdded {
-                                    acp_thread_id,
-                                    message_id: index.to_string(),
-                                    role: "assistant".to_string(),
-                                    content,
-                                    timestamp: chrono::Utc::now().timestamp(),
-                                }
-                            ) {
-                                eprintln!("❌ [ZED-UI] Failed to send message_added event: {}", e);
-                                log::error!("❌ [ZED-UI] Failed to send message_added event: {}", e);
+                        if let Some(content) = entry_content {
+                            if !cumulative_content.is_empty() {
+                                cumulative_content.push_str("\n\n");
                             }
+                            cumulative_content.push_str(&content);
+                        }
+                    }
+
+                    if !cumulative_content.is_empty() {
+                        eprintln!("📤 [ZED-UI] EntryUpdated {} -> MessageAdded (cumulative: {} chars)", index, cumulative_content.len());
+                        log::info!("📤 [ZED-UI] EntryUpdated {} -> MessageAdded (cumulative: {} chars)", index, cumulative_content.len());
+                        // Use constant message_id "response" so it always overwrites with complete state
+                        if let Err(e) = external_websocket_sync::send_websocket_event(
+                            external_websocket_sync::SyncEvent::MessageAdded {
+                                acp_thread_id,
+                                message_id: "response".to_string(),
+                                role: "assistant".to_string(),
+                                content: cumulative_content,
+                                timestamp: chrono::Utc::now().timestamp(),
+                            }
+                        ) {
+                            eprintln!("❌ [ZED-UI] Failed to send message_added event: {}", e);
+                            log::error!("❌ [ZED-UI] Failed to send message_added event: {}", e);
                         }
                     }
                 }
