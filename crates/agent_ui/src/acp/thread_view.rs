@@ -1686,6 +1686,41 @@ impl AcpThreadView {
                 self.entry_view_state.update(cx, |view_state, cx| {
                     view_state.sync_entry(*index, thread, window, cx)
                 });
+
+                // Send WebSocket event directly from ThreadView (bypasses subscription issues)
+                #[cfg(feature = "external_websocket_sync")]
+                {
+                    let thread_read = thread.read(cx);
+                    let acp_thread_id = thread_read.session_id().to_string();
+                    if let Some(entry) = thread_read.entries().get(*index) {
+                        // Only sync assistant messages and tool calls (not user messages)
+                        let content = match entry {
+                            acp_thread::AgentThreadEntry::AssistantMessage(msg) => {
+                                Some(msg.content_only(cx))
+                            }
+                            acp_thread::AgentThreadEntry::ToolCall(tool_call) => {
+                                Some(tool_call.to_markdown(cx))
+                            }
+                            acp_thread::AgentThreadEntry::UserMessage(_) => None,
+                        };
+                        if let Some(content) = content {
+                            eprintln!("📤 [ZED-UI] EntryUpdated {} -> MessageAdded ({} chars)", index, content.len());
+                            log::info!("📤 [ZED-UI] EntryUpdated {} -> MessageAdded ({} chars)", index, content.len());
+                            if let Err(e) = external_websocket_sync::send_websocket_event(
+                                external_websocket_sync::SyncEvent::MessageAdded {
+                                    acp_thread_id,
+                                    message_id: index.to_string(),
+                                    role: "assistant".to_string(),
+                                    content,
+                                    timestamp: chrono::Utc::now().timestamp(),
+                                }
+                            ) {
+                                eprintln!("❌ [ZED-UI] Failed to send message_added event: {}", e);
+                                log::error!("❌ [ZED-UI] Failed to send message_added event: {}", e);
+                            }
+                        }
+                    }
+                }
             }
             AcpThreadEvent::EntriesRemoved(range) => {
                 self.entry_view_state
@@ -1711,6 +1746,27 @@ impl AcpThreadView {
                     window,
                     cx,
                 );
+
+                // Send WebSocket event directly from ThreadView (bypasses subscription issues)
+                #[cfg(feature = "external_websocket_sync")]
+                {
+                    let acp_thread_id = thread.read(cx).session_id().to_string();
+                    // Get request_id from thread service's tracking (if available)
+                    let request_id = external_websocket_sync::get_thread_request_id(&acp_thread_id)
+                        .unwrap_or_default();
+                    eprintln!("📤 [ZED-UI] Stopped -> MessageCompleted (thread: {}, request: {})", acp_thread_id, request_id);
+                    log::info!("📤 [ZED-UI] Stopped -> MessageCompleted (thread: {}, request: {})", acp_thread_id, request_id);
+                    if let Err(e) = external_websocket_sync::send_websocket_event(
+                        external_websocket_sync::SyncEvent::MessageCompleted {
+                            acp_thread_id,
+                            message_id: "0".to_string(),
+                            request_id,
+                        }
+                    ) {
+                        eprintln!("❌ [ZED-UI] Failed to send message_completed event: {}", e);
+                        log::error!("❌ [ZED-UI] Failed to send message_completed event: {}", e);
+                    }
+                }
             }
             AcpThreadEvent::Refusal => {
                 self.thread_retry_status.take();
