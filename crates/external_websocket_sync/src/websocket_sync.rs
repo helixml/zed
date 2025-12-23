@@ -11,16 +11,31 @@
 //! - Queued events are preserved during reconnection attempts
 
 use anyhow::{Context as AnyhowContext, Result};
+use collections::HashMap;
 use futures::{SinkExt, StreamExt};
+use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 use tokio_tungstenite::{connect_async_tls_with_config, tungstenite::Message, Connector};
 use url::Url;
 
 use crate::types::{IncomingChatMessage, SyncEvent};
 use crate::ThreadCreationRequest;
+
+/// Throttle interval for streaming updates (100ms = max 10 updates/sec)
+const STREAMING_THROTTLE_INTERVAL: Duration = Duration::from_millis(100);
+
+/// State for throttling streaming updates per thread
+struct ThrottleState {
+    last_send: Instant,
+    pending_content: Option<String>,
+}
+
+/// Global throttle state for streaming updates
+static STREAMING_THROTTLE: Mutex<Option<HashMap<String, ThrottleState>>> = Mutex::new(None);
 
 // Reuse NoCertVerifier from http_client_tls for consistency
 use http_client_tls::NoCertVerifier;
@@ -540,6 +555,82 @@ pub fn send_websocket_event(event: SyncEvent) -> Result<()> {
         eprintln!("❌ [WEBSOCKET] WebSocket service not initialized!");
         Err(anyhow::anyhow!("WebSocket service not initialized"))
     }
+}
+
+/// Send a streaming message update with throttling to prevent UI thread overhead.
+/// Returns true if the message was actually sent, false if throttled.
+/// Call `flush_throttled_streaming_update` on completion to ensure final state is sent.
+pub fn send_throttled_streaming_update(
+    acp_thread_id: &str,
+    content: String,
+) -> Result<bool> {
+    let now = Instant::now();
+    let mut should_send = false;
+
+    {
+        let mut throttle_guard = STREAMING_THROTTLE.lock();
+        let throttle_map = throttle_guard.get_or_insert_with(HashMap::default);
+
+        if let Some(state) = throttle_map.get_mut(acp_thread_id) {
+            // Check if enough time has passed since last send
+            if now.duration_since(state.last_send) >= STREAMING_THROTTLE_INTERVAL {
+                should_send = true;
+                state.last_send = now;
+                state.pending_content = None;
+            } else {
+                // Throttled - just store for later
+                state.pending_content = Some(content.clone());
+            }
+        } else {
+            // First update for this thread - always send
+            should_send = true;
+            throttle_map.insert(
+                acp_thread_id.to_string(),
+                ThrottleState {
+                    last_send: now,
+                    pending_content: None,
+                },
+            );
+        }
+    }
+
+    if should_send {
+        send_websocket_event(SyncEvent::MessageAdded {
+            acp_thread_id: acp_thread_id.to_string(),
+            message_id: "response".to_string(),
+            role: "assistant".to_string(),
+            content,
+            timestamp: chrono::Utc::now().timestamp(),
+        })?;
+        Ok(true)
+    } else {
+        Ok(false)
+    }
+}
+
+/// Flush any pending throttled content for a thread.
+/// Call this when streaming completes to ensure the final state is sent.
+pub fn flush_throttled_streaming_update(acp_thread_id: &str) -> Result<()> {
+    let pending = {
+        let mut throttle_guard = STREAMING_THROTTLE.lock();
+        if let Some(throttle_map) = throttle_guard.as_mut() {
+            throttle_map.remove(acp_thread_id).and_then(|s| s.pending_content)
+        } else {
+            None
+        }
+    };
+
+    if let Some(content) = pending {
+        send_websocket_event(SyncEvent::MessageAdded {
+            acp_thread_id: acp_thread_id.to_string(),
+            message_id: "response".to_string(),
+            role: "assistant".to_string(),
+            content,
+            timestamp: chrono::Utc::now().timestamp(),
+        })?;
+    }
+
+    Ok(())
 }
 
 /// Notify Helix that the agent is ready to receive prompts

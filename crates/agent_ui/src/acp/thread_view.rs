@@ -1759,10 +1759,9 @@ impl AcpThreadView {
                     view_state.sync_entry(*index, thread, window, cx)
                 });
 
-                // Send WebSocket event directly from ThreadView (bypasses subscription issues)
-                // IMPORTANT: We send ALL entries' content (cumulative) on every update.
-                // This ensures Helix always has the complete current state, even if entries
-                // update out of order (e.g., entry 1 streaming while entry 2 is added).
+                // Send WebSocket event with THROTTLING to prevent UI thread overhead.
+                // Content building is O(n) per token, and we used to do it every token.
+                // Now we throttle to max 10 updates/second (100ms interval).
                 #[cfg(feature = "external_websocket_sync")]
                 {
                     let thread_read = thread.read(cx);
@@ -1789,20 +1788,20 @@ impl AcpThreadView {
                     }
 
                     if !cumulative_content.is_empty() {
-                        eprintln!("📤 [ZED-UI] EntryUpdated {} -> MessageAdded (cumulative: {} chars)", index, cumulative_content.len());
-                        log::info!("📤 [ZED-UI] EntryUpdated {} -> MessageAdded (cumulative: {} chars)", index, cumulative_content.len());
-                        // Use constant message_id "response" so it always overwrites with complete state
-                        if let Err(e) = external_websocket_sync::send_websocket_event(
-                            external_websocket_sync::SyncEvent::MessageAdded {
-                                acp_thread_id,
-                                message_id: "response".to_string(),
-                                role: "assistant".to_string(),
-                                content: cumulative_content,
-                                timestamp: chrono::Utc::now().timestamp(),
-                            }
+                        // Use throttled send - only actually sends max 10x/second
+                        match external_websocket_sync::send_throttled_streaming_update(
+                            &acp_thread_id,
+                            cumulative_content.clone(),
                         ) {
-                            eprintln!("❌ [ZED-UI] Failed to send message_added event: {}", e);
-                            log::error!("❌ [ZED-UI] Failed to send message_added event: {}", e);
+                            Ok(true) => {
+                                log::debug!("📤 [ZED-UI] EntryUpdated {} -> sent ({} chars)", index, cumulative_content.len());
+                            }
+                            Ok(false) => {
+                                // Throttled - this is expected and good for performance
+                            }
+                            Err(e) => {
+                                log::error!("❌ [ZED-UI] Failed to send throttled update: {}", e);
+                            }
                         }
                     }
                 }
@@ -1836,10 +1835,15 @@ impl AcpThreadView {
                 #[cfg(feature = "external_websocket_sync")]
                 {
                     let acp_thread_id = thread.read(cx).session_id().to_string();
+
+                    // Flush any pending throttled content before sending completion
+                    if let Err(e) = external_websocket_sync::flush_throttled_streaming_update(&acp_thread_id) {
+                        log::error!("❌ [ZED-UI] Failed to flush throttled content: {}", e);
+                    }
+
                     // Get request_id from thread service's tracking (if available)
                     let request_id = external_websocket_sync::get_thread_request_id(&acp_thread_id)
                         .unwrap_or_default();
-                    eprintln!("📤 [ZED-UI] Stopped -> MessageCompleted (thread: {}, request: {})", acp_thread_id, request_id);
                     log::info!("📤 [ZED-UI] Stopped -> MessageCompleted (thread: {}, request: {})", acp_thread_id, request_id);
                     if let Err(e) = external_websocket_sync::send_websocket_event(
                         external_websocket_sync::SyncEvent::MessageCompleted {
@@ -1848,7 +1852,6 @@ impl AcpThreadView {
                             request_id,
                         }
                     ) {
-                        eprintln!("❌ [ZED-UI] Failed to send message_completed event: {}", e);
                         log::error!("❌ [ZED-UI] Failed to send message_completed event: {}", e);
                     }
                 }
