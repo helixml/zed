@@ -1081,33 +1081,21 @@ impl AgentConfiguration {
                             .p_4()
                             .pt_0()
                             .gap_2()
-                            .child(self.render_agent_server(
-                                AgentIcon::Name(IconName::AiClaude),
-                                "Claude Code",
-                                false,
-                                cx,
-                            ))
-                            .child(Divider::horizontal().color(DividerColor::BorderFaded))
-                            .child(self.render_agent_server(
-                                AgentIcon::Name(IconName::AiOpenAi),
-                                "Codex CLI",
-                                false,
-                                cx,
-                            ))
-                            .child(Divider::horizontal().color(DividerColor::BorderFaded))
-                            .child(self.render_agent_server(
-                                AgentIcon::Name(IconName::AiGemini),
-                                "Gemini CLI",
-                                false,
-                                cx,
-                            ))
+                            // HELIX: Only show custom agents (Qwen Code etc), not built-in external agents
                             .map(|mut parent| {
-                                for (name, icon) in user_defined_agents {
-                                    parent = parent
-                                        .child(
+                                for (index, (name, icon)) in user_defined_agents.into_iter().enumerate() {
+                                    if index > 0 {
+                                        parent = parent.child(
                                             Divider::horizontal().color(DividerColor::BorderFaded),
-                                        )
-                                        .child(self.render_agent_server(icon, name, true, cx));
+                                        );
+                                    }
+                                    // HELIX: Use friendly name for Qwen
+                                    let display_name: SharedString = if name.0 == "qwen" {
+                                        "Qwen Code".into()
+                                    } else {
+                                        name.0.clone()
+                                    };
+                                    parent = parent.child(self.render_agent_server(icon, display_name, true, cx));
                                 }
                                 parent
                             }),

@@ -293,6 +293,7 @@ impl TitleBar {
         );
         subscriptions.push(cx.observe(&user_store, |_, _, cx| cx.notify()));
 
+        // HELIX: Claude Code onboarding banner hidden - users should use corporate provisioned LLMs
         let banner = cx.new(|cx| {
             OnboardingBanner::new(
                 "ACP Claude Code Onboarding",
@@ -302,8 +303,8 @@ impl TitleBar {
                 zed_actions::agent::OpenClaudeCodeOnboardingModal.boxed_clone(),
                 cx,
             )
-            // When updating this to a non-AI feature release, remove this line.
-            .visible_when(|cx| !project::DisableAiSettings::get_global(cx).disable_ai)
+            // HELIX: Always hide - prevent users from being encouraged to connect to external services
+            .visible_when(|_cx| false)
         });
 
         let platform_titlebar = cx.new(|cx| PlatformTitleBar::new(id, cx));
