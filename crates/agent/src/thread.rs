@@ -376,6 +376,51 @@ fn codeblock_tag(full_path: &Path, line_range: Option<&RangeInclusive<u32>>) -> 
     result
 }
 
+/// Format shell command output as a code block.
+/// Extracts the "Output:" field from the structured shell output format.
+/// Returns None if the output doesn't match the expected format.
+fn format_shell_output(output: &serde_json::Value) -> Option<String> {
+    // Try to get the "output" field from the JSON object
+    let obj = output.as_object()?;
+    let output_str = obj.get("output")?.as_str()?;
+
+    // Parse the shell output format to extract just the Output: field content.
+    // Output can span multiple lines until the next known field marker.
+    let field_markers = [
+        "Command:", "Directory:", "Output:", "Error:", "Exit Code:",
+        "Signal:", "Background PIDs:", "Process Group PGID:"
+    ];
+
+    let mut cmd_output = Vec::new();
+    let mut in_output_field = false;
+
+    for line in output_str.lines() {
+        // Check if this line starts a new field
+        let starts_new_field = field_markers.iter().any(|m| line.starts_with(m));
+
+        if line.starts_with("Output:") {
+            in_output_field = true;
+            let value = line.strip_prefix("Output:").unwrap_or("").trim();
+            if !value.is_empty() {
+                cmd_output.push(value.to_string());
+            }
+        } else if starts_new_field {
+            in_output_field = false;
+        } else if in_output_field {
+            cmd_output.push(line.to_string());
+        }
+    }
+
+    let full_output = cmd_output.join("\n");
+
+    // Return as a code block if there's output
+    if full_output.is_empty() || full_output == "(empty)" {
+        None
+    } else {
+        Some(format!("```\n{}\n```", full_output))
+    }
+}
+
 impl AgentMessage {
     pub fn to_markdown(&self) -> String {
         let mut markdown = String::from("## Assistant\n\n");
@@ -428,13 +473,20 @@ impl AgentMessage {
                 }
             }
 
+            // Format raw output nicely if present
             if let Some(output) = tool_result.output.as_ref() {
-                writeln!(
-                    markdown,
-                    "**Debug Output**:\n\n```json\n{}\n```\n",
-                    serde_json::to_string_pretty(output).unwrap()
-                )
-                .unwrap();
+                // Try to extract shell command output and format as a table
+                if let Some(formatted) = format_shell_output(output) {
+                    writeln!(markdown, "{formatted}\n").ok();
+                } else {
+                    // Fallback: show as JSON code block
+                    writeln!(
+                        markdown,
+                        "```json\n{}\n```\n",
+                        serde_json::to_string_pretty(output).unwrap_or_default()
+                    )
+                    .ok();
+                }
             }
         }
 
