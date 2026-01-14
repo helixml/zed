@@ -355,9 +355,21 @@ impl ToolCall {
             }
         }
 
-        // Fallback to content-based rendering
+        // Try to format content - Qwen Code sends JSON-stringified output in content
         for content in &self.content {
-            markdown.push_str(content.to_markdown(cx).as_str());
+            let content_md = content.to_markdown(cx);
+            // Check if this content is JSON that we can format nicely
+            if content_md.starts_with('{') {
+                if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&content_md) {
+                    if let Some(formatted) = format_shell_output(&parsed) {
+                        markdown.push_str(&formatted);
+                        markdown.push_str("\n\n");
+                        continue;
+                    }
+                }
+            }
+            // Fallback: use content as-is
+            markdown.push_str(&content_md);
             markdown.push_str("\n\n");
         }
         markdown
