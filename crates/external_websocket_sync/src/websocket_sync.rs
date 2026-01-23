@@ -250,6 +250,27 @@ impl WebSocketSync {
         eprintln!("✅ [WEBSOCKET] Sent test ping successfully");
         log::info!("✅ [WEBSOCKET] Sent test ping successfully");
 
+        // Send agent_ready immediately on connection to prevent deadlock
+        // The API waits for agent_ready before sending the initial chat_message,
+        // so we need to signal readiness as soon as we connect.
+        // Note: We send with no thread_id since no thread exists yet.
+        // The agent_name is just for logging - actual session mapping uses the WebSocket URL param.
+        let agent_ready_msg = serde_json::json!({
+            "event_type": "agent_ready",
+            "data": {
+                "agent_name": "zed-connection",
+                "thread_id": null
+            }
+        });
+        if let Err(e) = ws_sink.send(Message::Text(agent_ready_msg.to_string().into())).await {
+            eprintln!("⚠️ [WEBSOCKET] Failed to send initial agent_ready: {}", e);
+            log::warn!("⚠️ [WEBSOCKET] Failed to send initial agent_ready: {}", e);
+            // Don't return - this is not fatal, the API has a timeout fallback
+        } else {
+            eprintln!("✅ [WEBSOCKET] Sent initial agent_ready (connection ready for messages)");
+            log::info!("✅ [WEBSOCKET] Sent initial agent_ready (connection ready for messages)");
+        }
+
         // Main select loop - handle both incoming and outgoing messages
         loop {
             tokio::select! {

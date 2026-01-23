@@ -1712,10 +1712,23 @@ impl AcpThreadView {
                                 }
                                 acp_thread::AgentThreadEntry::AssistantMessage(_) |
                                 acp_thread::AgentThreadEntry::ToolCall(_) => {
-                                    // For assistant/tool entries, send cumulative content immediately
-                                    // so Helix sees new tool calls when they start (before any output)
+                                    // For assistant/tool entries, send content from current turn only
+                                    // (entries AFTER the last UserMessage) so Helix sees new tool calls
+                                    // when they start, but doesn't get content from previous turns
+                                    let entries = thread_read.entries();
+
+                                    // Find the last UserMessage index - we only want entries AFTER this
+                                    let last_user_idx = entries.iter()
+                                        .rposition(|e| matches!(e, acp_thread::AgentThreadEntry::UserMessage(_)));
+
                                     let mut cumulative_content = String::new();
-                                    for e in thread_read.entries().iter() {
+                                    for (idx, e) in entries.iter().enumerate() {
+                                        // Skip entries at or before the last user message
+                                        if let Some(user_idx) = last_user_idx {
+                                            if idx <= user_idx {
+                                                continue;
+                                            }
+                                        }
                                         let entry_content = match e {
                                             acp_thread::AgentThreadEntry::AssistantMessage(msg) => {
                                                 Some(msg.content_only(cx))
@@ -1733,8 +1746,8 @@ impl AcpThreadView {
                                         }
                                     }
                                     if !cumulative_content.is_empty() {
-                                        eprintln!("📤 [ZED-UI] NewEntry {} (assistant/tool) -> MessageAdded (cumulative: {} chars)", index, cumulative_content.len());
-                                        log::info!("📤 [ZED-UI] NewEntry {} (assistant/tool) -> MessageAdded (cumulative: {} chars)", index, cumulative_content.len());
+                                        eprintln!("📤 [ZED-UI] NewEntry {} (assistant/tool) -> MessageAdded (current turn: {} chars)", index, cumulative_content.len());
+                                        log::info!("📤 [ZED-UI] NewEntry {} (assistant/tool) -> MessageAdded (current turn: {} chars)", index, cumulative_content.len());
                                         if let Err(e) = external_websocket_sync::send_websocket_event(
                                             external_websocket_sync::SyncEvent::MessageAdded {
                                                 acp_thread_id,
@@ -1760,17 +1773,28 @@ impl AcpThreadView {
                 });
 
                 // Send WebSocket event directly from ThreadView (bypasses subscription issues)
-                // IMPORTANT: We send ALL entries' content (cumulative) on every update.
-                // This ensures Helix always has the complete current state, even if entries
-                // update out of order (e.g., entry 1 streaming while entry 2 is added).
+                // IMPORTANT: We only send entries AFTER the last UserMessage (current turn).
+                // This ensures each Helix interaction receives only its own response content,
+                // not content from previous turns which would cause cumulative concatenation.
                 #[cfg(feature = "external_websocket_sync")]
                 {
                     let thread_read = thread.read(cx);
                     let acp_thread_id = thread_read.session_id().to_string();
+                    let entries = thread_read.entries();
 
-                    // Collect ALL non-user entries into cumulative content
+                    // Find the last UserMessage index - we only want entries AFTER this
+                    let last_user_idx = entries.iter()
+                        .rposition(|e| matches!(e, acp_thread::AgentThreadEntry::UserMessage(_)));
+
+                    // Collect only entries AFTER the last UserMessage (current turn's response)
                     let mut cumulative_content = String::new();
-                    for entry in thread_read.entries().iter() {
+                    for (idx, entry) in entries.iter().enumerate() {
+                        // Skip entries at or before the last user message
+                        if let Some(user_idx) = last_user_idx {
+                            if idx <= user_idx {
+                                continue;
+                            }
+                        }
                         let entry_content = match entry {
                             acp_thread::AgentThreadEntry::AssistantMessage(msg) => {
                                 Some(msg.content_only(cx))
@@ -1789,8 +1813,8 @@ impl AcpThreadView {
                     }
 
                     if !cumulative_content.is_empty() {
-                        eprintln!("📤 [ZED-UI] EntryUpdated {} -> MessageAdded (cumulative: {} chars)", index, cumulative_content.len());
-                        log::info!("📤 [ZED-UI] EntryUpdated {} -> MessageAdded (cumulative: {} chars)", index, cumulative_content.len());
+                        eprintln!("📤 [ZED-UI] EntryUpdated {} -> MessageAdded (current turn: {} chars)", index, cumulative_content.len());
+                        log::info!("📤 [ZED-UI] EntryUpdated {} -> MessageAdded (current turn: {} chars)", index, cumulative_content.len());
                         // Use constant message_id "response" so it always overwrites with complete state
                         if let Err(e) = external_websocket_sync::send_websocket_event(
                             external_websocket_sync::SyncEvent::MessageAdded {
