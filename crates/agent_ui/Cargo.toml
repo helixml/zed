@@ -25,7 +25,7 @@ test-support = [
     "agent/test-support",
 ]
 unit-eval = []
-# external_websocket_sync = ["external_websocket_sync_dep"]
+external_websocket_sync = ["external_websocket_sync_dep"]
 
 [dependencies]
 acp_thread.workspace = true
@@ -118,7 +118,7 @@ async-fs.workspace = true
 reqwest_client = { workspace = true, optional = true }
 
 # External WebSocket sync feature
-# external_websocket_sync_dep = { path = "../external_websocket_sync", optional = true, package = "external_websocket_sync" }
+external_websocket_sync_dep = { path = "../external_websocket_sync", optional = true, package = "external_websocket_sync" }
 
 [dev-dependencies]
 acp_thread = { workspace = true, features = ["test-support"] }

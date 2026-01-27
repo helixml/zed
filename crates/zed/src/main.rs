@@ -22,10 +22,6 @@ use futures::{StreamExt, channel::oneshot, future};
 use git::GitHostingProviderRegistry;
 use git_ui::clone::clone_and_open;
 use gpui::{App, AppContext, Application, AsyncApp, Focusable as _, QuitMode, UpdateGlobal as _};
-// TODO: Fix after upstream merge
-// #[cfg(feature = "external_websocket_sync")]
-// TODO: Fix after upstream merge
-// use external_websocket_sync;
 
 use gpui_tokio::Tokio;
 use language::LanguageRegistry;
@@ -665,9 +661,8 @@ fn main() {
             false,
             cx,
         );
-        // TODO: Fix after upstream merge
-// #[cfg(feature = "external_websocket_sync")]
-        // external_websocket_sync::init(cx);
+        #[cfg(feature = "external_websocket_sync")]
+        external_websocket_sync::init(cx);
 
         agent_ui_v2::agents_panel::init(cx);
         repl::init(app_state.fs.clone(), cx);

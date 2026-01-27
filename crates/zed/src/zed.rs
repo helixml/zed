@@ -761,7 +761,7 @@ async fn initialize_agent_panel(
 
                 external_websocket_sync::setup_thread_handler(
                     workspace.project().clone(),
-                    panel.read(cx).acp_history_store().clone(),
+                    panel.read(cx).thread_store().clone(),
                     workspace.app_state().fs.clone(),
                     cx
                 );
@@ -769,7 +769,6 @@ async fn initialize_agent_panel(
 
                 // Start WebSocket service if enabled in settings
                 use external_websocket_sync::ExternalSyncSettings;
-                use settings::Settings;
 
                 eprintln!("🔧 [ZED] Checking WebSocket settings...");
                 let settings = ExternalSyncSettings::get_global(cx);

@@ -409,7 +409,7 @@ impl TextThreadEditor {
     }
     
     #[cfg(feature = "external_websocket_sync")]
-    fn mark_websocket_triggered(&mut self, cx: &mut Context<Self>) {
+    fn mark_websocket_triggered(&mut self, _cx: &mut Context<Self>) {
         // Store in context metadata that this was triggered by WebSocket
         // This prevents the Assist action from triggering duplicate AI processing
         log::error!("🎯 [TEXT_THREAD] Marking context as WebSocket-triggered to prevent duplicates");

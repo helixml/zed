@@ -4,11 +4,10 @@
 //! Called from workspace creation, contains all business logic.
 
 use anyhow::Result;
-use acp_thread::{AcpThread, AcpThreadEvent};
-use action_log::ActionLog;
-use agent::HistoryStore;
-use agent_client_protocol::{ContentBlock, PromptCapabilities, SessionId, TextContent};
-use gpui::{App, Entity, EventEmitter, WeakEntity, prelude::*};
+use acp_thread::{AcpThread, AcpThreadEvent, AgentConnection, AgentSessionInfo};
+use agent::ThreadStore;
+use agent_client_protocol::{ContentBlock, TextContent};
+use gpui::{App, Entity, WeakEntity};
 use parking_lot::RwLock;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -16,7 +15,6 @@ use fs::Fs;
 use project::Project;
 use tokio::sync::mpsc;
 use util::ResultExt;
-use watch;
 
 use crate::{ExternalAgent, ThreadCreationRequest, ThreadOpenRequest, SyncEvent};
 
@@ -112,7 +110,7 @@ pub fn get_thread(acp_thread_id: &str) -> Option<WeakEntity<AcpThread>> {
 /// to WebSocket messages from external systems (e.g., Helix).
 pub fn setup_thread_handler(
     project: Entity<Project>,
-    acp_history_store: Entity<HistoryStore>,
+    thread_store: Entity<ThreadStore>,
     fs: Arc<dyn Fs>,
     cx: &mut App,
 ) {
@@ -134,10 +132,10 @@ pub fn setup_thread_handler(
 
     // Clone resources for both spawned tasks
     let project_for_create = project.clone();
-    let acp_history_store_for_create = acp_history_store.clone();
+    let thread_store_for_create = thread_store.clone();
     let fs_for_create = fs.clone();
     let project_for_open = project.clone();
-    let acp_history_store_for_open = acp_history_store.clone();
+    let thread_store_for_open = thread_store.clone();
     let fs_for_open = fs.clone();
 
     // Spawn handler task to process thread creation requests
@@ -200,7 +198,7 @@ pub fn setup_thread_handler(
                     // Try to load the session from the agent
                     let load_result = load_thread_from_agent(
                         project_for_create.clone(),
-                        acp_history_store_for_create.clone(),
+                        thread_store_for_create.clone(),
                         fs_for_create.clone(),
                         existing_thread_id.clone(),
                         request.agent_name.clone(),
@@ -265,12 +263,13 @@ pub fn setup_thread_handler(
             // Create new ACP thread (synchronously via cx.update to avoid async context issues)
             eprintln!("🆕 [THREAD_SERVICE] Creating new ACP thread for request: {}", request.request_id);
             log::info!("🆕 [THREAD_SERVICE] Creating new ACP thread for request: {}", request.request_id);
+            // Create new thread
             if let Err(e) = cx.update(|cx| {
                 create_new_thread_sync(
                     project_for_create.clone(),
-                    acp_history_store_for_create.clone(),
+                    thread_store_for_create.clone(),
                     fs_for_create.clone(),
-                    request,
+                    request.clone(),
                     cx,
                 )
             }) {
@@ -302,9 +301,9 @@ pub fn setup_thread_handler(
             if let Err(e) = cx.update(|cx| {
                 open_existing_thread_sync(
                     project_for_open.clone(),
-                    acp_history_store_for_open.clone(),
+                    thread_store_for_open.clone(),
                     fs_for_open.clone(),
-                    request,
+                    request.clone(),
                     cx,
                 )
             }) {
@@ -323,7 +322,7 @@ pub fn setup_thread_handler(
 /// Create a new ACP thread and send the initial message (synchronous version)
 fn create_new_thread_sync(
     project: Entity<Project>,
-    acp_history_store: Entity<HistoryStore>,
+    thread_store: Entity<ThreadStore>,
     fs: Arc<dyn Fs>,
     request: ThreadCreationRequest,
     cx: &mut App,
@@ -341,7 +340,7 @@ fn create_new_thread_sync(
             },
         },
     };
-    let server = agent.server(fs, acp_history_store.clone());
+    let server = agent.server(fs, thread_store.clone());
 
     // Get agent server store from project
     let agent_server_store = project.read(cx).agent_server_store().clone();
@@ -371,7 +370,7 @@ fn create_new_thread_sync(
         if let Some(first_method) = auth_methods.first() {
             let auth_task = cx.update(|cx| {
                 connection.authenticate(first_method.id.clone(), cx)
-            })?;
+            });
             if let Err(e) = auth_task.await {
                 log::warn!("[THREAD_SERVICE] Authentication failed (continuing): {}", e);
             }
@@ -389,17 +388,17 @@ fn create_new_thread_sync(
                     project_clone.read(cx).worktrees(cx).next()
                         .map(|wt| wt.read(cx).abs_path().to_path_buf())
                         .unwrap_or_else(|| std::env::current_dir().unwrap_or_default())
-                }).unwrap_or_else(|_| std::env::current_dir().unwrap_or_default())
+                })
             });
-        let thread_entity = cx.update(|cx| {
+        let thread_entity: Entity<AcpThread> = cx.update(|cx| {
             connection.new_thread(project_clone.clone(), &cwd, cx)
-        })?.await?;
+        }).await?;
 
-        let acp_thread_id = cx.update(|cx| {
+        let acp_thread_id: String = cx.update(|cx| {
             let thread_id = thread_entity.read(cx).session_id().to_string();
             log::info!("[THREAD_SERVICE] Created ACP thread: {}", thread_id);
             thread_id
-        })?;
+        });
 
         // Keep thread entity alive for the duration of this task
         let _thread_keep_alive = thread_entity.clone();
@@ -448,9 +447,9 @@ fn create_new_thread_sync(
         }
 
         // Mark the entry that will be created as external-originated (so we don't echo it back)
-        let entry_idx_to_mark = cx.update(|cx| {
+        let entry_idx_to_mark: usize = cx.update(|cx| {
             thread_entity.read(cx).entries().len()
-        })?;
+        });
         mark_external_originated_entry(acp_thread_id.clone(), entry_idx_to_mark);
         eprintln!("🏷️ [THREAD_SERVICE] Marked entry {} as external-originated (won't echo back)", entry_idx_to_mark);
 
@@ -458,7 +457,7 @@ fn create_new_thread_sync(
         eprintln!("🔧 [THREAD_SERVICE] About to send message to thread...");
         let send_task = cx.update(|cx| {
             eprintln!("🔧 [THREAD_SERVICE] Updating thread entity to send message...");
-            let send_task = thread_entity.update(cx, |thread, cx| {
+            let send_task = thread_entity.update(cx, |thread: &mut AcpThread, cx| {
                 let message = vec![ContentBlock::Text(
                     TextContent::new(request_clone.message.clone())
                 )];
@@ -467,7 +466,7 @@ fn create_new_thread_sync(
             });
             eprintln!("✅ [THREAD_SERVICE] thread.send() returned Task");
             send_task
-        })?;
+        });
 
         // Await the send task directly (don't spawn and detach)
         eprintln!("🔧 [THREAD_SERVICE] Awaiting send task...");
@@ -507,26 +506,25 @@ async fn handle_follow_up_message(
     log::info!("🔄 [THREAD_SERVICE] Updated request_id for thread {} to {}", thread_id, request_id);
 
     // Mark the entry that will be created as external-originated
-    let entry_idx_to_mark = cx.update(|cx| {
-        thread.update(cx, |thread, _| thread.entries().len())
-    })??;
+    let entry_idx_to_mark: usize = cx.update(|cx| {
+        thread.update(cx, |thread: &mut AcpThread, _| thread.entries().len())
+    })?;
     mark_external_originated_entry(thread_id.clone(), entry_idx_to_mark);
     eprintln!("🏷️ [THREAD_SERVICE] Marked entry {} as external-originated (follow-up)", entry_idx_to_mark);
 
-    cx.update(|cx| {
-        let send_task = thread.update(cx, |thread, cx| {
+    let send_task = cx.update(|cx| {
+        thread.update(cx, |thread: &mut AcpThread, cx| {
             let message = vec![ContentBlock::Text(
                 TextContent::new(message.clone())
             )];
             thread.send(message, cx)
-        })?;
-        // Spawn the send task
-        cx.spawn(async move |_| {
-            send_task.await.log_err();
-            anyhow::Ok(())
-        }).detach();
+        })
+    })?;
+    // Spawn the send task
+    cx.spawn(async move |_cx| {
+        send_task.await.log_err();
         anyhow::Ok(())
-    })??;
+    }).detach();
 
     log::info!("✅ [THREAD_SERVICE] Follow-up message sent successfully");
     Ok(())
@@ -536,7 +534,7 @@ async fn handle_follow_up_message(
 /// This connects to the agent, loads the session via ACP protocol, registers it, and returns a weak reference.
 async fn load_thread_from_agent(
     project: Entity<Project>,
-    acp_history_store: Entity<HistoryStore>,
+    thread_store: Entity<ThreadStore>,
     fs: Arc<dyn Fs>,
     acp_thread_id: String,
     agent_name: Option<String>,
@@ -558,7 +556,7 @@ async fn load_thread_from_agent(
         },
     };
 
-    let server = agent.server(fs, acp_history_store.clone());
+    let server = agent.server(fs, thread_store.clone());
 
     // Get agent server store and create connection
     let (connection_task, cwd) = cx.update(|cx| {
@@ -580,15 +578,17 @@ async fn load_thread_from_agent(
                     .unwrap_or_else(|| std::env::current_dir().unwrap_or_default())
             });
         (connection_task, cwd)
-    })?;
+    });
 
     let (connection, _spawn_task) = connection_task.await?;
+    let connection: std::rc::Rc<dyn AgentConnection> = connection;
 
     eprintln!("✅ [THREAD_SERVICE] Connected to agent for loading thread");
     log::info!("✅ [THREAD_SERVICE] Connected to agent for loading thread");
 
     // Check if agent supports session loading
-    if !connection.supports_session_load() {
+    let supports_load = cx.update(|cx| connection.supports_load_session(cx));
+    if !supports_load {
         let err = anyhow::anyhow!("Agent does not support session loading");
         eprintln!("⚠️ [THREAD_SERVICE] {}", err);
         log::warn!("⚠️ [THREAD_SERVICE] {}", err);
@@ -597,16 +597,23 @@ async fn load_thread_from_agent(
 
     // Load the thread from agent
     let session_id = agent_client_protocol::SessionId::new(acp_thread_id.clone());
+    let session_info = AgentSessionInfo {
+        session_id,
+        cwd: Some(cwd.clone()),
+        title: None,
+        updated_at: None,
+        meta: None,
+    };
     let project_clone = project.clone();
     let load_task = cx.update(|cx| {
-        connection.load_thread(session_id, project_clone, &cwd, cx)
-    })?;
+        connection.load_session(session_info, project_clone, &cwd, cx)
+    });
 
-    let thread_entity = load_task.await?;
+    let thread_entity: Entity<AcpThread> = load_task.await?;
 
     let loaded_thread_id = cx.update(|cx| {
         thread_entity.read(cx).session_id().to_string()
-    })?;
+    });
 
     eprintln!("✅ [THREAD_SERVICE] Loaded thread from agent: {}", loaded_thread_id);
     log::info!("✅ [THREAD_SERVICE] Loaded thread from agent: {}", loaded_thread_id);
@@ -614,11 +621,11 @@ async fn load_thread_from_agent(
     // Subscribe to thread events for streaming responses (same as create_new_thread_sync)
     let thread_id_for_events = loaded_thread_id.clone();
     cx.update(|cx| {
-        cx.subscribe(&thread_entity, move |thread_entity, event, cx| {
+        cx.subscribe(&thread_entity, move |thread_entity, event, cx: &mut App| {
             match event {
                 AcpThreadEvent::NewEntry => {
                     eprintln!("🆕 [THREAD_SERVICE] NewEntry event received (loaded thread)");
-                    let thread = thread_entity.read(cx);
+                    let thread: &AcpThread = thread_entity.read(cx);
                     let latest_idx = thread.entries().len().saturating_sub(1);
                     if is_external_originated_entry(&thread_id_for_events, latest_idx) {
                         eprintln!("🔄 [THREAD_SERVICE] Entry {} from external system, skipping echo", latest_idx);
@@ -643,7 +650,7 @@ async fn load_thread_from_agent(
                 }
                 AcpThreadEvent::EntryUpdated(entry_idx) => {
                     eprintln!("🔔 [THREAD_SERVICE] EntryUpdated event for entry {} (loaded thread)", entry_idx);
-                    let thread = thread_entity.read(cx);
+                    let thread: &AcpThread = thread_entity.read(cx);
                     if let Some(entry) = thread.entries().get(*entry_idx) {
                         // Handle both AssistantMessage and ToolCall (which contains diffs)
                         let content = match entry {
@@ -684,7 +691,7 @@ async fn load_thread_from_agent(
             }
         })
         .detach();
-    })?;
+    });
 
     // Register thread for future access
     register_thread(loaded_thread_id.clone(), thread_entity.clone());
@@ -710,7 +717,7 @@ async fn load_thread_from_agent(
 /// Open an existing ACP thread from database and display it (synchronous version)
 fn open_existing_thread_sync(
     project: Entity<Project>,
-    acp_history_store: Entity<HistoryStore>,
+    thread_store: Entity<ThreadStore>,
     fs: Arc<dyn Fs>,
     request: ThreadOpenRequest,
     cx: &mut App,
@@ -744,7 +751,7 @@ fn open_existing_thread_sync(
     eprintln!("🔧 [THREAD_SERVICE] Selected agent: {:?}", agent);
     log::info!("🔧 [THREAD_SERVICE] Selected agent: {:?}", agent);
 
-    let server = agent.server(fs, acp_history_store.clone());
+    let server = agent.server(fs, thread_store.clone());
 
     // Get agent server store from project
     let agent_server_store = project.read(cx).agent_server_store().clone();
@@ -787,25 +794,33 @@ fn open_existing_thread_sync(
         log::info!("✅ [THREAD_SERVICE] Connected to agent server for thread loading");
 
         // Check if agent supports session loading
-        if !connection.supports_session_load() {
+        let supports_load = cx.update(|cx| connection.supports_load_session(cx));
+        if !supports_load {
             eprintln!("⚠️ [THREAD_SERVICE] Agent does not support session loading");
             log::warn!("⚠️ [THREAD_SERVICE] Agent does not support session loading");
             return Err(anyhow::anyhow!("Agent does not support session loading"));
         }
 
-        eprintln!("🔨 [THREAD_SERVICE] Calling connection.load_thread() to load from agent...");
-        log::info!("🔨 [THREAD_SERVICE] Calling connection.load_thread() to load from agent...");
+        eprintln!("🔨 [THREAD_SERVICE] Calling connection.load_session() to load from agent...");
+        log::info!("🔨 [THREAD_SERVICE] Calling connection.load_session() to load from agent...");
 
-        // Convert string to SessionId
+        // Convert string to SessionId and create AgentSessionInfo
         let session_id = agent_client_protocol::SessionId::new(request_clone.acp_thread_id.clone());
+        let session_info = AgentSessionInfo {
+            session_id,
+            cwd: Some(cwd.clone()),
+            title: None,
+            updated_at: None,
+            meta: None,
+        };
 
-        // Use the generic AgentConnection::load_thread() method
+        // Use the generic AgentConnection::load_session() method
         // This works for both NativeAgent (from local DB) and ACP agents (via session/load protocol)
         let load_task = cx.update(|cx| {
-            connection.load_thread(session_id, project_clone, &cwd, cx)
-        })?;
+            connection.load_session(session_info, project_clone, &cwd, cx)
+        });
 
-        let thread_entity = match load_task.await {
+        let thread_entity: Entity<AcpThread> = match load_task.await {
             Ok(entity) => entity,
             Err(e) => {
                 eprintln!("❌ [THREAD_SERVICE] connection.load_thread() failed: {}", e);
@@ -819,7 +834,7 @@ fn open_existing_thread_sync(
             eprintln!("✅ [THREAD_SERVICE] Loaded ACP thread from agent: {} (session_id)", thread_id);
             log::info!("✅ [THREAD_SERVICE] Loaded ACP thread from agent: {} (session_id)", thread_id);
             thread_id
-        })?;
+        });
 
         // Register thread for future access (strong reference keeps it alive)
         register_thread(acp_thread_id.clone(), thread_entity.clone());

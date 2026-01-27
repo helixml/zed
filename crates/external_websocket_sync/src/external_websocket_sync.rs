@@ -5,13 +5,11 @@
 //! and integration with AI platforms and other external tools.
 
 use anyhow::{Context, Result};
-use util::ResultExt;
 use assistant_text_thread::{TextThread, TextThreadId, TextThreadStore, MessageId};
 use assistant_slash_command::SlashCommandWorkingSet;
 use clock::ReplicaId;
 use collections::HashMap;
-use futures::StreamExt;
-use gpui::{App, AsyncApp, Entity, EventEmitter, Global, Subscription, Task};
+use gpui::{App, Entity, EventEmitter, Global, Subscription, Task};
 use tokio::sync::mpsc;
 
 use language_model;
@@ -21,8 +19,6 @@ use prompt_store::PromptBuilder;
 use serde::{Deserialize, Serialize};
 use session::AppSession;
 use std::sync::Arc;
-
-use settings::{Settings, SettingsStore};
 
 mod websocket_sync;
 
@@ -400,6 +396,7 @@ impl ExternalWebSocketSync {
     }
 
     /// Load configuration from settings
+    #[allow(dead_code)]
     fn load_config(&self, cx: &App) -> Option<ExternalSyncConfig> {
         let settings = ExternalSyncSettings::get_global(cx);
         
@@ -643,6 +640,15 @@ pub fn init(cx: &mut App) {
     // Create global WebSocket sender
     cx.set_global(WebSocketSender::default());
 
+    // If running in Helix sandbox (HELIX_SESSION_ID is set), enable staff features
+    // This ensures ACP beta features like session loading work with custom agents (e.g., Qwen)
+    // Staff features include: acp-beta, agent-v2, subagents, etc.
+    if std::env::var("HELIX_SESSION_ID").is_ok() {
+        log::info!("🔧 [HELIX] Detected Helix sandbox (HELIX_SESSION_ID set), enabling staff features");
+        use feature_flags::FeatureFlagAppExt;
+        cx.set_staff(true);
+    }
+
     // TODO: Auto-start WebSocket service when enabled
     // Currently disabled because tokio_tungstenite requires Tokio runtime
     // which isn't available during GPUI init. Need to either:
@@ -680,8 +686,8 @@ pub fn init_full(
 
 /// Initialize with session and prompt builder, store for later use
 pub async fn init_with_session(
-    session: Arc<AppSession>,
-    prompt_builder: Arc<PromptBuilder>,
+    _session: Arc<AppSession>,
+    _prompt_builder: Arc<PromptBuilder>,
 ) -> Result<()> {
     log::info!("Session and prompt builder will be passed directly to initialization methods");
     Ok(())
