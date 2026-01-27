@@ -1097,6 +1097,21 @@ impl acp_thread::AgentConnection for NativeAgentConnection {
         Some(Rc::new(self.clone()) as Rc<dyn acp_thread::AgentTelemetry>)
     }
 
+    fn supports_session_load(&self) -> bool {
+        true
+    }
+
+    fn load_thread(
+        self: Rc<Self>,
+        session_id: acp::SessionId,
+        _project: Entity<Project>,
+        _cwd: &Path,
+        cx: &mut App,
+    ) -> Task<Result<Entity<AcpThread>>> {
+        log::info!("📖 [NATIVE_AGENT] load_thread() called for session: {}", session_id.0);
+        self.0.update(cx, |agent, cx| agent.open_thread(session_id, cx))
+    }
+
     fn into_any(self: Rc<Self>) -> Rc<dyn Any> {
         self
     }
