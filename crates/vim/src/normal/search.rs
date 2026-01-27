@@ -10,7 +10,7 @@ use util::serde::default_true;
 use workspace::{notifications::NotifyResultExt, searchable::Direction};
 
 use crate::{
-    Vim,
+    Vim, VimSettings,
     command::CommandRange,
     motion::Motion,
     state::{Mode, SearchState},
@@ -34,6 +34,32 @@ pub(crate) struct MoveToNext {
 #[action(namespace = vim)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct MoveToPrevious {
+    #[serde(default = "default_true")]
+    case_sensitive: bool,
+    #[serde(default)]
+    partial_word: bool,
+    #[serde(default = "default_true")]
+    regex: bool,
+}
+
+/// Searches for the word under the cursor without moving.
+#[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Action)]
+#[action(namespace = vim)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct SearchUnderCursor {
+    #[serde(default = "default_true")]
+    case_sensitive: bool,
+    #[serde(default)]
+    partial_word: bool,
+    #[serde(default = "default_true")]
+    regex: bool,
+}
+
+/// Searches for the word under the cursor without moving (backwards).
+#[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Action)]
+#[action(namespace = vim)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct SearchUnderCursorPrevious {
     #[serde(default = "default_true")]
     case_sensitive: bool,
     #[serde(default)]
@@ -95,6 +121,8 @@ actions!(
 pub(crate) fn register(editor: &mut Editor, cx: &mut Context<Vim>) {
     Vim::action(editor, cx, Vim::move_to_next);
     Vim::action(editor, cx, Vim::move_to_previous);
+    Vim::action(editor, cx, Vim::search_under_cursor);
+    Vim::action(editor, cx, Vim::search_under_cursor_previous);
     Vim::action(editor, cx, Vim::move_to_next_match);
     Vim::action(editor, cx, Vim::move_to_previous_match);
     Vim::action(editor, cx, Vim::search);
@@ -104,12 +132,47 @@ pub(crate) fn register(editor: &mut Editor, cx: &mut Context<Vim>) {
 }
 
 impl Vim {
+    fn search_under_cursor(
+        &mut self,
+        action: &SearchUnderCursor,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.move_to_internal(
+            Direction::Next,
+            action.case_sensitive,
+            !action.partial_word,
+            action.regex,
+            false,
+            window,
+            cx,
+        )
+    }
+
+    fn search_under_cursor_previous(
+        &mut self,
+        action: &SearchUnderCursorPrevious,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.move_to_internal(
+            Direction::Prev,
+            action.case_sensitive,
+            !action.partial_word,
+            action.regex,
+            false,
+            window,
+            cx,
+        )
+    }
+
     fn move_to_next(&mut self, action: &MoveToNext, window: &mut Window, cx: &mut Context<Self>) {
         self.move_to_internal(
             Direction::Next,
             action.case_sensitive,
             !action.partial_word,
             action.regex,
+            true,
             window,
             cx,
         )
@@ -126,6 +189,7 @@ impl Vim {
             action.case_sensitive,
             !action.partial_word,
             action.regex,
+            true,
             window,
             cx,
         )
@@ -332,6 +396,7 @@ impl Vim {
         case_sensitive: bool,
         whole_word: bool,
         regex: bool,
+        move_cursor: bool,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -377,27 +442,29 @@ impl Vim {
 
             let Some(search) = search else { return false };
 
-            let search_bar = search_bar.downgrade();
-            cx.spawn_in(window, async move |_, cx| {
-                search.await?;
-                search_bar.update_in(cx, |search_bar, window, cx| {
-                    search_bar.select_match(direction, count, window, cx);
+            if move_cursor {
+                let search_bar = search_bar.downgrade();
+                cx.spawn_in(window, async move |_, cx| {
+                    search.await?;
+                    search_bar.update_in(cx, |search_bar, window, cx| {
+                        search_bar.select_match(direction, count, window, cx);
 
-                    vim.update(cx, |vim, cx| {
-                        let new_selections = vim.editor_selections(window, cx);
-                        vim.search_motion(
-                            Motion::ZedSearchResult {
-                                prior_selections,
-                                new_selections,
-                            },
-                            window,
-                            cx,
-                        )
-                    });
-                })?;
-                anyhow::Ok(())
-            })
-            .detach_and_log_err(cx);
+                        vim.update(cx, |vim, cx| {
+                            let new_selections = vim.editor_selections(window, cx);
+                            vim.search_motion(
+                                Motion::ZedSearchResult {
+                                    prior_selections,
+                                    new_selections,
+                                },
+                                window,
+                                cx,
+                            )
+                        });
+                    })?;
+                    anyhow::Ok(())
+                })
+                .detach_and_log_err(cx);
+            }
             true
         });
         if !searched {
@@ -514,7 +581,9 @@ impl Vim {
                 )
             }
 
-            if !replacement.flag_g {
+            // gdefault inverts the behavior of the 'g' flag.
+            let replace_all = VimSettings::get_global(cx).gdefault != replacement.flag_g;
+            if !replace_all {
                 options.set(SearchOptions::ONE_MATCH_PER_LINE, true);
             }
 
@@ -637,7 +706,7 @@ impl Replacement {
 
         for c in flags.chars() {
             match c {
-                'g' => replacement.flag_g = true,
+                'g' => replacement.flag_g = !replacement.flag_g,
                 'n' => replacement.flag_n = true,
                 'c' => replacement.flag_c = true,
                 'i' => replacement.case_sensitive = Some(false),
@@ -1073,6 +1142,59 @@ mod test {
             "ˇbb bb bb bb
             aa
             aa"
+        });
+    }
+
+    #[gpui::test]
+    async fn test_replace_gdefault(cx: &mut gpui::TestAppContext) {
+        let mut cx = NeovimBackedTestContext::new(cx).await;
+
+        // Set the `gdefault` option in both Zed and Neovim.
+        cx.simulate_shared_keystrokes(": s e t space g d e f a u l t")
+            .await;
+        cx.simulate_shared_keystrokes("enter").await;
+
+        cx.set_shared_state(indoc! {
+            "ˇaa aa aa aa
+                aa
+                aa"
+        })
+        .await;
+
+        // With gdefault on, :s/// replaces all matches (like :s///g normally).
+        cx.simulate_shared_keystrokes(": s / a a / b b").await;
+        cx.simulate_shared_keystrokes("enter").await;
+        cx.shared_state().await.assert_eq(indoc! {
+            "ˇbb bb bb bb
+                aa
+                aa"
+        });
+
+        // With gdefault on, :s///g replaces only the first match.
+        cx.simulate_shared_keystrokes(": s / b b / c c / g").await;
+        cx.simulate_shared_keystrokes("enter").await;
+        cx.shared_state().await.assert_eq(indoc! {
+            "ˇcc bb bb bb
+                aa
+                aa"
+        });
+
+        // Each successive `/g` flag should invert the one before it.
+        cx.simulate_shared_keystrokes(": s / b b / d d / g g").await;
+        cx.simulate_shared_keystrokes("enter").await;
+        cx.shared_state().await.assert_eq(indoc! {
+            "ˇcc dd dd dd
+                aa
+                aa"
+        });
+
+        cx.simulate_shared_keystrokes(": s / c c / e e / g g g")
+            .await;
+        cx.simulate_shared_keystrokes("enter").await;
+        cx.shared_state().await.assert_eq(indoc! {
+            "ˇee dd dd dd
+                aa
+                aa"
         });
     }
 

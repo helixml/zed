@@ -13,7 +13,7 @@ use editor::{Editor, EditorElement, EditorStyle};
 use extension_host::{ExtensionManifest, ExtensionOperation, ExtensionStore};
 use fuzzy::{StringMatchCandidate, match_strings};
 use gpui::{
-    Action, App, ClipboardItem, Context, Corner, Entity, EventEmitter, Flatten, Focusable,
+    Action, App, ClipboardItem, Context, Corner, Entity, EventEmitter, Focusable,
     InteractiveElement, KeyContext, ParentElement, Point, Render, Styled, Task, TextStyle,
     UniformListScrollHandle, WeakEntity, Window, actions, point, uniform_list,
 };
@@ -131,25 +131,22 @@ pub fn init(cx: &mut App) {
                 let workspace_handle = cx.entity().downgrade();
                 window
                     .spawn(cx, async move |cx| {
-                        let extension_path =
-                            match Flatten::flatten(prompt.await.map_err(|e| e.into())) {
-                                Ok(Some(mut paths)) => paths.pop()?,
-                                Ok(None) => return None,
-                                Err(err) => {
-                                    workspace_handle
-                                        .update(cx, |workspace, cx| {
-                                            workspace.show_portal_error(err.to_string(), cx);
-                                        })
-                                        .ok();
-                                    return None;
-                                }
-                            };
+                        let extension_path = match prompt.await.map_err(anyhow::Error::from) {
+                            Ok(Some(mut paths)) => paths.pop()?,
+                            Ok(None) => return None,
+                            Err(err) => {
+                                workspace_handle
+                                    .update(cx, |workspace, cx| {
+                                        workspace.show_portal_error(err.to_string(), cx);
+                                    })
+                                    .ok();
+                                return None;
+                            }
+                        };
 
-                        let install_task = store
-                            .update(cx, |store, cx| {
-                                store.install_dev_extension(extension_path, cx)
-                            })
-                            .ok()?;
+                        let install_task = store.update(cx, |store, cx| {
+                            store.install_dev_extension(extension_path, cx)
+                        });
 
                         match install_task.await {
                             Ok(_) => {}
@@ -284,6 +281,10 @@ fn keywords_by_feature() -> &'static BTreeMap<Feature, Vec<&'static str>> {
             (Feature::Vim, vec!["vim"]),
         ])
     })
+}
+
+fn extension_button_id(extension_id: &Arc<str>, operation: ExtensionOperation) -> ElementId {
+    (SharedString::from(extension_id.clone()), operation as usize).into()
 }
 
 struct ExtensionCardButtons {
@@ -641,7 +642,7 @@ impl ExtensionsPage {
                                 }),
                             )
                             .child(
-                                Button::new(SharedString::from(extension.id.clone()), "Uninstall")
+                                Button::new(extension_button_id(&extension.id, ExtensionOperation::Remove), "Uninstall")
                                     .color(Color::Accent)
                                     .disabled(matches!(status, ExtensionStatus::Removing))
                                     .on_click({
@@ -988,7 +989,7 @@ impl ExtensionsPage {
             // The button here is a placeholder, as it won't be interactable anyways.
             return ExtensionCardButtons {
                 install_or_uninstall: Button::new(
-                    SharedString::from(extension.id.clone()),
+                    extension_button_id(&extension.id, ExtensionOperation::Install),
                     "Install",
                 ),
                 configure: None,
@@ -1004,7 +1005,7 @@ impl ExtensionsPage {
         match status.clone() {
             ExtensionStatus::NotInstalled => ExtensionCardButtons {
                 install_or_uninstall: Button::new(
-                    SharedString::from(extension.id.clone()),
+                    extension_button_id(&extension.id, ExtensionOperation::Install),
                     "Install",
                 )
                 .style(ButtonStyle::Tinted(ui::TintColor::Accent))
@@ -1026,7 +1027,7 @@ impl ExtensionsPage {
             },
             ExtensionStatus::Installing => ExtensionCardButtons {
                 install_or_uninstall: Button::new(
-                    SharedString::from(extension.id.clone()),
+                    extension_button_id(&extension.id, ExtensionOperation::Install),
                     "Install",
                 )
                 .style(ButtonStyle::Tinted(ui::TintColor::Accent))
@@ -1040,7 +1041,7 @@ impl ExtensionsPage {
             },
             ExtensionStatus::Upgrading => ExtensionCardButtons {
                 install_or_uninstall: Button::new(
-                    SharedString::from(extension.id.clone()),
+                    extension_button_id(&extension.id, ExtensionOperation::Remove),
                     "Uninstall",
                 )
                 .style(ButtonStyle::OutlinedGhost)
@@ -1053,12 +1054,16 @@ impl ExtensionsPage {
                     .disabled(true)
                 }),
                 upgrade: Some(
-                    Button::new(SharedString::from(extension.id.clone()), "Upgrade").disabled(true),
+                    Button::new(
+                        extension_button_id(&extension.id, ExtensionOperation::Upgrade),
+                        "Upgrade",
+                    )
+                    .disabled(true),
                 ),
             },
             ExtensionStatus::Installed(installed_version) => ExtensionCardButtons {
                 install_or_uninstall: Button::new(
-                    SharedString::from(extension.id.clone()),
+                    extension_button_id(&extension.id, ExtensionOperation::Remove),
                     "Uninstall",
                 )
                 .style(ButtonStyle::OutlinedGhost)
@@ -1102,7 +1107,7 @@ impl ExtensionsPage {
                     None
                 } else {
                     Some(
-                        Button::new(SharedString::from(extension.id.clone()), "Upgrade")
+                        Button::new(extension_button_id(&extension.id, ExtensionOperation::Upgrade), "Upgrade")
                           .style(ButtonStyle::Tinted(ui::TintColor::Accent))
                             .when(!is_compatible, |upgrade_button| {
                                 upgrade_button.disabled(true).tooltip({
@@ -1139,7 +1144,7 @@ impl ExtensionsPage {
             },
             ExtensionStatus::Removing => ExtensionCardButtons {
                 install_or_uninstall: Button::new(
-                    SharedString::from(extension.id.clone()),
+                    extension_button_id(&extension.id, ExtensionOperation::Remove),
                     "Uninstall",
                 )
                 .style(ButtonStyle::OutlinedGhost)
@@ -1601,7 +1606,7 @@ impl Render for ExtensionsPage {
                             .w_full()
                             .gap_1p5()
                             .justify_between()
-                            .child(Headline::new("Extensions").size(HeadlineSize::XLarge))
+                            .child(Headline::new("Extensions").size(HeadlineSize::Large))
                             .child(
                                 Button::new("install-dev-extension", "Install Dev Extension")
                                     .style(ButtonStyle::Outlined)
@@ -1686,7 +1691,8 @@ impl Render for ExtensionsPage {
                     )
                     .children(ExtensionProvides::iter().filter_map(|provides| {
                         match provides {
-                            ExtensionProvides::SlashCommands
+                            ExtensionProvides::AgentServers
+                            | ExtensionProvides::SlashCommands
                             | ExtensionProvides::IndexedDocsProviders => return None,
                             _ => {}
                         }
