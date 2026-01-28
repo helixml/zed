@@ -300,6 +300,11 @@ pub struct AcpThreadView {
     _subscriptions: [Subscription; 5],
     show_codex_windows_warning: bool,
     in_flight_prompt: Option<Vec<acp::ContentBlock>>,
+    /// Track last known tool call status discriminant to detect transitions (for boundary-based WebSocket updates)
+    /// We store the discriminant rather than the full ToolCallStatus because it contains a oneshot::Sender
+    /// which can't be cloned.
+    #[cfg(feature = "external_websocket_sync")]
+    last_tool_call_status: HashMap<usize, std::mem::Discriminant<ToolCallStatus>>,
 }
 
 enum ThreadState {
@@ -500,6 +505,8 @@ impl AcpThreadView {
             resume_thread_metadata: None,
             show_codex_windows_warning: false,
             in_flight_prompt: None,
+            #[cfg(feature = "external_websocket_sync")]
+            last_tool_call_status: HashMap::default(),
         }
     }
 
@@ -646,6 +653,8 @@ impl AcpThreadView {
             resume_thread_metadata: resume_thread,
             show_codex_windows_warning,
             in_flight_prompt: None,
+            #[cfg(feature = "external_websocket_sync")]
+            last_tool_call_status: HashMap::default(),
         }
     }
 
@@ -1661,6 +1670,7 @@ impl AcpThreadView {
         cx.notify();
     }
 
+
     fn handle_thread_event(
         &mut self,
         thread: &Entity<AcpThread>,
@@ -1693,6 +1703,9 @@ impl AcpThreadView {
                         if let Some(entry) = thread_read.entries().get(index) {
                             match entry {
                                 acp_thread::AgentThreadEntry::UserMessage(msg) => {
+                                    // New user message = new turn, clear tool call status tracking
+                                    self.last_tool_call_status.clear();
+
                                     // User messages get their own message_id (for proper display)
                                     let content = msg.content.to_markdown(cx).to_string();
                                     eprintln!("📤 [ZED-UI] NewEntry {} (user) -> MessageAdded ({} chars)", index, content.len());
@@ -1772,61 +1785,90 @@ impl AcpThreadView {
                     view_state.sync_entry(*index, thread, window, cx)
                 });
 
-                // Send WebSocket event directly from ThreadView (bypasses subscription issues)
-                // IMPORTANT: We only send entries AFTER the last UserMessage (current turn).
-                // This ensures each Helix interaction receives only its own response content,
-                // not content from previous turns which would cause cumulative concatenation.
+                // BOUNDARY-BASED UPDATES: Only send WebSocket updates when tool call status changes.
+                // This reduces O(n²) per-token updates to O(n) boundary-based updates.
+                // We still need to send on NewEntry (handled above) and Stopped (handled below).
                 #[cfg(feature = "external_websocket_sync")]
                 {
                     let thread_read = thread.read(cx);
-                    let acp_thread_id = thread_read.session_id().to_string();
                     let entries = thread_read.entries();
 
-                    // Find the last UserMessage index - we only want entries AFTER this
-                    let last_user_idx = entries.iter()
-                        .rposition(|e| matches!(e, acp_thread::AgentThreadEntry::UserMessage(_)));
+                    // Check if this update represents a tool call status change (boundary event)
+                    let should_send = if let Some(acp_thread::AgentThreadEntry::ToolCall(tool_call)) = entries.get(*index) {
+                        let current_discriminant = std::mem::discriminant(&tool_call.status);
+                        let previous_discriminant = self.last_tool_call_status.get(index);
 
-                    // Collect only entries AFTER the last UserMessage (current turn's response)
-                    let mut cumulative_content = String::new();
-                    for (idx, entry) in entries.iter().enumerate() {
-                        // Skip entries at or before the last user message
-                        if let Some(user_idx) = last_user_idx {
-                            if idx <= user_idx {
-                                continue;
-                            }
-                        }
-                        let entry_content = match entry {
-                            acp_thread::AgentThreadEntry::AssistantMessage(msg) => {
-                                Some(msg.content_only(cx))
-                            }
-                            acp_thread::AgentThreadEntry::ToolCall(tool_call) => {
-                                Some(tool_call.to_markdown(cx))
-                            }
-                            acp_thread::AgentThreadEntry::UserMessage(_) => None,
+                        // Determine if status actually changed (comparing discriminants only)
+                        let status_changed = match previous_discriminant {
+                            Some(prev) => *prev != current_discriminant,
+                            None => true, // First time seeing this tool call
                         };
-                        if let Some(content) = entry_content {
-                            if !cumulative_content.is_empty() {
-                                cumulative_content.push_str("\n\n");
-                            }
-                            cumulative_content.push_str(&content);
-                        }
-                    }
 
-                    if !cumulative_content.is_empty() {
-                        eprintln!("📤 [ZED-UI] EntryUpdated {} -> MessageAdded (current turn: {} chars)", index, cumulative_content.len());
-                        log::info!("📤 [ZED-UI] EntryUpdated {} -> MessageAdded (current turn: {} chars)", index, cumulative_content.len());
-                        // Use constant message_id "response" so it always overwrites with complete state
-                        if let Err(e) = external_websocket_sync::send_websocket_event(
-                            external_websocket_sync::SyncEvent::MessageAdded {
-                                acp_thread_id,
-                                message_id: "response".to_string(),
-                                role: "assistant".to_string(),
-                                content: cumulative_content,
-                                timestamp: chrono::Utc::now().timestamp(),
+                        if status_changed {
+                            // Update our tracking with the new discriminant
+                            self.last_tool_call_status.insert(*index, current_discriminant);
+                            eprintln!("🔄 [ZED-UI] EntryUpdated {} - tool call status changed -> sending update", index);
+                            log::info!("🔄 [ZED-UI] EntryUpdated {} - tool call status changed -> sending update", index);
+                            true
+                        } else {
+                            // No status change, skip sending (this is the optimization!)
+                            false
+                        }
+                    } else {
+                        // Not a tool call - for streaming text, we skip per-token updates
+                        // The final state will be sent on Stopped event
+                        false
+                    };
+
+                    if should_send {
+                        let acp_thread_id = thread_read.session_id().to_string();
+
+                        // Find the last UserMessage index - we only want entries AFTER this
+                        let last_user_idx = entries.iter()
+                            .rposition(|e| matches!(e, acp_thread::AgentThreadEntry::UserMessage(_)));
+
+                        // Collect only entries AFTER the last UserMessage (current turn's response)
+                        let mut cumulative_content = String::new();
+                        for (idx, entry) in entries.iter().enumerate() {
+                            // Skip entries at or before the last user message
+                            if let Some(user_idx) = last_user_idx {
+                                if idx <= user_idx {
+                                    continue;
+                                }
                             }
-                        ) {
-                            eprintln!("❌ [ZED-UI] Failed to send message_added event: {}", e);
-                            log::error!("❌ [ZED-UI] Failed to send message_added event: {}", e);
+                            let entry_content = match entry {
+                                acp_thread::AgentThreadEntry::AssistantMessage(msg) => {
+                                    Some(msg.content_only(cx))
+                                }
+                                acp_thread::AgentThreadEntry::ToolCall(tool_call) => {
+                                    Some(tool_call.to_markdown(cx))
+                                }
+                                acp_thread::AgentThreadEntry::UserMessage(_) => None,
+                            };
+                            if let Some(content) = entry_content {
+                                if !cumulative_content.is_empty() {
+                                    cumulative_content.push_str("\n\n");
+                                }
+                                cumulative_content.push_str(&content);
+                            }
+                        }
+
+                        if !cumulative_content.is_empty() {
+                            eprintln!("📤 [ZED-UI] EntryUpdated {} -> MessageAdded (current turn: {} chars)", index, cumulative_content.len());
+                            log::info!("📤 [ZED-UI] EntryUpdated {} -> MessageAdded (current turn: {} chars)", index, cumulative_content.len());
+                            // Use constant message_id "response" so it always overwrites with complete state
+                            if let Err(e) = external_websocket_sync::send_websocket_event(
+                                external_websocket_sync::SyncEvent::MessageAdded {
+                                    acp_thread_id,
+                                    message_id: "response".to_string(),
+                                    role: "assistant".to_string(),
+                                    content: cumulative_content,
+                                    timestamp: chrono::Utc::now().timestamp(),
+                                }
+                            ) {
+                                eprintln!("❌ [ZED-UI] Failed to send message_added event: {}", e);
+                                log::error!("❌ [ZED-UI] Failed to send message_added event: {}", e);
+                            }
                         }
                     }
                 }
@@ -1859,8 +1901,60 @@ impl AcpThreadView {
                 // Send WebSocket event directly from ThreadView (bypasses subscription issues)
                 #[cfg(feature = "external_websocket_sync")]
                 {
-                    let acp_thread_id = thread.read(cx).session_id().to_string();
-                    // Get request_id from thread service's tracking (if available)
+                    let thread_read = thread.read(cx);
+                    let acp_thread_id = thread_read.session_id().to_string();
+                    let entries = thread_read.entries();
+
+                    // BOUNDARY EVENT: Send final state - this is critical since we skip per-token updates
+                    // Find the last UserMessage index - we only want entries AFTER this
+                    let last_user_idx = entries.iter()
+                        .rposition(|e| matches!(e, acp_thread::AgentThreadEntry::UserMessage(_)));
+
+                    // Collect only entries AFTER the last UserMessage (current turn's response)
+                    let mut cumulative_content = String::new();
+                    for (idx, entry) in entries.iter().enumerate() {
+                        // Skip entries at or before the last user message
+                        if let Some(user_idx) = last_user_idx {
+                            if idx <= user_idx {
+                                continue;
+                            }
+                        }
+                        let entry_content = match entry {
+                            acp_thread::AgentThreadEntry::AssistantMessage(msg) => {
+                                Some(msg.content_only(cx))
+                            }
+                            acp_thread::AgentThreadEntry::ToolCall(tool_call) => {
+                                Some(tool_call.to_markdown(cx))
+                            }
+                            acp_thread::AgentThreadEntry::UserMessage(_) => None,
+                        };
+                        if let Some(content) = entry_content {
+                            if !cumulative_content.is_empty() {
+                                cumulative_content.push_str("\n\n");
+                            }
+                            cumulative_content.push_str(&content);
+                        }
+                    }
+
+                    // Send final content state first
+                    if !cumulative_content.is_empty() {
+                        eprintln!("📤 [ZED-UI] Stopped -> MessageAdded FINAL (current turn: {} chars)", cumulative_content.len());
+                        log::info!("📤 [ZED-UI] Stopped -> MessageAdded FINAL (current turn: {} chars)", cumulative_content.len());
+                        if let Err(e) = external_websocket_sync::send_websocket_event(
+                            external_websocket_sync::SyncEvent::MessageAdded {
+                                acp_thread_id: acp_thread_id.clone(),
+                                message_id: "response".to_string(),
+                                role: "assistant".to_string(),
+                                content: cumulative_content,
+                                timestamp: chrono::Utc::now().timestamp(),
+                            }
+                        ) {
+                            eprintln!("❌ [ZED-UI] Failed to send final message_added event: {}", e);
+                            log::error!("❌ [ZED-UI] Failed to send final message_added event: {}", e);
+                        }
+                    }
+
+                    // Then send MessageCompleted
                     let request_id = external_websocket_sync::get_thread_request_id(&acp_thread_id)
                         .unwrap_or_default();
                     eprintln!("📤 [ZED-UI] Stopped -> MessageCompleted (thread: {}, request: {})", acp_thread_id, request_id);
@@ -1875,6 +1969,9 @@ impl AcpThreadView {
                         eprintln!("❌ [ZED-UI] Failed to send message_completed event: {}", e);
                         log::error!("❌ [ZED-UI] Failed to send message_completed event: {}", e);
                     }
+
+                    // Clear tool call status tracking for next turn
+                    self.last_tool_call_status.clear();
                 }
             }
             AcpThreadEvent::Refusal => {
