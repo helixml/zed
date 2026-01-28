@@ -442,6 +442,16 @@ pub fn count_anthropic_tokens_with_tiktoken(request: LanguageModelRequest) -> Re
         .map(|tokens| (tokens + tokens_from_images) as u64)
 }
 
+/// Async wrapper for token counting, for use by providers (like Zed Cloud) that
+/// don't have direct access to Anthropic's count_tokens API.
+pub fn count_anthropic_tokens(
+    request: LanguageModelRequest,
+    cx: &App,
+) -> BoxFuture<'static, Result<u64>> {
+    cx.background_spawn(async move { count_anthropic_tokens_with_tiktoken(request) })
+        .boxed()
+}
+
 impl AnthropicModel {
     fn stream_completion(
         &self,
