@@ -61,6 +61,26 @@ impl From<RemoteTransportType> for HttpTransportType {
     }
 }
 
+impl From<settings::HttpTransportType> for HttpTransportType {
+    fn from(value: settings::HttpTransportType) -> Self {
+        match value {
+            settings::HttpTransportType::Auto => HttpTransportType::Auto,
+            settings::HttpTransportType::StreamableHttp => HttpTransportType::StreamableHttp,
+            settings::HttpTransportType::LegacySse => HttpTransportType::LegacySse,
+        }
+    }
+}
+
+impl From<HttpTransportType> for settings::HttpTransportType {
+    fn from(value: HttpTransportType) -> Self {
+        match value {
+            HttpTransportType::Auto => settings::HttpTransportType::Auto,
+            HttpTransportType::StreamableHttp => settings::HttpTransportType::StreamableHttp,
+            HttpTransportType::LegacySse => settings::HttpTransportType::LegacySse,
+        }
+    }
+}
+
 use crate::{
     task_store::{TaskSettingsLocation, TaskStore},
     worktree_store::{WorktreeStore, WorktreeStoreEvent},

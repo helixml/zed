@@ -172,6 +172,7 @@ impl ConfigurationSource {
                                 enabled: true,
                                 url,
                                 headers: auth,
+                                transport: Default::default(),
                             },
                         )
                     })
@@ -411,6 +412,7 @@ impl ConfigureContextServerModal {
                     enabled: _,
                     url,
                     headers,
+                    ..
                 } => Some(ConfigurationTarget::ExistingHttp {
                     id: server_id,
                     url,
