@@ -1,9 +1,11 @@
-use std::{path::PathBuf, sync::Arc};
+use std::{borrow::Cow, path::PathBuf, sync::Arc};
 
 use collections::{BTreeMap, HashMap};
-use schemars::JsonSchema;
+use schemars::{JsonSchema, json_schema};
 use serde::{Deserialize, Serialize};
 use settings_macros::{MergeFrom, with_fallible_options};
+
+use crate::merge_from::MergeFrom as MergeFromTrait;
 use util::serde::default_true;
 
 use crate::{
@@ -214,6 +216,8 @@ pub enum ContextServerSettingsContent {
         /// Whether the context server is enabled.
         #[serde(default = "default_true")]
         enabled: bool,
+        /// Must be "sse" - this field distinguishes SSE from HTTP transport.
+        source: SseMarker,
         /// The URL of the SSE endpoint (legacy HTTP+SSE transport, MCP 2024-11-05).
         url: String,
         /// Optional headers to send.
@@ -254,6 +258,50 @@ impl ContextServerSettingsContent {
                 ..
             } => *sse_enabled = enabled,
         }
+    }
+}
+
+/// Marker type that only deserializes from the literal string "sse".
+/// Used to distinguish SSE transport from HTTP transport in untagged enum deserialization.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub struct SseMarker;
+
+impl serde::Serialize for SseMarker {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str("sse")
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for SseMarker {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let s = String::deserialize(deserializer)?;
+        if s == "sse" {
+            Ok(SseMarker)
+        } else {
+            Err(serde::de::Error::custom(format!(
+                "expected 'sse', got '{}'",
+                s
+            )))
+        }
+    }
+}
+
+impl JsonSchema for SseMarker {
+    fn schema_name() -> std::borrow::Cow<'static, str> {
+        std::borrow::Cow::Borrowed("SseMarker")
+    }
+
+    fn json_schema(_: &mut schemars::SchemaGenerator) -> schemars::Schema {
+        json_schema!({
+            "type": "string",
+            "const": "sse"
+        })
+    }
+}
+
+impl MergeFromTrait for SseMarker {
+    fn merge_from(&mut self, _other: &Self) {
+        // Nothing to merge - it's always "sse"
     }
 }
 

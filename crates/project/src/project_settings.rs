@@ -177,6 +177,7 @@ impl From<settings::ContextServerSettingsContent> for ContextServerSettings {
             },
             settings::ContextServerSettingsContent::Sse {
                 enabled,
+                source: _,
                 url,
                 headers,
             } => ContextServerSettings::Sse {
@@ -211,6 +212,7 @@ impl Into<settings::ContextServerSettingsContent> for ContextServerSettings {
                 headers,
             } => settings::ContextServerSettingsContent::Sse {
                 enabled,
+                source: settings::SseMarker,
                 url,
                 headers,
             },
