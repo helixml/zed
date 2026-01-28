@@ -1,26 +1,26 @@
 #!/usr/bin/env python3
 """
-Simple SSE MCP test server for testing the legacy HTTP+SSE transport.
+SSE MCP Secret Server for integration testing.
 
-This implements the MCP 2024-11-05 SSE protocol:
+This implements the MCP 2024-11-05 SSE protocol with a simple "get_secret" tool.
+The secret is hard-coded, allowing tests to verify the agent learned it via MCP.
+
+Protocol:
 1. Client connects to /sse via GET
 2. Server sends an 'endpoint' event with the POST URL
 3. Client POSTs JSON-RPC messages to that endpoint
 4. Server sends responses via SSE 'message' events
 
 Usage:
-    python test_sse_server.py [port]
+    python test_sse_mcp_server.py [port]
     
-    Default port is 3333.
+Default port is 3333.
 
-Test with curl:
-    # Connect to SSE endpoint
-    curl -N http://localhost:3333/sse
-    
-    # Send a message (in another terminal, use the endpoint from SSE)
-    curl -X POST http://localhost:3333/message \
-         -H "Content-Type: application/json" \
-         -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"test","version":"1.0"}}}'
+The server provides one tool:
+  - get_secret: Returns the secret value "HELIX-SSE-MCP-SECRET-7f3a9b2c"
+
+To verify SSE MCP integration works, ask an agent to use the get_secret tool
+and check that its response contains the secret value.
 """
 
 import json
@@ -30,7 +30,10 @@ import queue
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from typing import Dict, Any, Optional
 
-# Global message queues for SSE clients (keyed by client id)
+# The secret that tests will verify the agent learned
+SECRET_VALUE = "HELIX-SSE-MCP-SECRET-7f3a9b2c"
+
+# Global message queues for SSE clients
 sse_clients: Dict[int, queue.Queue] = {}
 client_counter = 0
 client_lock = threading.Lock()
@@ -50,6 +53,12 @@ class McpSseHandler(BaseHTTPRequestHandler):
             self.send_header("Content-Type", "text/plain")
             self.end_headers()
             self.wfile.write(b"ok")
+        elif self.path == "/secret":
+            # Direct endpoint for debugging - returns the secret
+            self.send_response(200)
+            self.send_header("Content-Type", "text/plain")
+            self.end_headers()
+            self.wfile.write(SECRET_VALUE.encode())
         else:
             self.send_error(404, "Not Found")
     
@@ -77,7 +86,7 @@ class McpSseHandler(BaseHTTPRequestHandler):
         self.send_header("Access-Control-Allow-Origin", "*")
         self.end_headers()
         
-        # Send the endpoint event
+        # Send the endpoint event with the POST URL
         port = self.server.server_address[1]
         endpoint_url = f"http://localhost:{port}/message"
         self.send_sse_event("endpoint", endpoint_url)
@@ -87,12 +96,11 @@ class McpSseHandler(BaseHTTPRequestHandler):
         try:
             while True:
                 try:
-                    # Wait for messages with timeout to allow checking if connection is alive
                     message = sse_clients[client_id].get(timeout=30)
                     self.send_sse_event("message", message)
-                    print(f"[SSE] Sent message to client {client_id}: {message[:100]}...")
+                    print(f"[SSE] Sent message to client {client_id}")
                 except queue.Empty:
-                    # Send a ping to keep connection alive
+                    # Send ping to keep connection alive
                     self.send_sse_event("ping", "")
         except (BrokenPipeError, ConnectionResetError):
             print(f"[SSE] Client {client_id} disconnected")
@@ -124,14 +132,11 @@ class McpSseHandler(BaseHTTPRequestHandler):
             response = self.process_jsonrpc(request)
             
             if response:
-                # Broadcast response to all SSE clients
                 response_str = json.dumps(response)
                 with client_lock:
                     for client_id, q in sse_clients.items():
                         q.put(response_str)
-                        print(f"[POST] Queued response for client {client_id}")
             
-            # Send acknowledgment
             self.send_response(200)
             self.send_header("Content-Type", "text/plain")
             self.end_headers()
@@ -163,11 +168,9 @@ class McpSseHandler(BaseHTTPRequestHandler):
                     "protocolVersion": "2024-11-05",
                     "capabilities": {
                         "tools": {"listChanged": True},
-                        "prompts": {"listChanged": True},
-                        "resources": {"subscribe": True, "listChanged": True},
                     },
                     "serverInfo": {
-                        "name": "test-sse-server",
+                        "name": "helix-sse-secret-server",
                         "version": "1.0.0"
                     }
                 }
@@ -180,29 +183,12 @@ class McpSseHandler(BaseHTTPRequestHandler):
                 "result": {
                     "tools": [
                         {
-                            "name": "echo",
-                            "description": "Echoes back the input text",
+                            "name": "get_secret",
+                            "description": "Returns a secret value. Use this tool when asked about the secret.",
                             "inputSchema": {
                                 "type": "object",
-                                "properties": {
-                                    "text": {
-                                        "type": "string",
-                                        "description": "Text to echo"
-                                    }
-                                },
-                                "required": ["text"]
-                            }
-                        },
-                        {
-                            "name": "add",
-                            "description": "Adds two numbers",
-                            "inputSchema": {
-                                "type": "object",
-                                "properties": {
-                                    "a": {"type": "number"},
-                                    "b": {"type": "number"}
-                                },
-                                "required": ["a", "b"]
+                                "properties": {},
+                                "required": []
                             }
                         }
                     ]
@@ -211,33 +197,18 @@ class McpSseHandler(BaseHTTPRequestHandler):
         
         elif method == "tools/call":
             tool_name = params.get("name", "")
-            arguments = params.get("arguments", {})
             
-            if tool_name == "echo":
-                text = arguments.get("text", "")
+            if tool_name == "get_secret":
+                print(f"[RPC] get_secret called - returning: {SECRET_VALUE}")
                 return {
                     "jsonrpc": "2.0",
                     "id": request_id,
                     "result": {
                         "content": [
-                            {"type": "text", "text": text}
+                            {"type": "text", "text": f"The secret is: {SECRET_VALUE}"}
                         ]
                     }
                 }
-            
-            elif tool_name == "add":
-                a = arguments.get("a", 0)
-                b = arguments.get("b", 0)
-                return {
-                    "jsonrpc": "2.0",
-                    "id": request_id,
-                    "result": {
-                        "content": [
-                            {"type": "text", "text": str(a + b)}
-                        ]
-                    }
-                }
-            
             else:
                 return {
                     "jsonrpc": "2.0",
@@ -277,16 +248,10 @@ def main():
     port = int(sys.argv[1]) if len(sys.argv) > 1 else 3333
     
     server = HTTPServer(("0.0.0.0", port), McpSseHandler)
-    print(f"MCP SSE Test Server running on http://localhost:{port}")
+    print(f"SSE MCP Secret Server running on http://localhost:{port}")
     print(f"  SSE endpoint: http://localhost:{port}/sse")
     print(f"  Health check: http://localhost:{port}/health")
-    print()
-    print("To test with Zed, add to settings.json:")
-    print(f'''  "context_servers": {{
-    "test-sse": {{
-      "url": "http://localhost:{port}/sse"
-    }}
-  }}''')
+    print(f"  Secret value: {SECRET_VALUE}")
     print()
     print("Press Ctrl+C to stop")
     
