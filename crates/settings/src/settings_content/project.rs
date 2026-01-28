@@ -202,16 +202,6 @@ pub enum ContextServerSettingsContent {
         #[serde(flatten)]
         command: ContextServerCommand,
     },
-    Http {
-        /// Whether the context server is enabled.
-        #[serde(default = "default_true")]
-        enabled: bool,
-        /// The URL of the remote context server (Streamable HTTP transport, MCP 2025-03-26+).
-        url: String,
-        /// Optional headers to send.
-        #[serde(skip_serializing_if = "HashMap::is_empty", default)]
-        headers: HashMap<String, String>,
-    },
     Sse {
         /// Whether the context server is enabled.
         #[serde(default = "default_true")]
@@ -219,6 +209,16 @@ pub enum ContextServerSettingsContent {
         /// Must be "sse" - this field distinguishes SSE from HTTP transport.
         source: SseMarker,
         /// The URL of the SSE endpoint (legacy HTTP+SSE transport, MCP 2024-11-05).
+        url: String,
+        /// Optional headers to send.
+        #[serde(skip_serializing_if = "HashMap::is_empty", default)]
+        headers: HashMap<String, String>,
+    },
+    Http {
+        /// Whether the context server is enabled.
+        #[serde(default = "default_true")]
+        enabled: bool,
+        /// The URL of the remote context server (Streamable HTTP transport, MCP 2025-03-26+).
         url: String,
         /// Optional headers to send.
         #[serde(skip_serializing_if = "HashMap::is_empty", default)]
