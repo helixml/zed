@@ -302,18 +302,18 @@ impl Transport for SseTransport {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use futures::StreamExt;
     use gpui::TestAppContext;
     use http_client::FakeHttpClient;
     use http_client::http::Response;
+    use parking_lot::Mutex as ParkingMutex;
 
     #[gpui::test]
-    async fn test_sse_transport_endpoint_event(cx: &mut TestAppContext) {
+    fn test_sse_transport_endpoint_event(cx: &mut TestAppContext) {
         let executor = cx.executor();
-        
+
         // Simulate SSE response with endpoint event followed by a message
         let sse_response = "event: endpoint\ndata: http://localhost:3000/message\n\nevent: message\ndata: {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{}}\n\n";
-        
+
         let http_client = FakeHttpClient::create(move |req| {
             let sse_response = sse_response.to_string();
             async move {
@@ -334,15 +334,23 @@ mod tests {
             }
         });
 
-        let transport = SseTransport::new(
+        let transport = Arc::new(SseTransport::new(
             http_client,
             "http://localhost:3000/sse".to_string(),
             HashMap::default(),
             executor.clone(),
-        );
+        ));
 
-        // Connect to SSE endpoint
-        transport.connect().await.unwrap();
+        // Start connection in a spawned task
+        let transport_clone = transport.clone();
+        executor
+            .spawn(async move {
+                transport_clone.connect().await.unwrap();
+            })
+            .detach();
+
+        // Drive the executor to process the async tasks
+        cx.run_until_parked();
 
         // Verify we got the POST endpoint
         assert_eq!(
@@ -350,19 +358,26 @@ mod tests {
             Some("http://localhost:3000/message".to_string())
         );
 
-        // Check we can receive messages
-        let mut receiver = transport.receive();
-        let msg = receiver.next().await;
+        // Check we can receive messages - the stream task should have processed the message event
+        // Use executor to poll the receiver
+        let transport_clone = transport.clone();
+        let msg = executor.block(async move {
+            let mut receiver = transport_clone.receive();
+            use futures::StreamExt;
+            receiver.next().await
+        });
+
         assert!(msg.is_some());
         assert!(msg.unwrap().contains("jsonrpc"));
     }
 
     #[gpui::test]
-    async fn test_sse_transport_send_message(cx: &mut TestAppContext) {
+    fn test_sse_transport_send_message(cx: &mut TestAppContext) {
         let executor = cx.executor();
-        
-        let sse_response = "event: endpoint\ndata: http://localhost:3000/message\n\n";
-        
+
+        // SSE response with endpoint event, then a message event (simulating server response)
+        let sse_response = "event: endpoint\ndata: http://localhost:3000/message\n\nevent: message\ndata: {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"success\":true}}\n\n";
+
         let http_client = FakeHttpClient::create(move |req| {
             let sse_response = sse_response.to_string();
             async move {
@@ -373,31 +388,303 @@ mod tests {
                         .body(sse_response.into())
                         .unwrap())
                 } else {
-                    // POST - return a JSON-RPC response
+                    // POST - return simple acknowledgment (real SSE servers send response via SSE stream)
                     Ok(Response::builder()
                         .status(200)
-                        .body("{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{}}".to_string().into())
+                        .body("accepted".to_string().into())
                         .unwrap())
                 }
             }
         });
 
-        let transport = SseTransport::new(
+        let transport = Arc::new(SseTransport::new(
             http_client,
             "http://localhost:3000/sse".to_string(),
             HashMap::default(),
             executor.clone(),
+        ));
+
+        // First, connect to the SSE endpoint
+        let transport_clone = transport.clone();
+        executor
+            .spawn(async move {
+                transport_clone.connect().await.unwrap();
+            })
+            .detach();
+
+        // Drive executor to complete the connection and SSE stream processing
+        cx.run_until_parked();
+
+        // Verify connection succeeded
+        assert!(transport.post_endpoint.lock().is_some());
+
+        // Now send a message
+        let transport_clone = transport.clone();
+        executor
+            .spawn(async move {
+                transport_clone
+                    .send("{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"test\"}".to_string())
+                    .await
+                    .unwrap();
+            })
+            .detach();
+
+        // Drive executor to complete the send
+        cx.run_until_parked();
+
+        // The response should be available from the SSE stream (the message event)
+        let msg = transport.response_rx.try_recv().ok();
+
+        assert!(msg.is_some());
+        assert!(msg.unwrap().contains("success"));
+    }
+
+    #[gpui::test]
+    fn test_sse_transport_initialize_flow(cx: &mut TestAppContext) {
+        // Test the full MCP initialize flow: connect -> initialize request -> initialized notification
+        let executor = cx.executor();
+
+        // Track requests received by the mock server
+        let requests_received: Arc<ParkingMutex<Vec<String>>> = Arc::new(ParkingMutex::new(Vec::new()));
+        let requests_clone = requests_received.clone();
+
+        // SSE stream: endpoint event, then initialize response
+        let sse_response = concat!(
+            "event: endpoint\n",
+            "data: http://localhost:3000/message\n",
+            "\n",
+            "event: message\n",
+            "data: {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"protocolVersion\":\"2024-11-05\",\"capabilities\":{\"tools\":{\"listChanged\":true}},\"serverInfo\":{\"name\":\"test-server\",\"version\":\"1.0\"}}}\n",
+            "\n"
         );
 
-        // Send a message (this will auto-connect)
-        transport
-            .send("{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\"}".to_string())
-            .await
-            .unwrap();
+        let http_client = FakeHttpClient::create(move |req| {
+            let sse_response = sse_response.to_string();
+            let requests_clone = requests_clone.clone();
+            async move {
+                if req.method() == Method::GET {
+                    Ok(Response::builder()
+                        .status(200)
+                        .header("content-type", "text/event-stream")
+                        .body(sse_response.into())
+                        .unwrap())
+                } else {
+                    // Capture the POST body
+                    let mut body = req.into_body();
+                    let mut body_str = String::new();
+                    futures::AsyncReadExt::read_to_string(&mut body, &mut body_str).await.ok();
+                    requests_clone.lock().push(body_str);
 
-        // The response should be available
-        let mut receiver = transport.receive();
-        let msg = receiver.next().await;
+                    Ok(Response::builder()
+                        .status(200)
+                        .body("accepted".into())
+                        .unwrap())
+                }
+            }
+        });
+
+        let transport = Arc::new(SseTransport::new(
+            http_client,
+            "http://localhost:3000/sse".to_string(),
+            HashMap::default(),
+            executor.clone(),
+        ));
+
+        // Connect
+        let transport_clone = transport.clone();
+        executor
+            .spawn(async move {
+                transport_clone.connect().await.unwrap();
+            })
+            .detach();
+        cx.run_until_parked();
+
+        // Send initialize request
+        let transport_clone = transport.clone();
+        executor
+            .spawn(async move {
+                transport_clone
+                    .send(r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"zed","version":"1.0"}}}"#.to_string())
+                    .await
+                    .unwrap();
+            })
+            .detach();
+        cx.run_until_parked();
+
+        // Verify the request was sent
+        let requests = requests_received.lock();
+        assert_eq!(requests.len(), 1);
+        assert!(requests[0].contains("initialize"));
+        assert!(requests[0].contains("protocolVersion"));
+        drop(requests);
+
+        // Verify we got the response
+        let msg = transport.response_rx.try_recv().ok();
         assert!(msg.is_some());
+        let response = msg.unwrap();
+        assert!(response.contains("protocolVersion"));
+        assert!(response.contains("test-server"));
+    }
+
+    #[gpui::test]
+    fn test_sse_transport_with_auth_headers(cx: &mut TestAppContext) {
+        // Test that custom headers (like Authorization) are sent with requests
+        let executor = cx.executor();
+
+        let headers_received: Arc<ParkingMutex<Vec<(String, String)>>> = Arc::new(ParkingMutex::new(Vec::new()));
+        let headers_clone = headers_received.clone();
+
+        let sse_response = "event: endpoint\ndata: http://localhost:3000/message\n\n";
+
+        let http_client = FakeHttpClient::create(move |req| {
+            let sse_response = sse_response.to_string();
+            let headers_clone = headers_clone.clone();
+            async move {
+                // Capture headers
+                for (name, value) in req.headers() {
+                    if name.as_str() == "authorization" || name.as_str() == "x-custom-header" {
+                        headers_clone.lock().push((
+                            name.to_string(),
+                            value.to_str().unwrap_or("").to_string(),
+                        ));
+                    }
+                }
+
+                if req.method() == Method::GET {
+                    Ok(Response::builder()
+                        .status(200)
+                        .header("content-type", "text/event-stream")
+                        .body(sse_response.into())
+                        .unwrap())
+                } else {
+                    Ok(Response::builder()
+                        .status(200)
+                        .body("accepted".into())
+                        .unwrap())
+                }
+            }
+        });
+
+        let mut headers = HashMap::default();
+        headers.insert("Authorization".to_string(), "Bearer test-token-123".to_string());
+        headers.insert("X-Custom-Header".to_string(), "custom-value".to_string());
+
+        let transport = Arc::new(SseTransport::new(
+            http_client,
+            "http://localhost:3000/sse".to_string(),
+            headers,
+            executor.clone(),
+        ));
+
+        // Connect (should send headers with GET request)
+        let transport_clone = transport.clone();
+        executor
+            .spawn(async move {
+                transport_clone.connect().await.unwrap();
+            })
+            .detach();
+        cx.run_until_parked();
+
+        // Send a message (should send headers with POST request)
+        let transport_clone = transport.clone();
+        executor
+            .spawn(async move {
+                transport_clone
+                    .send(r#"{"jsonrpc":"2.0","id":1,"method":"test"}"#.to_string())
+                    .await
+                    .unwrap();
+            })
+            .detach();
+        cx.run_until_parked();
+
+        // Verify headers were sent
+        let headers = headers_received.lock();
+        // Should have headers from both GET and POST requests
+        assert!(headers.len() >= 2, "Expected at least 2 header captures, got {}", headers.len());
+        
+        let auth_headers: Vec<_> = headers.iter().filter(|(k, _)| k == "authorization").collect();
+        assert!(!auth_headers.is_empty(), "Authorization header should be present");
+        assert!(auth_headers.iter().any(|(_, v)| v == "Bearer test-token-123"));
+    }
+
+    #[gpui::test]
+    fn test_sse_transport_connection_error(cx: &mut TestAppContext) {
+        // Test handling of connection errors
+        let executor = cx.executor();
+
+        let http_client = FakeHttpClient::create(move |_req| {
+            async move {
+                Ok(Response::builder()
+                    .status(500)
+                    .body("Internal Server Error".into())
+                    .unwrap())
+            }
+        });
+
+        let transport = Arc::new(SseTransport::new(
+            http_client,
+            "http://localhost:3000/sse".to_string(),
+            HashMap::default(),
+            executor.clone(),
+        ));
+
+        // Try to connect - should fail
+        let transport_clone = transport.clone();
+        let result: Arc<ParkingMutex<Option<anyhow::Result<()>>>> = Arc::new(ParkingMutex::new(None));
+        let result_clone = result.clone();
+        
+        executor
+            .spawn(async move {
+                let r = transport_clone.connect().await;
+                *result_clone.lock() = Some(r);
+            })
+            .detach();
+        cx.run_until_parked();
+
+        // Verify connection failed
+        let result = result.lock();
+        assert!(result.is_some());
+        assert!(result.as_ref().unwrap().is_err());
+    }
+
+    #[gpui::test]
+    fn test_sse_transport_wrong_content_type(cx: &mut TestAppContext) {
+        // Test handling of wrong content type response
+        let executor = cx.executor();
+
+        let http_client = FakeHttpClient::create(move |_req| {
+            async move {
+                Ok(Response::builder()
+                    .status(200)
+                    .header("content-type", "application/json")  // Wrong content type!
+                    .body("{}".into())
+                    .unwrap())
+            }
+        });
+
+        let transport = Arc::new(SseTransport::new(
+            http_client,
+            "http://localhost:3000/sse".to_string(),
+            HashMap::default(),
+            executor.clone(),
+        ));
+
+        let transport_clone = transport.clone();
+        let result: Arc<ParkingMutex<Option<anyhow::Result<()>>>> = Arc::new(ParkingMutex::new(None));
+        let result_clone = result.clone();
+        
+        executor
+            .spawn(async move {
+                let r = transport_clone.connect().await;
+                *result_clone.lock() = Some(r);
+            })
+            .detach();
+        cx.run_until_parked();
+
+        // Verify connection failed due to wrong content type
+        let result = result.lock();
+        assert!(result.is_some());
+        let err = result.as_ref().unwrap().as_ref().unwrap_err();
+        assert!(err.to_string().contains("text/event-stream"));
     }
 }
