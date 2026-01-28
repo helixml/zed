@@ -296,6 +296,18 @@ impl AgentConnection for AcpConnection {
                                     .collect(),
                             ),
                         )),
+                        project::context_server_store::ContextServerConfiguration::Sse {
+                            url,
+                            headers,
+                            ..
+                        } => Some(acp::McpServer::Http(
+                            acp::McpServerHttp::new(id.0.to_string(), url.to_string()).headers(
+                                headers
+                                    .iter()
+                                    .map(|(name, value)| acp::HttpHeader::new(name, value))
+                                    .collect(),
+                            ),
+                        )),
                     }
                 })
                 .collect()
@@ -669,6 +681,18 @@ impl AgentConnection for AcpConnection {
                                 }),
                         )),
                         project::context_server_store::ContextServerConfiguration::Http {
+                            url,
+                            headers,
+                            ..
+                        } => Some(acp::McpServer::Http(
+                            acp::McpServerHttp::new(id.0.to_string(), url.to_string()).headers(
+                                headers
+                                    .iter()
+                                    .map(|(name, value)| acp::HttpHeader::new(name, value))
+                                    .collect(),
+                            ),
+                        )),
+                        project::context_server_store::ContextServerConfiguration::Sse {
                             url,
                             headers,
                             ..

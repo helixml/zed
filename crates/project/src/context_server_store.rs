@@ -102,7 +102,10 @@ pub enum ContextServerConfiguration {
     Http {
         url: url::Url,
         headers: HashMap<String, String>,
-        transport: crate::project_settings::HttpTransportType,
+    },
+    Sse {
+        url: url::Url,
+        headers: HashMap<String, String>,
     },
 }
 
@@ -112,6 +115,7 @@ impl ContextServerConfiguration {
             ContextServerConfiguration::Custom { command } => Some(command),
             ContextServerConfiguration::Extension { command, .. } => Some(command),
             ContextServerConfiguration::Http { .. } => None,
+            ContextServerConfiguration::Sse { .. } => None,
         }
     }
 
@@ -152,10 +156,17 @@ impl ContextServerConfiguration {
                 enabled: _,
                 url,
                 headers: auth,
-                transport,
             } => {
                 let url = url::Url::parse(&url).log_err()?;
-                Some(ContextServerConfiguration::Http { url, headers: auth, transport })
+                Some(ContextServerConfiguration::Http { url, headers: auth })
+            }
+            ContextServerSettings::Sse {
+                enabled: _,
+                url,
+                headers: auth,
+            } => {
+                let url = url::Url::parse(&url).log_err()?;
+                Some(ContextServerConfiguration::Sse { url, headers: auth })
             }
         }
     }
@@ -489,13 +500,19 @@ impl ContextServerStore {
         }
 
         match configuration.as_ref() {
-            ContextServerConfiguration::Http { url, headers, transport } => Ok(Arc::new(ContextServer::remote(
+            ContextServerConfiguration::Http { url, headers } => Ok(Arc::new(ContextServer::http(
                 id,
                 url,
                 headers.clone(),
                 cx.http_client(),
                 cx.background_executor().clone(),
-                (*transport).into(),
+            )?)),
+            ContextServerConfiguration::Sse { url, headers } => Ok(Arc::new(ContextServer::sse(
+                id,
+                url,
+                headers.clone(),
+                cx.http_client(),
+                cx.background_executor().clone(),
             )?)),
             _ => {
                 let root_path = self
