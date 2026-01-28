@@ -6,6 +6,19 @@ use serde::{Deserialize, Serialize};
 use settings_macros::{MergeFrom, with_fallible_options};
 use util::serde::default_true;
 
+/// Transport type for remote HTTP MCP servers
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum HttpTransportType {
+    /// Auto-detect based on URL (use legacy SSE if path ends with /sse)
+    #[default]
+    Auto,
+    /// New Streamable HTTP transport (2025-03-26+ MCP spec)
+    StreamableHttp,
+    /// Legacy HTTP+SSE transport (2024-11-05 MCP spec)
+    LegacySse,
+}
+
 use crate::{
     AllLanguageSettingsContent, DelayMs, ExtendingVec, ProjectTerminalSettingsContent,
     SlashCommandSettings,
@@ -209,6 +222,12 @@ pub enum ContextServerSettingsContent {
         /// Optional headers to send.
         #[serde(skip_serializing_if = "HashMap::is_empty", default)]
         headers: HashMap<String, String>,
+        /// Transport type to use for connecting to the server.
+        /// - "auto" (default): Auto-detect based on URL (use legacy SSE if path ends with /sse)
+        /// - "streamable_http": New Streamable HTTP transport (2025-03-26+ MCP spec)
+        /// - "legacy_sse": Legacy HTTP+SSE transport (2024-11-05 MCP spec)
+        #[serde(skip_serializing_if = "Option::is_none", default)]
+        transport: Option<HttpTransportType>,
     },
     Extension {
         /// Whether the context server is enabled.

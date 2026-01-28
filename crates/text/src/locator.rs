@@ -1,5 +1,6 @@
-use smallvec::SmallVec;
+use smallvec::{SmallVec, smallvec};
 use std::iter;
+use std::sync::LazyLock;
 
 /// An identifier for a position in a ordered collection.
 ///
@@ -11,23 +12,24 @@ use std::iter;
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Locator(SmallVec<[u64; 4]>);
 
+static MIN_LOCATOR: LazyLock<Locator> = LazyLock::new(|| Locator(smallvec![u64::MIN]));
+static MAX_LOCATOR: LazyLock<Locator> = LazyLock::new(|| Locator(smallvec![u64::MAX]));
+
 impl Locator {
-    pub const fn min() -> Self {
-        // SAFETY: 1 is <= 4
-        Self(unsafe { SmallVec::from_const_with_len_unchecked([u64::MIN; 4], 1) })
+    pub fn min() -> Self {
+        MIN_LOCATOR.clone()
     }
 
-    pub const fn max() -> Self {
-        // SAFETY: 1 is <= 4
-        Self(unsafe { SmallVec::from_const_with_len_unchecked([u64::MAX; 4], 1) })
+    pub fn max() -> Self {
+        MAX_LOCATOR.clone()
     }
 
-    pub const fn min_ref() -> &'static Self {
-        const { &Self::min() }
+    pub fn min_ref() -> &'static Self {
+        &MIN_LOCATOR
     }
 
-    pub const fn max_ref() -> &'static Self {
-        const { &Self::max() }
+    pub fn max_ref() -> &'static Self {
+        &MAX_LOCATOR
     }
 
     pub fn assign(&mut self, other: &Self) {

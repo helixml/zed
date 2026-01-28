@@ -1,6 +1,6 @@
 use anyhow::Context as _;
 use collections::HashMap;
-use context_server::ContextServerCommand;
+use context_server::{ContextServerCommand, RemoteTransportType};
 use dap::adapters::DebugAdapterName;
 use fs::Fs;
 use futures::StreamExt as _;
@@ -27,6 +27,39 @@ use std::{path::PathBuf, sync::Arc, time::Duration};
 use task::{DebugTaskFile, TaskTemplates, VsCodeDebugTaskFile, VsCodeTaskFile};
 use util::{ResultExt, rel_path::RelPath, serde::default_true};
 use worktree::{PathChange, UpdatedEntriesSet, Worktree, WorktreeId};
+
+/// Transport type for remote HTTP MCP servers
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum HttpTransportType {
+    /// Auto-detect based on URL (use legacy SSE if path ends with /sse)
+    #[default]
+    Auto,
+    /// New Streamable HTTP transport (2025-03-26+ MCP spec)
+    StreamableHttp,
+    /// Legacy HTTP+SSE transport (2024-11-05 MCP spec)
+    LegacySse,
+}
+
+impl From<HttpTransportType> for RemoteTransportType {
+    fn from(value: HttpTransportType) -> Self {
+        match value {
+            HttpTransportType::Auto => RemoteTransportType::Auto,
+            HttpTransportType::StreamableHttp => RemoteTransportType::StreamableHttp,
+            HttpTransportType::LegacySse => RemoteTransportType::LegacySse,
+        }
+    }
+}
+
+impl From<RemoteTransportType> for HttpTransportType {
+    fn from(value: RemoteTransportType) -> Self {
+        match value {
+            RemoteTransportType::Auto => HttpTransportType::Auto,
+            RemoteTransportType::StreamableHttp => HttpTransportType::StreamableHttp,
+            RemoteTransportType::LegacySse => HttpTransportType::LegacySse,
+        }
+    }
+}
 
 use crate::{
     task_store::{TaskSettingsLocation, TaskStore},
@@ -134,6 +167,12 @@ pub enum ContextServerSettings {
         /// Optional authentication configuration for the remote server.
         #[serde(skip_serializing_if = "HashMap::is_empty", default)]
         headers: HashMap<String, String>,
+        /// Transport type to use for connecting to the server.
+        /// - "auto" (default): Auto-detect based on URL (use legacy SSE if path ends with /sse)
+        /// - "streamable_http": New Streamable HTTP transport (2025-03-26+ MCP spec)
+        /// - "legacy_sse": Legacy HTTP+SSE transport (2024-11-05 MCP spec)
+        #[serde(default)]
+        transport: HttpTransportType,
     },
     Extension {
         /// Whether the context server is enabled.
@@ -160,10 +199,12 @@ impl From<settings::ContextServerSettingsContent> for ContextServerSettings {
                 enabled,
                 url,
                 headers,
+                transport,
             } => ContextServerSettings::Http {
                 enabled,
                 url,
                 headers,
+                transport: transport.map(|t| t.into()).unwrap_or_default(),
             },
         }
     }
@@ -181,10 +222,12 @@ impl Into<settings::ContextServerSettingsContent> for ContextServerSettings {
                 enabled,
                 url,
                 headers,
+                transport,
             } => settings::ContextServerSettingsContent::Http {
                 enabled,
                 url,
                 headers,
+                transport: Some(transport.into()),
             },
         }
     }

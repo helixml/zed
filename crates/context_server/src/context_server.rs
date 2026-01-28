@@ -19,7 +19,7 @@ use parking_lot::RwLock;
 pub use settings::ContextServerCommand;
 use url::Url;
 
-use crate::transport::HttpTransport;
+use crate::transport::{HttpTransport, SseTransport};
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct ContextServerId(pub Arc<str>);
@@ -28,6 +28,20 @@ impl Display for ContextServerId {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{}", self.0)
     }
+}
+
+/// Transport type for remote MCP servers
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum RemoteTransportType {
+    /// New Streamable HTTP transport (2025-03-26+)
+    /// Server responds with either JSON or SSE based on content-type
+    #[default]
+    StreamableHttp,
+    /// Legacy HTTP+SSE transport (2024-11-05)
+    /// Client GETs SSE endpoint first, receives POST endpoint via event
+    LegacySse,
+    /// Auto-detect: try StreamableHttp first, fall back to LegacySse
+    Auto,
 }
 
 enum ContextServerTransport {
@@ -57,6 +71,7 @@ impl ContextServer {
         }
     }
 
+    /// Create a context server using HTTP transport (new Streamable HTTP protocol)
     pub fn http(
         id: ContextServerId,
         endpoint: &Url,
@@ -64,15 +79,88 @@ impl ContextServer {
         http_client: Arc<dyn HttpClient>,
         executor: gpui::BackgroundExecutor,
     ) -> Result<Self> {
-        let transport = match endpoint.scheme() {
-            "http" | "https" => {
-                log::info!("Using HTTP transport for {}", endpoint);
-                let transport =
-                    HttpTransport::new(http_client, endpoint.to_string(), headers, executor);
-                Arc::new(transport) as _
+        Self::remote(
+            id,
+            endpoint,
+            headers,
+            http_client,
+            executor,
+            RemoteTransportType::StreamableHttp,
+        )
+    }
+
+    /// Create a context server using legacy SSE transport (2024-11-05 protocol)
+    pub fn sse(
+        id: ContextServerId,
+        endpoint: &Url,
+        headers: HashMap<String, String>,
+        http_client: Arc<dyn HttpClient>,
+        executor: gpui::BackgroundExecutor,
+    ) -> Result<Self> {
+        Self::remote(
+            id,
+            endpoint,
+            headers,
+            http_client,
+            executor,
+            RemoteTransportType::LegacySse,
+        )
+    }
+
+    /// Create a context server with automatic transport detection
+    ///
+    /// Transport selection logic:
+    /// 1. If URL path ends with `/sse`, use legacy SSE transport
+    /// 2. If transport_type is specified, use that
+    /// 3. Otherwise, use the new Streamable HTTP transport
+    pub fn remote(
+        id: ContextServerId,
+        endpoint: &Url,
+        headers: HashMap<String, String>,
+        http_client: Arc<dyn HttpClient>,
+        executor: gpui::BackgroundExecutor,
+        transport_type: RemoteTransportType,
+    ) -> Result<Self> {
+        let scheme = endpoint.scheme();
+        if scheme != "http" && scheme != "https" {
+            anyhow::bail!("unsupported MCP url scheme: {}", scheme);
+        }
+
+        // Determine which transport to use
+        let use_legacy_sse = match transport_type {
+            RemoteTransportType::StreamableHttp => false,
+            RemoteTransportType::LegacySse => true,
+            RemoteTransportType::Auto => {
+                // Auto-detect based on URL path
+                let path = endpoint.path();
+                path.ends_with("/sse") || path.ends_with("/sse/")
             }
-            _ => anyhow::bail!("unsupported MCP url scheme {}", endpoint.scheme()),
         };
+
+        let transport: Arc<dyn crate::transport::Transport> = if use_legacy_sse {
+            log::info!(
+                "[ContextServer] Using legacy SSE transport for {}",
+                endpoint
+            );
+            Arc::new(SseTransport::new(
+                http_client,
+                endpoint.to_string(),
+                headers,
+                executor,
+            ))
+        } else {
+            log::info!(
+                "[ContextServer] Using Streamable HTTP transport for {}",
+                endpoint
+            );
+            Arc::new(HttpTransport::new(
+                http_client,
+                endpoint.to_string(),
+                headers,
+                executor,
+            ))
+        };
+
         Ok(Self::new(id, transport))
     }
 

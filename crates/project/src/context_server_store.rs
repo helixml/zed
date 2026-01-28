@@ -102,6 +102,7 @@ pub enum ContextServerConfiguration {
     Http {
         url: url::Url,
         headers: HashMap<String, String>,
+        transport: crate::project_settings::HttpTransportType,
     },
 }
 
@@ -151,9 +152,10 @@ impl ContextServerConfiguration {
                 enabled: _,
                 url,
                 headers: auth,
+                transport,
             } => {
                 let url = url::Url::parse(&url).log_err()?;
-                Some(ContextServerConfiguration::Http { url, headers: auth })
+                Some(ContextServerConfiguration::Http { url, headers: auth, transport })
             }
         }
     }
@@ -487,12 +489,13 @@ impl ContextServerStore {
         }
 
         match configuration.as_ref() {
-            ContextServerConfiguration::Http { url, headers } => Ok(Arc::new(ContextServer::http(
+            ContextServerConfiguration::Http { url, headers, transport } => Ok(Arc::new(ContextServer::remote(
                 id,
                 url,
                 headers.clone(),
                 cx.http_client(),
                 cx.background_executor().clone(),
+                (*transport).into(),
             )?)),
             _ => {
                 let root_path = self
