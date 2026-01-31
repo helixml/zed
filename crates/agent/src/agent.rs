@@ -1109,7 +1109,18 @@ impl acp_thread::AgentConnection for NativeAgentConnection {
         cx: &mut App,
     ) -> Task<Result<Entity<AcpThread>>> {
         log::info!("📖 [NATIVE_AGENT] load_thread() called for session: {}", session_id.0);
-        self.0.update(cx, |agent, cx| agent.open_thread(session_id, cx))
+        // Clone the Entity<NativeAgent> to keep it alive for the duration of the async task.
+        // Without this, the Rc<NativeAgentConnection> is consumed when this method is called,
+        // dropping the only strong reference to NativeAgent. The spawned task inside
+        // open_thread captures a WeakEntity, which then fails with "entity released".
+        let agent = self.0.clone();
+        cx.spawn(async move |_cx| {
+            // Keep the strong reference alive until open_thread completes
+            let task = agent.update(_cx, |a, cx| a.open_thread(session_id, cx))?;
+            let result = task.await;
+            // agent is dropped here, after the task completes
+            result
+        })
     }
 
     fn into_any(self: Rc<Self>) -> Rc<dyn Any> {
