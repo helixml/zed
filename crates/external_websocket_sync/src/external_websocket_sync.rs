@@ -83,6 +83,11 @@ static PENDING_THREAD_OPEN_REQUESTS: parking_lot::Mutex<Vec<ThreadOpenRequest>> 
 static GLOBAL_THREAD_DISPLAY_CALLBACK: parking_lot::Mutex<Option<mpsc::UnboundedSender<ThreadDisplayNotification>>> =
     parking_lot::Mutex::new(None);
 
+/// Pending thread display notifications that arrived before AgentPanel was ready
+/// These get replayed when init_thread_display_callback is called
+static PENDING_THREAD_DISPLAY_NOTIFICATIONS: parking_lot::Mutex<Vec<ThreadDisplayNotification>> =
+    parking_lot::Mutex::new(Vec::new());
+
 /// Static global for thread open callback (loads thread from database and displays it)
 static GLOBAL_THREAD_OPEN_CALLBACK: parking_lot::Mutex<Option<mpsc::UnboundedSender<ThreadOpenRequest>>> =
     parking_lot::Mutex::new(None);
@@ -182,10 +187,32 @@ pub fn init_thread_creation_callback(sender: mpsc::UnboundedSender<ThreadCreatio
 }
 
 /// Initialize the global thread display callback (called from agent_panel)
+/// Also replays any pending notifications that arrived before AgentPanel was ready
 pub fn init_thread_display_callback(sender: mpsc::UnboundedSender<ThreadDisplayNotification>) {
     log::info!("🔧 [CALLBACK] init_thread_display_callback() called - registering global callback");
-    *GLOBAL_THREAD_DISPLAY_CALLBACK.lock() = Some(sender);
+    eprintln!("🔧 [CALLBACK] init_thread_display_callback() called - registering global callback");
+
+    // Store the callback
+    *GLOBAL_THREAD_DISPLAY_CALLBACK.lock() = Some(sender.clone());
     log::info!("✅ [CALLBACK] Global thread display callback registered");
+    eprintln!("✅ [CALLBACK] Global thread display callback registered");
+
+    // Replay any pending notifications that arrived before AgentPanel was ready
+    let pending: Vec<ThreadDisplayNotification> = std::mem::take(&mut *PENDING_THREAD_DISPLAY_NOTIFICATIONS.lock());
+    if !pending.is_empty() {
+        log::info!("🔄 [CALLBACK] Replaying {} pending thread display notifications", pending.len());
+        eprintln!("🔄 [CALLBACK] Replaying {} pending thread display notifications", pending.len());
+        for notification in pending {
+            log::info!("🔄 [CALLBACK] Replaying display notification for session: {}", notification.helix_session_id);
+            eprintln!("🔄 [CALLBACK] Replaying display notification for session: {}", notification.helix_session_id);
+            if let Err(e) = sender.send(notification) {
+                log::error!("❌ [CALLBACK] Failed to replay display notification: {:?}", e);
+                eprintln!("❌ [CALLBACK] Failed to replay display notification: {:?}", e);
+            }
+        }
+        log::info!("✅ [CALLBACK] Finished replaying pending display notifications");
+        eprintln!("✅ [CALLBACK] Finished replaying pending display notifications");
+    }
 }
 
 /// Initialize the global thread open callback (called from thread_service)
@@ -245,22 +272,32 @@ pub fn request_thread_open(request: ThreadOpenRequest) -> Result<()> {
 }
 
 /// Notify AgentPanel to display a thread (for auto-select)
+/// If AgentPanel isn't ready yet, the notification is queued for later replay
 pub fn notify_thread_display(notification: ThreadDisplayNotification) -> Result<()> {
     log::info!("🔧 [CALLBACK] notify_thread_display() called for session: {}", notification.helix_session_id);
+    eprintln!("🔧 [CALLBACK] notify_thread_display() called for session: {}", notification.helix_session_id);
 
     let sender = GLOBAL_THREAD_DISPLAY_CALLBACK.lock().clone();
     if let Some(sender) = sender {
         log::info!("✅ [CALLBACK] Found global display callback sender, sending notification...");
+        eprintln!("✅ [CALLBACK] Found global display callback sender, sending notification...");
         sender.send(notification)
             .map_err(|e| {
                 log::error!("❌ [CALLBACK] Failed to send to channel: {:?}", e);
+                eprintln!("❌ [CALLBACK] Failed to send to channel: {:?}", e);
                 anyhow::anyhow!("Failed to send thread display notification")
             })?;
         log::info!("✅ [CALLBACK] Notification sent to callback channel successfully");
+        eprintln!("✅ [CALLBACK] Notification sent to callback channel successfully");
         Ok(())
     } else {
-        log::warn!("⚠️ [CALLBACK] Thread display callback not initialized - AgentPanel may not be ready");
-        Ok(()) // Not an error - AgentPanel might not be created yet
+        // Queue the notification for later replay when AgentPanel initializes
+        log::warn!("⏳ [CALLBACK] Thread display callback not yet initialized - queueing notification for later replay");
+        eprintln!("⏳ [CALLBACK] Thread display callback not yet initialized - queueing session={} for later replay", notification.helix_session_id);
+        PENDING_THREAD_DISPLAY_NOTIFICATIONS.lock().push(notification);
+        log::info!("✅ [CALLBACK] Display notification queued successfully (will replay when AgentPanel is ready)");
+        eprintln!("✅ [CALLBACK] Display notification queued successfully (will replay when AgentPanel is ready)");
+        Ok(())
     }
 }
 

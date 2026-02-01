@@ -302,10 +302,23 @@ impl NativeAgent {
         thread_handle: Entity<Thread>,
         cx: &mut Context<Self>,
     ) -> Entity<AcpThread> {
-        let connection = Rc::new(NativeAgentConnection(cx.entity()));
-
         let thread = thread_handle.read(cx);
         let session_id = thread.id().clone();
+
+        // If session already exists, return the existing AcpThread to avoid orphaning
+        // the entity that the UI might be observing
+        if let Some(existing_session) = self.sessions.get(&session_id) {
+            if let Some(acp_thread) = existing_session.acp_thread.upgrade() {
+                log::info!(
+                    "📖 [AGENT] Session {} already exists, returning existing AcpThread",
+                    session_id.0
+                );
+                return acp_thread;
+            }
+            // If acp_thread was released, fall through to recreate
+        }
+
+        let connection = Rc::new(NativeAgentConnection(cx.entity()));
         let title = thread.title();
         let project = thread.project.clone();
         let action_log = thread.action_log.clone();
@@ -672,6 +685,19 @@ impl NativeAgent {
         log::info!("📖 [AGENT] Currently registered sessions count: {}", self.sessions.len());
         for (session_id, _session) in self.sessions.iter() {
             log::info!("📖 [AGENT]   - Registered session ID: {}", session_id.0);
+        }
+
+        // If session already exists, return the existing AcpThread immediately
+        // This avoids orphaning the entity that the UI might be observing
+        if let Some(existing_session) = self.sessions.get(&id) {
+            if let Some(acp_thread) = existing_session.acp_thread.upgrade() {
+                log::info!(
+                    "📖 [AGENT] Session {} already exists, returning existing AcpThread (skipping DB load)",
+                    id.0
+                );
+                return Task::ready(Ok(acp_thread));
+            }
+            // If acp_thread was released, fall through to reload from DB
         }
 
         let task = self.load_thread(id.clone(), cx);
