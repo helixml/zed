@@ -668,17 +668,10 @@ async fn load_thread_from_agent(
                     }
                 }
                 AcpThreadEvent::Stopped => {
-                    eprintln!("🛑 [THREAD_SERVICE] Thread Stopped event (loaded thread)");
-                    let current_request_id = get_thread_request_id(&thread_id_for_events)
-                        .unwrap_or_default();
-                    let event = SyncEvent::MessageCompleted {
-                        acp_thread_id: thread_id_for_events.clone(),
-                        message_id: "0".to_string(),
-                        request_id: current_request_id.clone(),
-                    };
-                    if let Err(e) = crate::send_websocket_event(event) {
-                        eprintln!("❌ [THREAD_SERVICE] Failed to send message_completed: {}", e);
-                    }
+                    // NOTE: MessageCompleted is sent by thread_view.rs when the UI is displayed.
+                    // We don't send it here to avoid duplicate events.
+                    // notify_thread_display() always creates a UI view after loading a thread.
+                    eprintln!("🛑 [THREAD_SERVICE] Thread Stopped event (loaded thread) - UI handles MessageCompleted");
                 }
                 _ => {}
             }

@@ -404,14 +404,22 @@ impl AcpThreadView {
             )
         });
 
-        // Sync all existing entries from the thread
+        // Sync all existing entries from the thread and add them to the list
         let action_log = thread.read(cx).action_log().clone();
         let count = thread.read(cx).entries().len();
+        eprintln!("🔧 [FROM_EXISTING] Syncing {} entries from existing thread", count);
         entry_view_state.update(cx, |view_state, cx| {
             for ix in 0..count {
                 view_state.sync_entry(ix, &thread, window, cx);
             }
         });
+        // CRITICAL: Add entries to list_state so they render in the UI
+        // Without this, the list starts empty and only shows new messages
+        list_state.splice_focusable(
+            0..0,
+            (0..count).filter_map(|ix| entry_view_state.read(cx).entry(ix).map(|e| e.focus_handle(cx))),
+        );
+        eprintln!("✅ [FROM_EXISTING] Added {} entries to list_state", count);
 
         let title_editor = if thread.update(cx, |thread, cx| thread.can_set_title(cx)) {
             let editor = cx.new(|cx| {
@@ -908,6 +916,16 @@ impl AcpThreadView {
                                 None
                             };
 
+                        // Register thread with THREAD_REGISTRY so WebSocket commands find this entity
+                        // This is critical: without this, thread_service creates a DIFFERENT entity
+                        // and UI updates don't propagate because UI observes the wrong entity
+                        #[cfg(feature = "external_websocket_sync")]
+                        {
+                            let session_id = thread.read(cx).session_id().to_string();
+                            eprintln!("📋 [THREAD_VIEW] Registering thread {} in THREAD_REGISTRY", session_id);
+                            external_websocket_sync::register_thread(session_id, thread.clone());
+                        }
+
                         this.thread_state = ThreadState::Ready {
                             thread,
                             title_editor,
@@ -1107,6 +1125,11 @@ impl AcpThreadView {
             | ThreadState::Loading { .. }
             | ThreadState::LoadError { .. } => None,
         }
+    }
+
+    /// Returns the agent name for this thread view (e.g., "qwen", "codex")
+    pub fn agent_name(&self) -> SharedString {
+        self.agent.name()
     }
 
     pub fn mode_selector(&self) -> Option<&Entity<ModeSelector>> {

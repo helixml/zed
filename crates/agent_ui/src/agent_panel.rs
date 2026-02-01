@@ -83,6 +83,15 @@ const AGENT_PANEL_KEY: &str = "agent_panel";
 struct SerializedAgentPanel {
     width: Option<Pixels>,
     selected_agent: Option<AgentType>,
+    /// The session ID and agent name of the last active ACP thread (for resume on restart)
+    #[serde(default)]
+    active_acp_session: Option<SerializedAcpSession>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+struct SerializedAcpSession {
+    session_id: String,
+    agent_name: String,
 }
 
 pub fn init(cx: &mut App) {
@@ -456,18 +465,48 @@ impl AgentPanel {
     }
 
     fn serialize(&mut self, cx: &mut Context<Self>) {
+        eprintln!("🔧 [SERIALIZE] serialize() called");
+
         let width = self.width;
         let selected_agent = self.selected_agent.clone();
+
+        // Get session ID and agent name from active view if it's an ACP thread
+        let active_acp_session = if let ActiveView::ExternalAgentThread { thread_view } = &self.active_view {
+            let view = thread_view.read(cx);
+            let agent_name = view.agent_name().to_string();
+            let session = view.thread().map(|thread| {
+                SerializedAcpSession {
+                    session_id: thread.read(cx).session_id().0.to_string(),
+                    agent_name: agent_name.clone(),
+                }
+            });
+            eprintln!("🔧 [SERIALIZE] ExternalAgentThread active, session={:?}", session);
+            session
+        } else {
+            eprintln!("🔧 [SERIALIZE] Not an ExternalAgentThread, active_acp_session=None");
+            None
+        };
+
+        let serialized_data = SerializedAgentPanel {
+            width,
+            selected_agent: Some(selected_agent.clone()),
+            active_acp_session: active_acp_session.clone(),
+        };
+        eprintln!("🔧 [SERIALIZE] Serializing: {:?}", serialized_data);
+
         self.pending_serialization = Some(cx.background_spawn(async move {
-            KEY_VALUE_STORE
+            eprintln!("🔧 [SERIALIZE] Async write starting...");
+            let result = KEY_VALUE_STORE
                 .write_kvp(
                     AGENT_PANEL_KEY.into(),
-                    serde_json::to_string(&SerializedAgentPanel {
-                        width,
-                        selected_agent: Some(selected_agent),
-                    })?,
+                    serde_json::to_string(&serialized_data)?,
                 )
-                .await?;
+                .await;
+            match &result {
+                Ok(()) => eprintln!("✅ [SERIALIZE] Async write completed successfully"),
+                Err(e) => eprintln!("❌ [SERIALIZE] Async write failed: {:?}", e),
+            }
+            result?;
             anyhow::Ok(())
         }));
     }
@@ -512,16 +551,44 @@ impl AgentPanel {
                     cx.new(|cx| Self::new(workspace, text_thread_store, prompt_store, window, cx));
 
                 panel.as_mut(cx).loading = true;
-                if let Some(serialized_panel) = serialized_panel {
+
+                // Log serialized state for debugging
+                eprintln!("📂 [AGENT_PANEL] Loading panel - serialized_panel exists: {}", serialized_panel.is_some());
+                if let Some(ref sp) = serialized_panel {
+                    eprintln!("📂 [AGENT_PANEL] - selected_agent: {:?}", sp.selected_agent);
+                    eprintln!("📂 [AGENT_PANEL] - active_acp_session: {:?}", sp.active_acp_session);
+                }
+
+                if let Some(serialized_panel) = &serialized_panel {
                     panel.update(cx, |panel, cx| {
                         panel.width = serialized_panel.width.map(|w| w.round());
-                        if let Some(selected_agent) = serialized_panel.selected_agent {
+
+                        // First check for saved session (takes priority)
+                        if let Some(session) = serialized_panel.active_acp_session.clone() {
+                            log::info!("📂 [AGENT_PANEL] Resuming saved ACP session on startup: {} (agent: {})", session.session_id, session.agent_name);
+                            eprintln!("📂 [AGENT_PANEL] Resuming saved ACP session on startup: {} (agent: {})", session.session_id, session.agent_name);
+                            let session_id = agent_client_protocol::SessionId::new(session.session_id);
+                            panel.load_acp_agent_session(
+                                SharedString::from(session.agent_name),
+                                session_id,
+                                std::path::PathBuf::new(), // cwd not used
+                                window,
+                                cx,
+                            );
+                        } else if let Some(selected_agent) = serialized_panel.selected_agent.clone() {
+                            // No saved session, create new thread for selected agent
+                            eprintln!("📂 [AGENT_PANEL] No saved session, creating new thread for agent: {:?}", selected_agent);
                             panel.selected_agent = selected_agent.clone();
                             panel.new_agent_thread(selected_agent, window, cx);
+                        } else {
+                            // No selected agent either, fall back to NativeAgent
+                            eprintln!("📂 [AGENT_PANEL] No saved session or agent, falling back to NativeAgent");
+                            panel.new_agent_thread(AgentType::NativeAgent, window, cx);
                         }
                         cx.notify();
                     });
                 } else {
+                    eprintln!("📂 [AGENT_PANEL] No serialized panel, creating new NativeAgent thread");
                     panel.update(cx, |panel, cx| {
                         panel.new_agent_thread(AgentType::NativeAgent, window, cx);
                     });
@@ -592,48 +659,9 @@ impl AgentPanel {
         // Message completion now handled in TextThreadEditor which always runs
 
 
-        let panel_type = AgentSettings::get_global(cx).default_view;
-        let active_view = match panel_type {
-            DefaultView::Thread => ActiveView::native_agent(
-                fs.clone(),
-                prompt_store.clone(),
-                acp_history_store.clone(),
-                project.clone(),
-                workspace.clone(),
-                window,
-                cx,
-            ),
-            DefaultView::TextThread => {
-                let context = text_thread_store.update(cx, |store, cx| store.create(cx));
-                let lsp_adapter_delegate = match make_lsp_adapter_delegate(&project.clone(), cx) {
-                    Ok(delegate) => delegate,
-                    Err(e) => {
-                        log::error!("⚠️ [AGENT_PANEL] Failed to create LSP adapter delegate: {:?}", e);
-                        None
-                    }
-                };
-                let text_thread_editor = cx.new(|cx| {
-                    let mut editor = TextThreadEditor::for_text_thread(
-                        context,
-                        fs.clone(),
-                        workspace.clone(),
-                        project.clone(),
-                        lsp_adapter_delegate,
-                        window,
-                        cx,
-                    );
-                    editor.insert_default_prompt(window, cx);
-                    editor
-                });
-                ActiveView::text_thread(
-                    text_thread_editor,
-                    acp_history_store.clone(),
-                    language_registry.clone(),
-                    window,
-                    cx,
-                )
-            }
-        };
+        // Start with History view - the actual view will be set by load() based on serialized state
+        // This prevents creating an orphan thread when we're about to restore a saved session
+        let active_view = ActiveView::History;
 
         let weak_panel = cx.entity().downgrade();
 
@@ -754,9 +782,25 @@ impl AgentPanel {
                             });
                         }
 
-                        // Create view directly from existing thread entity (avoids agent instance mismatch)
+                        // Check if we already have a view for this thread to avoid duplicate subscriptions
+                        let incoming_session_id = notification.helix_session_id.clone();
                         let agent_name = notification.agent_name.clone();
+
                         this.update_in(cx, |this, window, cx| {
+                            // Check if current view is already for this thread
+                            if let ActiveView::ExternalAgentThread { thread_view } = &this.active_view {
+                                if let Some(existing_thread) = thread_view.read(cx).thread() {
+                                    let existing_session_id = existing_thread.read(cx).session_id().to_string();
+                                    if existing_session_id == incoming_session_id {
+                                        eprintln!("🔄 [AGENT_PANEL] Already showing thread {}, skipping view creation", incoming_session_id);
+                                        log::info!("🔄 [AGENT_PANEL] Already showing thread {}, skipping view creation", incoming_session_id);
+                                        // Just focus the panel, don't create a new view
+                                        return;
+                                    }
+                                }
+                            }
+
+                            // Create view directly from existing thread entity (avoids agent instance mismatch)
                             let thread_view = cx.new(|cx| {
                                 crate::acp::AcpThreadView::from_existing_thread(
                                     notification.thread_entity.clone(),
@@ -1592,6 +1636,12 @@ impl AgentPanel {
         if focus {
             self.focus_handle(cx).focus(window);
         }
+
+        // Serialize whenever view changes to ExternalAgentThread to persist active session
+        if matches!(self.active_view, ActiveView::ExternalAgentThread { .. }) {
+            eprintln!("🔧 [AGENT_PANEL] View changed to ExternalAgentThread, serializing...");
+            self.serialize(cx);
+        }
     }
 
     fn populate_recently_opened_menu_section(
@@ -1778,7 +1828,19 @@ impl AgentPanel {
         let loading = self.loading;
 
         // Get the correct agent for this session
-        let ext_agent = ExternalAgent::Custom { name: agent_name.clone() };
+        // "zed-agent" is the wire protocol name, "Zed Agent" is the display name
+        // Both map to NativeAgent
+        eprintln!("🔧 [LOAD_ACP] load_acp_agent_session called with agent_name={:?}", agent_name);
+        let ext_agent = match agent_name.as_ref() {
+            "zed-agent" | "Zed Agent" => {
+                eprintln!("🔧 [LOAD_ACP] Matched NativeAgent for agent_name={:?}", agent_name);
+                ExternalAgent::NativeAgent
+            }
+            _ => {
+                eprintln!("🔧 [LOAD_ACP] Using Custom agent for agent_name={:?}", agent_name);
+                ExternalAgent::Custom { name: agent_name.clone() }
+            }
+        };
 
         cx.spawn_in(window, async move |this, cx| {
             let server = ext_agent.server(fs, history_store.clone());
