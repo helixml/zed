@@ -1,80 +1,101 @@
 # E2E test environment for Zed WebSocket sync
-# Provides: Zed (built from source), ACP agents, xvfb, software Vulkan
+# Provides: Zed (built from source with cache), xvfb, software Vulkan
 #
 # Usage:
-#   docker build -t zed-websocket-e2e -f e2e-test/Dockerfile ../..
-#   docker run --rm zed-websocket-e2e
+#   cd /path/to/zed-upstream
+#   docker build -t zed-ws-e2e -f crates/external_websocket_sync/e2e-test/Dockerfile .
+#   docker run --rm zed-ws-e2e
+#
+# BuildKit cache mounts persist cargo registry, git deps, rustup, and build
+# artifacts across builds (same pattern as Helix's Dockerfile.zed-build).
 
-FROM ubuntu:25.10 AS base
+FROM ubuntu:25.10 AS builder
 
 ENV DEBIAN_FRONTEND=noninteractive
-ENV CARGO_HOME=/usr/local/cargo
-ENV RUSTUP_HOME=/usr/local/rustup
-ENV PATH="/usr/local/cargo/bin:${PATH}"
 
-# System deps for Zed build + headless testing
+# Zed build dependencies (matches Helix Dockerfile.zed-build + Zed's script/linux)
 RUN apt-get update && apt-get install -y \
-    # Build essentials
-    build-essential cmake pkg-config \
-    # Zed system dependencies
-    libxkbcommon-dev libwayland-dev libvulkan-dev \
-    libx11-xcb-dev libxcb-shape0-dev libxcb-xfixes0-dev \
-    libxcb-randr0-dev libxcb-present-dev libxcb-sync-dev \
-    libxcb-render0-dev libxcb-composite0-dev libxcb-damage0-dev \
-    libxcb-shm0-dev libxcb-glx0-dev libxcb-xkb-dev libxcb-dpms0-dev \
-    libxcb-record0-dev libxcb-dri2-0-dev libxcb-dri3-dev \
-    libfontconfig-dev libfreetype-dev \
-    libssl-dev libsqlite3-dev libzstd-dev \
+    build-essential curl git pkg-config clang cmake mold \
+    libssl-dev libzstd-dev libsqlite3-dev \
+    libvulkan-dev \
+    libwayland-dev libxkbcommon-dev libxkbcommon-x11-dev \
+    libxcb-shape0-dev libxcb-xfixes0-dev libxcb-render0-dev \
+    libxcb1-dev libx11-dev libx11-xcb-dev libxrandr-dev \
+    libfreetype-dev libfontconfig-dev \
+    libasound2-dev \
+    libatk1.0-dev libgtk-3-dev libglib2.0-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install rustup (no toolchain yet, that comes from rust-toolchain.toml or default)
+ENV RUSTUP_HOME=/root/.rustup
+ENV CARGO_HOME=/root/.cargo
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain none
+ENV PATH="/root/.cargo/bin:${PATH}"
+
+# Copy source (filtered by .dockerignore — excludes target/, .git/)
+COPY . /zed
+WORKDIR /zed
+
+# Build with BuildKit cache mounts for fast rebuilds:
+#   - /root/.cargo/registry: crate index + source archives
+#   - /root/.cargo/git: git dependency checkouts
+#   - /root/.rustup: toolchain + rustup data
+#   - /zed/target-e2e: build artifacts (incremental compilation)
+RUN --mount=type=cache,target=/root/.cargo/registry \
+    --mount=type=cache,target=/root/.cargo/git \
+    --mount=type=cache,target=/root/.rustup \
+    --mount=type=cache,target=/zed/target-e2e \
+    if [ ! -f /root/.rustup/settings.toml ]; then \
+        echo "Bootstrapping rustup in cache mount..." && \
+        curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain none; \
+    fi && \
+    CARGO_TARGET_DIR=target-e2e \
+    RUSTFLAGS='-C link-arg=-s' \
+    cargo build --release -p zed --features external_websocket_sync && \
+    cp target-e2e/release/zed /zed-binary
+
+# Runtime stage — no Rust toolchain, just Zed + test deps
+FROM ubuntu:25.10
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+# Runtime shared libraries + headless display + Python for mock server
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    # Zed runtime libs
+    libxkbcommon0 libxkbcommon-x11-0 libwayland-client0 libvulkan1 \
+    libx11-xcb1 libxcb-shape0 libxcb-xfixes0 \
+    libxcb-randr0 libxcb-render0 \
+    libxcb-shm0 libxcb-glx0 libxcb-xkb1 \
+    libxcb1 libx11-6 \
+    libfontconfig1 libfreetype6 \
+    libssl3t64 libsqlite3-0 libzstd1 \
+    libasound2t64 \
+    libatk1.0-0t64 libgtk-3-0t64 \
     # Headless display
     xvfb x11-utils \
     # Software Vulkan (lavapipe)
-    mesa-vulkan-drivers mesa-utils \
-    # Networking
-    curl wget git \
-    # Runtime
-    ca-certificates \
+    mesa-vulkan-drivers \
+    # Python for mock WebSocket server
+    python3 python3-websockets \
     && rm -rf /var/lib/apt/lists/*
 
-# Install Rust
-RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | \
-    sh -s -- -y --default-toolchain stable --profile minimal
+# Copy Zed binary from builder
+COPY --from=builder /zed-binary /usr/local/bin/zed
 
-# Install Node.js (needed for some ACP agents)
-RUN curl -fsSL https://deb.nodesource.com/setup_20.x | bash - && \
-    apt-get install -y nodejs && rm -rf /var/lib/apt/lists/*
+# Copy test script
+COPY crates/external_websocket_sync/e2e-test/run_e2e.sh /test/run_e2e.sh
+RUN chmod +x /test/run_e2e.sh
 
-# Install Claude Code (ACP agent)
-RUN npm install -g @anthropic-ai/claude-code || true
-
-# Copy Zed source
-WORKDIR /build/zed
-COPY . .
-
-# Build Zed with WebSocket sync feature
-RUN cargo build --release -p zed --features external_websocket_sync 2>&1 | tail -5
-
-# Build the mock server test binary
-RUN cargo test -p external_websocket_sync --features test-support --no-run 2>&1 | tail -5
-
-# Runtime stage
-FROM base AS test
+# Headless display environment
+ENV DISPLAY=:99
+ENV VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/lvp_icd.json
+ENV LIBGL_ALWAYS_SOFTWARE=1
+ENV ZED_ALLOW_EMULATED_GPU=1
+ENV ZED_ALLOW_ROOT=true
 
 WORKDIR /test
 
-# Copy built artifacts
-COPY --from=base /build/zed/target/release/zed /usr/local/bin/zed
-COPY --from=base /build/zed/crates/external_websocket_sync/e2e-test/run_e2e.sh /test/run_e2e.sh
-COPY --from=base /build/zed/crates/external_websocket_sync/PROTOCOL_SPEC.md /test/PROTOCOL_SPEC.md
-
-# Set up headless display
-ENV DISPLAY=:99
-ENV VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/lvp_icd.x86_64.json
-ENV LIBGL_ALWAYS_SOFTWARE=1
-
 # Create a minimal project directory for Zed to open
 RUN mkdir -p /test/project && echo "# Test Project" > /test/project/README.md
-
-# API keys are passed as build args or env vars at runtime
-# docker run -e ANTHROPIC_API_KEY=... zed-websocket-e2e
 
 ENTRYPOINT ["/test/run_e2e.sh"]
