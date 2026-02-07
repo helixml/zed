@@ -68,7 +68,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libxcb-shm0 libxcb-glx0 libxcb-xkb1 \
     libxcb1 libx11-6 \
     libfontconfig1 libfreetype6 \
-    libssl3t64 libsqlite3-0 libzstd1 \
+    libssl3t64 libsqlite3-0 libzstd1 ca-certificates \
     libasound2t64 \
     libatk1.0-0t64 libgtk-3-0t64 \
     # Headless display

@@ -19,6 +19,7 @@ use tokio::sync::mpsc;
 use util::ResultExt;
 use watch;
 
+use settings::Settings as _;
 use crate::{ExternalAgent, ThreadCreationRequest, ThreadOpenRequest, SyncEvent};
 
 /// Global registry of active ACP threads (service layer)
@@ -330,6 +331,35 @@ fn create_new_thread_sync(
     cx: &mut App,
 ) -> Result<()> {
     log::info!("[THREAD_SERVICE] Creating ACP thread with agent: {:?}", request.agent_name);
+
+    // Ensure language model providers are authenticated before connecting.
+    // NativeAgent::new() (called during connect) reads the model list via refresh_list().
+    // If providers aren't authenticated yet, the model list is empty and new_thread()
+    // creates threads with model=None, causing "No language model configured" errors.
+    {
+        let registry = language_model::LanguageModelRegistry::global(cx);
+        let providers = registry.read(cx).providers().clone();
+        eprintln!("🔧 [THREAD_SERVICE] Pre-authenticating {} language model providers...", providers.len());
+        for provider in &providers {
+            eprintln!("🔧 [THREAD_SERVICE]   Authenticating provider: {}", provider.name().0);
+            provider.authenticate(cx);
+        }
+
+        // Ensure the default model is selected in the registry
+        let settings = agent_settings::AgentSettings::get_global(cx);
+        if let Some(ref default_model) = settings.default_model {
+            eprintln!("🔧 [THREAD_SERVICE] Setting default model: {}/{}", default_model.provider.0, default_model.model);
+            let selected = language_model::SelectedModel {
+                provider: language_model::LanguageModelProviderId::from(default_model.provider.0.clone()),
+                model: language_model::LanguageModelId::from(default_model.model.clone()),
+            };
+            language_model::LanguageModelRegistry::global(cx).update(cx, |registry, cx| {
+                registry.select_default_model(Some(&selected), cx);
+                let has = registry.default_model().is_some();
+                eprintln!("🔧 [THREAD_SERVICE] Registry default_model set: {}", has);
+            });
+        }
+    }
 
     let agent = match request.agent_name.as_deref() {
         Some("zed-agent") | None => ExternalAgent::NativeAgent,

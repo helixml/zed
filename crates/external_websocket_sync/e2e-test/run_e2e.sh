@@ -223,10 +223,15 @@ ZED_CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/zed"
 mkdir -p "$ZED_CONFIG_DIR"
 cat > "$ZED_CONFIG_DIR/settings.json" << JSONEOF
 {
+  "language_models": {
+    "anthropic": {
+      "api_url": "https://api.anthropic.com"
+    }
+  },
   "agent": {
     "default_model": {
       "provider": "anthropic",
-      "model": "claude-sonnet-4-20250514"
+      "model": "claude-sonnet-4-5-latest"
     },
     "always_allow_tool_actions": true,
     "show_onboarding": false,
