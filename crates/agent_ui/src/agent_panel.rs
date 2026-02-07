@@ -454,6 +454,8 @@ pub struct AgentPanel {
     selected_agent: AgentType,
     show_trust_workspace_message: bool,
     last_configuration_error_telemetry: Option<String>,
+    #[cfg(feature = "external_websocket_sync")]
+    _ws_thread_subscriptions: Vec<Subscription>,
 }
 
 impl AgentPanel {
@@ -671,20 +673,92 @@ impl AgentPanel {
                         });
                     }
 
-                    this.update_in(cx, |this, window, cx| {
+                    this.update_in(cx, |this, _window, cx| {
                         // Check if current view is already for this thread
                         if let ActiveView::AgentThread { thread_view } = &this.active_view {
                             if let Some(active_thread) = thread_view.read(cx).as_active_thread() {
                                 let existing_session_id = active_thread.read(cx).thread.read(cx).session_id().to_string();
                                 if existing_session_id == incoming_session_id {
+                                    eprintln!("🔄 [AGENT_PANEL] Already showing thread {}, skipping", incoming_session_id);
                                     return;
                                 }
                             }
                         }
 
-                        // Create a new thread view from the existing thread entity
-                        // This will need to be adapted based on the external_websocket_sync API
-                        let _ = (agent_name, notification, window);
+                        // Subscribe to AcpThread events for WebSocket forwarding.
+                        // The AcpServerView's handle_thread_event won't fire for threads
+                        // created by thread_service (different connection path), so we
+                        // subscribe to the thread directly and forward Stopped events.
+                        let thread_entity = notification.thread_entity.clone();
+                        let session_id_for_events = incoming_session_id.clone();
+                        let event_sub = cx.subscribe(&thread_entity, move |_this, thread, event, cx| {
+                            match event {
+                                acp_thread::AcpThreadEvent::Stopped => {
+                                    let acp_thread_id = thread.read(cx).session_id().to_string();
+                                    let entries = thread.read(cx).entries();
+
+                                    // Find content after last user message
+                                    let last_user_idx = entries.iter()
+                                        .rposition(|e| matches!(e, acp_thread::AgentThreadEntry::UserMessage(_)));
+
+                                    let mut cumulative_content = String::new();
+                                    for (idx, entry) in entries.iter().enumerate() {
+                                        if let Some(user_idx) = last_user_idx {
+                                            if idx <= user_idx { continue; }
+                                        }
+                                        let entry_content = match entry {
+                                            acp_thread::AgentThreadEntry::AssistantMessage(msg) => {
+                                                Some(msg.to_markdown(cx))
+                                            }
+                                            acp_thread::AgentThreadEntry::ToolCall(tool_call) => {
+                                                Some(tool_call.to_markdown(cx))
+                                            }
+                                            acp_thread::AgentThreadEntry::UserMessage(_) => None,
+                                        };
+                                        if let Some(content) = entry_content {
+                                            if !cumulative_content.is_empty() {
+                                                cumulative_content.push_str("\n\n");
+                                            }
+                                            cumulative_content.push_str(&content);
+                                        }
+                                    }
+
+                                    // Send final MessageAdded
+                                    if !cumulative_content.is_empty() {
+                                        eprintln!("📤 [ZED-UI] Stopped -> MessageAdded FINAL ({} chars)", cumulative_content.len());
+                                        let _ = external_websocket_sync::send_websocket_event(
+                                            external_websocket_sync::SyncEvent::MessageAdded {
+                                                acp_thread_id: acp_thread_id.clone(),
+                                                message_id: "response".to_string(),
+                                                role: "assistant".to_string(),
+                                                content: cumulative_content,
+                                                timestamp: std::time::SystemTime::now()
+                                                    .duration_since(std::time::UNIX_EPOCH)
+                                                    .map(|d| d.as_secs() as i64)
+                                                    .unwrap_or(0),
+                                            }
+                                        );
+                                    }
+
+                                    // Send MessageCompleted
+                                    let request_id = external_websocket_sync::get_thread_request_id(&acp_thread_id)
+                                        .unwrap_or_else(|| session_id_for_events.clone());
+                                    eprintln!("📤 [ZED-UI] Stopped -> MessageCompleted (thread: {}, request: {})", acp_thread_id, request_id);
+                                    let _ = external_websocket_sync::send_websocket_event(
+                                        external_websocket_sync::SyncEvent::MessageCompleted {
+                                            acp_thread_id,
+                                            message_id: "response".to_string(),
+                                            request_id,
+                                        }
+                                    );
+                                }
+                                _ => {}
+                            }
+                        });
+                        this._ws_thread_subscriptions.push(event_sub);
+
+                        eprintln!("✅ [AGENT_PANEL] Subscribed to thread {} for WebSocket event forwarding", incoming_session_id);
+                        let _ = agent_name;
                     }).log_err();
                 }
 
@@ -740,6 +814,8 @@ impl AgentPanel {
             selected_agent: AgentType::default(),
             show_trust_workspace_message: false,
             last_configuration_error_telemetry: None,
+            #[cfg(feature = "external_websocket_sync")]
+            _ws_thread_subscriptions: Vec::new(),
         };
 
         // Initial sync of agent servers from extensions
