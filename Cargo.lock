@@ -6231,6 +6231,7 @@ dependencies = [
  "agent",
  "agent-client-protocol",
  "agent_servers",
+ "agent_settings",
  "anyhow",
  "assistant_slash_command",
  "assistant_text_thread",
