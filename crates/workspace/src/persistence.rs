@@ -1457,6 +1457,15 @@ impl WorkspaceDb {
                 host = Some(format!("mock-{}", options.id));
                 user = Some(format!("mock-user-{}", options.id));
             }
+            // When test-support is enabled on remote but not on workspace,
+            // the Mock variant exists but we can't access it - just skip.
+            #[cfg(not(any(test, feature = "test-support")))]
+            #[allow(unreachable_patterns)]
+            _ => {
+                kind = RemoteConnectionKind::Ssh;
+                host = Some("mock".to_string());
+                user = None;
+            }
         }
         Self::get_or_create_remote_connection_query(
             this,

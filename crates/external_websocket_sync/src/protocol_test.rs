@@ -25,6 +25,7 @@ mod tests {
     static TEST_LOCK: parking_lot::Mutex<()> = parking_lot::const_mutex(());
 
     #[tokio::test]
+    #[ignore] // Requires HELIX_SESSION_ID env var - run with `cargo test -- --ignored`
     async fn test_end_to_end_protocol_flow() -> Result<()> {
         let _guard = TEST_LOCK.lock();
         println!("\n🧪 Testing end-to-end WebSocket protocol flow\n");
@@ -214,6 +215,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore] // Requires HELIX_SESSION_ID env var - run with `cargo test -- --ignored`
     async fn test_follow_up_message_flow() -> Result<()> {
         let _guard = TEST_LOCK.lock();
         println!("\n🧪 Testing follow-up message flow (reusing existing thread)\n");

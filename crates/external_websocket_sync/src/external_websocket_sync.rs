@@ -741,6 +741,9 @@ pub fn get_global_sync_service(cx: &App) -> Option<&ExternalWebSocketSync> {
     cx.try_global::<ExternalWebSocketSync>()
 }
 
+#[cfg(any(test, feature = "test-support"))]
+pub mod mock_helix_server;
+
 #[cfg(test)]
 mod protocol_test;
 
