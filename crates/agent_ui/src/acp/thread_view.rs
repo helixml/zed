@@ -5,6 +5,8 @@ use acp_thread::{
     UserMessageId,
 };
 use acp_thread::{AgentConnection, Plan};
+#[cfg(feature = "external_websocket_sync")]
+use external_websocket_sync_dep as external_websocket_sync;
 use action_log::{ActionLog, ActionLogTelemetry};
 use agent::{NativeAgentServer, NativeAgentSessionList, SharedThread, ThreadStore};
 use agent_client_protocol::{self as acp, PromptCapabilities};
@@ -174,6 +176,9 @@ pub struct AcpServerView {
     notification_subscriptions: HashMap<WindowHandle<AgentNotification>, Vec<Subscription>>,
     auth_task: Option<Task<()>>,
     _subscriptions: Vec<Subscription>,
+    /// Track last known tool call status discriminant to detect transitions (for boundary-based WebSocket updates)
+    #[cfg(feature = "external_websocket_sync")]
+    last_tool_call_status: HashMap<usize, std::mem::Discriminant<ToolCallStatus>>,
 }
 
 impl AcpServerView {
@@ -307,6 +312,8 @@ impl AcpServerView {
             history,
             _subscriptions: subscriptions,
             focus_handle: cx.focus_handle(),
+            #[cfg(feature = "external_websocket_sync")]
+            last_tool_call_status: HashMap::default(),
         }
     }
 
@@ -654,11 +661,40 @@ impl AcpServerView {
                                 .focus(window, cx);
                         }
 
+                        // Register thread with THREAD_REGISTRY so WebSocket commands find this entity
+                        #[cfg(feature = "external_websocket_sync")]
+                        {
+                            let session_id = current.read(cx).thread.read(cx).session_id().to_string();
+                            external_websocket_sync::register_thread(session_id, current.read(cx).thread.clone());
+                        }
+
                         this.server_state = ServerState::Connected(ConnectedServerState {
                             connection,
                             auth_state: AuthState::Ok,
-                            current,
+                            current: current.clone(),
                         });
+
+                        // Notify external system when user created a new thread (not resume)
+                        #[cfg(feature = "external_websocket_sync")]
+                        {
+                            if resume_thread.is_none() {
+                                let thread_entity = &current.read(cx).thread;
+                                let entry_count = thread_entity.read(cx).entries().len();
+                                if entry_count > 0 {
+                                    let acp_thread_id = thread_entity.read(cx).session_id().to_string();
+                                    let title = thread_entity.read(cx).title().to_string();
+                                    let title_opt = if title.is_empty() { None } else { Some(title) };
+                                    if let Err(e) = external_websocket_sync::send_websocket_event(
+                                        external_websocket_sync::SyncEvent::UserCreatedThread {
+                                            acp_thread_id,
+                                            title: title_opt,
+                                        }
+                                    ) {
+                                        log::error!("Failed to send UserCreatedThread WebSocket event: {}", e);
+                                    }
+                                }
+                            }
+                        }
 
                         cx.notify();
                     }
@@ -926,6 +962,81 @@ impl AcpServerView {
                         );
                     });
                 }
+
+                // Send WebSocket event for new entries
+                #[cfg(feature = "external_websocket_sync")]
+                {
+                    let thread_read = thread.read(cx);
+                    let acp_thread_id = thread_read.session_id().to_string();
+
+                    // Skip if this entry originated from external system (prevents echo)
+                    if !external_websocket_sync::is_external_originated_entry(&acp_thread_id, index) {
+                        if let Some(entry) = thread_read.entries().get(index) {
+                            match entry {
+                                acp_thread::AgentThreadEntry::UserMessage(msg) => {
+                                    // New user message = new turn, clear tool call status tracking
+                                    self.last_tool_call_status.clear();
+
+                                    let content = msg.content.to_markdown(cx).to_string();
+                                    if let Err(e) = external_websocket_sync::send_websocket_event(
+                                        external_websocket_sync::SyncEvent::MessageAdded {
+                                            acp_thread_id,
+                                            message_id: index.to_string(),
+                                            role: "user".to_string(),
+                                            content,
+                                            timestamp: chrono::Utc::now().timestamp(),
+                                        }
+                                    ) {
+                                        log::error!("Failed to send user message WebSocket event: {}", e);
+                                    }
+                                }
+                                acp_thread::AgentThreadEntry::AssistantMessage(_) |
+                                acp_thread::AgentThreadEntry::ToolCall(_) => {
+                                    let entries = thread_read.entries();
+                                    let last_user_idx = entries.iter()
+                                        .rposition(|e| matches!(e, acp_thread::AgentThreadEntry::UserMessage(_)));
+
+                                    let mut cumulative_content = String::new();
+                                    for (idx, e) in entries.iter().enumerate() {
+                                        if let Some(user_idx) = last_user_idx {
+                                            if idx <= user_idx {
+                                                continue;
+                                            }
+                                        }
+                                        let entry_content = match e {
+                                            acp_thread::AgentThreadEntry::AssistantMessage(msg) => {
+                                                Some(msg.to_markdown(cx))
+                                            }
+                                            acp_thread::AgentThreadEntry::ToolCall(tool_call) => {
+                                                Some(tool_call.to_markdown(cx))
+                                            }
+                                            acp_thread::AgentThreadEntry::UserMessage(_) => None,
+                                        };
+                                        if let Some(content) = entry_content {
+                                            if !cumulative_content.is_empty() {
+                                                cumulative_content.push_str("\n\n");
+                                            }
+                                            cumulative_content.push_str(&content);
+                                        }
+                                    }
+                                    if !cumulative_content.is_empty() {
+                                        if let Err(e) = external_websocket_sync::send_websocket_event(
+                                            external_websocket_sync::SyncEvent::MessageAdded {
+                                                acp_thread_id,
+                                                message_id: "response".to_string(),
+                                                role: "assistant".to_string(),
+                                                content: cumulative_content,
+                                                timestamp: chrono::Utc::now().timestamp(),
+                                            }
+                                        ) {
+                                            log::error!("Failed to send assistant message WebSocket event: {}", e);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
             }
             AcpThreadEvent::EntryUpdated(index) => {
                 if let Some(entry_view_state) = self
@@ -935,6 +1046,77 @@ impl AcpServerView {
                     entry_view_state.update(cx, |view_state, cx| {
                         view_state.sync_entry(*index, thread, window, cx)
                     });
+                }
+
+                // BOUNDARY-BASED UPDATES: Only send WebSocket updates when tool call status changes.
+                #[cfg(feature = "external_websocket_sync")]
+                {
+                    let thread_read = thread.read(cx);
+                    let entries = thread_read.entries();
+
+                    let should_send = if let Some(acp_thread::AgentThreadEntry::ToolCall(tool_call)) = entries.get(*index) {
+                        let current_discriminant = std::mem::discriminant(&tool_call.status);
+                        let previous_discriminant = self.last_tool_call_status.get(index);
+
+                        let status_changed = match previous_discriminant {
+                            Some(prev) => *prev != current_discriminant,
+                            None => true,
+                        };
+
+                        if status_changed {
+                            self.last_tool_call_status.insert(*index, current_discriminant);
+                            true
+                        } else {
+                            false
+                        }
+                    } else {
+                        false
+                    };
+
+                    if should_send {
+                        let acp_thread_id = thread_read.session_id().to_string();
+
+                        let last_user_idx = entries.iter()
+                            .rposition(|e| matches!(e, acp_thread::AgentThreadEntry::UserMessage(_)));
+
+                        let mut cumulative_content = String::new();
+                        for (idx, entry) in entries.iter().enumerate() {
+                            if let Some(user_idx) = last_user_idx {
+                                if idx <= user_idx {
+                                    continue;
+                                }
+                            }
+                            let entry_content = match entry {
+                                acp_thread::AgentThreadEntry::AssistantMessage(msg) => {
+                                    Some(msg.to_markdown(cx))
+                                }
+                                acp_thread::AgentThreadEntry::ToolCall(tool_call) => {
+                                    Some(tool_call.to_markdown(cx))
+                                }
+                                acp_thread::AgentThreadEntry::UserMessage(_) => None,
+                            };
+                            if let Some(content) = entry_content {
+                                if !cumulative_content.is_empty() {
+                                    cumulative_content.push_str("\n\n");
+                                }
+                                cumulative_content.push_str(&content);
+                            }
+                        }
+
+                        if !cumulative_content.is_empty() {
+                            if let Err(e) = external_websocket_sync::send_websocket_event(
+                                external_websocket_sync::SyncEvent::MessageAdded {
+                                    acp_thread_id,
+                                    message_id: "response".to_string(),
+                                    role: "assistant".to_string(),
+                                    content: cumulative_content,
+                                    timestamp: chrono::Utc::now().timestamp(),
+                                }
+                            ) {
+                                log::error!("Failed to send EntryUpdated WebSocket event: {}", e);
+                            }
+                        }
+                    }
                 }
             }
             AcpThreadEvent::EntriesRemoved(range) => {
@@ -1000,6 +1182,72 @@ impl AcpServerView {
                     self.send_queued_message_at_index(0, false, window, cx);
                 }
 
+                // Send WebSocket events on Stopped (final state)
+                #[cfg(feature = "external_websocket_sync")]
+                {
+                    let thread_read = thread.read(cx);
+                    let acp_thread_id = thread_read.session_id().to_string();
+                    let entries = thread_read.entries();
+
+                    let last_user_idx = entries.iter()
+                        .rposition(|e| matches!(e, acp_thread::AgentThreadEntry::UserMessage(_)));
+
+                    let mut cumulative_content = String::new();
+                    for (idx, entry) in entries.iter().enumerate() {
+                        if let Some(user_idx) = last_user_idx {
+                            if idx <= user_idx {
+                                continue;
+                            }
+                        }
+                        let entry_content = match entry {
+                            acp_thread::AgentThreadEntry::AssistantMessage(msg) => {
+                                Some(msg.to_markdown(cx))
+                            }
+                            acp_thread::AgentThreadEntry::ToolCall(tool_call) => {
+                                Some(tool_call.to_markdown(cx))
+                            }
+                            acp_thread::AgentThreadEntry::UserMessage(_) => None,
+                        };
+                        if let Some(content) = entry_content {
+                            if !cumulative_content.is_empty() {
+                                cumulative_content.push_str("\n\n");
+                            }
+                            cumulative_content.push_str(&content);
+                        }
+                    }
+
+                    // Send final content state
+                    if !cumulative_content.is_empty() {
+                        if let Err(e) = external_websocket_sync::send_websocket_event(
+                            external_websocket_sync::SyncEvent::MessageAdded {
+                                acp_thread_id: acp_thread_id.clone(),
+                                message_id: "response".to_string(),
+                                role: "assistant".to_string(),
+                                content: cumulative_content,
+                                timestamp: chrono::Utc::now().timestamp(),
+                            }
+                        ) {
+                            log::error!("Failed to send final MessageAdded WebSocket event: {}", e);
+                        }
+                    }
+
+                    // Then send MessageCompleted
+                    let request_id = external_websocket_sync::get_thread_request_id(&acp_thread_id)
+                        .unwrap_or_default();
+                    if let Err(e) = external_websocket_sync::send_websocket_event(
+                        external_websocket_sync::SyncEvent::MessageCompleted {
+                            acp_thread_id,
+                            message_id: "0".to_string(),
+                            request_id,
+                        }
+                    ) {
+                        log::error!("Failed to send MessageCompleted WebSocket event: {}", e);
+                    }
+
+                    // Clear tool call status tracking for next turn
+                    self.last_tool_call_status.clear();
+                }
+
                 self.history.update(cx, |history, cx| history.refresh(cx));
             }
             AcpThreadEvent::Refusal => {
@@ -1057,6 +1305,22 @@ impl AcpServerView {
                         }
                     });
                 }
+                // Notify external system of title change
+                #[cfg(feature = "external_websocket_sync")]
+                {
+                    let acp_thread_id = thread.read(cx).session_id().to_string();
+                    let title_str = thread.read(cx).title().to_string();
+
+                    if let Err(e) = external_websocket_sync::send_websocket_event(
+                        external_websocket_sync::SyncEvent::ThreadTitleChanged {
+                            acp_thread_id,
+                            title: title_str,
+                        }
+                    ) {
+                        log::error!("Failed to send ThreadTitleChanged WebSocket event: {}", e);
+                    }
+                }
+
                 self.history.update(cx, |history, cx| history.refresh(cx));
             }
             AcpThreadEvent::PromptCapabilitiesUpdated => {

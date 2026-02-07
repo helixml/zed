@@ -36,6 +36,10 @@ use crate::{
     ExternalAgent, ExternalAgentInitialContent, NewExternalAgentThread,
     NewNativeAgentThreadFromSummary,
 };
+#[cfg(feature = "external_websocket_sync")]
+use external_websocket_sync_dep as external_websocket_sync;
+#[cfg(feature = "external_websocket_sync")]
+use tokio::sync::mpsc;
 use agent_settings::AgentSettings;
 use ai_onboarding::AgentPanelOnboarding;
 use anyhow::{Result, anyhow};
@@ -85,6 +89,15 @@ const DEFAULT_THREAD_TITLE: &str = "New Thread";
 struct SerializedAgentPanel {
     width: Option<Pixels>,
     selected_agent: Option<AgentType>,
+    /// The session ID and agent name of the last active ACP thread (for resume on restart)
+    #[serde(default)]
+    active_acp_session: Option<SerializedAcpSession>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+struct SerializedAcpSession {
+    session_id: String,
+    agent_name: String,
 }
 
 pub fn init(cx: &mut App) {
@@ -241,7 +254,7 @@ enum HistoryKind {
     TextThreads,
 }
 
-enum ActiveView {
+pub(crate) enum ActiveView {
     Uninitialized,
     AgentThread {
         thread_view: Entity<AcpServerView>,
@@ -426,7 +439,7 @@ pub struct AgentPanel {
     configuration: Option<Entity<AgentConfiguration>>,
     configuration_subscription: Option<Subscription>,
     focus_handle: FocusHandle,
-    active_view: ActiveView,
+    pub(crate) active_view: ActiveView,
     previous_view: Option<ActiveView>,
     new_thread_menu_handle: PopoverMenuHandle<ContextMenu>,
     agent_panel_menu_handle: PopoverMenuHandle<ContextMenu>,
@@ -444,9 +457,31 @@ pub struct AgentPanel {
 }
 
 impl AgentPanel {
+    /// Get the thread store (for WebSocket integration setup)
+    #[cfg(feature = "external_websocket_sync")]
+    pub fn acp_history_store(&self) -> &Entity<ThreadStore> {
+        &self.thread_store
+    }
+
     fn serialize(&mut self, cx: &mut Context<Self>) {
         let width = self.width;
         let selected_agent = self.selected_agent.clone();
+
+        // Get session ID and agent name from active view if it's an ACP thread
+        let active_acp_session = if let ActiveView::AgentThread { thread_view } = &self.active_view {
+            thread_view.read(cx).as_active_thread().and_then(|active_thread| {
+                let thread = &active_thread.read(cx).thread;
+                let session_id = thread.read(cx).session_id().0.to_string();
+                let agent_name = active_thread.read(cx).agent_name.to_string();
+                Some(SerializedAcpSession {
+                    session_id,
+                    agent_name,
+                })
+            })
+        } else {
+            None
+        };
+
         self.pending_serialization = Some(cx.background_spawn(async move {
             KEY_VALUE_STORE
                 .write_kvp(
@@ -454,6 +489,7 @@ impl AgentPanel {
                     serde_json::to_string(&SerializedAgentPanel {
                         width,
                         selected_agent: Some(selected_agent),
+                        active_acp_session,
                     })?,
                 )
                 .await?;
@@ -614,6 +650,48 @@ impl AgentPanel {
                 cx,
             )
         });
+
+        // Setup callback handler for auto-opening threads created by external systems
+        #[cfg(feature = "external_websocket_sync")]
+        {
+            let (callback_tx, mut callback_rx) = mpsc::unbounded_channel::<external_websocket_sync::ThreadDisplayNotification>();
+            external_websocket_sync::init_thread_display_callback(callback_tx);
+
+            let workspace_weak = workspace.clone();
+
+            cx.spawn_in(window, async move |this, cx| {
+                while let Some(notification) = callback_rx.recv().await {
+                    let incoming_session_id = notification.helix_session_id.clone();
+                    let agent_name = notification.agent_name.clone();
+
+                    // Ensure the panel is focused
+                    if let Some(workspace) = workspace_weak.upgrade() {
+                        let _ = workspace.update_in(cx, |workspace, window, cx| {
+                            workspace.focus_panel::<AgentPanel>(window, cx);
+                        });
+                    }
+
+                    this.update_in(cx, |this, window, cx| {
+                        // Check if current view is already for this thread
+                        if let ActiveView::AgentThread { thread_view } = &this.active_view {
+                            if let Some(active_thread) = thread_view.read(cx).as_active_thread() {
+                                let existing_session_id = active_thread.read(cx).thread.read(cx).session_id().to_string();
+                                if existing_session_id == incoming_session_id {
+                                    return;
+                                }
+                            }
+                        }
+
+                        // Create a new thread view from the existing thread entity
+                        // This will need to be adapted based on the external_websocket_sync API
+                        let _ = (agent_name, notification, window);
+                    }).log_err();
+                }
+
+                anyhow::Ok(())
+            })
+            .detach();
+        }
 
         // Subscribe to extension events to sync agent servers when extensions change
         let extension_subscription = if let Some(extension_events) = ExtensionEvents::try_global(cx)

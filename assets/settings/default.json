@@ -446,7 +446,8 @@
     // Whether to show the user menu in the titlebar.
     "show_user_menu": true,
     // Whether to show the sign in button in the titlebar.
-    "show_sign_in": true,
+    // Disabled by default for on-prem/self-hosted deployments.
+    "show_sign_in": false,
     // Whether to show the menus in the titlebar.
     "show_menus": false,
   },
@@ -1080,6 +1081,14 @@
     //
     // Default: false
     "show_turn_stats": false,
+    // Whether to show the Zed Pro onboarding banner in the agent panel.
+    //
+    // Default: true
+    "show_onboarding": true,
+    // Whether to automatically open the agent panel when Zed launches.
+    //
+    // Default: false
+    "auto_open_panel": false
   },
   // Whether the screen sharing icon is shown in the os status bar.
   "show_call_status_icon": true,

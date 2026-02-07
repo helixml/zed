@@ -22,6 +22,8 @@ use futures::{StreamExt, channel::oneshot, future};
 use git::GitHostingProviderRegistry;
 use git_ui::clone::clone_and_open;
 use gpui::{App, AppContext, Application, AsyncApp, Focusable as _, QuitMode, UpdateGlobal as _};
+#[cfg(feature = "external_websocket_sync")]
+use external_websocket_sync;
 
 use gpui_tokio::Tokio;
 use language::LanguageRegistry;
@@ -323,6 +325,7 @@ fn main() {
 
     let failed_single_instance_check = if *zed_env_vars::ZED_STATELESS
         || *release_channel::RELEASE_CHANNEL == ReleaseChannel::Dev
+        || args.allow_multiple_instances
     {
         false
     } else {
@@ -633,6 +636,8 @@ fn main() {
             cx,
         );
         agent_ui_v2::agents_panel::init(cx);
+        #[cfg(feature = "external_websocket_sync")]
+        external_websocket_sync::init(cx);
         repl::init(app_state.fs.clone(), cx);
         recent_projects::init(cx);
         dev_container::init(cx);
@@ -1567,6 +1572,10 @@ struct Args {
     /// Output current environment variables as JSON to stdout
     #[arg(long, hide = true)]
     printenv: bool,
+
+    /// Disable single instance check, allowing multiple Zed instances to run simultaneously
+    #[arg(long)]
+    allow_multiple_instances: bool,
 }
 
 #[derive(Clone, Debug)]

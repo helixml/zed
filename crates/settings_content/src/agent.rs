@@ -136,6 +136,14 @@ pub struct AgentSettingsContent {
     /// This setting only applies to the native Zed agent. External agent servers (Claude Code, Gemini CLI, etc.)
     /// have their own permission systems and are not affected by these settings.
     pub tool_permissions: Option<ToolPermissionsContent>,
+    /// Whether to show the Zed Pro onboarding banner in the agent panel.
+    ///
+    /// Default: true
+    pub show_onboarding: Option<bool>,
+    /// Whether to automatically open the agent panel when Zed launches.
+    ///
+    /// Default: false
+    pub auto_open_panel: Option<bool>,
 }
 
 impl AgentSettingsContent {

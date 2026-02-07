@@ -86,6 +86,7 @@ members = [
     "crates/gpui",
     "crates/gpui_macros",
     "crates/gpui_tokio",
+    "crates/external_websocket_sync",
     "crates/html_to_markdown",
     "crates/http_client",
     "crates/http_client_tls",
@@ -308,6 +309,7 @@ eval_utils = { path = "crates/eval_utils" }
 extension = { path = "crates/extension" }
 extension_host = { path = "crates/extension_host" }
 extensions_ui = { path = "crates/extensions_ui" }
+external_websocket_sync = { path = "crates/external_websocket_sync" }
 feature_flags = { path = "crates/feature_flags" }
 feedback = { path = "crates/feedback" }
 file_finder = { path = "crates/file_finder" }

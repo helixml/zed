@@ -1,0 +1,73 @@
+[package]
+name = "external_websocket_sync"
+version = "0.1.0"
+edition.workspace = true
+publish.workspace = true
+license = "GPL-3.0-or-later"
+
+[lints]
+workspace = true
+
+[lib]
+path = "src/external_websocket_sync.rs"
+doctest = false
+
+[features]
+default = ["server"]
+server = ["axum", "tower", "tower-http"]
+test-support = []
+
+[dependencies]
+acp_thread.workspace = true
+action_log.workspace = true
+agent-client-protocol.workspace = true
+agent.workspace = true
+agent_servers.workspace = true
+anyhow.workspace = true
+assistant_text_thread.workspace = true
+assistant_slash_command.workspace = true
+axum = { version = "0.7", optional = true, features = ["ws"] }
+chrono.workspace = true
+clock.workspace = true
+collections.workspace = true
+context_server.workspace = true
+fs.workspace = true
+futures.workspace = true
+gpui.workspace = true
+http.workspace = true
+language.workspace = true
+language_model.workspace = true
+log.workspace = true
+parking_lot.workspace = true
+project.workspace = true
+prompt_store.workspace = true
+reqwest.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+session.workspace = true
+settings.workspace = true
+schemars.workspace = true
+ui.workspace = true
+smol.workspace = true
+telemetry_events.workspace = true
+tokio = { version = "1.0", features = ["full"] }
+tokio-tungstenite = { version = "0.26", features = ["__rustls-tls"] }
+tokio-rustls = "0.26"
+rustls.workspace = true
+http_client_tls.workspace = true
+tower = { version = "0.4", optional = true }
+tower-http = { version = "0.5", features = ["fs", "trace", "cors"], optional = true }
+tungstenite = "0.26"
+url.workspace = true
+util.workspace = true
+uuid.workspace = true
+watch.workspace = true
+
+[dev-dependencies]
+env_logger.workspace = true
+fs.workspace = true
+gpui = { workspace = true, features = ["test-support"] }
+indoc.workspace = true
+project = { workspace = true, features = ["test-support"] }
+tempfile.workspace = true
+util.workspace = true

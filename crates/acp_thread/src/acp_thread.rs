@@ -401,6 +401,17 @@ impl ToolCall {
             self.label.read(cx).source(),
             self.status
         );
+
+        // Try to format raw_output nicely (e.g., Qwen Code shell output)
+        if let Some(raw_output) = &self.raw_output {
+            if let Some(formatted) = format_shell_output(raw_output) {
+                markdown.push_str(&formatted);
+                markdown.push_str("\n\n");
+                return markdown;
+            }
+        }
+
+        // Fallback to content-based rendering
         for content in &self.content {
             markdown.push_str(content.to_markdown(cx).as_str());
             markdown.push_str("\n\n");
@@ -2580,17 +2591,152 @@ fn markdown_for_raw_output(
                 cx,
             )
         })),
-        value => Some(cx.new(|cx| {
-            let pretty_json = to_string_pretty(value).unwrap_or_else(|_| value.to_string());
-
-            Markdown::new(
-                format!("```json\n{}\n```", pretty_json).into(),
-                Some(language_registry.clone()),
-                None,
-                cx,
-            )
-        })),
+        value => {
+            // Try to format shell output nicely (e.g., Qwen Code)
+            if let Some(formatted) = format_shell_output(value) {
+                Some(cx.new(|cx| {
+                    Markdown::new(
+                        formatted.into(),
+                        Some(language_registry.clone()),
+                        None,
+                        cx,
+                    )
+                }))
+            } else {
+                let pretty_json = to_string_pretty(value).unwrap_or_else(|_| value.to_string());
+                Some(cx.new(|cx| {
+                    Markdown::new(
+                        format!("```json\n{}\n```", pretty_json).into(),
+                        Some(language_registry.clone()),
+                        None,
+                        cx,
+                    )
+                }))
+            }
+        }
     }
+}
+
+/// Format shell command output with a metadata table and output code block.
+/// Extracts Command, Directory, Exit Code into a table, and Output into a code block.
+/// Returns None if the output doesn't match the expected shell output format.
+///
+/// Handles Qwen Code's shell tool output format which can come as:
+/// 1. Object: {"output":"Command: cd /path\nDirectory: ...\nOutput: ...\nExit Code: 0"}
+/// 2. String containing JSON: "{\"output\":\"Command: ...\"}"
+/// 3. String containing the raw output directly: "Command: cd /path\n..."
+fn format_shell_output(output: &serde_json::Value) -> Option<String> {
+    let output_str = if let Some(obj) = output.as_object() {
+        obj.get("output")?.as_str()?.to_string()
+    } else if let Some(s) = output.as_str() {
+        if s.starts_with('{') {
+            if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(s) {
+                if let Some(obj) = parsed.as_object() {
+                    obj.get("output")?.as_str()?.to_string()
+                } else {
+                    return None;
+                }
+            } else {
+                return None;
+            }
+        } else if s.contains("Command:") || s.contains("Exit Code:") {
+            s.to_string()
+        } else {
+            return None;
+        }
+    } else {
+        return None;
+    };
+
+    let field_markers = [
+        "Command:",
+        "Directory:",
+        "Output:",
+        "Error:",
+        "Exit Code:",
+        "Signal:",
+        "Background PIDs:",
+        "Process Group PGID:",
+    ];
+
+    let mut command: Option<String> = None;
+    let mut directory: Option<String> = None;
+    let mut exit_code: Option<String> = None;
+    let mut signal: Option<String> = None;
+    let mut cmd_output = Vec::new();
+    let mut in_output_field = false;
+
+    for line in output_str.lines() {
+        let starts_new_field = field_markers.iter().any(|m| line.starts_with(m));
+
+        if line.starts_with("Command:") {
+            in_output_field = false;
+            command = Some(line.strip_prefix("Command:").unwrap_or("").trim().to_string());
+        } else if line.starts_with("Directory:") {
+            in_output_field = false;
+            directory = Some(line.strip_prefix("Directory:").unwrap_or("").trim().to_string());
+        } else if line.starts_with("Exit Code:") {
+            in_output_field = false;
+            exit_code = Some(line.strip_prefix("Exit Code:").unwrap_or("").trim().to_string());
+        } else if line.starts_with("Signal:") {
+            in_output_field = false;
+            signal = Some(line.strip_prefix("Signal:").unwrap_or("").trim().to_string());
+        } else if line.starts_with("Output:") {
+            in_output_field = true;
+            let value = line.strip_prefix("Output:").unwrap_or("").trim();
+            if !value.is_empty() {
+                cmd_output.push(value.to_string());
+            }
+        } else if starts_new_field {
+            in_output_field = false;
+        } else if in_output_field {
+            cmd_output.push(line.to_string());
+        }
+    }
+
+    let full_output = cmd_output.join("\n");
+    let has_output = !full_output.is_empty() && full_output != "(empty)";
+
+    let mut result = String::new();
+
+    // Build table rows for metadata
+    let mut table_rows = Vec::new();
+    if let Some(cmd) = &command {
+        table_rows.push(format!("| Command | `{}` |", cmd));
+    }
+    if let Some(dir) = &directory {
+        table_rows.push(format!("| Directory | `{}` |", dir));
+    }
+    match (&exit_code, &signal) {
+        (Some(code), Some(sig)) => {
+            table_rows.push(format!("| Exit | {} (signal: {}) |", code, sig));
+        }
+        (Some(code), None) => {
+            table_rows.push(format!("| Exit | {} |", code));
+        }
+        (None, Some(sig)) => {
+            table_rows.push(format!("| Exit | signal: {} |", sig));
+        }
+        (None, None) => {}
+    }
+
+    if table_rows.is_empty() && !has_output {
+        return None;
+    }
+
+    if !table_rows.is_empty() {
+        result.push_str("| | |\n|---|---|\n");
+        result.push_str(&table_rows.join("\n"));
+        result.push('\n');
+    }
+
+    if has_output {
+        result.push_str("\n```\n");
+        result.push_str(&full_output);
+        result.push_str("\n```\n");
+    }
+
+    Some(result)
 }
 
 #[cfg(test)]

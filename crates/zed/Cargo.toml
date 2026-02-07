@@ -13,6 +13,7 @@ workspace = true
 
 [features]
 tracy = ["ztracing/tracy"]
+external_websocket_sync = ["agent_ui/external_websocket_sync", "dep:external_websocket_sync"]
 test-support = [
     "gpui/test-support",
     "gpui/screen-capture",
@@ -136,6 +137,7 @@ edit_prediction.workspace = true
 edit_prediction_ui.workspace = true
 http_client.workspace = true
 image_viewer.workspace = true
+external_websocket_sync = { workspace = true, optional = true }
 inspector_ui.workspace = true
 install_cli.workspace = true
 journal.workspace = true

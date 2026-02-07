@@ -51,6 +51,8 @@ pub struct AgentSettings {
     pub message_editor_min_lines: usize,
     pub show_turn_stats: bool,
     pub tool_permissions: ToolPermissions,
+    pub show_onboarding: bool,
+    pub auto_open_panel: bool,
 }
 
 impl AgentSettings {
@@ -241,6 +243,8 @@ impl Settings for AgentSettings {
             message_editor_min_lines: agent.message_editor_min_lines.unwrap(),
             show_turn_stats: agent.show_turn_stats.unwrap(),
             tool_permissions: compile_tool_permissions(agent.tool_permissions),
+            show_onboarding: agent.show_onboarding.unwrap(),
+            auto_open_panel: agent.auto_open_panel.unwrap(),
         }
     }
 }

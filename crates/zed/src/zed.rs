@@ -766,6 +766,37 @@ async fn initialize_agent_panel(
         })
         .detach();
 
+        // Setup WebSocket thread handler for external sync (if panel exists)
+        #[cfg(feature = "external_websocket_sync")]
+        {
+            if let Some(panel) = workspace.panel::<agent_ui::AgentPanel>(cx) {
+                external_websocket_sync::setup_thread_handler(
+                    workspace.project().clone(),
+                    panel.read(cx).acp_history_store().clone(),
+                    workspace.app_state().fs.clone(),
+                    cx
+                );
+
+                // Start WebSocket service if enabled in settings
+                use external_websocket_sync::ExternalSyncSettings;
+                use settings::Settings;
+
+                let settings = ExternalSyncSettings::get_global(cx);
+
+                if settings.enabled && settings.websocket_sync.enabled {
+                    let config = external_websocket_sync::WebSocketSyncConfig {
+                        enabled: true,
+                        url: settings.websocket_sync.external_url.clone(),
+                        auth_token: settings.websocket_sync.auth_token.clone().unwrap_or_default(),
+                        use_tls: settings.websocket_sync.use_tls,
+                        skip_tls_verify: settings.websocket_sync.skip_tls_verify,
+                    };
+
+                    external_websocket_sync::init_websocket_service(config);
+                }
+            }
+        }
+
         // Register the actions that are shared between `assistant` and `assistant2`.
         //
         // We need to do this here instead of within the individual `init`

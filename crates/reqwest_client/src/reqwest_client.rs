@@ -27,9 +27,15 @@ pub struct ReqwestClient {
 
 impl ReqwestClient {
     fn builder() -> reqwest::ClientBuilder {
-        reqwest::Client::builder()
-            .use_rustls_tls()
-            .connect_timeout(Duration::from_secs(10))
+        let builder = reqwest::Client::builder()
+            .connect_timeout(Duration::from_secs(10));
+
+        // Use insecure TLS if ZED_HTTP_INSECURE_TLS=1 for enterprise deployments with internal CAs
+        if http_client_tls::is_insecure_tls_enabled() {
+            builder.use_preconfigured_tls(http_client_tls::insecure_tls_config())
+        } else {
+            builder.use_rustls_tls()
+        }
     }
 
     pub fn new() -> Self {
@@ -72,8 +78,15 @@ impl ReqwestClient {
             client_has_proxy = false;
         };
 
+        // Use insecure TLS if ZED_HTTP_INSECURE_TLS=1 for enterprise deployments with internal CAs
+        let tls_config = if http_client_tls::is_insecure_tls_enabled() {
+            log::warn!("Using insecure TLS mode - certificate verification disabled");
+            http_client_tls::insecure_tls_config()
+        } else {
+            http_client_tls::tls_config()
+        };
         let client = client
-            .use_preconfigured_tls(http_client_tls::tls_config())
+            .use_preconfigured_tls(tls_config)
             .build()?;
         let mut client: ReqwestClient = client.into();
         client.proxy = client_has_proxy.then_some(proxy).flatten();
