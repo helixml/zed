@@ -15,7 +15,7 @@ echo "============================================"
 echo ""
 
 ZED_BINARY="${ZED_BINARY:-/usr/local/bin/zed}"
-TEST_TIMEOUT="${TEST_TIMEOUT:-120}"
+TEST_TIMEOUT="${TEST_TIMEOUT:-240}"
 PROJECT_DIR="/test/project"
 MOCK_PORT_FILE="/tmp/mock_helix_port"
 
@@ -66,11 +66,14 @@ cat > /tmp/mock_helix_server.py << 'PYEOF'
 #!/usr/bin/env python3
 """Mock Helix WebSocket server for E2E testing.
 
-Implements the Helix side of the WebSocket sync protocol:
-1. Accepts connections on /api/v1/external-agents/sync
-2. Waits for agent_ready event from Zed
-3. Sends a chat_message command
-4. Records all received events and validates the protocol flow
+Multi-phase test covering:
+  Phase 1: Basic thread - send chat_message, get response
+  Phase 2: Follow-up on same thread - send chat_message with acp_thread_id
+  Phase 3: New thread via WebSocket - send chat_message without acp_thread_id
+  Phase 4: Verify all threads tracked correctly
+
+This simulates what Helix spectasks need: a single session spanning
+multiple Zed threads (e.g., when context fills up and a new thread starts).
 """
 import asyncio
 import json
@@ -81,65 +84,214 @@ import websockets
 from websockets.asyncio.server import serve
 
 received_events = []
-test_done = asyncio.Event()
-chat_sent = False  # Only send chat_message once
-TEST_MESSAGE = "What is 2 + 2? Reply with just the number."
-REQUEST_ID = "e2e-test-req-001"
+all_tests_done = asyncio.Event()
+websocket_ref = None  # Store websocket for sending commands from phases
+
+# Track state across phases
+phase = 0
+thread_ids = []  # Collect all thread IDs we see
+completed_threads = {}  # thread_id -> list of completed request_ids
+
 
 async def handle_connection(websocket):
     """Handle a single WebSocket connection from Zed."""
-    global chat_sent
+    global phase, websocket_ref
+    websocket_ref = websocket
     print(f"[mock-server] Zed connected from {websocket.remote_address}", flush=True)
 
     async for message in websocket:
         try:
             data = json.loads(message)
             event_type = data.get("event_type", "unknown")
-            print(f"[mock-server] <- Received: {event_type}", flush=True)
+            event_data = data.get("data", {})
+            print(f"[mock-server] <- {event_type}: {json.dumps(event_data)[:120]}", flush=True)
             received_events.append(data)
 
-            if event_type == "agent_ready" and not chat_sent:
-                chat_sent = True
-                print("[mock-server] Agent ready! Sending chat_message...", flush=True)
-                command = {
-                    "type": "chat_message",
-                    "data": {
-                        "message": TEST_MESSAGE,
-                        "request_id": REQUEST_ID,
-                        "agent_name": "zed-agent"
-                    }
-                }
-                await websocket.send(json.dumps(command))
-                print("[mock-server] -> Sent: chat_message", flush=True)
-
-            elif event_type == "agent_ready":
-                print("[mock-server] Agent ready (ignoring, chat already sent)", flush=True)
+            if event_type == "agent_ready" and phase == 0:
+                phase = 1
+                await run_phase_1(websocket)
 
             elif event_type == "thread_created":
-                tid = data.get("data", {}).get("acp_thread_id", "?")
-                print(f"[mock-server] Thread created: {tid}", flush=True)
-
-            elif event_type == "message_added":
-                role = data.get("data", {}).get("role", "?")
-                content = data.get("data", {}).get("content", "")
-                preview = (content[:80] + "...") if len(content) > 80 else content
-                print(f"[mock-server] Message ({role}): {preview}", flush=True)
+                tid = event_data.get("acp_thread_id", "?")
+                thread_ids.append(tid)
+                print(f"[mock-server] 📋 Thread #{len(thread_ids)}: {tid}", flush=True)
 
             elif event_type == "message_completed":
-                print("[mock-server] Message completed!", flush=True)
-                test_done.set()
+                tid = event_data.get("acp_thread_id", "?")
+                rid = event_data.get("request_id", "?")
+                completed_threads.setdefault(tid, []).append(rid)
+                print(f"[mock-server] ✅ Completed: thread={tid[:12]}... req={rid}", flush=True)
+
+                # Advance to next phase after completion
+                if phase == 1:
+                    phase = 2
+                    await asyncio.sleep(1)
+                    await run_phase_2(websocket)
+                elif phase == 2:
+                    phase = 3
+                    await asyncio.sleep(1)
+                    await run_phase_3(websocket)
+                elif phase == 3:
+                    phase = 4
+                    await asyncio.sleep(0.5)
+                    all_tests_done.set()
 
         except json.JSONDecodeError:
             print(f"[mock-server] Invalid JSON: {message[:100]}", flush=True)
 
 
+async def run_phase_1(ws):
+    """Phase 1: Basic thread creation - send chat_message, no thread ID."""
+    print("\n" + "="*50, flush=True)
+    print("  PHASE 1: Basic thread creation", flush=True)
+    print("="*50, flush=True)
+    command = {
+        "type": "chat_message",
+        "data": {
+            "message": "What is 2 + 2? Reply with just the number.",
+            "request_id": "req-phase1",
+            "agent_name": "zed-agent"
+        }
+    }
+    await ws.send(json.dumps(command))
+    print("[mock-server] -> Sent: chat_message (phase 1, new thread)", flush=True)
+
+
+async def run_phase_2(ws):
+    """Phase 2: Follow-up on existing thread - send to same thread ID."""
+    print("\n" + "="*50, flush=True)
+    print("  PHASE 2: Follow-up on existing thread", flush=True)
+    print("="*50, flush=True)
+    if not thread_ids:
+        print("[mock-server] ERROR: No thread IDs captured from phase 1!", flush=True)
+        sys.exit(1)
+
+    first_thread_id = thread_ids[0]
+    print(f"[mock-server] Using thread from phase 1: {first_thread_id}", flush=True)
+    command = {
+        "type": "chat_message",
+        "data": {
+            "message": "What is 3 + 3? Reply with just the number.",
+            "request_id": "req-phase2",
+            "acp_thread_id": first_thread_id,
+            "agent_name": "zed-agent"
+        }
+    }
+    await ws.send(json.dumps(command))
+    print("[mock-server] -> Sent: chat_message (phase 2, follow-up)", flush=True)
+
+
+async def run_phase_3(ws):
+    """Phase 3: New thread via WebSocket - simulates thread transition
+    (e.g., context ran out, Helix starts fresh thread for same task)."""
+    print("\n" + "="*50, flush=True)
+    print("  PHASE 3: New thread (simulating thread transition)", flush=True)
+    print("="*50, flush=True)
+    command = {
+        "type": "chat_message",
+        "data": {
+            "message": "What is 10 + 10? Reply with just the number.",
+            "request_id": "req-phase3",
+            "agent_name": "zed-agent"
+        }
+    }
+    await ws.send(json.dumps(command))
+    print("[mock-server] -> Sent: chat_message (phase 3, new thread)", flush=True)
+
+
 async def process_request(connection, request):
-    """Validate the WebSocket request path and auth."""
-    # request.path includes query string in websockets 15.x
+    """Validate the WebSocket request path."""
     path = request.path.split("?")[0]
     if path != "/api/v1/external-agents/sync":
         return connection.respond(HTTPStatus.NOT_FOUND, f"Not found: {path}\n")
     return None
+
+
+def validate_results():
+    """Validate all test phases passed."""
+    print("\n" + "="*50, flush=True)
+    print("  VALIDATION", flush=True)
+    print("="*50, flush=True)
+
+    event_types = [e.get("event_type") for e in received_events]
+    print(f"[mock-server] Total events: {len(received_events)}", flush=True)
+    print(f"[mock-server] Thread IDs seen: {thread_ids}", flush=True)
+    print(f"[mock-server] Completed threads: {completed_threads}", flush=True)
+
+    errors = []
+
+    # --- Phase 1: Basic thread creation ---
+    thread_created_events = [e for e in received_events if e.get("event_type") == "thread_created"]
+    if len(thread_created_events) < 1:
+        errors.append("Phase 1: No thread_created event")
+
+    phase1_completions = [e for e in received_events
+        if e.get("event_type") == "message_completed"
+        and e.get("data", {}).get("request_id") == "req-phase1"]
+    if not phase1_completions:
+        errors.append("Phase 1: No message_completed for req-phase1")
+
+    # --- Phase 2: Follow-up on existing thread ---
+    # Should NOT create a new thread (follow-up to existing)
+    phase2_completions = [e for e in received_events
+        if e.get("event_type") == "message_completed"
+        and e.get("data", {}).get("request_id") == "req-phase2"]
+    if not phase2_completions:
+        errors.append("Phase 2: No message_completed for req-phase2")
+    else:
+        # Follow-up should use the SAME thread_id as phase 1
+        p2_thread = phase2_completions[0].get("data", {}).get("acp_thread_id", "")
+        if thread_ids and p2_thread != thread_ids[0]:
+            errors.append(f"Phase 2: Follow-up used different thread! Expected {thread_ids[0][:12]}..., got {p2_thread[:12]}...")
+        else:
+            print(f"[mock-server] ✅ Phase 2: Follow-up used same thread: {p2_thread[:12]}...", flush=True)
+
+    # --- Phase 3: New thread creation ---
+    if len(thread_ids) < 2:
+        errors.append(f"Phase 3: Expected at least 2 thread_created events, got {len(thread_ids)}")
+    else:
+        if thread_ids[0] == thread_ids[1]:
+            errors.append("Phase 3: New thread has same ID as first thread!")
+        else:
+            print(f"[mock-server] ✅ Phase 3: New thread created: {thread_ids[1][:12]}...", flush=True)
+
+    phase3_completions = [e for e in received_events
+        if e.get("event_type") == "message_completed"
+        and e.get("data", {}).get("request_id") == "req-phase3"]
+    if not phase3_completions:
+        errors.append("Phase 3: No message_completed for req-phase3")
+
+    # --- Overall: assistant responses ---
+    assistant_msgs = [e for e in received_events
+        if e.get("event_type") == "message_added"
+        and e.get("data", {}).get("role") == "assistant"]
+    if len(assistant_msgs) < 3:
+        errors.append(f"Expected at least 3 assistant messages, got {len(assistant_msgs)}")
+
+    for i, msg in enumerate(assistant_msgs):
+        content = msg.get("data", {}).get("content", "")[:80]
+        print(f"[mock-server] Assistant msg {i+1}: {content}", flush=True)
+
+    # --- Phase 2 should NOT have created a thread_created event ---
+    # Count thread_created events: phase 1 creates one, phase 3 creates one = 2
+    # Phase 2 (follow-up) should NOT create a thread
+    if len(thread_created_events) > 2:
+        # More than 2 thread_created = phase 2 incorrectly created a thread
+        errors.append(f"Too many thread_created events ({len(thread_created_events)}). Phase 2 follow-up should not create new thread.")
+
+    # --- Summary ---
+    if errors:
+        print("", flush=True)
+        for err in errors:
+            print(f"[mock-server] ❌ FAIL: {err}", flush=True)
+        return False
+
+    print("", flush=True)
+    print("[mock-server] ✅ Phase 1: Basic thread creation - PASSED", flush=True)
+    print("[mock-server] ✅ Phase 2: Follow-up on existing thread - PASSED", flush=True)
+    print("[mock-server] ✅ Phase 3: New thread via WebSocket - PASSED", flush=True)
+    print(f"[mock-server] ✅ Total threads: {len(thread_ids)}, Total completions: {sum(len(v) for v in completed_threads.values())}", flush=True)
+    return True
 
 
 async def run_server(port):
@@ -157,38 +309,16 @@ async def run_server(port):
             f.write(str(actual_port))
 
         try:
-            await asyncio.wait_for(test_done.wait(), timeout=120)
+            await asyncio.wait_for(all_tests_done.wait(), timeout=180)
         except asyncio.TimeoutError:
             event_types = [e.get("event_type") for e in received_events]
-            print(f"[mock-server] TIMEOUT. Events received: {event_types}", flush=True)
+            print(f"[mock-server] TIMEOUT at phase {phase}. Events: {event_types}", flush=True)
             sys.exit(1)
 
-    # ---- Validate protocol flow ----
-    event_types = [e.get("event_type") for e in received_events]
-    print(f"[mock-server] Event sequence: {event_types}", flush=True)
-
-    errors = []
-    for expected in ["agent_ready", "thread_created", "message_added", "message_completed"]:
-        if expected not in event_types:
-            errors.append(f"Missing expected event: {expected}")
-
-    assistant_msgs = [
-        e for e in received_events
-        if e.get("event_type") == "message_added"
-        and e.get("data", {}).get("role") == "assistant"
-    ]
-    if not assistant_msgs:
-        errors.append("No assistant messages received")
+    if validate_results():
+        print("\n[mock-server] ALL MULTI-THREAD PROTOCOL CHECKS PASSED", flush=True)
     else:
-        last_content = assistant_msgs[-1].get("data", {}).get("content", "")
-        print(f"[mock-server] Last assistant content: {last_content[:200]}", flush=True)
-
-    if errors:
-        for err in errors:
-            print(f"[mock-server] FAIL: {err}", flush=True)
         sys.exit(1)
-
-    print("[mock-server] ALL PROTOCOL CHECKS PASSED", flush=True)
 
 
 if __name__ == "__main__":
