@@ -2489,99 +2489,109 @@ impl AgentPanel {
                             )
                             .separator()
                             .header("External Agents")
-                            .item(
-                                ContextMenuEntry::new("Claude Code")
-                                    .when(is_agent_selected(AgentType::ClaudeCode), |this| {
-                                        this.action(Box::new(NewExternalAgentThread {
-                                            agent: None,
-                                        }))
-                                    })
-                                    .icon(IconName::AiClaude)
-                                    .disabled(is_via_collab)
-                                    .icon_color(Color::Muted)
-                                    .handler({
-                                        let workspace = workspace.clone();
-                                        move |window, cx| {
-                                            if let Some(workspace) = workspace.upgrade() {
-                                                workspace.update(cx, |workspace, cx| {
-                                                    if let Some(panel) =
-                                                        workspace.panel::<AgentPanel>(cx)
-                                                    {
-                                                        panel.update(cx, |panel, cx| {
-                                                            panel.new_agent_thread(
-                                                                AgentType::ClaudeCode,
-                                                                window,
-                                                                cx,
-                                                            );
+                            .map(|menu| {
+                                // In Helix builds (external_websocket_sync), hide built-in agents
+                                // since they are managed externally via the Helix platform.
+                                #[cfg(feature = "external_websocket_sync")]
+                                { menu }
+                                #[cfg(not(feature = "external_websocket_sync"))]
+                                {
+                                    menu
+                                    .item(
+                                        ContextMenuEntry::new("Claude Code")
+                                            .when(is_agent_selected(AgentType::ClaudeCode), |this| {
+                                                this.action(Box::new(NewExternalAgentThread {
+                                                    agent: None,
+                                                }))
+                                            })
+                                            .icon(IconName::AiClaude)
+                                            .disabled(is_via_collab)
+                                            .icon_color(Color::Muted)
+                                            .handler({
+                                                let workspace = workspace.clone();
+                                                move |window, cx| {
+                                                    if let Some(workspace) = workspace.upgrade() {
+                                                        workspace.update(cx, |workspace, cx| {
+                                                            if let Some(panel) =
+                                                                workspace.panel::<AgentPanel>(cx)
+                                                            {
+                                                                panel.update(cx, |panel, cx| {
+                                                                    panel.new_agent_thread(
+                                                                        AgentType::ClaudeCode,
+                                                                        window,
+                                                                        cx,
+                                                                    );
+                                                                });
+                                                            }
                                                         });
                                                     }
-                                                });
-                                            }
-                                        }
-                                    }),
-                            )
-                            .item(
-                                ContextMenuEntry::new("Codex CLI")
-                                    .when(is_agent_selected(AgentType::Codex), |this| {
-                                        this.action(Box::new(NewExternalAgentThread {
-                                            agent: None,
-                                        }))
-                                    })
-                                    .icon(IconName::AiOpenAi)
-                                    .disabled(is_via_collab)
-                                    .icon_color(Color::Muted)
-                                    .handler({
-                                        let workspace = workspace.clone();
-                                        move |window, cx| {
-                                            if let Some(workspace) = workspace.upgrade() {
-                                                workspace.update(cx, |workspace, cx| {
-                                                    if let Some(panel) =
-                                                        workspace.panel::<AgentPanel>(cx)
-                                                    {
-                                                        panel.update(cx, |panel, cx| {
-                                                            panel.new_agent_thread(
-                                                                AgentType::Codex,
-                                                                window,
-                                                                cx,
-                                                            );
+                                                }
+                                            }),
+                                    )
+                                    .item(
+                                        ContextMenuEntry::new("Codex CLI")
+                                            .when(is_agent_selected(AgentType::Codex), |this| {
+                                                this.action(Box::new(NewExternalAgentThread {
+                                                    agent: None,
+                                                }))
+                                            })
+                                            .icon(IconName::AiOpenAi)
+                                            .disabled(is_via_collab)
+                                            .icon_color(Color::Muted)
+                                            .handler({
+                                                let workspace = workspace.clone();
+                                                move |window, cx| {
+                                                    if let Some(workspace) = workspace.upgrade() {
+                                                        workspace.update(cx, |workspace, cx| {
+                                                            if let Some(panel) =
+                                                                workspace.panel::<AgentPanel>(cx)
+                                                            {
+                                                                panel.update(cx, |panel, cx| {
+                                                                    panel.new_agent_thread(
+                                                                        AgentType::Codex,
+                                                                        window,
+                                                                        cx,
+                                                                    );
+                                                                });
+                                                            }
                                                         });
                                                     }
-                                                });
-                                            }
-                                        }
-                                    }),
-                            )
-                            .item(
-                                ContextMenuEntry::new("Gemini CLI")
-                                    .when(is_agent_selected(AgentType::Gemini), |this| {
-                                        this.action(Box::new(NewExternalAgentThread {
-                                            agent: None,
-                                        }))
-                                    })
-                                    .icon(IconName::AiGemini)
-                                    .icon_color(Color::Muted)
-                                    .disabled(is_via_collab)
-                                    .handler({
-                                        let workspace = workspace.clone();
-                                        move |window, cx| {
-                                            if let Some(workspace) = workspace.upgrade() {
-                                                workspace.update(cx, |workspace, cx| {
-                                                    if let Some(panel) =
-                                                        workspace.panel::<AgentPanel>(cx)
-                                                    {
-                                                        panel.update(cx, |panel, cx| {
-                                                            panel.new_agent_thread(
-                                                                AgentType::Gemini,
-                                                                window,
-                                                                cx,
-                                                            );
+                                                }
+                                            }),
+                                    )
+                                    .item(
+                                        ContextMenuEntry::new("Gemini CLI")
+                                            .when(is_agent_selected(AgentType::Gemini), |this| {
+                                                this.action(Box::new(NewExternalAgentThread {
+                                                    agent: None,
+                                                }))
+                                            })
+                                            .icon(IconName::AiGemini)
+                                            .icon_color(Color::Muted)
+                                            .disabled(is_via_collab)
+                                            .handler({
+                                                let workspace = workspace.clone();
+                                                move |window, cx| {
+                                                    if let Some(workspace) = workspace.upgrade() {
+                                                        workspace.update(cx, |workspace, cx| {
+                                                            if let Some(panel) =
+                                                                workspace.panel::<AgentPanel>(cx)
+                                                            {
+                                                                panel.update(cx, |panel, cx| {
+                                                                    panel.new_agent_thread(
+                                                                        AgentType::Gemini,
+                                                                        window,
+                                                                        cx,
+                                                                    );
+                                                                });
+                                                            }
                                                         });
                                                     }
-                                                });
-                                            }
-                                        }
-                                    }),
-                            )
+                                                }
+                                            }),
+                                    )
+                                }
+                            })
                             .map(|mut menu| {
                                 let agent_server_store = agent_server_store.read(cx);
                                 let agent_names = agent_server_store
