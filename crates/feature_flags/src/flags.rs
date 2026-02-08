@@ -22,6 +22,12 @@ pub struct AcpBetaFeatureFlag;
 
 impl FeatureFlag for AcpBetaFeatureFlag {
     const NAME: &'static str = "acp-beta";
+
+    // Enable ACP beta features (session list, load, resume) for all users.
+    // These are needed for Helix's external agent session management.
+    fn enabled_for_all() -> bool {
+        true
+    }
 }
 
 pub struct ToolPermissionsFeatureFlag;
