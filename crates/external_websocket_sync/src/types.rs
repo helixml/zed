@@ -217,6 +217,19 @@ pub enum SyncEvent {
         /// Optional thread ID if a thread was loaded from session
         thread_id: Option<String>,
     },
+    /// Response to query_ui_state command — reports current agent panel UI state
+    /// Used by E2E tests to verify that threads are correctly displayed
+    #[serde(rename = "ui_state_response")]
+    UiStateResponse {
+        /// Echoed back from the query to correlate request/response
+        query_id: String,
+        /// Current active view: "agent_thread", "history", "uninitialized", "agent_thread_loading", "other"
+        active_view: String,
+        /// Session ID of the currently displayed thread (if active_view == "agent_thread")
+        thread_id: Option<String>,
+        /// Number of entries in the displayed thread
+        entry_count: usize,
+    },
 }
 
 impl SyncEvent {
@@ -275,6 +288,15 @@ impl SyncEvent {
                 serde_json::json!({
                     "agent_name": agent_name,
                     "thread_id": thread_id,
+                })
+            ),
+            SyncEvent::UiStateResponse { query_id, active_view, thread_id, entry_count } => (
+                "ui_state_response".to_string(),
+                serde_json::json!({
+                    "query_id": query_id,
+                    "active_view": active_view,
+                    "thread_id": thread_id,
+                    "entry_count": entry_count,
                 })
             ),
         };

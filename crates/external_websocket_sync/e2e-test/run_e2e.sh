@@ -67,13 +67,16 @@ cat > /tmp/mock_helix_server.py << 'PYEOF'
 """Mock Helix WebSocket server for E2E testing.
 
 Multi-phase test covering:
-  Phase 1: Basic thread - send chat_message, get response
-  Phase 2: Follow-up on same thread - send chat_message with acp_thread_id
-  Phase 3: New thread via WebSocket - send chat_message without acp_thread_id
-  Phase 4: Verify all threads tracked correctly
+  Phase 1: Basic thread - send chat_message, get response, verify UI state
+  Phase 2: Follow-up on same thread - send chat_message with acp_thread_id, verify UI state
+  Phase 3: New thread via WebSocket - send chat_message without acp_thread_id, verify UI state
+  Phase 4: Validate all protocol + UI state checks
 
 This simulates what Helix spectasks need: a single session spanning
 multiple Zed threads (e.g., when context fills up and a new thread starts).
+
+UI state queries verify that the agent panel actually displays threads
+(catches regressions in from_existing_thread / ThreadDisplayNotification).
 """
 import asyncio
 import json
@@ -92,6 +95,48 @@ phase = 0
 thread_ids = []  # Collect all thread IDs we see
 completed_threads = {}  # thread_id -> list of completed request_ids
 
+# UI state query tracking
+ui_state_responses = {}  # query_id -> response data
+ui_state_waiters = {}  # query_id -> asyncio.Event
+
+
+async def query_ui_state(ws, query_id, timeout=15):
+    """Send query_ui_state and wait for matching ui_state_response."""
+    # Set up waiter before sending (to avoid race)
+    wait_event = asyncio.Event()
+    ui_state_waiters[query_id] = wait_event
+
+    command = {"type": "query_ui_state", "data": {"query_id": query_id}}
+    await ws.send(json.dumps(command))
+    print(f"[mock-server] -> Sent: query_ui_state (query_id={query_id})", flush=True)
+
+    try:
+        await asyncio.wait_for(wait_event.wait(), timeout=timeout)
+    except asyncio.TimeoutError:
+        print(f"[mock-server] ⚠️  Timeout waiting for ui_state_response query_id={query_id}", flush=True)
+        return None
+
+    return ui_state_responses.get(query_id)
+
+
+async def advance_after_completion(ws, completed_phase):
+    """Run UI state query and advance to next phase.
+    Runs as a background task so the message loop stays unblocked."""
+    global phase
+    await asyncio.sleep(2)  # Let GPUI render the thread view
+    await query_ui_state(ws, f"after-phase{completed_phase}")
+    await asyncio.sleep(1)
+    if completed_phase == 1:
+        phase = 2
+        await run_phase_2(ws)
+    elif completed_phase == 2:
+        phase = 3
+        await run_phase_3(ws)
+    elif completed_phase == 3:
+        phase = 4
+        await asyncio.sleep(0.5)
+        all_tests_done.set()
+
 
 async def handle_connection(websocket):
     """Handle a single WebSocket connection from Zed."""
@@ -106,6 +151,14 @@ async def handle_connection(websocket):
             event_data = data.get("data", {})
             print(f"[mock-server] <- {event_type}: {json.dumps(event_data)[:120]}", flush=True)
             received_events.append(data)
+
+            # Handle ui_state_response — wake up any waiters
+            if event_type == "ui_state_response":
+                qid = event_data.get("query_id", "")
+                ui_state_responses[qid] = event_data
+                if qid in ui_state_waiters:
+                    ui_state_waiters[qid].set()
+                continue
 
             if event_type == "agent_ready" and phase == 0:
                 phase = 1
@@ -122,19 +175,11 @@ async def handle_connection(websocket):
                 completed_threads.setdefault(tid, []).append(rid)
                 print(f"[mock-server] ✅ Completed: thread={tid[:12]}... req={rid}", flush=True)
 
-                # Advance to next phase after completion
-                if phase == 1:
-                    phase = 2
-                    await asyncio.sleep(1)
-                    await run_phase_2(websocket)
-                elif phase == 2:
-                    phase = 3
-                    await asyncio.sleep(1)
-                    await run_phase_3(websocket)
-                elif phase == 3:
-                    phase = 4
-                    await asyncio.sleep(0.5)
-                    all_tests_done.set()
+                # Spawn phase advancement as background task so the message
+                # loop stays unblocked (needed to receive ui_state_response)
+                current_phase = phase
+                if current_phase in (1, 2, 3):
+                    asyncio.create_task(advance_after_completion(websocket, current_phase))
 
         except json.JSONDecodeError:
             print(f"[mock-server] Invalid JSON: {message[:100]}", flush=True)
@@ -276,8 +321,70 @@ def validate_results():
     # Count thread_created events: phase 1 creates one, phase 3 creates one = 2
     # Phase 2 (follow-up) should NOT create a thread
     if len(thread_created_events) > 2:
-        # More than 2 thread_created = phase 2 incorrectly created a thread
         errors.append(f"Too many thread_created events ({len(thread_created_events)}). Phase 2 follow-up should not create new thread.")
+
+    # --- UI State Validation ---
+    print("\n" + "-"*50, flush=True)
+    print("  UI STATE VALIDATION", flush=True)
+    print("-"*50, flush=True)
+    print(f"[mock-server] UI state responses received: {list(ui_state_responses.keys())}", flush=True)
+
+    # After Phase 1: should show first thread
+    state1 = ui_state_responses.get("after-phase1")
+    if state1 is None:
+        errors.append("UI State: No response for after-phase1 query")
+    else:
+        if state1.get("active_view") != "agent_thread":
+            errors.append(f"UI State after phase 1: active_view is '{state1.get('active_view')}', expected 'agent_thread'")
+        else:
+            print(f"[mock-server] ✅ UI State after phase 1: active_view=agent_thread", flush=True)
+        if thread_ids and state1.get("thread_id") != thread_ids[0]:
+            errors.append(f"UI State after phase 1: thread_id is '{state1.get('thread_id')}', expected '{thread_ids[0]}'")
+        else:
+            print(f"[mock-server] ✅ UI State after phase 1: correct thread displayed", flush=True)
+        p1_entries = state1.get("entry_count", 0)
+        if p1_entries < 2:
+            errors.append(f"UI State after phase 1: entry_count is {p1_entries}, expected >= 2 (user + assistant)")
+        else:
+            print(f"[mock-server] ✅ UI State after phase 1: {p1_entries} entries", flush=True)
+
+    # After Phase 2: same thread, more entries
+    state2 = ui_state_responses.get("after-phase2")
+    if state2 is None:
+        errors.append("UI State: No response for after-phase2 query")
+    else:
+        if state2.get("active_view") != "agent_thread":
+            errors.append(f"UI State after phase 2: active_view is '{state2.get('active_view')}', expected 'agent_thread'")
+        else:
+            print(f"[mock-server] ✅ UI State after phase 2: active_view=agent_thread", flush=True)
+        if thread_ids and state2.get("thread_id") != thread_ids[0]:
+            errors.append(f"UI State after phase 2: thread_id is '{state2.get('thread_id')}', expected '{thread_ids[0]}' (same thread)")
+        else:
+            print(f"[mock-server] ✅ UI State after phase 2: still showing same thread (follow-up)", flush=True)
+        p2_entries = state2.get("entry_count", 0)
+        if state1 and p2_entries <= state1.get("entry_count", 0):
+            errors.append(f"UI State after phase 2: entry_count {p2_entries} should be > phase 1 count {state1.get('entry_count', 0)}")
+        else:
+            print(f"[mock-server] ✅ UI State after phase 2: {p2_entries} entries (more than phase 1)", flush=True)
+
+    # After Phase 3: DIFFERENT thread (new thread created)
+    state3 = ui_state_responses.get("after-phase3")
+    if state3 is None:
+        errors.append("UI State: No response for after-phase3 query")
+    else:
+        if state3.get("active_view") != "agent_thread":
+            errors.append(f"UI State after phase 3: active_view is '{state3.get('active_view')}', expected 'agent_thread'")
+        else:
+            print(f"[mock-server] ✅ UI State after phase 3: active_view=agent_thread", flush=True)
+        if len(thread_ids) >= 2 and state3.get("thread_id") != thread_ids[1]:
+            errors.append(f"UI State after phase 3: thread_id is '{state3.get('thread_id')}', expected '{thread_ids[1]}' (NEW thread)")
+        else:
+            print(f"[mock-server] ✅ UI State after phase 3: switched to new thread", flush=True)
+        p3_entries = state3.get("entry_count", 0)
+        if p3_entries < 2:
+            errors.append(f"UI State after phase 3: entry_count is {p3_entries}, expected >= 2")
+        else:
+            print(f"[mock-server] ✅ UI State after phase 3: {p3_entries} entries", flush=True)
 
     # --- Summary ---
     if errors:
@@ -290,6 +397,7 @@ def validate_results():
     print("[mock-server] ✅ Phase 1: Basic thread creation - PASSED", flush=True)
     print("[mock-server] ✅ Phase 2: Follow-up on existing thread - PASSED", flush=True)
     print("[mock-server] ✅ Phase 3: New thread via WebSocket - PASSED", flush=True)
+    print("[mock-server] ✅ UI State: All 3 queries verified - PASSED", flush=True)
     print(f"[mock-server] ✅ Total threads: {len(thread_ids)}, Total completions: {sum(len(v) for v in completed_threads.values())}", flush=True)
     return True
 
@@ -309,14 +417,15 @@ async def run_server(port):
             f.write(str(actual_port))
 
         try:
-            await asyncio.wait_for(all_tests_done.wait(), timeout=180)
+            await asyncio.wait_for(all_tests_done.wait(), timeout=240)
         except asyncio.TimeoutError:
             event_types = [e.get("event_type") for e in received_events]
             print(f"[mock-server] TIMEOUT at phase {phase}. Events: {event_types}", flush=True)
+            print(f"[mock-server] UI state responses: {ui_state_responses}", flush=True)
             sys.exit(1)
 
     if validate_results():
-        print("\n[mock-server] ALL MULTI-THREAD PROTOCOL CHECKS PASSED", flush=True)
+        print("\n[mock-server] ALL MULTI-THREAD PROTOCOL + UI STATE CHECKS PASSED", flush=True)
     else:
         sys.exit(1)
 

@@ -92,6 +92,14 @@ static PENDING_THREAD_DISPLAY_NOTIFICATIONS: parking_lot::Mutex<Vec<ThreadDispla
 static GLOBAL_THREAD_OPEN_CALLBACK: parking_lot::Mutex<Option<mpsc::UnboundedSender<ThreadOpenRequest>>> =
     parking_lot::Mutex::new(None);
 
+/// Static global for UI state query callback (queries AgentPanel's active view for E2E testing)
+static GLOBAL_UI_STATE_QUERY_CALLBACK: parking_lot::Mutex<Option<mpsc::UnboundedSender<UiStateQueryRequest>>> =
+    parking_lot::Mutex::new(None);
+
+/// Pending UI state queries that arrived before AgentPanel was ready
+static PENDING_UI_STATE_QUERIES: parking_lot::Mutex<Vec<UiStateQueryRequest>> =
+    parking_lot::Mutex::new(Vec::new());
+
 /// Request to create ACP thread from external WebSocket message
 #[derive(Clone, Debug)]
 pub struct ThreadCreationRequest {
@@ -108,6 +116,12 @@ pub struct ThreadOpenRequest {
     /// Which ACP agent to use (e.g., "qwen", "claude", "gemini", "codex").
     /// None or empty means use NativeAgent (Zed's built-in agent).
     pub agent_name: Option<String>,
+}
+
+/// Request to query UI state from AgentPanel (for E2E testing)
+#[derive(Clone, Debug)]
+pub struct UiStateQueryRequest {
+    pub query_id: String,
 }
 
 /// Notification to display a thread in AgentPanel (for auto-select)
@@ -267,6 +281,42 @@ pub fn request_thread_open(request: ThreadOpenRequest) -> Result<()> {
         PENDING_THREAD_OPEN_REQUESTS.lock().push(request);
         log::info!("✅ [CALLBACK] Open request queued successfully (will replay when callback is registered)");
         eprintln!("✅ [CALLBACK] Open request queued successfully (will replay when callback is registered)");
+        Ok(())
+    }
+}
+
+/// Initialize the global UI state query callback (called from agent_panel)
+/// Also replays any pending queries that arrived before AgentPanel was ready
+pub fn init_ui_state_query_callback(sender: mpsc::UnboundedSender<UiStateQueryRequest>) {
+    log::info!("🔧 [CALLBACK] init_ui_state_query_callback() called - registering global callback");
+    eprintln!("🔧 [CALLBACK] init_ui_state_query_callback() called - registering global callback");
+
+    *GLOBAL_UI_STATE_QUERY_CALLBACK.lock() = Some(sender.clone());
+
+    let pending: Vec<UiStateQueryRequest> = std::mem::take(&mut *PENDING_UI_STATE_QUERIES.lock());
+    if !pending.is_empty() {
+        log::info!("🔄 [CALLBACK] Replaying {} pending UI state queries", pending.len());
+        for request in pending {
+            if let Err(e) = sender.send(request) {
+                log::error!("❌ [CALLBACK] Failed to replay UI state query: {:?}", e);
+            }
+        }
+    }
+}
+
+/// Request UI state from AgentPanel (called from WebSocket handler)
+/// If AgentPanel isn't ready yet, the query is queued for later replay
+pub fn request_ui_state_query(request: UiStateQueryRequest) -> Result<()> {
+    log::info!("🔧 [CALLBACK] request_ui_state_query() called: query_id={}", request.query_id);
+    eprintln!("🔧 [CALLBACK] request_ui_state_query() called: query_id={}", request.query_id);
+
+    let sender = GLOBAL_UI_STATE_QUERY_CALLBACK.lock().clone();
+    if let Some(sender) = sender {
+        sender.send(request)
+            .map_err(|_| anyhow::anyhow!("Failed to send UI state query"))?;
+        Ok(())
+    } else {
+        PENDING_UI_STATE_QUERIES.lock().push(request);
         Ok(())
     }
 }

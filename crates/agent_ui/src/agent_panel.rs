@@ -717,6 +717,51 @@ impl AgentPanel {
                 anyhow::Ok(())
             })
             .detach();
+
+            // Setup callback handler for UI state queries (E2E testing)
+            let (query_tx, mut query_rx) = mpsc::unbounded_channel::<external_websocket_sync::UiStateQueryRequest>();
+            external_websocket_sync::init_ui_state_query_callback(query_tx);
+
+            cx.spawn_in(window, async move |this, cx| {
+                while let Some(query) = query_rx.recv().await {
+                    let query_id = query.query_id.clone();
+                    this.update(cx, |this, cx| {
+                        let (active_view_str, thread_id, entry_count) = match &this.active_view {
+                            ActiveView::AgentThread { thread_view } => {
+                                if let Some(acp_thread_view) = thread_view.read(cx).as_active_thread() {
+                                    let thread_entity = &acp_thread_view.read(cx).thread;
+                                    let thread = thread_entity.read(cx);
+                                    (
+                                        "agent_thread".to_string(),
+                                        Some(thread.session_id().to_string()),
+                                        thread.entries().len(),
+                                    )
+                                } else {
+                                    ("agent_thread_loading".to_string(), None, 0)
+                                }
+                            }
+                            ActiveView::History { .. } => ("history".to_string(), None, 0),
+                            ActiveView::Uninitialized => ("uninitialized".to_string(), None, 0),
+                            _ => ("other".to_string(), None, 0),
+                        };
+
+                        eprintln!("🔍 [AGENT_PANEL] UI state query {}: active_view={}, thread_id={:?}, entry_count={}",
+                                  query_id, active_view_str, thread_id, entry_count);
+
+                        let _ = external_websocket_sync::send_websocket_event(
+                            external_websocket_sync::SyncEvent::UiStateResponse {
+                                query_id,
+                                active_view: active_view_str,
+                                thread_id,
+                                entry_count,
+                            }
+                        );
+                    }).log_err();
+                }
+
+                anyhow::Ok(())
+            })
+            .detach();
         }
 
         // Subscribe to extension events to sync agent servers when extensions change

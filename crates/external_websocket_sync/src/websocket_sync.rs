@@ -380,6 +380,7 @@ impl WebSocketSync {
         match command.command_type.as_str() {
             "chat_message" => Self::handle_chat_message(command.data).await,
             "open_thread" => Self::handle_open_thread(command.data).await,
+            "query_ui_state" => Self::handle_query_ui_state(command.data).await,
             _ => {
                 eprintln!("⚠️  [WEBSOCKET-IN] Ignoring unknown command: {}", command.command_type);
                 log::warn!("⚠️  [WEBSOCKET-IN] Ignoring unknown command: {}", command.command_type);
@@ -453,6 +454,22 @@ impl WebSocketSync {
         eprintln!("✅ [WEBSOCKET-IN] request_thread_open() succeeded");
         log::info!("✅ [WEBSOCKET-IN] request_thread_open() succeeded");
 
+        Ok(())
+    }
+
+    /// Handle query_ui_state command (query AgentPanel's active view for E2E testing)
+    async fn handle_query_ui_state(data: serde_json::Value) -> Result<()> {
+        let query_id = data.get("query_id")
+            .and_then(|v| v.as_str())
+            .unwrap_or("unknown")
+            .to_string();
+
+        eprintln!("🔍 [WEBSOCKET-IN] Processing query_ui_state: query_id={}", query_id);
+        log::info!("🔍 [WEBSOCKET-IN] Processing query_ui_state: query_id={}", query_id);
+
+        crate::request_ui_state_query(crate::UiStateQueryRequest { query_id })?;
+
+        eprintln!("✅ [WEBSOCKET-IN] query_ui_state request dispatched");
         Ok(())
     }
 
