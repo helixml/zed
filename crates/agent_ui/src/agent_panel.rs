@@ -683,13 +683,34 @@ impl AgentPanel {
                             }
                         }
 
-                        // Open the thread in the UI via the standard AcpServerView path.
-                        // This creates a proper view that subscribes to all thread events
-                        // (NewEntry, EntryUpdated, Stopped, etc.) for both UI rendering
-                        // and WebSocket event forwarding.
-                        let thread_info = acp_thread::AgentSessionInfo::new(incoming_session_id.clone());
-                        this.open_thread(thread_info, window, cx);
-                        eprintln!("✅ [AGENT_PANEL] Auto-opened thread {} via open_thread", incoming_session_id);
+                        // Create view directly from existing thread entity.
+                        // We can't use open_thread() because it creates a new ACP connection
+                        // that won't find this thread (thread_service uses a different agent
+                        // instance). Instead, wrap the existing Entity<AcpThread> directly.
+                        let server = crate::ExternalAgent::NativeAgent
+                            .server(this.fs.clone(), this.thread_store.clone());
+                        let thread_view = cx.new(|cx| {
+                            crate::acp::AcpServerView::from_existing_thread(
+                                notification.thread_entity.clone(),
+                                server,
+                                this.workspace.clone(),
+                                this.project.clone(),
+                                Some(this.thread_store.clone()),
+                                this.prompt_store.clone(),
+                                this.acp_history.clone(),
+                                agent_name,
+                                window,
+                                cx,
+                            )
+                        });
+
+                        this.set_active_view(
+                            ActiveView::AgentThread { thread_view },
+                            true,
+                            window,
+                            cx,
+                        );
+                        eprintln!("✅ [AGENT_PANEL] Auto-opened existing headless thread {} in UI", incoming_session_id);
                     }).log_err();
                 }
 

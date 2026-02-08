@@ -161,6 +161,51 @@ impl ProfileProvider for Entity<agent::Thread> {
     }
 }
 
+/// No-op AgentConnection for headless threads created by thread_service.
+/// These threads are driven entirely by the WebSocket sync system, not by
+/// user interaction through the ACP connection.
+#[cfg(feature = "external_websocket_sync")]
+struct HeadlessConnection;
+
+#[cfg(feature = "external_websocket_sync")]
+impl AgentConnection for HeadlessConnection {
+    fn telemetry_id(&self) -> SharedString {
+        "headless".into()
+    }
+
+    fn new_thread(
+        self: Rc<Self>,
+        _project: Entity<Project>,
+        _cwd: &std::path::Path,
+        _cx: &mut gpui::App,
+    ) -> Task<Result<Entity<AcpThread>>> {
+        Task::ready(Err(anyhow!("headless connection cannot create threads")))
+    }
+
+    fn auth_methods(&self) -> &[acp::AuthMethod] {
+        &[]
+    }
+
+    fn authenticate(&self, _method: acp::AuthMethodId, _cx: &mut gpui::App) -> Task<Result<()>> {
+        Task::ready(Ok(()))
+    }
+
+    fn prompt(
+        &self,
+        _user_message_id: Option<UserMessageId>,
+        _params: acp::PromptRequest,
+        _cx: &mut gpui::App,
+    ) -> Task<Result<acp::PromptResponse>> {
+        Task::ready(Err(anyhow!("headless connection cannot prompt")))
+    }
+
+    fn cancel(&self, _session_id: &acp::SessionId, _cx: &mut gpui::App) {}
+
+    fn into_any(self: Rc<Self>) -> Rc<dyn std::any::Any> {
+        self
+    }
+}
+
 pub struct AcpServerView {
     agent: Rc<dyn AgentServer>,
     agent_server_store: Entity<AgentServerStore>,
@@ -305,6 +350,155 @@ impl AcpServerView {
                 window,
                 cx,
             ),
+            login: None,
+            notifications: Vec::new(),
+            notification_subscriptions: HashMap::default(),
+            auth_task: None,
+            history,
+            _subscriptions: subscriptions,
+            focus_handle: cx.focus_handle(),
+            #[cfg(feature = "external_websocket_sync")]
+            last_tool_call_status: HashMap::default(),
+        }
+    }
+
+    /// Create an AcpServerView wrapping an existing headless thread entity.
+    ///
+    /// This bypasses the normal connection/loading path for threads created
+    /// by thread_service (WebSocket-created threads). Each server.connect()
+    /// creates a new NativeAgent instance, so the thread exists in one agent's
+    /// sessions but the UI would use another — we can't look it up.
+    /// Instead, we wrap the existing Entity<AcpThread> directly.
+    #[cfg(feature = "external_websocket_sync")]
+    pub fn from_existing_thread(
+        thread: gpui::Entity<AcpThread>,
+        agent: Rc<dyn AgentServer>,
+        workspace: WeakEntity<Workspace>,
+        project: Entity<Project>,
+        thread_store: Option<Entity<ThreadStore>>,
+        prompt_store: Option<Entity<PromptStore>>,
+        history: Entity<AcpThreadHistory>,
+        agent_name: Option<String>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let prompt_capabilities = Rc::new(RefCell::new(acp::PromptCapabilities::default()));
+        let available_commands = Rc::new(RefCell::new(vec![]));
+
+        let agent_server_store = project.read(cx).agent_server_store().clone();
+        let subscriptions = vec![
+            cx.observe_global_in::<SettingsStore>(window, Self::agent_ui_font_size_changed),
+            cx.observe_global_in::<AgentFontSize>(window, Self::agent_ui_font_size_changed),
+            cx.subscribe_in(
+                &agent_server_store,
+                window,
+                Self::handle_agent_servers_updated,
+            ),
+        ];
+
+        cx.on_release(|this, cx| {
+            for window in this.notifications.drain(..) {
+                window
+                    .update(cx, |_, window, _| {
+                        window.remove_window();
+                    })
+                    .ok();
+            }
+        })
+        .detach();
+
+        // Build the entry view state and sync existing entries
+        let agent_name_str = agent_name.unwrap_or_else(|| agent.name().to_string());
+        let display_name: SharedString = agent_name_str.clone().into();
+        let agent_shared_name: SharedString = agent_name_str.into();
+
+        let entry_view_state = cx.new(|_cx| {
+            EntryViewState::new(
+                workspace.clone(),
+                project.downgrade(),
+                thread_store.clone(),
+                history.downgrade(),
+                prompt_store.clone(),
+                prompt_capabilities.clone(),
+                available_commands.clone(),
+                agent_shared_name.clone(),
+            )
+        });
+
+        let list_state = ListState::new(0, gpui::ListAlignment::Bottom, gpui::px(2048.0));
+
+        // Sync existing entries from the thread
+        let count = thread.read(cx).entries().len();
+        entry_view_state.update(cx, |view_state, cx| {
+            for ix in 0..count {
+                view_state.sync_entry(ix, &thread, window, cx);
+            }
+        });
+        list_state.splice_focusable(
+            0..0,
+            (0..count).map(|ix| entry_view_state.read(cx).entry(ix).and_then(|e| e.focus_handle(cx))),
+        );
+
+        let action_log = thread.read(cx).action_log().clone();
+
+        // Subscribe AcpServerView to thread events (drives UI updates + WebSocket forwarding)
+        let thread_subscriptions = vec![
+            cx.subscribe_in(&thread, window, Self::handle_thread_event),
+            cx.observe(&action_log, |_, _, cx| cx.notify()),
+        ];
+
+        // Create a no-op connection for headless threads
+        let connection: Rc<dyn AgentConnection> = Rc::new(HeadlessConnection);
+
+        let weak = cx.weak_entity();
+        let current = cx.new(|cx| {
+            AcpThreadView::new(
+                thread.clone(),
+                None, // login
+                weak,
+                agent_shared_name.clone(),
+                display_name,
+                workspace.clone(),
+                entry_view_state,
+                None, // title_editor
+                None, // config_options_view
+                None, // mode_selector
+                None, // model_selector
+                None, // profile_selector
+                list_state,
+                prompt_capabilities,
+                available_commands,
+                false, // resumed_without_history
+                None,  // resume_thread_metadata
+                project.downgrade(),
+                thread_store.clone(),
+                history.clone(),
+                prompt_store.clone(),
+                None, // initial_content
+                thread_subscriptions,
+                window,
+                cx,
+            )
+        });
+
+        // Register thread in THREAD_REGISTRY
+        {
+            let session_id = thread.read(cx).session_id().to_string();
+            external_websocket_sync::register_thread(session_id, thread);
+        }
+
+        Self {
+            agent,
+            agent_server_store,
+            workspace,
+            project,
+            thread_store,
+            prompt_store,
+            server_state: ServerState::Connected(ConnectedServerState {
+                connection,
+                auth_state: AuthState::Ok,
+                current,
+            }),
             login: None,
             notifications: Vec::new(),
             notification_subscriptions: HashMap::default(),
