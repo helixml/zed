@@ -1,7 +1,7 @@
 use std::{ops::Range, path::Path, rc::Rc, sync::Arc, time::Duration};
 
 use acp_thread::{AcpThread, AgentSessionInfo};
-use agent::{ContextServerRegistry, SharedThread, ThreadStore};
+use agent::{ContextServerRegistry, NativeAgentSessionList, SharedThread, ThreadStore};
 use agent_client_protocol as acp;
 use agent_servers::AgentServer;
 use db::kvp::{Dismissable, KEY_VALUE_STORE};
@@ -707,6 +707,22 @@ impl AgentPanel {
                             window,
                             cx,
                         );
+
+                        // Dismiss onboarding so "Welcome to Zed AI" doesn't show
+                        OnboardingUpsell::set_dismissed(true, cx);
+
+                        // Ensure history view has a session_list so threads appear in "View All".
+                        // The normal flow sets session_list when a NativeAgent connection is made,
+                        // but from_existing_thread uses HeadlessConnection which doesn't provide one.
+                        // Create a NativeAgentSessionList wrapping the ThreadStore so saved threads
+                        // are discoverable in the history UI.
+                        let thread_store = this.thread_store.clone();
+                        this.acp_history.update(cx, |history, cx| {
+                            let session_list: Rc<dyn acp_thread::AgentSessionList> =
+                                Rc::new(NativeAgentSessionList::new(thread_store, cx));
+                            history.set_session_list(Some(session_list), cx);
+                        });
+
                         eprintln!("✅ [AGENT_PANEL] Auto-opened existing headless thread {} in UI", incoming_session_id);
                     }).log_err();
 

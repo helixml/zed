@@ -1420,7 +1420,7 @@ pub struct NativeAgentSessionList {
 }
 
 impl NativeAgentSessionList {
-    fn new(thread_store: Entity<ThreadStore>, cx: &mut App) -> Self {
+    pub fn new(thread_store: Entity<ThreadStore>, cx: &mut App) -> Self {
         let (tx, rx) = smol::channel::unbounded();
         let this_tx = tx.clone();
         let subscription = cx.observe(&thread_store, move |_, _| {

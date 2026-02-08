@@ -323,6 +323,44 @@ def validate_results():
     if len(thread_created_events) > 2:
         errors.append(f"Too many thread_created events ({len(thread_created_events)}). Phase 2 follow-up should not create new thread.")
 
+    # --- Streaming validation ---
+    # Verify that message_added events arrive BEFORE message_completed (streaming, not batch)
+    print("\n" + "-"*50, flush=True)
+    print("  STREAMING VALIDATION", flush=True)
+    print("-"*50, flush=True)
+
+    for req_id in ["req-phase1", "req-phase2", "req-phase3"]:
+        # Find the index of the first message_added for this phase's thread
+        # and the index of message_completed for this request
+        first_added_idx = None
+        completed_idx = None
+        added_count = 0
+        for i, evt in enumerate(received_events):
+            etype = evt.get("event_type")
+            edata = evt.get("data", {})
+            if etype == "message_added" and edata.get("role") == "assistant":
+                # Match by thread: for phase1/2 use thread_ids[0], for phase3 use thread_ids[1]
+                evt_tid = edata.get("acp_thread_id", "")
+                if req_id == "req-phase3" and len(thread_ids) >= 2 and evt_tid == thread_ids[1]:
+                    if first_added_idx is None:
+                        first_added_idx = i
+                    added_count += 1
+                elif req_id in ("req-phase1", "req-phase2") and thread_ids and evt_tid == thread_ids[0]:
+                    if first_added_idx is None:
+                        first_added_idx = i
+                    added_count += 1
+            elif etype == "message_completed" and edata.get("request_id") == req_id:
+                completed_idx = i
+
+        if first_added_idx is not None and completed_idx is not None:
+            if first_added_idx < completed_idx:
+                print(f"[mock-server] ✅ Streaming {req_id}: {added_count} message_added events before message_completed", flush=True)
+            else:
+                errors.append(f"Streaming {req_id}: message_added (idx={first_added_idx}) did NOT arrive before message_completed (idx={completed_idx})")
+        elif completed_idx is not None:
+            errors.append(f"Streaming {req_id}: No assistant message_added events received before completion")
+        # If neither exists, the earlier phase validation already caught it
+
     # --- UI State Validation ---
     print("\n" + "-"*50, flush=True)
     print("  UI STATE VALIDATION", flush=True)
@@ -397,6 +435,7 @@ def validate_results():
     print("[mock-server] ✅ Phase 1: Basic thread creation - PASSED", flush=True)
     print("[mock-server] ✅ Phase 2: Follow-up on existing thread - PASSED", flush=True)
     print("[mock-server] ✅ Phase 3: New thread via WebSocket - PASSED", flush=True)
+    print("[mock-server] ✅ Streaming: message_added before message_completed - PASSED", flush=True)
     print("[mock-server] ✅ UI State: All 3 queries verified - PASSED", flush=True)
     print(f"[mock-server] ✅ Total threads: {len(thread_ids)}, Total completions: {sum(len(v) for v in completed_threads.values())}", flush=True)
     return True
