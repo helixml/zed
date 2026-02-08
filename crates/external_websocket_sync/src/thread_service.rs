@@ -514,8 +514,63 @@ fn create_new_thread_sync(
             }
         }
 
-        eprintln!("✅ [THREAD_SERVICE] Message send awaited - AI should be responding");
-        log::info!("✅ [THREAD_SERVICE] Message send awaited - AI should be responding");
+        eprintln!("✅ [THREAD_SERVICE] Message send awaited - AI response complete");
+        log::info!("✅ [THREAD_SERVICE] Message send awaited - AI response complete");
+
+        // Send WebSocket events for the AI response.
+        // We do this here rather than via GPUI subscription because the
+        // NativeAgentConnection bridge emits AcpThreadEvent from cx.spawn()
+        // without window context, and subscribe_in silently drops those events.
+        let acp_thread_id_for_ws = acp_thread_id.clone();
+        let request_id_for_ws = request_clone.request_id.clone();
+        cx.update(|cx| {
+            let thread = thread_entity.read(cx);
+            let entries = thread.entries();
+            let entry_count = entries.len();
+            eprintln!("📤 [THREAD_SERVICE] Sending WebSocket events for {} entries", entry_count);
+
+            // Build cumulative assistant response from all entries after the user message
+            let mut cumulative_content = String::new();
+            for entry in entries.iter().skip(1) { // skip entry 0 (user message)
+                match entry {
+                    acp_thread::AgentThreadEntry::AssistantMessage(msg) => {
+                        for chunk in &msg.chunks {
+                            match chunk {
+                                acp_thread::AssistantMessageChunk::Message { block } |
+                                acp_thread::AssistantMessageChunk::Thought { block } => {
+                                    cumulative_content.push_str(&block.to_markdown(cx).to_string());
+                                }
+                            }
+                        }
+                    }
+                    acp_thread::AgentThreadEntry::ToolCall(_tc) => {
+                        cumulative_content.push_str("\n[Tool call]\n");
+                    }
+                    _ => {}
+                }
+            }
+
+            if !cumulative_content.is_empty() {
+                eprintln!("📤 [THREAD_SERVICE] Sending message_added: {} chars", cumulative_content.len());
+                let _ = crate::send_websocket_event(SyncEvent::MessageAdded {
+                    acp_thread_id: acp_thread_id_for_ws.clone(),
+                    message_id: "response".to_string(),
+                    role: "assistant".to_string(),
+                    content: cumulative_content,
+                    timestamp: chrono::Utc::now().timestamp(),
+                });
+            }
+
+            // Send message_completed
+            let request_id = crate::get_thread_request_id(&acp_thread_id_for_ws)
+                .unwrap_or(request_id_for_ws);
+            eprintln!("📤 [THREAD_SERVICE] Sending message_completed: request_id={}", request_id);
+            let _ = crate::send_websocket_event(SyncEvent::MessageCompleted {
+                acp_thread_id: acp_thread_id_for_ws,
+                message_id: "0".to_string(),
+                request_id,
+            });
+        });
 
         anyhow::Ok(())
     }).detach();
@@ -545,20 +600,76 @@ async fn handle_follow_up_message(
     mark_external_originated_entry(thread_id.clone(), entry_idx_to_mark);
     eprintln!("🏷️ [THREAD_SERVICE] Marked entry {} as external-originated (follow-up)", entry_idx_to_mark);
 
-    cx.update(|cx| {
-        let send_task = thread.update(cx, |thread: &mut AcpThread, cx| {
+    let send_task = cx.update(|cx| {
+        thread.update(cx, |thread: &mut AcpThread, cx| {
             let message = vec![ContentBlock::Text(
                 TextContent::new(message.clone())
             )];
             thread.send(message, cx)
-        })?;
-        // Spawn the send task
-        cx.spawn(async move |_| {
-            send_task.await.log_err();
-            anyhow::Ok(())
-        }).detach();
-        anyhow::Ok(())
+        })
     })?;
+
+    // Await the send task to completion (LLM response finishes)
+    match send_task.await {
+        Ok(_) => {
+            eprintln!("✅ [THREAD_SERVICE] Follow-up send completed successfully");
+        }
+        Err(e) => {
+            eprintln!("❌ [THREAD_SERVICE] Follow-up send failed: {}", e);
+            return Err(e);
+        }
+    }
+
+    // Send WebSocket events for the follow-up response
+    let thread_id_for_ws = thread_id.clone();
+    let request_id_for_ws = request_id.clone();
+    cx.update(|cx| {
+        if let Some(thread_entity) = thread.upgrade() {
+            let thread_read = thread_entity.read(cx);
+            let entries = thread_read.entries();
+            eprintln!("📤 [THREAD_SERVICE] Follow-up: sending WebSocket events ({} total entries)", entries.len());
+
+            // Build cumulative assistant response from entries after last user message
+            let mut cumulative_content = String::new();
+            // Find the last user message and collect assistant content after it
+            let last_user_idx = entries.iter().rposition(|e| matches!(e, acp_thread::AgentThreadEntry::UserMessage(_))).unwrap_or(0);
+            for entry in entries.iter().skip(last_user_idx + 1) {
+                match entry {
+                    acp_thread::AgentThreadEntry::AssistantMessage(msg) => {
+                        for chunk in &msg.chunks {
+                            match chunk {
+                                acp_thread::AssistantMessageChunk::Message { block } |
+                                acp_thread::AssistantMessageChunk::Thought { block } => {
+                                    cumulative_content.push_str(&block.to_markdown(cx).to_string());
+                                }
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+
+            if !cumulative_content.is_empty() {
+                eprintln!("📤 [THREAD_SERVICE] Follow-up: sending message_added ({} chars)", cumulative_content.len());
+                let _ = crate::send_websocket_event(SyncEvent::MessageAdded {
+                    acp_thread_id: thread_id_for_ws.clone(),
+                    message_id: "response".to_string(),
+                    role: "assistant".to_string(),
+                    content: cumulative_content,
+                    timestamp: chrono::Utc::now().timestamp(),
+                });
+            }
+
+            let rid = crate::get_thread_request_id(&thread_id_for_ws)
+                .unwrap_or(request_id_for_ws);
+            eprintln!("📤 [THREAD_SERVICE] Follow-up: sending message_completed (request_id={})", rid);
+            let _ = crate::send_websocket_event(SyncEvent::MessageCompleted {
+                acp_thread_id: thread_id_for_ws,
+                message_id: "0".to_string(),
+                request_id: rid,
+            });
+        }
+    });
 
     log::info!("✅ [THREAD_SERVICE] Follow-up message sent successfully");
     Ok(())

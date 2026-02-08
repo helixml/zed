@@ -441,7 +441,12 @@ impl AcpServerView {
 
         let action_log = thread.read(cx).action_log().clone();
 
-        // Subscribe AcpServerView to thread events (drives UI updates + WebSocket forwarding)
+        // Subscribe AcpServerView to thread events (drives UI updates).
+        // NOTE: WebSocket event forwarding is handled by thread_service.rs directly,
+        // not via this subscription. The NativeAgentConnection bridge emits events
+        // from cx.spawn() without window context, so subscribe_in silently drops
+        // those events. The UI subscription still works for events emitted from
+        // within window context (e.g., user-initiated actions).
         let thread_subscriptions = vec![
             cx.subscribe_in(&thread, window, Self::handle_thread_event),
             cx.observe(&action_log, |_, _, cx| cx.notify()),
