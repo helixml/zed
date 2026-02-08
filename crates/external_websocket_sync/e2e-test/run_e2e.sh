@@ -70,7 +70,8 @@ Multi-phase test covering:
   Phase 1: Basic thread - send chat_message, get response, verify UI state
   Phase 2: Follow-up on same thread - send chat_message with acp_thread_id, verify UI state
   Phase 3: New thread via WebSocket - send chat_message without acp_thread_id, verify UI state
-  Phase 4: Validate all protocol + UI state checks
+  Phase 4: Follow-up to NON-VISIBLE thread - send chat_message to Thread A while Thread B is displayed
+           This catches the 'entity released' regression where sending to a non-visible thread fails.
 
 This simulates what Helix spectasks need: a single session spanning
 multiple Zed threads (e.g., when context fills up and a new thread starts).
@@ -134,6 +135,9 @@ async def advance_after_completion(ws, completed_phase):
         await run_phase_3(ws)
     elif completed_phase == 3:
         phase = 4
+        await run_phase_4(ws)
+    elif completed_phase == 4:
+        phase = 5
         await asyncio.sleep(0.5)
         all_tests_done.set()
 
@@ -178,7 +182,7 @@ async def handle_connection(websocket):
                 # Spawn phase advancement as background task so the message
                 # loop stays unblocked (needed to receive ui_state_response)
                 current_phase = phase
-                if current_phase in (1, 2, 3):
+                if current_phase in (1, 2, 3, 4):
                     asyncio.create_task(advance_after_completion(websocket, current_phase))
 
         except json.JSONDecodeError:
@@ -242,6 +246,33 @@ async def run_phase_3(ws):
     }
     await ws.send(json.dumps(command))
     print("[mock-server] -> Sent: chat_message (phase 3, new thread)", flush=True)
+
+
+async def run_phase_4(ws):
+    """Phase 4: Follow-up to NON-VISIBLE thread - tests sending a message back
+    to Thread A after Phase 3 switched the display to Thread B.
+    This reproduces the 'entity released' regression."""
+    print("\n" + "="*50, flush=True)
+    print("  PHASE 4: Follow-up to non-visible thread", flush=True)
+    print("="*50, flush=True)
+    if len(thread_ids) < 2:
+        print("[mock-server] ERROR: Need at least 2 threads for phase 4!", flush=True)
+        sys.exit(1)
+
+    first_thread_id = thread_ids[0]
+    print(f"[mock-server] Sending back to Thread A (non-visible): {first_thread_id}", flush=True)
+    print(f"[mock-server] Thread B (currently visible): {thread_ids[1]}", flush=True)
+    command = {
+        "type": "chat_message",
+        "data": {
+            "message": "What is 5 + 5? Reply with just the number.",
+            "request_id": "req-phase4",
+            "acp_thread_id": first_thread_id,
+            "agent_name": "zed-agent"
+        }
+    }
+    await ws.send(json.dumps(command))
+    print("[mock-server] -> Sent: chat_message (phase 4, back to Thread A)", flush=True)
 
 
 async def process_request(connection, request):
@@ -310,18 +341,39 @@ def validate_results():
     assistant_msgs = [e for e in received_events
         if e.get("event_type") == "message_added"
         and e.get("data", {}).get("role") == "assistant"]
-    if len(assistant_msgs) < 3:
-        errors.append(f"Expected at least 3 assistant messages, got {len(assistant_msgs)}")
+    if len(assistant_msgs) < 4:
+        errors.append(f"Expected at least 4 assistant messages, got {len(assistant_msgs)}")
 
     for i, msg in enumerate(assistant_msgs):
         content = msg.get("data", {}).get("content", "")[:80]
         print(f"[mock-server] Assistant msg {i+1}: {content}", flush=True)
 
-    # --- Phase 2 should NOT have created a thread_created event ---
+    # --- Phase 4: Follow-up to non-visible thread ---
+    phase4_completions = [e for e in received_events
+        if e.get("event_type") == "message_completed"
+        and e.get("data", {}).get("request_id") == "req-phase4"]
+    if not phase4_completions:
+        errors.append("Phase 4: No message_completed for req-phase4")
+    else:
+        # Phase 4 sends to Thread A (thread_ids[0]), so completion should reference Thread A
+        p4_thread = phase4_completions[0].get("data", {}).get("acp_thread_id", "")
+        if thread_ids and p4_thread != thread_ids[0]:
+            errors.append(f"Phase 4: Expected thread {thread_ids[0][:12]}..., got {p4_thread[:12]}...")
+        else:
+            print(f"[mock-server] ✅ Phase 4: Follow-up to non-visible thread completed on Thread A: {p4_thread[:12]}...", flush=True)
+
+    # Check for thread_load_error events (entity released regression)
+    thread_load_errors = [e for e in received_events if e.get("event_type") == "thread_load_error"]
+    if thread_load_errors:
+        for err_evt in thread_load_errors:
+            err_data = err_evt.get("data", {})
+            errors.append(f"Thread load error: {err_data.get('error', 'unknown')} (thread={err_data.get('acp_thread_id', '?')})")
+
+    # --- Phase 2/4 should NOT have created new thread_created events ---
     # Count thread_created events: phase 1 creates one, phase 3 creates one = 2
-    # Phase 2 (follow-up) should NOT create a thread
+    # Phase 2 (follow-up) and Phase 4 (follow-up to non-visible) should NOT create threads
     if len(thread_created_events) > 2:
-        errors.append(f"Too many thread_created events ({len(thread_created_events)}). Phase 2 follow-up should not create new thread.")
+        errors.append(f"Too many thread_created events ({len(thread_created_events)}). Follow-up phases should not create new threads.")
 
     # --- Streaming validation ---
     # Verify that message_added events arrive BEFORE message_completed (streaming, not batch)
@@ -329,7 +381,7 @@ def validate_results():
     print("  STREAMING VALIDATION", flush=True)
     print("-"*50, flush=True)
 
-    for req_id in ["req-phase1", "req-phase2", "req-phase3"]:
+    for req_id in ["req-phase1", "req-phase2", "req-phase3", "req-phase4"]:
         # Find the index of the first message_added for this phase's thread
         # and the index of message_completed for this request
         first_added_idx = None
@@ -345,7 +397,7 @@ def validate_results():
                     if first_added_idx is None:
                         first_added_idx = i
                     added_count += 1
-                elif req_id in ("req-phase1", "req-phase2") and thread_ids and evt_tid == thread_ids[0]:
+                elif req_id in ("req-phase1", "req-phase2", "req-phase4") and thread_ids and evt_tid == thread_ids[0]:
                     if first_added_idx is None:
                         first_added_idx = i
                     added_count += 1
@@ -424,6 +476,27 @@ def validate_results():
         else:
             print(f"[mock-server] ✅ UI State after phase 3: {p3_entries} entries", flush=True)
 
+    # After Phase 4: Should switch BACK to Thread A (non-visible thread got a follow-up)
+    state4 = ui_state_responses.get("after-phase4")
+    if state4 is None:
+        errors.append("UI State: No response for after-phase4 query")
+    else:
+        if state4.get("active_view") != "agent_thread":
+            errors.append(f"UI State after phase 4: active_view is '{state4.get('active_view')}', expected 'agent_thread'")
+        else:
+            print(f"[mock-server] ✅ UI State after phase 4: active_view=agent_thread", flush=True)
+        if thread_ids and state4.get("thread_id") != thread_ids[0]:
+            errors.append(f"UI State after phase 4: thread_id is '{state4.get('thread_id')}', expected '{thread_ids[0]}' (Thread A, switched back)")
+        else:
+            print(f"[mock-server] ✅ UI State after phase 4: switched back to Thread A", flush=True)
+        p4_entries = state4.get("entry_count", 0)
+        if state1 and p4_entries <= state1.get("entry_count", 0):
+            # Phase 4 added a follow-up to Thread A, so entries should be more than after phase 1
+            # (phase 2 also added entries, so it should be > phase 2 entries too)
+            errors.append(f"UI State after phase 4: entry_count {p4_entries} should be > phase 1 count {state1.get('entry_count', 0)}")
+        else:
+            print(f"[mock-server] ✅ UI State after phase 4: {p4_entries} entries (more than phase 1)", flush=True)
+
     # --- Summary ---
     if errors:
         print("", flush=True)
@@ -435,8 +508,9 @@ def validate_results():
     print("[mock-server] ✅ Phase 1: Basic thread creation - PASSED", flush=True)
     print("[mock-server] ✅ Phase 2: Follow-up on existing thread - PASSED", flush=True)
     print("[mock-server] ✅ Phase 3: New thread via WebSocket - PASSED", flush=True)
+    print("[mock-server] ✅ Phase 4: Follow-up to non-visible thread - PASSED", flush=True)
     print("[mock-server] ✅ Streaming: message_added before message_completed - PASSED", flush=True)
-    print("[mock-server] ✅ UI State: All 3 queries verified - PASSED", flush=True)
+    print("[mock-server] ✅ UI State: All 4 queries verified - PASSED", flush=True)
     print(f"[mock-server] ✅ Total threads: {len(thread_ids)}, Total completions: {sum(len(v) for v in completed_threads.values())}", flush=True)
     return True
 
@@ -464,7 +538,7 @@ async def run_server(port):
             sys.exit(1)
 
     if validate_results():
-        print("\n[mock-server] ALL MULTI-THREAD PROTOCOL + UI STATE CHECKS PASSED", flush=True)
+        print("\n[mock-server] ALL MULTI-THREAD PROTOCOL + UI STATE CHECKS PASSED (4 phases)", flush=True)
     else:
         sys.exit(1)
 

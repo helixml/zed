@@ -177,6 +177,19 @@ pub fn setup_thread_handler(
                         "🔄 [THREAD_SERVICE] Sending to existing thread: {}",
                         existing_thread_id
                     );
+
+                    // Notify AgentPanel to display this thread (it may not be currently visible)
+                    // This ensures the UI switches to the correct thread before the message is sent
+                    if let Some(thread_entity) = thread.upgrade() {
+                        if let Err(e) = crate::notify_thread_display(crate::ThreadDisplayNotification {
+                            thread_entity: thread_entity.clone(),
+                            helix_session_id: existing_thread_id.clone(),
+                            agent_name: request.agent_name.clone(),
+                        }) {
+                            eprintln!("⚠️ [THREAD_SERVICE] Failed to notify thread display for follow-up: {}", e);
+                        }
+                    }
+
                     if let Err(e) = handle_follow_up_message(
                         thread,
                         existing_thread_id.clone(),
@@ -186,6 +199,16 @@ pub fn setup_thread_handler(
                     ).await {
                         eprintln!("❌ [THREAD_SERVICE] Failed to send follow-up message: {}", e);
                         log::error!("❌ [THREAD_SERVICE] Failed to send follow-up message: {}", e);
+
+                        // If follow-up failed (e.g., entity released), send error back to Helix
+                        let error_event = SyncEvent::ThreadLoadError {
+                            acp_thread_id: existing_thread_id.clone(),
+                            request_id: request.request_id.clone(),
+                            error: format!("Failed to send follow-up: {}", e),
+                        };
+                        if let Err(send_err) = crate::send_websocket_event(error_event) {
+                            eprintln!("❌ [THREAD_SERVICE] Failed to send error event: {}", send_err);
+                        }
                     }
                     continue;
                 } else {
