@@ -664,14 +664,11 @@ impl AgentPanel {
                     let incoming_session_id = notification.helix_session_id.clone();
                     let agent_name = notification.agent_name.clone();
 
-                    // Ensure the panel is focused
-                    if let Some(workspace) = workspace_weak.upgrade() {
-                        let _ = workspace.update_in(cx, |workspace, window, cx| {
-                            workspace.focus_panel::<AgentPanel>(window, cx);
-                        });
-                    }
-
                     this.update_in(cx, |this, window, cx| {
+                        // Set active view FIRST, before focusing panel.
+                        // focus_panel triggers set_active which creates a default thread
+                        // if the view is Uninitialized — we need to set our view first
+                        // to prevent that race.
                         // Check if current view is already for this thread
                         if let ActiveView::AgentThread { thread_view } = &this.active_view {
                             if let Some(active_thread) = thread_view.read(cx).as_active_thread() {
@@ -712,6 +709,14 @@ impl AgentPanel {
                         );
                         eprintln!("✅ [AGENT_PANEL] Auto-opened existing headless thread {} in UI", incoming_session_id);
                     }).log_err();
+
+                    // Focus the panel AFTER setting the active view to avoid
+                    // set_active creating a default thread (which would be immediately replaced)
+                    if let Some(workspace) = workspace_weak.upgrade() {
+                        let _ = workspace.update_in(cx, |workspace, window, cx| {
+                            workspace.focus_panel::<AgentPanel>(window, cx);
+                        });
+                    }
                 }
 
                 anyhow::Ok(())

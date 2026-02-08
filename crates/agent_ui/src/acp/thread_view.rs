@@ -441,14 +441,57 @@ impl AcpServerView {
 
         let action_log = thread.read(cx).action_log().clone();
 
-        // Subscribe AcpServerView to thread events (drives UI updates).
-        // NOTE: WebSocket event forwarding is handled by thread_service.rs directly,
-        // not via this subscription. The NativeAgentConnection bridge emits events
-        // from cx.spawn() without window context, so subscribe_in silently drops
-        // those events. The UI subscription still works for events emitted from
-        // within window context (e.g., user-initiated actions).
+        // Subscribe to thread events for UI updates.
+        // CRITICAL: The NativeAgentConnection bridge emits AcpThreadEvent from
+        // cx.spawn() without window context. GPUI's subscribe_in silently drops
+        // those events. We use a windowless cx.subscribe to catch ALL events,
+        // forward them through a channel, and process them in a cx.spawn_in task
+        // that has window context.
+        let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel::<()>();
+        let thread_for_sub = thread.clone();
+        let thread_sub = cx.subscribe(&thread_for_sub, move |_this, _thread, _event, _cx| {
+            let _ = event_tx.send(());
+        });
+
+        let thread_for_spawn = thread.downgrade();
+        let initial_entry_count = count; // entries already synced above
+        cx.spawn_in(window, async move |this, cx| {
+            let mut synced_count = initial_entry_count;
+            while event_rx.recv().await.is_some() {
+                // Drain any additional queued events (batch)
+                while event_rx.try_recv().is_ok() {}
+
+                this.update_in(cx, |this, window, cx| {
+                    if let Some(thread) = thread_for_spawn.upgrade() {
+                        // Sync new entries to the UI
+                        if let Some(active) = this.as_active_thread() {
+                            let total = thread.read(cx).entries().len();
+                            if total > synced_count {
+                                let entry_view_state = active.read(cx).entry_view_state.clone();
+                                let list_state = active.read(cx).list_state.clone();
+                                entry_view_state.update(cx, |view_state, cx| {
+                                    for ix in synced_count..total {
+                                        view_state.sync_entry(ix, &thread, window, cx);
+                                    }
+                                });
+                                list_state.splice_focusable(
+                                    synced_count..synced_count,
+                                    (synced_count..total).map(|ix| {
+                                        entry_view_state.read(cx).entry(ix).and_then(|e| e.focus_handle(cx))
+                                    }),
+                                );
+                                synced_count = total;
+                            }
+                        }
+                        cx.notify();
+                    }
+                }).ok();
+            }
+            anyhow::Ok(())
+        }).detach();
+
         let thread_subscriptions = vec![
-            cx.subscribe_in(&thread, window, Self::handle_thread_event),
+            thread_sub,
             cx.observe(&action_log, |_, _, cx| cx.notify()),
         ];
 
