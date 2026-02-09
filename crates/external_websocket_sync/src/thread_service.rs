@@ -529,7 +529,7 @@ fn create_new_thread_sync(
                                     ("user", msg.content.to_markdown(cx).to_string())
                                 }
                                 acp_thread::AgentThreadEntry::AssistantMessage(msg) => {
-                                    ("assistant", msg.to_markdown(cx))
+                                    ("assistant", msg.content_only(cx))
                                 }
                                 _ => return,
                             };
@@ -547,7 +547,7 @@ fn create_new_thread_sync(
                         if let Some(entry) = thread.entries().get(*entry_idx) {
                             let content = match entry {
                                 acp_thread::AgentThreadEntry::AssistantMessage(msg) => {
-                                    msg.to_markdown(cx)
+                                    msg.content_only(cx)
                                 }
                                 acp_thread::AgentThreadEntry::ToolCall(tool_call) => {
                                     tool_call.to_markdown(cx)
@@ -608,7 +608,7 @@ fn create_new_thread_sync(
             for entry in entries.iter().skip(1) { // skip entry 0 (user message)
                 match entry {
                     acp_thread::AgentThreadEntry::AssistantMessage(msg) => {
-                        cumulative_content.push_str(&msg.to_markdown(cx));
+                        cumulative_content.push_str(&msg.content_only(cx));
                     }
                     acp_thread::AgentThreadEntry::ToolCall(tc) => {
                         cumulative_content.push_str(&tc.to_markdown(cx));
@@ -686,7 +686,7 @@ async fn handle_follow_up_message(
                                     ("user", msg.content.to_markdown(cx).to_string())
                                 }
                                 acp_thread::AgentThreadEntry::AssistantMessage(msg) => {
-                                    ("assistant", msg.to_markdown(cx))
+                                    ("assistant", msg.content_only(cx))
                                 }
                                 _ => return,
                             };
@@ -704,7 +704,7 @@ async fn handle_follow_up_message(
                         if let Some(entry) = thread.entries().get(*entry_idx) {
                             let content = match entry {
                                 acp_thread::AgentThreadEntry::AssistantMessage(msg) => {
-                                    msg.to_markdown(cx)
+                                    msg.content_only(cx)
                                 }
                                 acp_thread::AgentThreadEntry::ToolCall(tool_call) => {
                                     tool_call.to_markdown(cx)
@@ -762,7 +762,7 @@ async fn handle_follow_up_message(
             for entry in entries.iter().skip(last_user_idx + 1) {
                 match entry {
                     acp_thread::AgentThreadEntry::AssistantMessage(msg) => {
-                        cumulative_content.push_str(&msg.to_markdown(cx));
+                        cumulative_content.push_str(&msg.content_only(cx));
                     }
                     acp_thread::AgentThreadEntry::ToolCall(tc) => {
                         cumulative_content.push_str(&tc.to_markdown(cx));
@@ -916,7 +916,7 @@ async fn load_thread_from_agent(
                         // Handle both AssistantMessage and ToolCall (which contains diffs)
                         let content = match entry {
                             acp_thread::AgentThreadEntry::AssistantMessage(msg) => {
-                                msg.to_markdown(cx)
+                                msg.content_only(cx)
                             }
                             acp_thread::AgentThreadEntry::ToolCall(tool_call) => {
                                 tool_call.to_markdown(cx)

@@ -108,6 +108,15 @@ impl AssistantMessage {
                 .join("\n\n")
         )
     }
+
+    /// Returns just the content without the "## Assistant" heading.
+    /// Used for syncing to external systems (e.g. Helix via WebSocket).
+    pub fn content_only(&self, cx: &App) -> String {
+        self.chunks
+            .iter()
+            .map(|chunk| chunk.to_markdown(cx))
+            .join("\n\n")
+    }
 }
 
 #[derive(Debug, PartialEq)]
