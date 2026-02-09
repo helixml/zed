@@ -1246,8 +1246,18 @@ impl acp_thread::AgentConnection for NativeAgentConnection {
         _cwd: &Path,
         cx: &mut App,
     ) -> Task<Result<Entity<acp_thread::AcpThread>>> {
-        self.0
-            .update(cx, |agent, cx| agent.open_thread(session.session_id, cx))
+        // Clone the Entity<NativeAgent> to keep it alive for the duration of the async task.
+        // Without this, the Rc<NativeAgentConnection> is consumed when this method is called,
+        // dropping the only strong reference to NativeAgent. The spawned task inside
+        // open_thread captures a WeakEntity, which then fails with "entity released".
+        let agent = self.0.clone();
+        let task = self.0.update(cx, |a, cx| a.open_thread(session.session_id, cx));
+        cx.spawn(async move |_cx| {
+            // Keep the strong reference (agent) alive until open_thread completes
+            let result = task.await;
+            drop(agent);
+            result
+        })
     }
 
     fn auth_methods(&self) -> &[acp::AuthMethod] {
