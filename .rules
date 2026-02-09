@@ -136,3 +136,26 @@ Other entities can then register a callback to handle these events by doing `cx.
 ## Build guidelines
 
 - Use `./script/clippy` instead of `cargo clippy`
+
+# Helix Fork
+
+This is a fork of Zed with a WebSocket-based sync layer for the Helix platform. All Helix-specific changes are behind `#[cfg(feature = "external_websocket_sync")]` feature gates.
+
+See **[portingguide.md](portingguide.md)** for:
+- Complete list of modified upstream files
+- Critical fixes that must be preserved during rebases
+- Rebase checklist
+- Build and test instructions
+- E2E test infrastructure
+
+```bash
+# Build with Helix features
+cargo build --features external_websocket_sync -p zed
+
+# Run unit tests
+cargo test -p external_websocket_sync
+
+# Run E2E test (requires ANTHROPIC_API_KEY)
+docker build -t zed-ws-e2e -f crates/external_websocket_sync/e2e-test/Dockerfile .
+docker run --rm -e ANTHROPIC_API_KEY=sk-ant-... -e TEST_TIMEOUT=120 zed-ws-e2e
+```
