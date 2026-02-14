@@ -38,6 +38,11 @@ static THREAD_REQUEST_MAP: parking_lot::Mutex<Option<Arc<RwLock<HashMap<String, 
 static EXTERNAL_ORIGINATED_ENTRIES: parking_lot::Mutex<Option<Arc<RwLock<HashMap<String, HashSet<usize>>>>>> =
     parking_lot::Mutex::new(None);
 
+/// Set of thread_ids that already have a persistent event subscription
+/// Prevents creating duplicate subscriptions when follow-up messages arrive
+static PERSISTENT_SUBSCRIPTIONS: parking_lot::Mutex<Option<Arc<RwLock<HashSet<String>>>>> =
+    parking_lot::Mutex::new(None);
+
 /// Initialize the thread registry
 pub fn init_thread_registry() {
     let mut registry = THREAD_REGISTRY.lock();
@@ -53,6 +58,11 @@ pub fn init_thread_registry() {
     let mut external_map = EXTERNAL_ORIGINATED_ENTRIES.lock();
     if external_map.is_none() {
         *external_map = Some(Arc::new(RwLock::new(HashMap::new())));
+    }
+
+    let mut persistent_subs = PERSISTENT_SUBSCRIPTIONS.lock();
+    if persistent_subs.is_none() {
+        *persistent_subs = Some(Arc::new(RwLock::new(HashSet::new())));
     }
 }
 
@@ -72,6 +82,22 @@ pub fn is_external_originated_entry(thread_id: &str, entry_idx: usize) -> bool {
         m.read().get(thread_id).map_or(false, |set| set.contains(&entry_idx))
     } else {
         false
+    }
+}
+
+/// Check if a thread already has a persistent event subscription
+fn has_persistent_subscription(thread_id: &str) -> bool {
+    init_thread_registry();
+    let subs = PERSISTENT_SUBSCRIPTIONS.lock();
+    subs.as_ref().map_or(false, |s| s.read().contains(thread_id))
+}
+
+/// Mark a thread as having a persistent event subscription
+fn mark_persistent_subscription(thread_id: String) {
+    init_thread_registry();
+    let subs = PERSISTENT_SUBSCRIPTIONS.lock();
+    if let Some(s) = subs.as_ref() {
+        s.write().insert(thread_id);
     }
 }
 
@@ -516,12 +542,13 @@ fn create_new_thread_sync(
             eprintln!("🎭 [THREAD_SERVICE] simulate_input=true, NOT marking entry as external-originated (will sync back)");
         }
 
-        // Subscribe to streaming events BEFORE sending the message.
-        // This fires for AcpThreadEvent emitted from cx.spawn() (bridge events)
-        // because cx.subscribe() (windowless) catches all events regardless of context.
-        // send_websocket_event doesn't need a window, so this works.
+        // Subscribe to thread events PERSISTENTLY so that:
+        // 1. Streaming responses for this message are synced to Helix
+        // 2. Future user-typed messages in Zed's UI also sync back to Helix
+        // The subscription lives as long as the thread entity (via .detach())
         let thread_id_for_sub = acp_thread_id.clone();
-        let _streaming_sub = cx.update(|cx| {
+        mark_persistent_subscription(acp_thread_id.clone());
+        cx.update(|cx| {
             cx.subscribe(&thread_entity, move |thread_entity, event, cx| {
                 match event {
                     AcpThreadEvent::NewEntry => {
@@ -572,7 +599,7 @@ fn create_new_thread_sync(
                     }
                     _ => {}
                 }
-            })
+            }).detach();
         });
 
         // Send the initial message to the thread to trigger AI response
@@ -621,9 +648,6 @@ fn create_new_thread_sync(
             });
         });
 
-        // Drop the streaming subscription (it's been serving its purpose during the send)
-        drop(_streaming_sub);
-
         anyhow::Ok(())
     }).detach();
 
@@ -659,65 +683,71 @@ async fn handle_follow_up_message(
         eprintln!("🎭 [THREAD_SERVICE] simulate_input=true, NOT marking entry as external-originated (will sync back)");
     }
 
-    // Subscribe to streaming events BEFORE sending the message
-    let thread_id_for_sub = thread_id.clone();
-    let _streaming_sub = cx.update(|cx| {
-        if let Some(thread_entity) = thread.upgrade() {
-            Some(cx.subscribe(&thread_entity, move |thread_entity, event, cx| {
-                match event {
-                    AcpThreadEvent::NewEntry => {
-                        let thread = thread_entity.read(cx);
-                        let latest_idx = thread.entries().len().saturating_sub(1);
-                        if is_external_originated_entry(&thread_id_for_sub, latest_idx) {
-                            return;
+    // Only create a subscription if one doesn't already exist for this thread.
+    // Threads created via create_new_thread_sync or load_thread_from_agent already have
+    // a persistent subscription. Creating another would cause duplicate events.
+    if !has_persistent_subscription(&thread_id) {
+        eprintln!("🔔 [THREAD_SERVICE] No persistent subscription for thread {}, creating one", thread_id);
+        let thread_id_for_sub = thread_id.clone();
+        mark_persistent_subscription(thread_id.clone());
+        cx.update(|cx| {
+            if let Some(thread_entity) = thread.upgrade() {
+                cx.subscribe(&thread_entity, move |thread_entity, event, cx| {
+                    match event {
+                        AcpThreadEvent::NewEntry => {
+                            let thread = thread_entity.read(cx);
+                            let latest_idx = thread.entries().len().saturating_sub(1);
+                            if is_external_originated_entry(&thread_id_for_sub, latest_idx) {
+                                return;
+                            }
+                            if let Some(entry) = thread.entries().get(latest_idx) {
+                                let (role, content) = match entry {
+                                    acp_thread::AgentThreadEntry::UserMessage(msg) => {
+                                        ("user", msg.content.to_markdown(cx).to_string())
+                                    }
+                                    acp_thread::AgentThreadEntry::AssistantMessage(msg) => {
+                                        ("assistant", msg.content_only(cx))
+                                    }
+                                    _ => return,
+                                };
+                                let _ = crate::send_websocket_event(SyncEvent::MessageAdded {
+                                    acp_thread_id: thread_id_for_sub.clone(),
+                                    message_id: latest_idx.to_string(),
+                                    role: role.to_string(),
+                                    content,
+                                    timestamp: chrono::Utc::now().timestamp(),
+                                });
+                            }
                         }
-                        if let Some(entry) = thread.entries().get(latest_idx) {
-                            let (role, content) = match entry {
-                                acp_thread::AgentThreadEntry::UserMessage(msg) => {
-                                    ("user", msg.content.to_markdown(cx).to_string())
-                                }
-                                acp_thread::AgentThreadEntry::AssistantMessage(msg) => {
-                                    ("assistant", msg.content_only(cx))
-                                }
-                                _ => return,
-                            };
-                            let _ = crate::send_websocket_event(SyncEvent::MessageAdded {
-                                acp_thread_id: thread_id_for_sub.clone(),
-                                message_id: latest_idx.to_string(),
-                                role: role.to_string(),
-                                content,
-                                timestamp: chrono::Utc::now().timestamp(),
-                            });
+                        AcpThreadEvent::EntryUpdated(entry_idx) => {
+                            let thread = thread_entity.read(cx);
+                            if let Some(entry) = thread.entries().get(*entry_idx) {
+                                let content = match entry {
+                                    acp_thread::AgentThreadEntry::AssistantMessage(msg) => {
+                                        msg.content_only(cx)
+                                    }
+                                    acp_thread::AgentThreadEntry::ToolCall(tool_call) => {
+                                        tool_call.to_markdown(cx)
+                                    }
+                                    _ => return,
+                                };
+                                let _ = crate::send_websocket_event(SyncEvent::MessageAdded {
+                                    acp_thread_id: thread_id_for_sub.clone(),
+                                    message_id: entry_idx.to_string(),
+                                    role: "assistant".to_string(),
+                                    content,
+                                    timestamp: chrono::Utc::now().timestamp(),
+                                });
+                            }
                         }
+                        _ => {}
                     }
-                    AcpThreadEvent::EntryUpdated(entry_idx) => {
-                        let thread = thread_entity.read(cx);
-                        if let Some(entry) = thread.entries().get(*entry_idx) {
-                            let content = match entry {
-                                acp_thread::AgentThreadEntry::AssistantMessage(msg) => {
-                                    msg.content_only(cx)
-                                }
-                                acp_thread::AgentThreadEntry::ToolCall(tool_call) => {
-                                    tool_call.to_markdown(cx)
-                                }
-                                _ => return,
-                            };
-                            let _ = crate::send_websocket_event(SyncEvent::MessageAdded {
-                                acp_thread_id: thread_id_for_sub.clone(),
-                                message_id: entry_idx.to_string(),
-                                role: "assistant".to_string(),
-                                content,
-                                timestamp: chrono::Utc::now().timestamp(),
-                            });
-                        }
-                    }
-                    _ => {}
-                }
-            }))
-        } else {
-            None
-        }
-    });
+                }).detach();
+            }
+        });
+    } else {
+        eprintln!("🔔 [THREAD_SERVICE] Thread {} already has persistent subscription, skipping", thread_id);
+    }
 
     let send_task = cx.update(|cx| {
         thread.update(cx, |thread: &mut AcpThread, cx| {
@@ -845,6 +875,7 @@ async fn load_thread_from_agent(
 
     // Subscribe to thread events for streaming responses (same as create_new_thread_sync)
     let thread_id_for_events = loaded_thread_id.clone();
+    mark_persistent_subscription(loaded_thread_id.clone());
     cx.update(|cx| {
         cx.subscribe(&thread_entity, move |thread_entity, event, cx| {
             match event {
