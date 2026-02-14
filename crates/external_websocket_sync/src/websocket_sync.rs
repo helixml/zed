@@ -379,6 +379,7 @@ impl WebSocketSync {
 
         match command.command_type.as_str() {
             "chat_message" => Self::handle_chat_message(command.data).await,
+            "simulate_user_input" => Self::handle_simulate_user_input(command.data).await,
             "open_thread" => Self::handle_open_thread(command.data).await,
             "query_ui_state" => Self::handle_query_ui_state(command.data).await,
             _ => {
@@ -413,6 +414,7 @@ impl WebSocketSync {
             message: chat_msg.message.clone(),
             request_id: chat_msg.request_id.clone(),
             agent_name: chat_msg.agent_name.clone(),
+            simulate_input: false,
         };
 
         eprintln!("🎯 [WEBSOCKET-IN] Calling request_thread_creation()...");
@@ -420,6 +422,39 @@ impl WebSocketSync {
         crate::request_thread_creation(request)?;
         eprintln!("✅ [WEBSOCKET-IN] request_thread_creation() succeeded");
         log::info!("✅ [WEBSOCKET-IN] request_thread_creation() succeeded");
+
+        Ok(())
+    }
+
+    /// Handle simulate_user_input command
+    ///
+    /// Like chat_message but does NOT mark the entry as external-originated.
+    /// This simulates a user typing in Zed's agent panel, so the NewEntry
+    /// subscription fires and syncs the user message back to Helix.
+    /// Used for E2E testing the Zed → Helix sync direction.
+    async fn handle_simulate_user_input(data: serde_json::Value) -> Result<()> {
+        let chat_msg: IncomingChatMessage = serde_json::from_value(data)
+            .context("Failed to parse simulate_user_input data")?;
+
+        eprintln!("🎭 [WEBSOCKET-IN] Processing simulate_user_input: acp_thread_id={:?}, request_id={}, message_len={}",
+                   chat_msg.acp_thread_id, chat_msg.request_id, chat_msg.message.len());
+        log::info!("🎭 [WEBSOCKET-IN] Processing simulate_user_input: acp_thread_id={:?}, request_id={}, message_len={}",
+                   chat_msg.acp_thread_id, chat_msg.request_id, chat_msg.message.len());
+
+        // Request thread creation via callback with simulate_input=true
+        let request = ThreadCreationRequest {
+            acp_thread_id: chat_msg.acp_thread_id.clone(),
+            message: chat_msg.message.clone(),
+            request_id: chat_msg.request_id.clone(),
+            agent_name: chat_msg.agent_name.clone(),
+            simulate_input: true,
+        };
+
+        eprintln!("🎯 [WEBSOCKET-IN] Calling request_thread_creation() with simulate_input=true...");
+        log::info!("🎯 [WEBSOCKET-IN] Calling request_thread_creation() with simulate_input=true...");
+        crate::request_thread_creation(request)?;
+        eprintln!("✅ [WEBSOCKET-IN] request_thread_creation() succeeded (simulate_input)");
+        log::info!("✅ [WEBSOCKET-IN] request_thread_creation() succeeded (simulate_input)");
 
         Ok(())
     }

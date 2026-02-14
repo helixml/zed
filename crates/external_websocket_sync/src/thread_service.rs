@@ -195,6 +195,7 @@ pub fn setup_thread_handler(
                         existing_thread_id.clone(),
                         request.request_id.clone(),
                         request.message,
+                        request.simulate_input,
                         cx.clone()
                     ).await {
                         eprintln!("❌ [THREAD_SERVICE] Failed to send follow-up message: {}", e);
@@ -248,6 +249,7 @@ pub fn setup_thread_handler(
                                 existing_thread_id.clone(),
                                 request.request_id.clone(),
                                 request.message,
+                                request.simulate_input,
                                 cx.clone()
                             ).await {
                                 eprintln!("❌ [THREAD_SERVICE] Failed to send message to loaded thread: {}", e);
@@ -503,11 +505,16 @@ fn create_new_thread_sync(
         }
 
         // Mark the entry that will be created as external-originated (so we don't echo it back)
-        let entry_idx_to_mark = cx.update(|cx| {
-            thread_entity.read(cx).entries().len()
-        });
-        mark_external_originated_entry(acp_thread_id.clone(), entry_idx_to_mark);
-        eprintln!("🏷️ [THREAD_SERVICE] Marked entry {} as external-originated (won't echo back)", entry_idx_to_mark);
+        // Unless simulate_input=true, in which case we want the sync to fire
+        if !request_clone.simulate_input {
+            let entry_idx_to_mark = cx.update(|cx| {
+                thread_entity.read(cx).entries().len()
+            });
+            mark_external_originated_entry(acp_thread_id.clone(), entry_idx_to_mark);
+            eprintln!("🏷️ [THREAD_SERVICE] Marked entry {} as external-originated (won't echo back)", entry_idx_to_mark);
+        } else {
+            eprintln!("🎭 [THREAD_SERVICE] simulate_input=true, NOT marking entry as external-originated (will sync back)");
+        }
 
         // Subscribe to streaming events BEFORE sending the message.
         // This fires for AcpThreadEvent emitted from cx.spawn() (bridge events)
@@ -629,21 +636,28 @@ async fn handle_follow_up_message(
     thread_id: String,
     request_id: String,
     message: String,
+    simulate_input: bool,
     cx: gpui::AsyncApp,
 ) -> Result<()> {
-    log::info!("💬 [THREAD_SERVICE] Sending follow-up message: {}", message);
+    log::info!("💬 [THREAD_SERVICE] Sending follow-up message: {} (simulate_input={})", message, simulate_input);
 
     // CRITICAL: Update the request_id for this thread so message_completed uses the correct ID!
     set_thread_request_id(thread_id.clone(), request_id.clone());
     eprintln!("🔄 [THREAD_SERVICE] Updated request_id for thread {} to {}", thread_id, request_id);
     log::info!("🔄 [THREAD_SERVICE] Updated request_id for thread {} to {}", thread_id, request_id);
 
-    // Mark the entry that will be created as external-originated
-    let entry_idx_to_mark = cx.update(|cx| {
-        thread.update(cx, |thread, _| thread.entries().len())
-    })?;
-    mark_external_originated_entry(thread_id.clone(), entry_idx_to_mark);
-    eprintln!("🏷️ [THREAD_SERVICE] Marked entry {} as external-originated (follow-up)", entry_idx_to_mark);
+    // Mark the entry that will be created as external-originated (unless simulating user input)
+    // When simulate_input=true, we want the NewEntry subscription to fire so the user message
+    // syncs back to Helix (testing the Zed → Helix direction)
+    if !simulate_input {
+        let entry_idx_to_mark = cx.update(|cx| {
+            thread.update(cx, |thread, _| thread.entries().len())
+        })?;
+        mark_external_originated_entry(thread_id.clone(), entry_idx_to_mark);
+        eprintln!("🏷️ [THREAD_SERVICE] Marked entry {} as external-originated (follow-up)", entry_idx_to_mark);
+    } else {
+        eprintln!("🎭 [THREAD_SERVICE] simulate_input=true, NOT marking entry as external-originated (will sync back)");
+    }
 
     // Subscribe to streaming events BEFORE sending the message
     let thread_id_for_sub = thread_id.clone();

@@ -107,6 +107,10 @@ pub struct ThreadCreationRequest {
     pub message: String,
     pub request_id: String,
     pub agent_name: Option<String>, // Which agent to use (zed-agent or qwen) - defaults to zed-agent
+    /// When true, don't mark the entry as external-originated.
+    /// This allows the NewEntry subscription to fire and sync the user message back to Helix,
+    /// simulating a user typing directly in Zed's agent panel.
+    pub simulate_input: bool,
 }
 
 /// Request to open existing ACP thread from database and display in UI

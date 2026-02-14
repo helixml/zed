@@ -72,6 +72,9 @@ Multi-phase test covering:
   Phase 3: New thread via WebSocket - send chat_message without acp_thread_id, verify UI state
   Phase 4: Follow-up to NON-VISIBLE thread - send chat_message to Thread A while Thread B is displayed
            This catches the 'entity released' regression where sending to a non-visible thread fails.
+  Phase 5: Zed → Helix sync - send simulate_user_input, verify user message syncs back to Helix
+           This tests the bidirectional sync path where a user types in Zed and the message
+           appears in the Helix web UI.
 
 This simulates what Helix spectasks need: a single session spanning
 multiple Zed threads (e.g., when context fills up and a new thread starts).
@@ -138,6 +141,9 @@ async def advance_after_completion(ws, completed_phase):
         await run_phase_4(ws)
     elif completed_phase == 4:
         phase = 5
+        await run_phase_5(ws)
+    elif completed_phase == 5:
+        phase = 6
         await asyncio.sleep(0.5)
         all_tests_done.set()
 
@@ -182,7 +188,7 @@ async def handle_connection(websocket):
                 # Spawn phase advancement as background task so the message
                 # loop stays unblocked (needed to receive ui_state_response)
                 current_phase = phase
-                if current_phase in (1, 2, 3, 4):
+                if current_phase in (1, 2, 3, 4, 5):
                     asyncio.create_task(advance_after_completion(websocket, current_phase))
 
         except json.JSONDecodeError:
@@ -275,6 +281,32 @@ async def run_phase_4(ws):
     print("[mock-server] -> Sent: chat_message (phase 4, back to Thread A)", flush=True)
 
 
+async def run_phase_5(ws):
+    """Phase 5: Simulate user typing in Zed (Zed → Helix sync test).
+    Uses simulate_user_input command which does NOT mark the entry as external-originated,
+    so the NewEntry subscription fires and syncs the user message back to Helix."""
+    print("\n" + "="*50, flush=True)
+    print("  PHASE 5: Simulate user input (Zed → Helix sync)", flush=True)
+    print("="*50, flush=True)
+    if not thread_ids:
+        print("[mock-server] ERROR: No thread IDs available for phase 5!", flush=True)
+        sys.exit(1)
+
+    first_thread_id = thread_ids[0]
+    print(f"[mock-server] Sending simulate_user_input to thread: {first_thread_id}", flush=True)
+    command = {
+        "type": "simulate_user_input",
+        "data": {
+            "acp_thread_id": first_thread_id,
+            "message": "This message was typed by the user in Zed",
+            "request_id": "req-phase5",
+            "agent_name": "zed-agent"
+        }
+    }
+    await ws.send(json.dumps(command))
+    print("[mock-server] -> Sent: simulate_user_input (phase 5, Zed→Helix sync test)", flush=True)
+
+
 async def process_request(connection, request):
     """Validate the WebSocket request path."""
     path = request.path.split("?")[0]
@@ -341,8 +373,8 @@ def validate_results():
     assistant_msgs = [e for e in received_events
         if e.get("event_type") == "message_added"
         and e.get("data", {}).get("role") == "assistant"]
-    if len(assistant_msgs) < 4:
-        errors.append(f"Expected at least 4 assistant messages, got {len(assistant_msgs)}")
+    if len(assistant_msgs) < 5:
+        errors.append(f"Expected at least 5 assistant messages, got {len(assistant_msgs)}")
 
     for i, msg in enumerate(assistant_msgs):
         content = msg.get("data", {}).get("content", "")[:80]
@@ -361,6 +393,43 @@ def validate_results():
             errors.append(f"Phase 4: Expected thread {thread_ids[0][:12]}..., got {p4_thread[:12]}...")
         else:
             print(f"[mock-server] ✅ Phase 4: Follow-up to non-visible thread completed on Thread A: {p4_thread[:12]}...", flush=True)
+
+    # --- Phase 5: Simulate user input (Zed → Helix sync) ---
+    phase5_completions = [e for e in received_events
+        if e.get("event_type") == "message_completed"
+        and e.get("data", {}).get("request_id") == "req-phase5"]
+    if not phase5_completions:
+        errors.append("Phase 5: No message_completed for req-phase5")
+
+    # Key assertion: we should see a message_added with role="user" for this phase
+    # This proves the Zed → Helix sync direction works
+    phase5_user_msgs = [e for e in received_events
+        if e.get("event_type") == "message_added"
+        and e.get("data", {}).get("role") == "user"
+        and "typed by the user in Zed" in e.get("data", {}).get("content", "")]
+    if not phase5_user_msgs:
+        errors.append("Phase 5: No message_added with role='user' containing simulated input text (Zed → Helix sync broken!)")
+    else:
+        print(f"[mock-server] ✅ Phase 5: User message synced back to Helix: '{phase5_user_msgs[0].get('data', {}).get('content', '')[:60]}...'", flush=True)
+
+    # Phase 5 should also produce assistant responses (AI reply to simulated input)
+    phase5_assistant_msgs = []
+    # Find message_added events with role="assistant" between phase5 start and completion
+    in_phase5 = False
+    for evt in received_events:
+        etype = evt.get("event_type")
+        edata = evt.get("data", {})
+        if etype == "message_added" and edata.get("role") == "user" and "typed by the user in Zed" in edata.get("content", ""):
+            in_phase5 = True
+        if in_phase5 and etype == "message_added" and edata.get("role") == "assistant":
+            phase5_assistant_msgs.append(evt)
+        if in_phase5 and etype == "message_completed" and edata.get("request_id") == "req-phase5":
+            break
+
+    if not phase5_assistant_msgs:
+        errors.append("Phase 5: No assistant response received after simulated user input")
+    else:
+        print(f"[mock-server] ✅ Phase 5: Got {len(phase5_assistant_msgs)} assistant message(s) after simulated input", flush=True)
 
     # Check for thread_load_error events (entity released regression)
     thread_load_errors = [e for e in received_events if e.get("event_type") == "thread_load_error"]
@@ -381,7 +450,7 @@ def validate_results():
     print("  STREAMING VALIDATION", flush=True)
     print("-"*50, flush=True)
 
-    for req_id in ["req-phase1", "req-phase2", "req-phase3", "req-phase4"]:
+    for req_id in ["req-phase1", "req-phase2", "req-phase3", "req-phase4", "req-phase5"]:
         # Find the index of the first message_added for this phase's thread
         # and the index of message_completed for this request
         first_added_idx = None
@@ -397,7 +466,7 @@ def validate_results():
                     if first_added_idx is None:
                         first_added_idx = i
                     added_count += 1
-                elif req_id in ("req-phase1", "req-phase2", "req-phase4") and thread_ids and evt_tid == thread_ids[0]:
+                elif req_id in ("req-phase1", "req-phase2", "req-phase4", "req-phase5") and thread_ids and evt_tid == thread_ids[0]:
                     if first_added_idx is None:
                         first_added_idx = i
                     added_count += 1
@@ -509,8 +578,9 @@ def validate_results():
     print("[mock-server] ✅ Phase 2: Follow-up on existing thread - PASSED", flush=True)
     print("[mock-server] ✅ Phase 3: New thread via WebSocket - PASSED", flush=True)
     print("[mock-server] ✅ Phase 4: Follow-up to non-visible thread - PASSED", flush=True)
+    print("[mock-server] ✅ Phase 5: Zed → Helix user message sync - PASSED", flush=True)
     print("[mock-server] ✅ Streaming: message_added before message_completed - PASSED", flush=True)
-    print("[mock-server] ✅ UI State: All 4 queries verified - PASSED", flush=True)
+    print("[mock-server] ✅ UI State: All queries verified - PASSED", flush=True)
     print(f"[mock-server] ✅ Total threads: {len(thread_ids)}, Total completions: {sum(len(v) for v in completed_threads.values())}", flush=True)
     return True
 
@@ -538,7 +608,7 @@ async def run_server(port):
             sys.exit(1)
 
     if validate_results():
-        print("\n[mock-server] ALL MULTI-THREAD PROTOCOL + UI STATE CHECKS PASSED (4 phases)", flush=True)
+        print("\n[mock-server] ALL MULTI-THREAD PROTOCOL + UI STATE CHECKS PASSED (5 phases)", flush=True)
     else:
         sys.exit(1)
 
