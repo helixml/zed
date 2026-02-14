@@ -2489,45 +2489,46 @@ impl AgentPanel {
                             )
                             .separator()
                             .header("External Agents")
+                            // Claude Code is always shown (works with Helix via Claude subscription)
+                            .item(
+                                ContextMenuEntry::new("Claude Code")
+                                    .when(is_agent_selected(AgentType::ClaudeCode), |this| {
+                                        this.action(Box::new(NewExternalAgentThread {
+                                            agent: None,
+                                        }))
+                                    })
+                                    .icon(IconName::AiClaude)
+                                    .disabled(is_via_collab)
+                                    .icon_color(Color::Muted)
+                                    .handler({
+                                        let workspace = workspace.clone();
+                                        move |window, cx| {
+                                            if let Some(workspace) = workspace.upgrade() {
+                                                workspace.update(cx, |workspace, cx| {
+                                                    if let Some(panel) =
+                                                        workspace.panel::<AgentPanel>(cx)
+                                                    {
+                                                        panel.update(cx, |panel, cx| {
+                                                            panel.new_agent_thread(
+                                                                AgentType::ClaudeCode,
+                                                                window,
+                                                                cx,
+                                                            );
+                                                        });
+                                                    }
+                                                });
+                                            }
+                                        }
+                                    }),
+                            )
                             .map(|menu| {
-                                // In Helix builds (external_websocket_sync), hide built-in agents
-                                // since they are managed externally via the Helix platform.
+                                // In Helix builds (external_websocket_sync), hide Codex and Gemini
+                                // since they are not yet supported via the Helix platform.
                                 #[cfg(feature = "external_websocket_sync")]
                                 { menu }
                                 #[cfg(not(feature = "external_websocket_sync"))]
                                 {
                                     menu
-                                    .item(
-                                        ContextMenuEntry::new("Claude Code")
-                                            .when(is_agent_selected(AgentType::ClaudeCode), |this| {
-                                                this.action(Box::new(NewExternalAgentThread {
-                                                    agent: None,
-                                                }))
-                                            })
-                                            .icon(IconName::AiClaude)
-                                            .disabled(is_via_collab)
-                                            .icon_color(Color::Muted)
-                                            .handler({
-                                                let workspace = workspace.clone();
-                                                move |window, cx| {
-                                                    if let Some(workspace) = workspace.upgrade() {
-                                                        workspace.update(cx, |workspace, cx| {
-                                                            if let Some(panel) =
-                                                                workspace.panel::<AgentPanel>(cx)
-                                                            {
-                                                                panel.update(cx, |panel, cx| {
-                                                                    panel.new_agent_thread(
-                                                                        AgentType::ClaudeCode,
-                                                                        window,
-                                                                        cx,
-                                                                    );
-                                                                });
-                                                            }
-                                                        });
-                                                    }
-                                                }
-                                            }),
-                                    )
                                     .item(
                                         ContextMenuEntry::new("Codex CLI")
                                             .when(is_agent_selected(AgentType::Codex), |this| {
