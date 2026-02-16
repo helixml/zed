@@ -75,9 +75,7 @@ pub struct AgentSettingsContent {
     /// `rm -rf $HOME`, `rm -rf .`, or `rm -rf ..`, to prevent certain classes of failures
     /// from happening.
     ///
-    /// This setting has no effect on external agents that support permission modes, such as Claude Code.
-    ///
-    /// Set `agent_servers.claude.default_mode` to `bypassPermissions`, to disable all permission requests when using Claude Code.
+    /// This applies to all agents, including external agents like Claude Code.
     ///
     /// Default: false
     pub always_allow_tool_actions: Option<bool>,
