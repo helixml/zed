@@ -227,7 +227,10 @@ pub fn migrate_settings(text: &str) -> Result<Option<String>> {
             migrations::m_2025_11_20::SETTINGS_PATTERNS,
             &SETTINGS_QUERY_2025_11_20,
         ),
-        MigrationType::Json(migrations::m_2025_11_25::remove_context_server_source),
+        // Disabled: this migration removes "source" from context_servers, but
+        // update_value_in_json_text can't remove keys, so it produces identical
+        // output and the banner shows forever.
+        // MigrationType::Json(migrations::m_2025_11_25::remove_context_server_source),
         MigrationType::TreeSitter(
             migrations::m_2025_12_15::SETTINGS_PATTERNS,
             &SETTINGS_QUERY_2025_12_15,
