@@ -371,7 +371,7 @@ impl AcpThreadView {
             plan_expanded: false,
             queue_expanded: true,
             editor_expanded: false,
-            should_be_following: false,
+            should_be_following: true,
             editing_message: None,
             local_queued_messages: Vec::new(),
             queued_message_editors: Vec::new(),
