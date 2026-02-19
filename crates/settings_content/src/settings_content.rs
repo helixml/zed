@@ -1020,6 +1020,11 @@ pub struct RemoteSettingsContent {
     pub dev_container_connections: Option<Vec<DevContainerConnection>>,
     pub read_ssh_config: Option<bool>,
     pub use_podman: Option<bool>,
+    /// Whether to show a notification suggesting to open the project in a dev container
+    /// when a `.devcontainer` directory is detected.
+    ///
+    /// Default: true
+    pub suggest_dev_container: Option<bool>,
 }
 
 #[with_fallible_options]

@@ -32,6 +32,9 @@ pub struct RemoteSettings {
     pub wsl_connections: ExtendingVec<WslConnection>,
     /// Whether to read ~/.ssh/config for ssh connection sources.
     pub read_ssh_config: bool,
+    /// Whether to show a notification suggesting to open the project in a dev container
+    /// when a `.devcontainer` directory is detected.
+    pub suggest_dev_container: bool,
 }
 
 impl RemoteSettings {
@@ -119,6 +122,7 @@ impl Settings for RemoteSettings {
             ssh_connections: remote.ssh_connections.clone().unwrap_or_default().into(),
             wsl_connections: remote.wsl_connections.clone().unwrap_or_default().into(),
             read_ssh_config: remote.read_ssh_config.unwrap(),
+            suggest_dev_container: remote.suggest_dev_container.unwrap_or(true),
         }
     }
 }
