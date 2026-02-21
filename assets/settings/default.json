@@ -1088,7 +1088,7 @@
     // Whether to automatically open the agent panel when Zed launches.
     //
     // Default: false
-    "auto_open_panel": false
+    "auto_open_panel": false,
   },
   // Whether the screen sharing icon is shown in the os status bar.
   "show_call_status_icon": true,
@@ -2412,6 +2412,9 @@
   "ssh_connections": [],
   // Whether to read ~/.ssh/config for ssh connection sources.
   "read_ssh_config": true,
+  // Whether to show a notification suggesting to open the project in a dev container
+  // when a `.devcontainer` directory is detected.
+  "suggest_dev_container": true,
   // Default timeout in seconds for all context server tool calls.
   // Individual servers can override this in their configuration.
   // Examples:

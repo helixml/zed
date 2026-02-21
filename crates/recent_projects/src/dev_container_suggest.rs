@@ -1,6 +1,7 @@
 use db::kvp::KEY_VALUE_STORE;
 use gpui::{SharedString, Window};
 use project::{Project, WorktreeId};
+use settings::Settings;
 use std::sync::LazyLock;
 use ui::prelude::*;
 use util::rel_path::RelPath;
@@ -8,6 +9,8 @@ use workspace::Workspace;
 use workspace::notifications::NotificationId;
 use workspace::notifications::simple_message_notification::MessageNotification;
 use worktree::UpdatedEntriesSet;
+
+use crate::RemoteSettings;
 
 const DEV_CONTAINER_SUGGEST_KEY: &str = "dev_container_suggest_dismissed";
 
@@ -28,6 +31,11 @@ pub fn suggest_on_worktree_updated(
     window: &mut Window,
     cx: &mut Context<Workspace>,
 ) {
+    // Check if dev container suggestions are enabled
+    if !RemoteSettings::get_global(cx).suggest_dev_container {
+        return;
+    }
+
     let devcontainer_updated = updated_entries
         .iter()
         .any(|(path, _, _)| path.as_ref() == devcontainer_path());
