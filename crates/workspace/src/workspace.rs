@@ -5046,8 +5046,11 @@ impl Workspace {
         }
 
         // if you're already following, find the right pane and focus it.
+        // For Agent following, we only track visually without stealing keyboard focus.
         if let Some(follower_state) = self.follower_states.get(&leader_id) {
-            window.focus(&follower_state.pane().focus_handle(cx), cx);
+            if !matches!(leader_id, CollaboratorId::Agent) {
+                window.focus(&follower_state.pane().focus_handle(cx), cx);
+            }
 
             return;
         }
@@ -5683,7 +5686,10 @@ impl Workspace {
         }
 
         pane.update(cx, |pane, cx| {
-            let focus_active_item = pane.has_focus(window, cx) || transfer_focus;
+            // For Agent following, never steal keyboard focus - only update visual state.
+            // Users can click to explicitly focus the editor if they want to.
+            let focus_active_item = !matches!(leader_id, CollaboratorId::Agent)
+                && (pane.has_focus(window, cx) || transfer_focus);
             if let Some(index) = pane.index_for_item(item.as_ref()) {
                 pane.activate_item(index, false, false, window, cx);
             } else {
