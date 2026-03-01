@@ -65,6 +65,7 @@ impl GrepToolInput {
 }
 
 const RESULTS_PER_PAGE: u32 = 20;
+const MAX_LINE_CHARS: usize = 500;
 
 pub struct GrepTool {
     project: Entity<Project>,
@@ -300,7 +301,8 @@ impl AgentTool for GrepTool {
                     }
 
                     output.push_str("```\n");
-                    output.extend(snapshot.text_for_range(range));
+                    let text: String = snapshot.text_for_range(range).collect();
+                    output.push_str(&truncate_long_lines(&text, MAX_LINE_CHARS));
                     output.push_str("\n```\n");
 
                     if let Some(ancestor_range) = ancestor_range
@@ -328,6 +330,23 @@ impl AgentTool for GrepTool {
             }
         })
     }
+}
+
+/// Truncates lines that exceed the maximum character limit.
+/// Appends a truncation indicator showing the original line length.
+fn truncate_long_lines(text: &str, max_chars: usize) -> String {
+    text.lines()
+        .map(|line| {
+            let char_count = line.chars().count();
+            if char_count <= max_chars {
+                line.to_string()
+            } else {
+                let truncated: String = line.chars().take(max_chars).collect();
+                format!("{}... [truncated, {} chars total]", truncated, char_count)
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 #[cfg(test)]
@@ -1199,5 +1218,53 @@ mod tests {
                     .to_string()
             })
             .collect()
+    }
+
+    #[test]
+    fn test_truncate_long_lines_short_line_unchanged() {
+        let input = "This is a short line";
+        let result = truncate_long_lines(input, 500);
+        assert_eq!(result, input);
+    }
+
+    #[test]
+    fn test_truncate_long_lines_exactly_at_limit() {
+        let input: String = "x".repeat(500);
+        let result = truncate_long_lines(&input, 500);
+        assert_eq!(result, input);
+    }
+
+    #[test]
+    fn test_truncate_long_lines_exceeds_limit() {
+        let input: String = "x".repeat(1000);
+        let result = truncate_long_lines(&input, 500);
+        assert!(result.contains("... [truncated, 1000 chars total]"));
+        assert!(result.starts_with(&"x".repeat(500)));
+        assert!(!result.contains(&"x".repeat(501)));
+    }
+
+    #[test]
+    fn test_truncate_long_lines_multiline_mixed() {
+        let short_line = "short line";
+        let long_line: String = "y".repeat(600);
+        let input = format!("{}\n{}\nanother short", short_line, long_line);
+        let result = truncate_long_lines(&input, 500);
+
+        let lines: Vec<&str> = result.lines().collect();
+        assert_eq!(lines.len(), 3);
+        assert_eq!(lines[0], "short line");
+        assert!(lines[1].contains("... [truncated, 600 chars total]"));
+        assert_eq!(lines[2], "another short");
+    }
+
+    #[test]
+    fn test_truncate_long_lines_unicode() {
+        // Each emoji is multiple bytes but 1 char
+        let input: String = "🎉".repeat(600);
+        let result = truncate_long_lines(&input, 500);
+        assert!(result.contains("... [truncated, 600 chars total]"));
+        // Should have exactly 500 emoji chars before truncation indicator
+        let truncated_part: String = "🎉".repeat(500);
+        assert!(result.starts_with(&truncated_part));
     }
 }
