@@ -805,14 +805,20 @@ impl AgentPanel {
                         // focus_panel triggers set_active which creates a default thread
                         // if the view is Uninitialized — we need to set our view first
                         // to prevent that race.
-                        // Check if current view is already for this thread
+                        // Check if current view is already showing this exact thread entity.
+                        // IMPORTANT: Compare Entity references, NOT session IDs. After a
+                        // container restart, load_thread_from_agent() creates a NEW Entity
+                        // for the same thread ID. If we only compare session IDs, the panel
+                        // keeps observing the stale entity from state restoration while the
+                        // new entity receives live updates — causing a "brain split" where
+                        // Helix sees updates but Zed's display is frozen.
                         if let ActiveView::AgentThread { server_view } = &this.active_view {
                             if let Some(active_thread) = server_view.read(cx).active_thread() {
-                                let existing_session_id = active_thread.read(cx).thread.read(cx).session_id().to_string();
-                                if existing_session_id == incoming_session_id {
-                                    eprintln!("🔄 [AGENT_PANEL] Already showing thread {}, skipping", incoming_session_id);
+                                if active_thread.read(cx).thread == notification.thread_entity {
+                                    eprintln!("🔄 [AGENT_PANEL] Already showing thread {} with same entity, skipping", incoming_session_id);
                                     return;
                                 }
+                                eprintln!("🔄 [AGENT_PANEL] Thread {} entity changed (container restart?), rebinding to new entity", incoming_session_id);
                             }
                         }
 
