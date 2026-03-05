@@ -17,7 +17,6 @@ use fs::Fs;
 use project::Project;
 use tokio::sync::mpsc;
 use util::ResultExt;
-use settings::Settings as _;
 use crate::{ExternalAgent, ThreadCreationRequest, ThreadOpenRequest, SyncEvent};
 
 /// Global registry of active ACP threads (service layer)
@@ -497,25 +496,6 @@ fn create_new_thread_sync(
 ) -> Result<()> {
     log::info!("[THREAD_SERVICE] Creating ACP thread with agent: {:?}", request.agent_name);
 
-    // Ensure language model providers are authenticated before connecting.
-    // NativeAgent::new() (called during connect) reads the model list via refresh_list().
-    // If providers aren't authenticated yet, the model list is empty and new_thread()
-    // creates threads with model=None, causing "No language model configured" errors.
-    let auth_tasks = {
-        let registry = language_model::LanguageModelRegistry::global(cx);
-        let providers = registry.read(cx).providers().clone();
-        eprintln!("🔧 [THREAD_SERVICE] Pre-authenticating {} language model providers...", providers.len());
-        let tasks: Vec<_> = providers
-            .iter()
-            .map(|provider| {
-                eprintln!("🔧 [THREAD_SERVICE]   Authenticating provider: {}", provider.name().0);
-                provider.authenticate(cx)
-            })
-            .collect();
-
-        tasks
-    };
-
     let agent = match request.agent_name.as_deref() {
         Some("zed-agent") | None => ExternalAgent::NativeAgent,
         Some(name) => ExternalAgent::Custom {
@@ -532,33 +512,7 @@ fn create_new_thread_sync(
     let request_clone = request.clone();
     let project_clone = project.clone();
     cx.spawn(async move |cx| {
-        // Await provider authentication so models are available when creating sessions.
-        // This MUST complete before server.connect(), because NativeAgent::new() reads
-        // the model list during construction. If auth hasn't populated the provider's
-        // model list yet, the agent gets no model and thread.send() fails.
-        for task in auth_tasks {
-            if let Err(e) = task.await {
-                log::warn!("[THREAD_SERVICE] Provider authentication failed (continuing): {}", e);
-            }
-        }
-        eprintln!("✅ [THREAD_SERVICE] Provider authentication complete, connecting agent...");
-
-        // Now that providers are authenticated, set the default model and connect
         let connection_task = cx.update(|cx| {
-            // Re-select default model now that providers have their model lists
-            let settings = agent_settings::AgentSettings::get_global(cx);
-            if let Some(ref default_model) = settings.default_model {
-                let selected = language_model::SelectedModel {
-                    provider: language_model::LanguageModelProviderId::from(default_model.provider.0.clone()),
-                    model: language_model::LanguageModelId::from(default_model.model.clone()),
-                };
-                language_model::LanguageModelRegistry::global(cx).update(cx, |registry, cx| {
-                    registry.select_default_model(Some(&selected), cx);
-                    let has = registry.default_model().is_some();
-                    eprintln!("🔧 [THREAD_SERVICE] Registry default_model set: {}", has);
-                });
-            }
-
             let server = agent.server(fs, acp_history_store.clone());
             let agent_server_store = project.read(cx).agent_server_store().clone();
             let delegate = agent_servers::AgentServerDelegate::new(
@@ -602,9 +556,61 @@ fn create_new_thread_sync(
                 })
             });
         let connection_for_tools = connection.clone();
+        let connection_for_model = connection.clone();
         let thread_entity: Entity<AcpThread> = cx.update(|cx| {
             connection.new_session(project_clone.clone(), &cwd, cx)
         }).await?;
+
+        // Wait for the NativeAgent's model list to be populated.
+        // NativeAgent::new() spawns authenticate_all_language_model_providers()
+        // which runs asynchronously. When it completes, ProviderStateChanged
+        // fires, NativeAgent refreshes its model list. We wait for that refresh.
+        let session_id = cx.update(|cx| thread_entity.read(cx).session_id().clone());
+        {
+            let mut model_watch = cx.update(|cx| {
+                connection_for_model.model_selector(&session_id)
+                    .and_then(|selector| selector.watch(cx))
+            });
+            if let Some(ref mut watch_rx) = model_watch {
+                let wait_for_models = async {
+                    let _ = watch_rx.changed().await;
+                };
+                let timeout = async {
+                    smol::Timer::after(std::time::Duration::from_secs(15)).await;
+                    log::warn!("[THREAD_SERVICE] Timed out waiting for models (15s), proceeding");
+                };
+                futures::future::select(Box::pin(wait_for_models), Box::pin(timeout)).await;
+            }
+        }
+
+        // The settings system may set the default model to zed.dev (from default.json),
+        // which can't be resolved without a Zed account. The NativeAgent's auto-model
+        // logic uses registry.default_model() which may return None in this case.
+        // If the thread still has no model after the watch fired, explicitly select
+        // the first available model from the authenticated providers.
+        if let Some(selector) = cx.update(|_cx| connection_for_model.model_selector(&session_id)) {
+            let has_model = cx.update(|cx| selector.selected_model(cx)).await;
+            let needs_model = match has_model {
+                Ok(_) => false,
+                Err(_) => true,
+            };
+            if needs_model {
+                let model_list_result = cx.update(|cx| selector.list_models(cx)).await;
+                if let Ok(model_list) = model_list_result {
+                    let first_model_id = match &model_list {
+                        acp_thread::AgentModelList::Flat(models) => models.first().map(|m| m.id.clone()),
+                        acp_thread::AgentModelList::Grouped(groups) => {
+                            groups.values().flat_map(|v| v.iter()).next().map(|m| m.id.clone())
+                        }
+                    };
+                    if let Some(model_id) = first_model_id {
+                        if let Err(e) = cx.update(|cx| selector.select_model(model_id.clone(), cx)).await {
+                            log::warn!("[THREAD_SERVICE] Failed to select model: {}", e);
+                        }
+                    }
+                }
+            }
+        }
 
         // Wait for MCP context server tools to finish loading before sending
         // the first message, so the LLM request includes all available tools.

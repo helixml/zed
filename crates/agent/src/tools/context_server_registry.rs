@@ -88,6 +88,10 @@ impl ContextServerRegistry {
         self.pending_tool_loads > 0
     }
 
+    pub fn registered_server_count(&self) -> usize {
+        self.registered_servers.len()
+    }
+
     pub fn tools_ready_receiver(&self) -> watch::Receiver<usize> {
         self.tools_ready_tx.receiver()
     }

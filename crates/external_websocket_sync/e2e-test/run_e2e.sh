@@ -144,7 +144,8 @@ cat > "$ZED_CONFIG_DIR/settings.json" << JSONEOF
   "context_servers": {
     "slow-mcp-test": {
       "enabled": true,
-      "command": "/usr/local/bin/slow-mcp-server"
+      "command": "/usr/local/bin/slow-mcp-server",
+      "args": []
     }
   }
 }
