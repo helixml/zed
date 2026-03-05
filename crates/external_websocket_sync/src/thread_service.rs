@@ -513,20 +513,6 @@ fn create_new_thread_sync(
             })
             .collect();
 
-        // Ensure the default model is selected in the registry
-        let settings = agent_settings::AgentSettings::get_global(cx);
-        if let Some(ref default_model) = settings.default_model {
-            eprintln!("🔧 [THREAD_SERVICE] Setting default model: {}/{}", default_model.provider.0, default_model.model);
-            let selected = language_model::SelectedModel {
-                provider: language_model::LanguageModelProviderId::from(default_model.provider.0.clone()),
-                model: language_model::LanguageModelId::from(default_model.model.clone()),
-            };
-            language_model::LanguageModelRegistry::global(cx).update(cx, |registry, cx| {
-                registry.select_default_model(Some(&selected), cx);
-                let has = registry.default_model().is_some();
-                eprintln!("🔧 [THREAD_SERVICE] Registry default_model set: {}", has);
-            });
-        }
         tasks
     };
 
@@ -541,32 +527,48 @@ fn create_new_thread_sync(
             },
         },
     };
-    let server = agent.server(fs, acp_history_store.clone());
-
-    // Get agent server store from project
-    let agent_server_store = project.read(cx).agent_server_store().clone();
-
-    // Create delegate for connection
-    let delegate = agent_servers::AgentServerDelegate::new(
-        agent_server_store,
-        project.clone(),
-        None, // status_tx
-        None, // new_version_tx
-    );
-
-    // Connect to get AgentConnection
-    let connection_task = server.connect(delegate, cx);
 
     // Spawn async task to complete the connection and create the thread
     let request_clone = request.clone();
     let project_clone = project.clone();
     cx.spawn(async move |cx| {
-        // Await provider authentication so models are available when creating sessions
+        // Await provider authentication so models are available when creating sessions.
+        // This MUST complete before server.connect(), because NativeAgent::new() reads
+        // the model list during construction. If auth hasn't populated the provider's
+        // model list yet, the agent gets no model and thread.send() fails.
         for task in auth_tasks {
             if let Err(e) = task.await {
                 log::warn!("[THREAD_SERVICE] Provider authentication failed (continuing): {}", e);
             }
         }
+        eprintln!("✅ [THREAD_SERVICE] Provider authentication complete, connecting agent...");
+
+        // Now that providers are authenticated, set the default model and connect
+        let connection_task = cx.update(|cx| {
+            // Re-select default model now that providers have their model lists
+            let settings = agent_settings::AgentSettings::get_global(cx);
+            if let Some(ref default_model) = settings.default_model {
+                let selected = language_model::SelectedModel {
+                    provider: language_model::LanguageModelProviderId::from(default_model.provider.0.clone()),
+                    model: language_model::LanguageModelId::from(default_model.model.clone()),
+                };
+                language_model::LanguageModelRegistry::global(cx).update(cx, |registry, cx| {
+                    registry.select_default_model(Some(&selected), cx);
+                    let has = registry.default_model().is_some();
+                    eprintln!("🔧 [THREAD_SERVICE] Registry default_model set: {}", has);
+                });
+            }
+
+            let server = agent.server(fs, acp_history_store.clone());
+            let agent_server_store = project.read(cx).agent_server_store().clone();
+            let delegate = agent_servers::AgentServerDelegate::new(
+                agent_server_store,
+                project.clone(),
+                None,
+                None,
+            );
+            server.connect(delegate, cx)
+        });
 
         let (connection, _spawn_task): (std::rc::Rc<dyn acp_thread::AgentConnection>, _) = connection_task
             .await
