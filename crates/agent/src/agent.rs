@@ -338,6 +338,10 @@ impl NativeAgent {
         self.register_session(thread, cx)
     }
 
+    pub fn context_server_registry(&self) -> &Entity<ContextServerRegistry> {
+        &self.context_server_registry
+    }
+
     fn register_session(
         &mut self,
         thread_handle: Entity<Thread>,
@@ -1424,6 +1428,34 @@ impl acp_thread::AgentConnection for NativeAgentConnection {
 
     fn telemetry(&self) -> Option<Rc<dyn acp_thread::AgentTelemetry>> {
         Some(Rc::new(self.clone()) as Rc<dyn acp_thread::AgentTelemetry>)
+    }
+
+    fn wait_for_tools_ready(&self, cx: &mut App) -> Task<()> {
+        let agent = self.0.read(cx);
+        let registry = agent.context_server_registry().read(cx);
+        if !registry.has_pending_tool_loads() {
+            return Task::ready(());
+        }
+        let mut receiver = registry.tools_ready_receiver();
+        cx.spawn(async move |_cx| {
+            let wait = async {
+                loop {
+                    if receiver.changed().await.is_err() {
+                        return;
+                    }
+                    if *receiver.borrow() == 0 {
+                        return;
+                    }
+                }
+            };
+            let timeout = async {
+                smol::Timer::after(std::time::Duration::from_secs(30)).await;
+                log::warn!(
+                    "Timed out waiting for MCP tools to load after 30 seconds, proceeding without them"
+                );
+            };
+            futures::future::select(Box::pin(wait), Box::pin(timeout)).await;
+        })
     }
 
     fn into_any(self: Rc<Self>) -> Rc<dyn Any> {

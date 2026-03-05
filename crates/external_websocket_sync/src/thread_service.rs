@@ -588,9 +588,15 @@ fn create_new_thread_sync(
                         .unwrap_or_else(|| std::env::current_dir().unwrap_or_default())
                 })
             });
+        let connection_for_tools = connection.clone();
         let thread_entity: Entity<AcpThread> = cx.update(|cx| {
             connection.new_session(project_clone.clone(), &cwd, cx)
         }).await?;
+
+        // Wait for MCP context server tools to finish loading before sending
+        // the first message, so the LLM request includes all available tools.
+        let tools_ready_task = cx.update(|cx| connection_for_tools.wait_for_tools_ready(cx));
+        tools_ready_task.await;
 
         let acp_thread_id = cx.update(|cx| {
             let thread_id = thread_entity.read(cx).session_id().to_string();

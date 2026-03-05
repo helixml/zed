@@ -31,6 +31,8 @@ impl EventEmitter<ContextServerRegistryEvent> for ContextServerRegistry {}
 pub struct ContextServerRegistry {
     server_store: Entity<ContextServerStore>,
     registered_servers: HashMap<ContextServerId, RegisteredContextServer>,
+    pending_tool_loads: usize,
+    tools_ready_tx: watch::Sender<usize>,
     _subscription: gpui::Subscription,
 }
 
@@ -44,9 +46,12 @@ struct RegisteredContextServer {
 
 impl ContextServerRegistry {
     pub fn new(server_store: Entity<ContextServerStore>, cx: &mut Context<Self>) -> Self {
+        let (tools_ready_tx, _) = watch::channel(0usize);
         let mut this = Self {
             server_store: server_store.clone(),
             registered_servers: HashMap::default(),
+            pending_tool_loads: 0,
+            tools_ready_tx,
             _subscription: cx.subscribe(&server_store, Self::handle_context_server_store_event),
         };
         for server in server_store.read(cx).running_servers() {
@@ -54,6 +59,14 @@ impl ContextServerRegistry {
             this.reload_prompts_for_server(server.id(), cx);
         }
         this
+    }
+
+    pub fn has_pending_tool_loads(&self) -> bool {
+        self.pending_tool_loads > 0
+    }
+
+    pub fn tools_ready_receiver(&self) -> watch::Receiver<usize> {
+        self.tools_ready_tx.receiver()
     }
 
     pub fn tools_for_server(
@@ -174,6 +187,9 @@ impl ContextServerRegistry {
             return;
         }
 
+        self.pending_tool_loads += 1;
+        let _ = self.tools_ready_tx.send(self.pending_tool_loads);
+
         let registered_server = self.get_or_register_server(&server_id, cx);
         registered_server.load_tools = cx.spawn(async move |this, cx| {
             let response = client
@@ -182,6 +198,8 @@ impl ContextServerRegistry {
 
             this.update(cx, |this, cx| {
                 let Some(registered_server) = this.registered_servers.get_mut(&server_id) else {
+                    this.pending_tool_loads = this.pending_tool_loads.saturating_sub(1);
+                    let _ = this.tools_ready_tx.send(this.pending_tool_loads);
                     return;
                 };
 
@@ -198,6 +216,9 @@ impl ContextServerRegistry {
                     cx.emit(ContextServerRegistryEvent::ToolsChanged);
                     cx.notify();
                 }
+
+                this.pending_tool_loads = this.pending_tool_loads.saturating_sub(1);
+                let _ = this.tools_ready_tx.send(this.pending_tool_loads);
             })
         });
     }
