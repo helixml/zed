@@ -43,12 +43,18 @@ if [ ! -f "$SCRIPT_DIR/zed-binary" ]; then
     exit 1
 fi
 
-# Build Go test server (unless --no-build)
+# Build Go binaries (unless --no-build)
 if [ "${1:-}" != "--no-build" ]; then
     echo "=== Building Go test server ==="
     cd "$SCRIPT_DIR/helix-ws-test-server"
     go build -o helix-ws-test-server .
     echo "Built: $SCRIPT_DIR/helix-ws-test-server/helix-ws-test-server"
+    echo ""
+
+    echo "=== Building slow MCP server ==="
+    cd "$SCRIPT_DIR/slow-mcp-server"
+    CGO_ENABLED=0 go build -o slow-mcp-server .
+    echo "Built: $SCRIPT_DIR/slow-mcp-server/slow-mcp-server"
     echo ""
 fi
 

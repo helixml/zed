@@ -54,6 +54,10 @@ type testDriver struct {
 
 	// Track UI state responses (from query_ui_state)
 	uiStateResponses []types.SyncMessage
+
+	// Track timing for MCP tools wait validation
+	phase1ChatSentAt    time.Time // when we sent the chat_message for phase 1
+	phase1ThreadCreated time.Time // when we received thread_created for phase 1
 }
 
 func newTestDriver(srv *server.HelixAPIServer, store *memorystore.MemoryStore) *testDriver {
@@ -85,6 +89,9 @@ func (d *testDriver) syncEventCallback(sessionID string, syncMsg *types.SyncMess
 			acpThreadID, _ = syncMsg.Data["context_id"].(string)
 		}
 		if acpThreadID != "" {
+			if len(d.threadIDs) == 0 {
+				d.phase1ThreadCreated = time.Now()
+			}
 			d.threadIDs = append(d.threadIDs, acpThreadID)
 			log.Printf("[test-server] Thread #%d: %s (event=%s)", len(d.threadIDs), truncate(acpThreadID, 16), syncMsg.EventType)
 		}
@@ -238,6 +245,9 @@ func (d *testDriver) runPhase1() {
 	log.Println("\n==================================================")
 	log.Println("  PHASE 1: Basic thread creation")
 	log.Println("==================================================")
+	d.mu.Lock()
+	d.phase1ChatSentAt = time.Now()
+	d.mu.Unlock()
 	d.sendChatMessage("What is 2 + 2? Reply with just the number.", "req-phase1", "zed-agent")
 }
 
@@ -491,6 +501,31 @@ func (d *testDriver) validate() bool {
 		}
 	}
 
+	// --- MCP TOOLS WAIT VALIDATION ---
+	log.Println("\n--------------------------------------------------")
+	log.Println("  MCP TOOLS WAIT VALIDATION")
+	log.Println("--------------------------------------------------")
+
+	if !d.phase1ChatSentAt.IsZero() && !d.phase1ThreadCreated.IsZero() {
+		mcpWaitDuration := d.phase1ThreadCreated.Sub(d.phase1ChatSentAt)
+		log.Printf("[test-server] MCP wait: chat_message sent -> thread_created = %s", mcpWaitDuration)
+
+		// The slow MCP server delays tools/list by 10 seconds.
+		// If wait_for_tools_ready() works, thread creation should be delayed
+		// by at least 8 seconds (allowing 2s buffer for server startup).
+		const minExpectedDelay = 8 * time.Second
+		if mcpWaitDuration < minExpectedDelay {
+			errors = append(errors, fmt.Sprintf(
+				"MCP tools wait: thread_created arrived %.1fs after chat_message (expected >= %.0fs). "+
+					"This means Zed did NOT wait for MCP tools to load before sending the first message.",
+				mcpWaitDuration.Seconds(), minExpectedDelay.Seconds()))
+		} else {
+			log.Printf("[test-server] MCP tools wait: Zed correctly waited %.1fs for tools to load", mcpWaitDuration.Seconds())
+		}
+	} else {
+		log.Println("[test-server] WARNING: Could not measure MCP tools wait (missing timestamps)")
+	}
+
 	// --- STREAMING VALIDATION ---
 	log.Println("\n--------------------------------------------------")
 	log.Println("  STREAMING VALIDATION")
@@ -608,6 +643,7 @@ func (d *testDriver) validate() bool {
 	log.Println("[test-server] Phase 5: Zed -> Helix user message sync - PASSED")
 	log.Println("[test-server] Phase 6: Query UI state - PASSED")
 	log.Println("[test-server] Phase 7: Open thread + follow-up - PASSED")
+	log.Println("[test-server] MCP tools wait: Zed waited for slow MCP server before first message - PASSED")
 	log.Println("[test-server] Store state: Sessions and interactions created correctly - PASSED")
 	log.Println("[test-server] Accumulation: ResponseMessage content preserved - PASSED")
 
