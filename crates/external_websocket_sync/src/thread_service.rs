@@ -501,14 +501,17 @@ fn create_new_thread_sync(
     // NativeAgent::new() (called during connect) reads the model list via refresh_list().
     // If providers aren't authenticated yet, the model list is empty and new_thread()
     // creates threads with model=None, causing "No language model configured" errors.
-    {
+    let auth_tasks = {
         let registry = language_model::LanguageModelRegistry::global(cx);
         let providers = registry.read(cx).providers().clone();
         eprintln!("🔧 [THREAD_SERVICE] Pre-authenticating {} language model providers...", providers.len());
-        for provider in &providers {
-            eprintln!("🔧 [THREAD_SERVICE]   Authenticating provider: {}", provider.name().0);
-            provider.authenticate(cx);
-        }
+        let tasks: Vec<_> = providers
+            .iter()
+            .map(|provider| {
+                eprintln!("🔧 [THREAD_SERVICE]   Authenticating provider: {}", provider.name().0);
+                provider.authenticate(cx)
+            })
+            .collect();
 
         // Ensure the default model is selected in the registry
         let settings = agent_settings::AgentSettings::get_global(cx);
@@ -524,7 +527,8 @@ fn create_new_thread_sync(
                 eprintln!("🔧 [THREAD_SERVICE] Registry default_model set: {}", has);
             });
         }
-    }
+        tasks
+    };
 
     let agent = match request.agent_name.as_deref() {
         Some("zed-agent") | None => ExternalAgent::NativeAgent,
@@ -557,6 +561,13 @@ fn create_new_thread_sync(
     let request_clone = request.clone();
     let project_clone = project.clone();
     cx.spawn(async move |cx| {
+        // Await provider authentication so models are available when creating sessions
+        for task in auth_tasks {
+            if let Err(e) = task.await {
+                log::warn!("[THREAD_SERVICE] Provider authentication failed (continuing): {}", e);
+            }
+        }
+
         let (connection, _spawn_task): (std::rc::Rc<dyn acp_thread::AgentConnection>, _) = connection_task
             .await
             .log_err()
