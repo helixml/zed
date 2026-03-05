@@ -1,7 +1,7 @@
 use crate::{AgentToolOutput, AnyAgentTool, ToolCallEventStream, ToolInput};
 use agent_client_protocol::ToolKind;
 use anyhow::Result;
-use collections::{BTreeMap, HashMap};
+use collections::{BTreeMap, HashMap, HashSet};
 use context_server::{ContextServerId, client::NotificationSubscription};
 use futures::FutureExt as _;
 use gpui::{App, AppContext, AsyncApp, Context, Entity, EventEmitter, SharedString, Task};
@@ -32,6 +32,7 @@ pub struct ContextServerRegistry {
     server_store: Entity<ContextServerStore>,
     registered_servers: HashMap<ContextServerId, RegisteredContextServer>,
     pending_tool_loads: usize,
+    pending_server_starts: HashSet<ContextServerId>,
     tools_ready_tx: watch::Sender<usize>,
     _subscription: gpui::Subscription,
 }
@@ -51,13 +52,35 @@ impl ContextServerRegistry {
             server_store: server_store.clone(),
             registered_servers: HashMap::default(),
             pending_tool_loads: 0,
+            pending_server_starts: HashSet::default(),
             tools_ready_tx,
             _subscription: cx.subscribe(&server_store, Self::handle_context_server_store_event),
         };
-        for server in server_store.read(cx).running_servers() {
+        let (running_servers, starting_server_ids) = {
+            let store = server_store.read(cx);
+            let running = store.running_servers();
+            let starting: Vec<_> = store
+                .server_ids()
+                .iter()
+                .filter(|id| {
+                    matches!(
+                        store.status_for_server(id),
+                        Some(ContextServerStatus::Starting)
+                    )
+                })
+                .cloned()
+                .collect();
+            (running, starting)
+        };
+        for server in running_servers {
             this.reload_tools_for_server(server.id(), cx);
             this.reload_prompts_for_server(server.id(), cx);
         }
+        for server_id in starting_server_ids {
+            this.pending_server_starts.insert(server_id);
+            this.pending_tool_loads += 1;
+        }
+        let _ = this.tools_ready_tx.send(this.pending_tool_loads);
         this
     }
 
@@ -276,10 +299,18 @@ impl ContextServerRegistry {
         match status {
             ContextServerStatus::Starting => {}
             ContextServerStatus::Running => {
+                if self.pending_server_starts.remove(server_id) {
+                    self.pending_tool_loads = self.pending_tool_loads.saturating_sub(1);
+                    let _ = self.tools_ready_tx.send(self.pending_tool_loads);
+                }
                 self.reload_tools_for_server(server_id.clone(), cx);
                 self.reload_prompts_for_server(server_id.clone(), cx);
             }
             ContextServerStatus::Stopped | ContextServerStatus::Error(_) => {
+                if self.pending_server_starts.remove(server_id) {
+                    self.pending_tool_loads = self.pending_tool_loads.saturating_sub(1);
+                    let _ = self.tools_ready_tx.send(self.pending_tool_loads);
+                }
                 if let Some(registered_server) = self.registered_servers.remove(server_id) {
                     if !registered_server.tools.is_empty() {
                         cx.emit(ContextServerRegistryEvent::ToolsChanged);
