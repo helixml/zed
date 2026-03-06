@@ -889,27 +889,48 @@ impl AgentPanel {
                 while let Some(query) = query_rx.recv().await {
                     let query_id = query.query_id.clone();
                     this.update(cx, |this, cx| {
-                        let (active_view_str, thread_id, entry_count) = match &this.active_view {
+                        let (active_view_str, thread_id, entry_count, active_model) = match &this.active_view {
                             ActiveView::AgentThread { server_view } => {
                                 if let Some(acp_thread_view) = server_view.read(cx).active_thread() {
-                                    let thread_entity = &acp_thread_view.read(cx).thread;
+                                    let active_thread = acp_thread_view.read(cx);
+                                    let thread_entity = &active_thread.thread;
                                     let thread = thread_entity.read(cx);
+                                    let model_id = active_thread.current_model_id(cx);
                                     (
                                         "agent_thread".to_string(),
                                         Some(thread.session_id().to_string()),
                                         thread.entries().len(),
+                                        model_id,
                                     )
                                 } else {
-                                    ("agent_thread_loading".to_string(), None, 0)
+                                    ("agent_thread_loading".to_string(), None, 0, None)
                                 }
                             }
-                            ActiveView::History { .. } => ("history".to_string(), None, 0),
-                            ActiveView::Uninitialized => ("uninitialized".to_string(), None, 0),
-                            _ => ("other".to_string(), None, 0),
+                            ActiveView::History { .. } => ("history".to_string(), None, 0, None),
+                            ActiveView::Uninitialized => ("uninitialized".to_string(), None, 0, None),
+                            _ => ("other".to_string(), None, 0, None),
                         };
 
-                        eprintln!("🔍 [AGENT_PANEL] UI state query {}: active_view={}, thread_id={:?}, entry_count={}",
-                                  query_id, active_view_str, thread_id, entry_count);
+                        let mcp_servers = {
+                            let context_server_store = this.project.read(cx).context_server_store();
+                            let store = context_server_store.read(cx);
+                            let mut servers = std::collections::HashMap::new();
+                            for server_id in store.server_ids() {
+                                if let Some(status) = store.status_for_server(server_id) {
+                                    let status_str = match status {
+                                        project::context_server_store::ContextServerStatus::Running => "running",
+                                        project::context_server_store::ContextServerStatus::Starting => "starting",
+                                        project::context_server_store::ContextServerStatus::Stopped => "stopped",
+                                        project::context_server_store::ContextServerStatus::Error(_) => "error",
+                                    };
+                                    servers.insert(server_id.0.to_string(), status_str.to_string());
+                                }
+                            }
+                            servers
+                        };
+
+                        eprintln!("🔍 [AGENT_PANEL] UI state query {}: active_view={}, thread_id={:?}, entry_count={}, mcp_servers={:?}, active_model={:?}",
+                                  query_id, active_view_str, thread_id, entry_count, mcp_servers, active_model);
 
                         let _ = external_websocket_sync::send_websocket_event(
                             external_websocket_sync::SyncEvent::UiStateResponse {
@@ -917,6 +938,8 @@ impl AgentPanel {
                                 active_view: active_view_str,
                                 thread_id,
                                 entry_count,
+                                mcp_servers,
+                                active_model,
                             }
                         );
                     }).log_err();

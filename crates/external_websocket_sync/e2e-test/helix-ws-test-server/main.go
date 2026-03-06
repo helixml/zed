@@ -417,6 +417,46 @@ func (d *testDriver) validate() bool {
 			log.Printf("[test-server] Phase 6: UI state - active_view=%s, thread_id=%s, entry_count=%.0f",
 				activeView, truncate(threadID, 12), entryCount)
 		}
+
+		// Validate MCP server status
+		mcpServers, _ := resp.Data["mcp_servers"].(map[string]interface{})
+		if len(mcpServers) == 0 {
+			errors = append(errors, "Phase 6: ui_state_response mcp_servers is empty (expected at least slow-mcp-test)")
+		} else {
+			log.Printf("[test-server] Phase 6: MCP servers reported: %d", len(mcpServers))
+			slowMcpStatus, hasSlowMcp := mcpServers["slow-mcp-test"]
+			if !hasSlowMcp {
+				errors = append(errors, "Phase 6: mcp_servers missing 'slow-mcp-test' server")
+			} else if slowMcpStatus != "running" {
+				errors = append(errors, fmt.Sprintf(
+					"Phase 6: slow-mcp-test status=%q, expected 'running' (MCP server not connected)",
+					slowMcpStatus))
+			} else {
+				log.Printf("[test-server] Phase 6: slow-mcp-test MCP server is running (green/connected)")
+			}
+			for name, status := range mcpServers {
+				log.Printf("[test-server]   MCP server %q: %s", name, status)
+			}
+		}
+
+		// Validate active model matches settings.json configuration
+		activeModel, _ := resp.Data["active_model"].(string)
+		if activeModel == "" {
+			errors = append(errors, "Phase 6: ui_state_response active_model is empty (no model selected)")
+		} else {
+			log.Printf("[test-server] Phase 6: Active model: %s", activeModel)
+			// The settings.json configures "claude-sonnet-4-5-latest" as the default model.
+			// The model ID in Zed may include a provider prefix or resolve to a specific version,
+			// so we check that it contains "claude" as a sanity check that the Anthropic provider
+			// was selected (not zed.dev or some other default).
+			if !strings.Contains(strings.ToLower(activeModel), "claude") {
+				errors = append(errors, fmt.Sprintf(
+					"Phase 6: active_model=%q does not contain 'claude' — expected Anthropic model from settings.json",
+					activeModel))
+			} else {
+				log.Printf("[test-server] Phase 6: Model correctly set to Anthropic provider (contains 'claude')")
+			}
+		}
 	}
 
 	// Phase 7: open_thread + follow-up
@@ -642,6 +682,8 @@ func (d *testDriver) validate() bool {
 	log.Println("[test-server] Phase 4: Follow-up to non-visible thread - PASSED")
 	log.Println("[test-server] Phase 5: Zed -> Helix user message sync - PASSED")
 	log.Println("[test-server] Phase 6: Query UI state - PASSED")
+	log.Println("[test-server] Phase 6: MCP server connected (slow-mcp-test running) - PASSED")
+	log.Println("[test-server] Phase 6: Active model matches Anthropic provider config - PASSED")
 	log.Println("[test-server] Phase 7: Open thread + follow-up - PASSED")
 	log.Println("[test-server] MCP tools wait: Zed waited for slow MCP server before first message - PASSED")
 	log.Println("[test-server] Store state: Sessions and interactions created correctly - PASSED")
