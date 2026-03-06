@@ -140,6 +140,13 @@ cat > "$ZED_CONFIG_DIR/settings.json" << JSONEOF
     "always_allow_tool_actions": true,
     "show_onboarding": false,
     "auto_open_panel": true
+  },
+  "context_servers": {
+    "slow-mcp-test": {
+      "enabled": true,
+      "command": "/usr/local/bin/slow-mcp-server",
+      "args": []
+    }
   }
 }
 JSONEOF

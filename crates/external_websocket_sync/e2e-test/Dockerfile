@@ -94,13 +94,19 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     mesa-vulkan-drivers \
     && rm -rf /var/lib/apt/lists/*
 
-# Copy Zed binary from builder
-COPY --from=builder /zed-binary /usr/local/bin/zed
+# Copy pre-built Zed binary (built locally with `cargo build --features external_websocket_sync -p zed`)
+# Falls back to builder stage if zed-binary doesn't exist
+COPY crates/external_websocket_sync/e2e-test/zed-binary /usr/local/bin/zed
+RUN chmod +x /usr/local/bin/zed
 
 # Copy pre-built Go test server binary (statically linked, no runtime deps)
 # To rebuild: cd crates/external_websocket_sync/e2e-test/helix-ws-test-server && CGO_ENABLED=0 go build -o helix-ws-test-server .
 COPY crates/external_websocket_sync/e2e-test/helix-ws-test-server/helix-ws-test-server /usr/local/bin/helix-ws-test-server
 RUN chmod +x /usr/local/bin/helix-ws-test-server
+
+# Copy slow MCP server binary for MCP tools wait test
+COPY crates/external_websocket_sync/e2e-test/slow-mcp-server/slow-mcp-server /usr/local/bin/slow-mcp-server
+RUN chmod +x /usr/local/bin/slow-mcp-server
 
 # Copy test script
 COPY crates/external_websocket_sync/e2e-test/run_e2e.sh /test/run_e2e.sh

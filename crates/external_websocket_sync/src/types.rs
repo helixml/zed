@@ -229,6 +229,10 @@ pub enum SyncEvent {
         thread_id: Option<String>,
         /// Number of entries in the displayed thread
         entry_count: usize,
+        /// MCP context server statuses: server name -> status string ("running", "starting", "stopped", "error")
+        mcp_servers: HashMap<String, String>,
+        /// Currently selected model ID for the active thread (if available)
+        active_model: Option<String>,
     },
 }
 
@@ -290,13 +294,15 @@ impl SyncEvent {
                     "thread_id": thread_id,
                 })
             ),
-            SyncEvent::UiStateResponse { query_id, active_view, thread_id, entry_count } => (
+            SyncEvent::UiStateResponse { query_id, active_view, thread_id, entry_count, mcp_servers, active_model } => (
                 "ui_state_response".to_string(),
                 serde_json::json!({
                     "query_id": query_id,
                     "active_view": active_view,
                     "thread_id": thread_id,
                     "entry_count": entry_count,
+                    "mcp_servers": mcp_servers,
+                    "active_model": active_model,
                 })
             ),
         };

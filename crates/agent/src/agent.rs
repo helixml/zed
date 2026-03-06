@@ -338,6 +338,10 @@ impl NativeAgent {
         self.register_session(thread, cx)
     }
 
+    pub fn context_server_registry(&self) -> &Entity<ContextServerRegistry> {
+        &self.context_server_registry
+    }
+
     fn register_session(
         &mut self,
         thread_handle: Entity<Thread>,
@@ -1424,6 +1428,49 @@ impl acp_thread::AgentConnection for NativeAgentConnection {
 
     fn telemetry(&self) -> Option<Rc<dyn acp_thread::AgentTelemetry>> {
         Some(Rc::new(self.clone()) as Rc<dyn acp_thread::AgentTelemetry>)
+    }
+
+    fn wait_for_tools_ready(&self, cx: &mut App) -> Task<()> {
+        let agent = self.0.read(cx);
+        let registry = agent.context_server_registry().read(cx);
+        let has_pending = registry.has_pending_tool_loads();
+
+        let context_server_store = agent.project.read(cx).context_server_store();
+        let store = context_server_store.read(cx);
+        let configured_server_count = store.configured_server_ids().len();
+        let registered_count = registry.registered_server_count();
+        let has_unregistered_servers =
+            configured_server_count > 0 && registered_count < configured_server_count;
+
+        if !has_pending && !has_unregistered_servers {
+            return Task::ready(());
+        }
+
+        let mut receiver = registry.tools_ready_receiver();
+        let expected_servers = configured_server_count;
+        let registry_handle = agent.context_server_registry().clone();
+        cx.spawn(async move |cx| {
+            let wait = async {
+                loop {
+                    if receiver.changed().await.is_err() {
+                        return;
+                    }
+                    let all_done = cx.update(|cx| {
+                        let reg = registry_handle.read(cx);
+                        !reg.has_pending_tool_loads()
+                            && reg.registered_server_count() >= expected_servers
+                    });
+                    if all_done {
+                        return;
+                    }
+                }
+            };
+            let timeout = async {
+                smol::Timer::after(std::time::Duration::from_secs(30)).await;
+                log::warn!("Timed out waiting for MCP tools to load (30s), proceeding without them");
+            };
+            futures::future::select(Box::pin(wait), Box::pin(timeout)).await;
+        })
     }
 
     fn into_any(self: Rc<Self>) -> Rc<dyn Any> {

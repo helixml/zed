@@ -151,6 +151,15 @@ pub trait AgentConnection {
         None
     }
 
+    /// Wait for MCP context server tools to finish loading.
+    ///
+    /// Default implementation returns immediately. Agents that load tools
+    /// asynchronously (e.g. via MCP ListTools RPC) should override this to
+    /// block until all pending tool loads have completed.
+    fn wait_for_tools_ready(&self, _cx: &mut App) -> Task<()> {
+        Task::ready(())
+    }
+
     fn into_any(self: Rc<Self>) -> Rc<dyn Any>;
 }
 

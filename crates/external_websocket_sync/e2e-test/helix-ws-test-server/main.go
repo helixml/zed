@@ -54,6 +54,10 @@ type testDriver struct {
 
 	// Track UI state responses (from query_ui_state)
 	uiStateResponses []types.SyncMessage
+
+	// Track timing for MCP tools wait validation
+	phase1ChatSentAt    time.Time // when we sent the chat_message for phase 1
+	phase1ThreadCreated time.Time // when we received thread_created for phase 1
 }
 
 func newTestDriver(srv *server.HelixAPIServer, store *memorystore.MemoryStore) *testDriver {
@@ -85,6 +89,9 @@ func (d *testDriver) syncEventCallback(sessionID string, syncMsg *types.SyncMess
 			acpThreadID, _ = syncMsg.Data["context_id"].(string)
 		}
 		if acpThreadID != "" {
+			if len(d.threadIDs) == 0 {
+				d.phase1ThreadCreated = time.Now()
+			}
 			d.threadIDs = append(d.threadIDs, acpThreadID)
 			log.Printf("[test-server] Thread #%d: %s (event=%s)", len(d.threadIDs), truncate(acpThreadID, 16), syncMsg.EventType)
 		}
@@ -238,6 +245,9 @@ func (d *testDriver) runPhase1() {
 	log.Println("\n==================================================")
 	log.Println("  PHASE 1: Basic thread creation")
 	log.Println("==================================================")
+	d.mu.Lock()
+	d.phase1ChatSentAt = time.Now()
+	d.mu.Unlock()
 	d.sendChatMessage("What is 2 + 2? Reply with just the number.", "req-phase1", "zed-agent")
 }
 
@@ -407,6 +417,46 @@ func (d *testDriver) validate() bool {
 			log.Printf("[test-server] Phase 6: UI state - active_view=%s, thread_id=%s, entry_count=%.0f",
 				activeView, truncate(threadID, 12), entryCount)
 		}
+
+		// Validate MCP server status
+		mcpServers, _ := resp.Data["mcp_servers"].(map[string]interface{})
+		if len(mcpServers) == 0 {
+			errors = append(errors, "Phase 6: ui_state_response mcp_servers is empty (expected at least slow-mcp-test)")
+		} else {
+			log.Printf("[test-server] Phase 6: MCP servers reported: %d", len(mcpServers))
+			slowMcpStatus, hasSlowMcp := mcpServers["slow-mcp-test"]
+			if !hasSlowMcp {
+				errors = append(errors, "Phase 6: mcp_servers missing 'slow-mcp-test' server")
+			} else if slowMcpStatus != "running" {
+				errors = append(errors, fmt.Sprintf(
+					"Phase 6: slow-mcp-test status=%q, expected 'running' (MCP server not connected)",
+					slowMcpStatus))
+			} else {
+				log.Printf("[test-server] Phase 6: slow-mcp-test MCP server is running (green/connected)")
+			}
+			for name, status := range mcpServers {
+				log.Printf("[test-server]   MCP server %q: %s", name, status)
+			}
+		}
+
+		// Validate active model matches settings.json configuration
+		activeModel, _ := resp.Data["active_model"].(string)
+		if activeModel == "" {
+			errors = append(errors, "Phase 6: ui_state_response active_model is empty (no model selected)")
+		} else {
+			log.Printf("[test-server] Phase 6: Active model: %s", activeModel)
+			// The settings.json configures "claude-sonnet-4-5-latest" as the default model.
+			// The model ID in Zed may include a provider prefix or resolve to a specific version,
+			// so we check that it contains "claude" as a sanity check that the Anthropic provider
+			// was selected (not zed.dev or some other default).
+			if !strings.Contains(strings.ToLower(activeModel), "claude") {
+				errors = append(errors, fmt.Sprintf(
+					"Phase 6: active_model=%q does not contain 'claude' — expected Anthropic model from settings.json",
+					activeModel))
+			} else {
+				log.Printf("[test-server] Phase 6: Model correctly set to Anthropic provider (contains 'claude')")
+			}
+		}
 	}
 
 	// Phase 7: open_thread + follow-up
@@ -489,6 +539,31 @@ func (d *testDriver) validate() bool {
 			log.Printf("[test-server] Multi-thread: Thread A -> %s, Thread B -> %s (different sessions)",
 				truncate(sessionA, 12), truncate(sessionB, 12))
 		}
+	}
+
+	// --- MCP TOOLS WAIT VALIDATION ---
+	log.Println("\n--------------------------------------------------")
+	log.Println("  MCP TOOLS WAIT VALIDATION")
+	log.Println("--------------------------------------------------")
+
+	if !d.phase1ChatSentAt.IsZero() && !d.phase1ThreadCreated.IsZero() {
+		mcpWaitDuration := d.phase1ThreadCreated.Sub(d.phase1ChatSentAt)
+		log.Printf("[test-server] MCP wait: chat_message sent -> thread_created = %s", mcpWaitDuration)
+
+		// The slow MCP server delays tools/list by 10 seconds.
+		// If wait_for_tools_ready() works, thread creation should be delayed
+		// by at least 8 seconds (allowing 2s buffer for server startup).
+		const minExpectedDelay = 8 * time.Second
+		if mcpWaitDuration < minExpectedDelay {
+			errors = append(errors, fmt.Sprintf(
+				"MCP tools wait: thread_created arrived %.1fs after chat_message (expected >= %.0fs). "+
+					"This means Zed did NOT wait for MCP tools to load before sending the first message.",
+				mcpWaitDuration.Seconds(), minExpectedDelay.Seconds()))
+		} else {
+			log.Printf("[test-server] MCP tools wait: Zed correctly waited %.1fs for tools to load", mcpWaitDuration.Seconds())
+		}
+	} else {
+		log.Println("[test-server] WARNING: Could not measure MCP tools wait (missing timestamps)")
 	}
 
 	// --- STREAMING VALIDATION ---
@@ -607,7 +682,10 @@ func (d *testDriver) validate() bool {
 	log.Println("[test-server] Phase 4: Follow-up to non-visible thread - PASSED")
 	log.Println("[test-server] Phase 5: Zed -> Helix user message sync - PASSED")
 	log.Println("[test-server] Phase 6: Query UI state - PASSED")
+	log.Println("[test-server] Phase 6: MCP server connected (slow-mcp-test running) - PASSED")
+	log.Println("[test-server] Phase 6: Active model matches Anthropic provider config - PASSED")
 	log.Println("[test-server] Phase 7: Open thread + follow-up - PASSED")
+	log.Println("[test-server] MCP tools wait: Zed waited for slow MCP server before first message - PASSED")
 	log.Println("[test-server] Store state: Sessions and interactions created correctly - PASSED")
 	log.Println("[test-server] Accumulation: ResponseMessage content preserved - PASSED")
 
