@@ -491,7 +491,11 @@ impl AcpThreadView {
         if let Some(config_view) = self.config_options_view.as_ref() {
             return config_view.read(cx).current_model_value();
         }
-        None
+        // Fallback for headless/external threads that have neither selector nor config options:
+        // read from the global language model registry.
+        LanguageModelRegistry::read_global(cx)
+            .default_model()
+            .map(|m| m.model.id().0.to_string())
     }
 
     pub fn current_mode_id(&self, cx: &App) -> Option<Arc<str>> {
