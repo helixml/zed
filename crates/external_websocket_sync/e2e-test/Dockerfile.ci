@@ -1,16 +1,14 @@
-# CI E2E test image — builds Go test server from Helix source, uses pre-built Zed binary.
+# CI E2E test image — builds Go test server and slow-mcp-server from source,
+# uses pre-built Zed binary.
 #
-# Used by Drone CI (helix repo .drone.yml) where the Zed binary is already built
-# by a prior step, but the Go test server needs building with the current Helix source.
+# Context: this directory (crates/external_websocket_sync/e2e-test/).
+# Everything is built from the Zed repo source already present here.
 #
-# Context directory is assembled by the CI step with:
-#   zed-binary           — pre-built Zed binary
-#   run_e2e.sh           — test runner script
-#   helix-ws-test-server — Go test server source
-#   slow-mcp-server      — slow MCP test server source
-#   helix-go.mod         — Helix go.mod (for replace directive)
-#   helix-go.sum         — Helix go.sum
-#   helix-api            — Helix api/ source tree
+# External files placed into context by CI before build:
+#   zed-binary   — pre-built Zed binary (from build-zed step)
+#   helix-go.mod — Helix go.mod (for helix-ws-test-server replace directive)
+#   helix-go.sum — Helix go.sum
+#   helix-api/   — Helix api/ source tree
 
 # Stage 1: Build Go test server with real Helix server code
 FROM golang:1.25-alpine AS go-builder
