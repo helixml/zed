@@ -7,6 +7,7 @@
 #   zed-binary           — pre-built Zed binary
 #   run_e2e.sh           — test runner script
 #   helix-ws-test-server — Go test server source
+#   slow-mcp-server      — slow MCP test server source
 #   helix-go.mod         — Helix go.mod (for replace directive)
 #   helix-go.sum         — Helix go.sum
 #   helix-api            — Helix api/ source tree
@@ -23,7 +24,13 @@ RUN apk add --no-cache gcc g++ musl-dev && \
     go mod tidy && \
     CGO_ENABLED=1 go build -ldflags '-extldflags "-static"' -o /helix-ws-test-server .
 
-# Stage 2: Runtime
+# Stage 2: Build slow-mcp-server (standalone, no external deps)
+FROM golang:1.25-alpine AS mcp-builder
+COPY slow-mcp-server /app
+WORKDIR /app
+RUN CGO_ENABLED=0 go build -o /slow-mcp-server .
+
+# Stage 3: Runtime
 FROM ubuntu:25.10
 ENV DEBIAN_FRONTEND=noninteractive
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -41,8 +48,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     imagemagick \
     && rm -rf /var/lib/apt/lists/*
 COPY --from=go-builder /helix-ws-test-server /usr/local/bin/helix-ws-test-server
+COPY --from=mcp-builder /slow-mcp-server /usr/local/bin/slow-mcp-server
 COPY zed-binary /usr/local/bin/zed
-RUN chmod +x /usr/local/bin/zed /usr/local/bin/helix-ws-test-server
+RUN chmod +x /usr/local/bin/zed /usr/local/bin/helix-ws-test-server /usr/local/bin/slow-mcp-server
 COPY run_e2e.sh /test/run_e2e.sh
 RUN chmod +x /test/run_e2e.sh
 ENV DISPLAY=:99
