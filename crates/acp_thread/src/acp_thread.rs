@@ -1972,7 +1972,19 @@ impl AcpThread {
         self.running_turn = Some(RunningTurn {
             id: turn_id,
             send_task: cx.spawn(async move |this, cx| {
-                cancel_task.await;
+                // Wait for the previous turn to complete, but with a timeout.
+                // Some ACP agents (e.g. Claude Code) may not properly handle
+                // CancelNotification, causing the old turn's prompt() to hang
+                // indefinitely. Without a timeout, both the old and new turns
+                // would be stuck forever — neither emitting Stopped events.
+                // The old turn continues running in the background and will
+                // still emit its own Stopped event when it eventually completes.
+                let cancel_timeout = smol::Timer::after(std::time::Duration::from_secs(5));
+                futures::future::select(
+                    std::pin::pin!(cancel_task),
+                    std::pin::pin!(cancel_timeout),
+                )
+                .await;
                 tx.send(f(this, cx).await).ok();
             }),
         });
