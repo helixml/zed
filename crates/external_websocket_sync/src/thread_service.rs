@@ -45,6 +45,10 @@ static THREAD_AGENT_SESSION_MAP: parking_lot::Mutex<Option<Arc<RwLock<HashMap<St
 static THREAD_REQUEST_MAP: parking_lot::Mutex<Option<Arc<RwLock<HashMap<String, String>>>>> =
     parking_lot::Mutex::new(None);
 
+/// Reverse map of request_id -> thread_id for cancel_current_turn lookups
+static REQUEST_TO_THREAD_MAP: parking_lot::Mutex<Option<Arc<RwLock<HashMap<String, String>>>>> =
+    parking_lot::Mutex::new(None);
+
 /// Global map of thread_id -> Set of entry indices that originated from external system
 /// Prevents echoing external messages back (initial + follow-ups)
 static EXTERNAL_ORIGINATED_ENTRIES: parking_lot::Mutex<Option<Arc<RwLock<HashMap<String, HashSet<usize>>>>>> =
@@ -120,6 +124,10 @@ pub fn init_thread_registry() {
         *persistent_subs = Some(Arc::new(RwLock::new(HashSet::new())));
     }
 
+    let mut request_to_thread = REQUEST_TO_THREAD_MAP.lock();
+    if request_to_thread.is_none() {
+        *request_to_thread = Some(Arc::new(RwLock::new(HashMap::new())));
+    }
 }
 
 /// Mark an entry as originated from external system (won't be echoed back)
@@ -318,7 +326,12 @@ pub fn set_thread_request_id(acp_thread_id: String, request_id: String) {
     init_thread_registry();
     let map = THREAD_REQUEST_MAP.lock();
     if let Some(m) = map.as_ref() {
-        m.write().insert(acp_thread_id, request_id);
+        m.write().insert(acp_thread_id.clone(), request_id.clone());
+    }
+    // Also update reverse map for cancel_current_turn lookups
+    let reverse_map = REQUEST_TO_THREAD_MAP.lock();
+    if let Some(m) = reverse_map.as_ref() {
+        m.write().insert(request_id, acp_thread_id);
     }
 }
 
@@ -326,6 +339,12 @@ pub fn set_thread_request_id(acp_thread_id: String, request_id: String) {
 pub fn get_thread_request_id(acp_thread_id: &str) -> Option<String> {
     let map = THREAD_REQUEST_MAP.lock();
     map.as_ref()?.read().get(acp_thread_id).cloned()
+}
+
+/// Look up the thread_id for a given request_id (reverse map)
+pub fn get_thread_id_for_request(request_id: &str) -> Option<String> {
+    let map = REQUEST_TO_THREAD_MAP.lock();
+    map.as_ref()?.read().get(request_id).cloned()
 }
 
 /// Store the agent's session ID for a thread, so we can pass it to load_session later.
@@ -832,6 +851,56 @@ pub fn setup_thread_handler(
         }
 
         log::warn!("⚠️ [THREAD_SERVICE] Open thread handler task exiting - callback channel closed");
+        anyhow::Ok(())
+    })
+    .detach();
+
+    // Create callback channel for cancellation requests
+    let (cancel_tx, mut cancel_rx) = mpsc::unbounded_channel::<crate::CancellationRequest>();
+    crate::init_cancellation_callback(cancel_tx);
+
+    // Spawn handler task to process cancellation requests
+    cx.spawn(async move |cx| {
+        while let Some(request) = cancel_rx.recv().await {
+            log::info!("[THREAD_SERVICE] Received cancellation request: request_id={}", request.request_id);
+
+            // Look up which thread this request_id belongs to
+            let thread_id = get_thread_id_for_request(&request.request_id);
+            let thread = thread_id.as_deref().and_then(get_thread);
+
+            match thread {
+                Some(weak_thread) => {
+                    let cancel_result = cx.update(|cx| {
+                        if let Some(thread_entity) = weak_thread.upgrade() {
+                            thread_entity.update(cx, |thread, cx| {
+                                thread.cancel(cx)
+                            })
+                        } else {
+                            gpui::Task::ready(())
+                        }
+                    });
+                    if let Ok(task) = cancel_result {
+                        task.await;
+                    }
+                    log::info!("[THREAD_SERVICE] Cancelled turn for request_id={}", request.request_id);
+                    if let Err(e) = crate::send_websocket_event(SyncEvent::TurnCancelled {
+                        request_id: request.request_id,
+                        status: "cancelled".to_string(),
+                    }) {
+                        log::error!("[THREAD_SERVICE] Failed to send turn_cancelled event: {}", e);
+                    }
+                }
+                None => {
+                    log::info!("[THREAD_SERVICE] No active thread for request_id={}, sending noop", request.request_id);
+                    if let Err(e) = crate::send_websocket_event(SyncEvent::TurnCancelled {
+                        request_id: request.request_id,
+                        status: "noop".to_string(),
+                    }) {
+                        log::error!("[THREAD_SERVICE] Failed to send turn_cancelled noop event: {}", e);
+                    }
+                }
+            }
+        }
         anyhow::Ok(())
     })
     .detach();
