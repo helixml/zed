@@ -870,7 +870,7 @@ pub fn setup_thread_handler(
 
             match thread {
                 Some(weak_thread) => {
-                    let cancel_result = cx.update(|cx| {
+                    let task = cx.update(|cx| {
                         if let Some(thread_entity) = weak_thread.upgrade() {
                             thread_entity.update(cx, |thread, cx| {
                                 thread.cancel(cx)
@@ -879,9 +879,7 @@ pub fn setup_thread_handler(
                             gpui::Task::ready(())
                         }
                     });
-                    if let Ok(task) = cancel_result {
-                        task.await;
-                    }
+                    task.await;
                     log::info!("[THREAD_SERVICE] Cancelled turn for request_id={}", request.request_id);
                     if let Err(e) = crate::send_websocket_event(SyncEvent::TurnCancelled {
                         request_id: request.request_id,
