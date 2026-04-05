@@ -4,7 +4,7 @@
 // tests and production.
 //
 // The server runs multiple "rounds", one per agent type (zed-agent, claude, etc.).
-// Each round executes the same 12 test phases:
+// Each round executes the same 14 test phases:
 //
 //	Phase 1: Basic thread creation (new chat_message, no thread ID)
 //	Phase 2: Follow-up on existing thread (same thread ID)
@@ -18,6 +18,8 @@
 //	Phase 10: User-created thread (inject user_created_thread, verify work session, send chat on new thread)
 //	Phase 11: Spectask routing (set SpecTaskID on threads, verify FindConnectedSessionForSpecTask picks most recent)
 //	Phase 12: Reconnect test (kill Zed, wait for reconnection, send message to existing thread, verify delivery)
+//	Phase 13: Helix-initiated cancel (send chat_message, then cancel_current_turn, verify turn_cancelled with status cancelled)
+//	Phase 14: Cancel no-op (send cancel_current_turn with bogus request_id, verify turn_cancelled with status noop)
 //
 // Exit codes: 0 = all tests passed, 1 = test failure
 package main
@@ -84,6 +86,16 @@ type roundState struct {
 
 	// Phase 12: reconnect test (kill Zed, reconnect, verify message delivery)
 	phase12Completed bool // whether the reconnected message completed
+
+	// Phase 13: Helix-initiated cancel via cancel_current_turn
+	phase13ThreadID     string // thread ID for the long-running turn
+	phase13CancelSent   bool   // whether cancel_current_turn has been sent
+	phase13TurnCancelled bool  // whether turn_cancelled event was received
+	phase13CancelStatus string // status from turn_cancelled ("cancelled" or "noop")
+
+	// Phase 14: cancel no-op (request_id not found)
+	phase14TurnCancelled bool   // whether turn_cancelled event was received
+	phase14CancelStatus  string // status from turn_cancelled (expected "noop")
 }
 
 func newRoundState(agentName string) *roundState {
@@ -175,6 +187,11 @@ func (d *testDriver) syncEventCallback(sessionID string, syncMsg *types.SyncMess
 				d.round.phase8ThreadID = acpThreadID
 				log.Printf("[%s] Phase 8: Captured thread ID: %s", d.round.agentName, truncate(acpThreadID, 16))
 			}
+			// Capture the thread created for phase 13 (Helix-initiated cancel).
+			if d.phase == 13 && d.round.phase13ThreadID == "" {
+				d.round.phase13ThreadID = acpThreadID
+				log.Printf("[%s] Phase 13: Captured thread ID: %s", d.round.agentName, truncate(acpThreadID, 16))
+			}
 		}
 
 	case "user_created_thread":
@@ -200,7 +217,7 @@ func (d *testDriver) syncEventCallback(sessionID string, syncMsg *types.SyncMess
 			}
 		}
 		// Also check phase 8/9 thread IDs (they may not be in threadIDs yet)
-		if addedThreadID == d.round.phase8ThreadID || addedThreadID == d.round.phase9ThreadID {
+		if addedThreadID == d.round.phase8ThreadID || addedThreadID == d.round.phase9ThreadID || addedThreadID == d.round.phase13ThreadID {
 			isCurrentRoundThread = true
 		}
 		if !isCurrentRoundThread && addedThreadID != "" {
@@ -220,6 +237,22 @@ func (d *testDriver) syncEventCallback(sessionID string, syncMsg *types.SyncMess
 				d.mu.Unlock()
 				log.Printf("[%s] Phase 8: First assistant token arrived, sending interrupt to %s", agentName, truncate(threadID, 16))
 				d.sendChatMessage("Actually just say 'hello'.", d.round.reqID("phase8-interrupt"), agentName, threadID)
+				return
+			}
+		}
+
+		// Phase 13: send cancel_current_turn as soon as the first assistant token arrives.
+		// This tests the Helix-initiated cancel flow via the cancel_current_turn command.
+		if d.phase == 13 && !d.round.phase13CancelSent {
+			role, _ := syncMsg.Data["role"].(string)
+			threadID, _ := syncMsg.Data["acp_thread_id"].(string)
+			if role == "assistant" && threadID == d.round.phase13ThreadID {
+				d.round.phase13CancelSent = true
+				agentName := d.round.agentName
+				reqID := d.round.reqID("phase13")
+				d.mu.Unlock()
+				log.Printf("[%s] Phase 13: First assistant token arrived, sending cancel_current_turn for req=%s", agentName, reqID)
+				d.sendCancelCurrentTurn(reqID)
 				return
 			}
 		}
@@ -273,7 +306,7 @@ func (d *testDriver) syncEventCallback(sessionID string, syncMsg *types.SyncMess
 				break
 			}
 		}
-		if acpThreadID == d.round.phase8ThreadID || acpThreadID == d.round.phase9ThreadID {
+		if acpThreadID == d.round.phase8ThreadID || acpThreadID == d.round.phase9ThreadID || acpThreadID == d.round.phase13ThreadID {
 			isCurrentRoundThread = true
 		}
 		if !isCurrentRoundThread && acpThreadID != "" {
@@ -345,6 +378,32 @@ func (d *testDriver) syncEventCallback(sessionID string, syncMsg *types.SyncMess
 		if currentPhase == 6 {
 			go d.advanceAfterUiState()
 		}
+		return
+
+	case "turn_cancelled":
+		requestID, _ := syncMsg.Data["request_id"].(string)
+		status, _ := syncMsg.Data["status"].(string)
+		currentPhase := d.phase
+		agentName := d.round.agentName
+
+		if currentPhase == 13 {
+			d.round.phase13TurnCancelled = true
+			d.round.phase13CancelStatus = status
+			d.mu.Unlock()
+			log.Printf("[%s] Phase 13: turn_cancelled received: request_id=%s status=%s", agentName, requestID, status)
+			go d.advanceAfterPhase13()
+			return
+		}
+		if currentPhase == 14 {
+			d.round.phase14TurnCancelled = true
+			d.round.phase14CancelStatus = status
+			d.mu.Unlock()
+			log.Printf("[%s] Phase 14: turn_cancelled received: request_id=%s status=%s", agentName, requestID, status)
+			go d.advanceAfterPhase14()
+			return
+		}
+		d.mu.Unlock()
+		log.Printf("[%s] turn_cancelled (unexpected phase %d): request_id=%s status=%s", agentName, currentPhase, requestID, status)
 		return
 
 	case "thread_title_changed":
@@ -420,6 +479,18 @@ func (d *testDriver) sendOpenThread(acpThreadID, agentName string) {
 	}
 	if !d.srv.QueueCommand(d.agentID, cmd) {
 		log.Printf("[test-server] WARNING: Failed to send open_thread to agent %s", d.agentID)
+	}
+}
+
+func (d *testDriver) sendCancelCurrentTurn(requestID string) {
+	cmd := types.ExternalAgentCommand{
+		Type: "cancel_current_turn",
+		Data: map[string]interface{}{
+			"request_id": requestID,
+		},
+	}
+	if !d.srv.QueueCommand(d.agentID, cmd) {
+		log.Printf("[test-server] WARNING: Failed to send cancel_current_turn to agent %s", d.agentID)
 	}
 }
 
@@ -590,7 +661,10 @@ func (d *testDriver) advanceAfterCompletion(completedPhase int) {
 		agentName := d.round.agentName
 		d.mu.Unlock()
 		log.Printf("[%s] Phase 12: ✅ Reconnect message completed", agentName)
-		d.advanceToNextRound()
+		d.mu.Lock()
+		d.phase = 13
+		d.mu.Unlock()
+		d.runPhase13()
 	}
 }
 
@@ -1010,6 +1084,61 @@ func (d *testDriver) runPhase12() {
 	// message_completed and call advanceAfterCompletion(12).
 }
 
+func (d *testDriver) runPhase13() {
+	agent := d.round.agentName
+	log.Printf("\n==================================================")
+	log.Printf("  [%s] PHASE 13: Helix-initiated cancel (cancel_current_turn)", agent)
+	log.Printf("==================================================")
+	d.startPhaseTimeout(13)
+	log.Println("  Sends a chat_message to start a streaming turn, then")
+	log.Println("  fires cancel_current_turn when the first assistant token")
+	log.Println("  arrives. Verifies Zed responds with turn_cancelled (status=cancelled).")
+
+	// Send a long-running question that will produce streaming output.
+	// The syncEventCallback will fire cancel_current_turn when the first
+	// assistant token arrives.
+	d.sendChatMessage(
+		"Write a detailed explanation of binary search trees with three worked examples.",
+		d.round.reqID("phase13"),
+		agent,
+	)
+}
+
+func (d *testDriver) advanceAfterPhase13() {
+	time.Sleep(1 * time.Second)
+	d.mu.Lock()
+	agentName := d.round.agentName
+	d.mu.Unlock()
+	log.Printf("[%s] Phase 13: ✅ turn_cancelled received, advancing to phase 14", agentName)
+
+	d.mu.Lock()
+	d.phase = 14
+	d.mu.Unlock()
+	d.runPhase14()
+}
+
+func (d *testDriver) runPhase14() {
+	agent := d.round.agentName
+	log.Printf("\n==================================================")
+	log.Printf("  [%s] PHASE 14: Cancel no-op (bogus request_id)", agent)
+	log.Printf("==================================================")
+	d.startPhaseTimeout(14)
+	log.Println("  Sends cancel_current_turn with a request_id that doesn't")
+	log.Println("  correspond to any active turn. Verifies Zed responds with")
+	log.Println("  turn_cancelled (status=noop).")
+
+	d.sendCancelCurrentTurn("bogus-request-id-that-does-not-exist")
+}
+
+func (d *testDriver) advanceAfterPhase14() {
+	time.Sleep(1 * time.Second)
+	d.mu.Lock()
+	agentName := d.round.agentName
+	d.mu.Unlock()
+	log.Printf("[%s] Phase 14: ✅ turn_cancelled (noop) received, round complete", agentName)
+	d.advanceToNextRound()
+}
+
 // --- Per-round validation ---
 
 func (d *testDriver) validateRound() roundResult {
@@ -1258,11 +1387,46 @@ func (d *testDriver) validateRound() roundResult {
 		}
 	}
 
-	// Thread count: at minimum 3 threads (phases 1, 3, 8). ACP agents that don't
+	// Phase 13: Helix-initiated cancel
+	if !d.round.phase13TurnCancelled {
+		errors = append(errors, "Phase 13: No turn_cancelled event received (cancel_current_turn may not have been processed)")
+	} else {
+		if d.round.phase13CancelStatus != "cancelled" {
+			errors = append(errors, fmt.Sprintf("Phase 13: turn_cancelled status=%q, expected 'cancelled'", d.round.phase13CancelStatus))
+		} else {
+			log.Printf("[%s] Phase 13: ✅ turn_cancelled received with status=cancelled", agent)
+		}
+		// Verify the interaction is marked as interrupted in the store
+		phase13Interrupted := false
+		allInteractions := d.store.GetAllInteractions()
+		for _, i := range allInteractions {
+			if i.State == types.InteractionStateInterrupted {
+				phase13Interrupted = true
+				log.Printf("[%s] Phase 13: ✅ Interaction %s marked as interrupted", agent, truncate(i.ID, 12))
+				break
+			}
+		}
+		if !phase13Interrupted {
+			errors = append(errors, "Phase 13: No interaction in store with state=interrupted")
+		}
+	}
+
+	// Phase 14: cancel no-op
+	if !d.round.phase14TurnCancelled {
+		errors = append(errors, "Phase 14: No turn_cancelled event received (noop cancel may not have been processed)")
+	} else {
+		if d.round.phase14CancelStatus != "noop" {
+			errors = append(errors, fmt.Sprintf("Phase 14: turn_cancelled status=%q, expected 'noop'", d.round.phase14CancelStatus))
+		} else {
+			log.Printf("[%s] Phase 14: ✅ turn_cancelled received with status=noop", agent)
+		}
+	}
+
+	// Thread count: at minimum 4 threads (phases 1, 3, 8, 13). ACP agents that don't
 	// support session reload (like Claude Code) may create additional threads when
 	// follow-up messages fall through to create_new_thread (phases 4, 7, 11).
-	if len(threadCreatedEvents) > 3 {
-		log.Printf("[%s] Note: %d thread_created events (>3 expected for agents that don't retain sessions)",
+	if len(threadCreatedEvents) > 4 {
+		log.Printf("[%s] Note: %d thread_created events (>4 expected for agents that don't retain sessions)",
 			agent, len(threadCreatedEvents))
 	}
 
@@ -1346,6 +1510,8 @@ func (d *testDriver) validateRound() roundResult {
 		log.Printf("[%s] Phase 10: User-created thread - PASSED", agent)
 		log.Printf("[%s] Phase 11: Spectask routing - PASSED", agent)
 		log.Printf("[%s] Phase 12: Reconnect test - PASSED", agent)
+		log.Printf("[%s] Phase 13: Helix-initiated cancel - PASSED", agent)
+		log.Printf("[%s] Phase 14: Cancel no-op - PASSED", agent)
 	}
 
 	totalCompletions := 0
@@ -1390,10 +1556,10 @@ func (d *testDriver) validateStore() bool {
 	log.Printf("[store] Sessions in store: %d", len(sessions))
 	log.Printf("[store] Interactions in store: %d", len(interactions))
 
-	// Each round creates 3 threads (phases 1, 3, 8) = 3 sessions per round.
-	expectedSessions := 3 * len(d.agentRounds)
+	// Each round creates 4 threads (phases 1, 3, 8, 13) = 4 sessions per round.
+	expectedSessions := 4 * len(d.agentRounds)
 	if len(sessions) < expectedSessions {
-		errors = append(errors, fmt.Sprintf("Expected at least %d sessions (%d rounds * 3 threads), got %d",
+		errors = append(errors, fmt.Sprintf("Expected at least %d sessions (%d rounds * 4 threads), got %d",
 			expectedSessions, len(d.agentRounds), len(sessions)))
 	}
 
@@ -1410,15 +1576,21 @@ func (d *testDriver) validateStore() bool {
 		errors = append(errors, fmt.Sprintf("Expected at least %d sessions with ZedThreadID, got %d", expectedSessions, sessionsWithThread))
 	}
 
-	// Check completed interactions.
+	// Check completed/interrupted interactions.
 	// Phases 8 and 9 include mid-stream interrupt tests where the agent may be
 	// cancelled while executing tool calls (before generating any text). Those
 	// interactions legitimately end up complete with ResponseMessage="" and only
-	// tool_call entries. We treat them as "interrupted" and skip the text-content
-	// checks, but we do require that enough non-interrupted interactions have content.
+	// tool_call entries. Phase 13 interactions are marked as "interrupted" via
+	// the cancel_current_turn protocol.
 	completedInteractions := 0
 	completedWithContent := 0
+	interruptedInteractions := 0
 	for _, i := range interactions {
+		if i.State == types.InteractionStateInterrupted {
+			interruptedInteractions++
+			log.Printf("[store] Interaction %s: interrupted (phase 13 cancel_current_turn)", truncate(i.ID, 12))
+			continue
+		}
 		if i.State != types.InteractionStateComplete {
 			continue
 		}
