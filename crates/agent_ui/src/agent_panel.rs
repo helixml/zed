@@ -851,6 +851,21 @@ impl AgentPanel {
                 })?
                 .await?;
 
+            // Wait for WebSocket to connect before restoring threads.
+            // This ensures the agent_ready → open_thread handshake can complete:
+            // 1. WebSocket connects
+            // 2. Panel restoration loads thread from ACP storage (with shared lock)
+            // 3. Zed sends agent_ready
+            // 4. Server sends open_thread (which is a no-op if same thread, or loads
+            //    a different thread if the server wants to switch)
+            // The connection is local or DC-to-DC so this is fast (~100ms).
+            #[cfg(feature = "external_websocket_sync")]
+            {
+                external_websocket_sync::wait_for_websocket_connected(
+                    std::time::Duration::from_secs(10),
+                ).await;
+            }
+
             let last_active_thread = if let Some(thread_info) = serialized_panel
                 .as_ref()
                 .and_then(|p| p.last_active_thread.as_ref())
@@ -931,6 +946,19 @@ impl AgentPanel {
                             );
                         }
                     });
+                    // agent_ready is sent by initial_state's completion handler
+                    // when the thread load finishes (see conversation_view.rs)
+                } else {
+                    // No thread to restore — send agent_ready immediately so
+                    // the server knows Zed is ready and can flush its queue.
+                    // Without this, the server waits 60s for agent_ready.
+                    #[cfg(feature = "external_websocket_sync")]
+                    {
+                        external_websocket_sync::send_agent_ready(
+                            "zed-agent".to_string(),
+                            None,
+                        );
+                    }
                 }
                 panel
             })?;
@@ -1106,6 +1134,12 @@ impl AgentPanel {
                             },
                             _ => crate::Agent::NativeAgent,
                         };
+
+                        // Update selected_agent_type so serialization saves the correct type.
+                        // Without this, the panel serializes as NativeAgent, and on next
+                        // startup the restoration check goes through the sqlite path (which
+                        // fails for ACP agents), preventing thread restoration.
+                        this.selected_agent_type = connection_agent.clone().into();
 
                         let server = connection_agent.server(this.fs.clone(), this.thread_store.clone());
 

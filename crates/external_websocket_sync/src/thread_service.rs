@@ -61,6 +61,31 @@ static PERSISTENT_SUBSCRIPTIONS: parking_lot::Mutex<Option<Arc<RwLock<HashSet<St
 static THREAD_LOAD_IN_PROGRESS: parking_lot::Mutex<Option<String>> =
     parking_lot::Mutex::new(None);
 
+/// Try to acquire the thread load lock. Returns true if acquired (no other
+/// load in progress), false if another thread is currently loading.
+/// Must be paired with `release_thread_load_lock` when the load completes.
+pub fn try_acquire_thread_load_lock(thread_id: &str) -> bool {
+    let mut loading = THREAD_LOAD_IN_PROGRESS.lock();
+    if loading.is_some() {
+        eprintln!(
+            "⏳ [THREAD_SERVICE] Thread load lock busy (current={:?}), skipping load of {}",
+            loading, thread_id
+        );
+        false
+    } else {
+        eprintln!("🔒 [THREAD_SERVICE] Acquired thread load lock for {} (from panel restoration)", thread_id);
+        *loading = Some(thread_id.to_string());
+        true
+    }
+}
+
+/// Release the thread load lock after a load completes or fails.
+pub fn release_thread_load_lock() {
+    let mut loading = THREAD_LOAD_IN_PROGRESS.lock();
+    eprintln!("🔓 [THREAD_SERVICE] Released thread load lock (was {:?}, from panel restoration)", loading);
+    *loading = None;
+}
+
 /// Streaming throttle state per message entry.
 /// Keyed by "{thread_id}:{entry_idx}" to support multi-entry streaming.
 static STREAMING_THROTTLE: parking_lot::Mutex<Option<Arc<RwLock<HashMap<String, StreamingThrottleState>>>>> =
@@ -468,7 +493,7 @@ pub fn get_thread(acp_thread_id: &str) -> Option<WeakEntity<AcpThread>> {
 /// - `NewEntry`: new user/assistant message → send `message_added`
 /// - `EntryUpdated`: streaming tokens / tool call updates → throttled `message_added`
 /// - `Stopped`: turn completed → flush throttle + send `message_completed`
-fn ensure_thread_subscription(
+pub fn ensure_thread_subscription(
     thread_entity: &Entity<AcpThread>,
     thread_id: &str,
     cx: &mut App,
@@ -477,6 +502,16 @@ fn ensure_thread_subscription(
         eprintln!("🔔 [THREAD_SERVICE] Thread {} already has persistent subscription, skipping", thread_id);
         return;
     }
+
+    let entity_id = thread_entity.entity_id();
+    eprintln!(
+        "🔔 [THREAD_SERVICE] Creating NEW subscription for thread {} on entity {:?}",
+        thread_id, entity_id
+    );
+    log::info!(
+        "🔔 [THREAD_SERVICE] Creating NEW subscription for thread {} on entity {:?}",
+        thread_id, entity_id
+    );
 
     let thread_id_for_sub = thread_id.to_string();
     mark_persistent_subscription(thread_id.to_string());
@@ -489,7 +524,13 @@ fn ensure_thread_subscription(
         crate::get_thread_request_id(thread_id).unwrap_or_default()
     );
 
+    let sub_entity_id = entity_id;
     cx.subscribe(thread_entity, move |thread_entity, event, cx| {
+        let current_entity_id = thread_entity.entity_id();
+        eprintln!(
+            "🔔 [THREAD_SERVICE] Subscription FIRED for thread {} on entity {:?} (subscribed to {:?}), event: {:?}",
+            thread_id_for_sub, current_entity_id, sub_entity_id, std::mem::discriminant(event)
+        );
         match event {
             AcpThreadEvent::NewEntry => {
                 let thread = thread_entity.read(cx);

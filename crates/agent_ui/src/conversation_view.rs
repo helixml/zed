@@ -758,6 +758,10 @@ impl ConversationView {
         // Register thread in THREAD_REGISTRY
         {
             let session_id_str = id.to_string();
+            eprintln!(
+                "📋 [CONV_VIEW] from_existing_thread: registering entity {:?} for session {}",
+                thread.entity_id(), session_id_str
+            );
             external_websocket_sync::register_thread(session_id_str, thread);
         }
 
@@ -895,6 +899,28 @@ impl ConversationView {
 
             telemetry::event!("Agent Thread Started", agent = connection.telemetry_id());
 
+            // Acquire the shared thread load lock to prevent racing with
+            // open_existing_thread_sync in thread_service. Only one thread load
+            // can be in progress at a time. Use a drop guard so the lock is
+            // released on all exit paths (success, error, early return).
+            #[cfg(feature = "external_websocket_sync")]
+            struct LoadLockGuard(bool);
+            #[cfg(feature = "external_websocket_sync")]
+            impl Drop for LoadLockGuard {
+                fn drop(&mut self) {
+                    if self.0 {
+                        external_websocket_sync::release_thread_load_lock();
+                    }
+                }
+            }
+            #[cfg(feature = "external_websocket_sync")]
+            let _load_lock_guard = if load_session_id.is_some() {
+                let sid = load_session_id.as_ref().unwrap().0.to_string();
+                LoadLockGuard(external_websocket_sync::try_acquire_thread_load_lock(&sid))
+            } else {
+                LoadLockGuard(false)
+            };
+
             let mut resumed_without_history = false;
             let result = if let Some(session_id) = load_session_id.clone() {
                 cx.update(|_, cx| {
@@ -991,7 +1017,27 @@ impl ConversationView {
                         #[cfg(feature = "external_websocket_sync")]
                         {
                             let session_id = current.read(cx).thread.read(cx).session_id().to_string();
-                            external_websocket_sync::register_thread(session_id, current.read(cx).thread.clone());
+                            let entity = current.read(cx).thread.clone();
+                            eprintln!(
+                                "📋 [CONV_VIEW] initial_state: registering entity {:?} for session {} (is_resume={})",
+                                entity.entity_id(), session_id, is_resume
+                            );
+                            external_websocket_sync::register_thread(session_id.clone(), entity.clone());
+
+                            // When panel restoration resumes a thread, set up the WebSocket
+                            // sync subscription and send agent_ready. Panel restoration
+                            // bypasses the thread_service path (which normally does both),
+                            // so we must do it here. Without agent_ready, the server waits
+                            // 60s before flushing the open_thread/chat_message queue.
+                            if is_resume {
+                                external_websocket_sync::ensure_thread_subscription(
+                                    &entity, &session_id, cx,
+                                );
+                                external_websocket_sync::send_agent_ready(
+                                    this.agent.agent_id().0.to_string(),
+                                    Some(session_id),
+                                );
+                            }
                         }
 
                         let id = current.read(cx).thread.read(cx).session_id().clone();
