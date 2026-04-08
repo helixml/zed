@@ -86,6 +86,11 @@ pub fn release_thread_load_lock() {
     *loading = None;
 }
 
+/// Returns the thread_id currently held in the load lock, if any.
+pub fn get_load_in_progress_thread() -> Option<String> {
+    THREAD_LOAD_IN_PROGRESS.lock().clone()
+}
+
 /// Streaming throttle state per message entry.
 /// Keyed by "{thread_id}:{entry_idx}" to support multi-entry streaming.
 static STREAMING_THROTTLE: parking_lot::Mutex<Option<Arc<RwLock<HashMap<String, StreamingThrottleState>>>>> =
@@ -1477,13 +1482,62 @@ fn open_existing_thread_sync(
     // async loads race: both pass the registry check above, both spawn load tasks,
     // and the second overwrites the first's entity in the registry — orphaning
     // the first entity's event subscriptions.
+    //
+    // If panel restoration already holds the lock, WAIT for it to finish rather
+    // than skipping — panel restoration registers the entity, and once it releases
+    // the lock we can find the entity via the fast path and just subscribe +
+    // send agent_ready without doing a duplicate load.
     {
         let mut loading = THREAD_LOAD_IN_PROGRESS.lock();
         if let Some(in_progress) = loading.as_ref() {
-            eprintln!("⏳ [THREAD_SERVICE] DUPLICATE LOAD PREVENTED: {} is already loading, skipping load of {}",
+            let in_progress = in_progress.clone();
+            eprintln!("⏳ [THREAD_SERVICE] Load lock held by '{}', waiting for release before handling '{}'",
                       in_progress, request.acp_thread_id);
-            log::warn!("⏳ [THREAD_SERVICE] DUPLICATE LOAD PREVENTED: {} is already loading, skipping load of {}",
+            log::info!("⏳ [THREAD_SERVICE] Load lock held by '{}', waiting for release before handling '{}'",
                        in_progress, request.acp_thread_id);
+            drop(loading); // release parking_lot lock before spawning
+
+            let acp_thread_id = request.acp_thread_id.clone();
+            let agent_name = request.agent_name.clone();
+            cx.spawn(async move |cx| {
+                // Poll until the load lock is released (max 30 s).
+                let deadline = Instant::now() + Duration::from_secs(30);
+                loop {
+                    smol::Timer::after(Duration::from_millis(50)).await;
+                    if THREAD_LOAD_IN_PROGRESS.lock().is_none() {
+                        eprintln!("🔓 [THREAD_SERVICE] Load lock released, rechecking fast path for '{}'", acp_thread_id);
+                        break;
+                    }
+                    if Instant::now() > deadline {
+                        eprintln!("⚠️ [THREAD_SERVICE] Timed out waiting for load lock for '{}', proceeding anyway", acp_thread_id);
+                        break;
+                    }
+                }
+
+                // Recheck registry — whoever held the lock should have registered the entity.
+                if let Some(thread_weak) = get_thread(&acp_thread_id) {
+                    if let Some(thread_entity) = thread_weak.upgrade() {
+                        let flag_was_set = {
+                            let subs = PERSISTENT_SUBSCRIPTIONS.lock();
+                            subs.as_ref().map(|s| s.read().contains(&acp_thread_id)).unwrap_or(false)
+                        };
+                        let entity_id = thread_entity.entity_id();
+                        eprintln!(
+                            "🔍 [THREAD_SERVICE] After lock wait: fast-path entity={:?}, subscription flag was_set={} for '{}'",
+                            entity_id, flag_was_set, acp_thread_id
+                        );
+                        cx.update(|cx| {
+                            ensure_thread_subscription(&thread_entity, &acp_thread_id, cx);
+                        });
+                    }
+                    let agent_name_for_ready = agent_name.unwrap_or_else(|| "zed-agent".to_string());
+                    eprintln!("🚀 [THREAD_SERVICE] Sending agent_ready after lock-wait for '{}'", acp_thread_id);
+                    crate::send_agent_ready(agent_name_for_ready, Some(acp_thread_id));
+                } else {
+                    eprintln!("⚠️ [THREAD_SERVICE] Lock released but entity not in registry for '{}' — no action taken", acp_thread_id);
+                    log::warn!("⚠️ [THREAD_SERVICE] Lock released but entity not in registry for '{}'", acp_thread_id);
+                }
+            }).detach();
             return Ok(());
         }
         eprintln!("🔒 [THREAD_SERVICE] Acquired thread load lock for {}", request.acp_thread_id);
@@ -1632,10 +1686,25 @@ fn open_existing_thread_sync(
         // the panel-restoration entity while we registered a brand-new entity from
         // load_session — events on the new entity are never forwarded to Helix.
         {
+            let flag_was_set = {
+                let subs = PERSISTENT_SUBSCRIPTIONS.lock();
+                subs.as_ref().map(|s| s.read().contains(&acp_thread_id)).unwrap_or(false)
+            };
+            let load_session_entity_id = thread_entity.entity_id();
+            eprintln!(
+                "🔍 [THREAD_SERVICE] open_existing_thread_sync slow path: subscription flag was_set={}, load_session entity={:?} for '{}'",
+                flag_was_set, load_session_entity_id, acp_thread_id
+            );
+            log::info!(
+                "🔍 [THREAD_SERVICE] open_existing_thread_sync slow path: subscription flag was_set={}, load_session entity={:?} for '{}'",
+                flag_was_set, load_session_entity_id, acp_thread_id
+            );
+            // Clear any stale flag from a racing panel restoration that used a
+            // different entity before load_session completed here.
             let subs = PERSISTENT_SUBSCRIPTIONS.lock();
             if let Some(s) = subs.as_ref() {
                 if s.write().remove(&acp_thread_id) {
-                    eprintln!("🔄 [THREAD_SERVICE] Cleared stale subscription flag for '{}' (panel restoration used a different entity)", acp_thread_id);
+                    eprintln!("🔄 [THREAD_SERVICE] Cleared stale subscription flag for '{}' (was set on a different entity)", acp_thread_id);
                     log::info!("🔄 [THREAD_SERVICE] Cleared stale subscription flag for '{}' before re-subscribing on load_session entity", acp_thread_id);
                 }
             }
