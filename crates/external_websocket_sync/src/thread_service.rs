@@ -1624,6 +1624,22 @@ fn open_existing_thread_sync(
         // after a Zed restart the thread loads successfully but its NewEntry /
         // EntryUpdated / Stopped events have no listener, so message_added is
         // never emitted and the interaction stays stuck in "waiting" forever.
+        //
+        // We MUST clear the persistent-subscription flag first.  Panel restoration
+        // may have already called ensure_thread_subscription on a *different* entity
+        // (the one it created before load_session ran here), setting the flag.
+        // If we skip the call because the flag is set, the subscription stays on
+        // the panel-restoration entity while we registered a brand-new entity from
+        // load_session — events on the new entity are never forwarded to Helix.
+        {
+            let subs = PERSISTENT_SUBSCRIPTIONS.lock();
+            if let Some(s) = subs.as_ref() {
+                if s.write().remove(&acp_thread_id) {
+                    eprintln!("🔄 [THREAD_SERVICE] Cleared stale subscription flag for '{}' (panel restoration used a different entity)", acp_thread_id);
+                    log::info!("🔄 [THREAD_SERVICE] Cleared stale subscription flag for '{}' before re-subscribing on load_session entity", acp_thread_id);
+                }
+            }
+        }
         cx.update(|cx| {
             ensure_thread_subscription(&thread_entity, &acp_thread_id, cx);
         });
