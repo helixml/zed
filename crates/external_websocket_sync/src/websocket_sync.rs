@@ -423,10 +423,27 @@ impl WebSocketSync {
             return Ok(());
         }
 
-        eprintln!("💬 [WEBSOCKET-IN] Processing chat_message: acp_thread_id={:?}, request_id={}, message_len={}",
-                   chat_msg.acp_thread_id, chat_msg.request_id, chat_msg.message.len());
-        log::info!("💬 [WEBSOCKET-IN] Processing chat_message: acp_thread_id={:?}, request_id={}, message_len={}",
-                   chat_msg.acp_thread_id, chat_msg.request_id, chat_msg.message.len());
+        eprintln!("💬 [WEBSOCKET-IN] Processing chat_message: acp_thread_id={:?}, request_id={}, message_len={}, interrupt={}",
+                   chat_msg.acp_thread_id, chat_msg.request_id, chat_msg.message.len(), chat_msg.interrupt);
+        log::info!("💬 [WEBSOCKET-IN] Processing chat_message: acp_thread_id={:?}, request_id={}, message_len={}, interrupt={}",
+                   chat_msg.acp_thread_id, chat_msg.request_id, chat_msg.message.len(), chat_msg.interrupt);
+
+        // If this is an interrupt message and we have an existing thread, cancel its
+        // running turn immediately via the dedicated cancel task (which runs independently
+        // of the sequential callback_rx loop, so it can fire even while the loop is
+        // blocked awaiting the previous turn's response).
+        if chat_msg.interrupt {
+            if let Some(ref thread_id) = chat_msg.acp_thread_id {
+                if !thread_id.is_empty() {
+                    eprintln!("⚡ [WEBSOCKET-IN] Interrupt flag set — cancelling running turn on thread: {}", thread_id);
+                    log::info!("⚡ [WEBSOCKET-IN] Interrupt flag set — cancelling running turn on thread: {}", thread_id);
+                    if let Err(e) = crate::request_cancel_thread(thread_id.clone()) {
+                        eprintln!("⚠️ [WEBSOCKET-IN] Failed to request cancel for thread {}: {}", thread_id, e);
+                        log::warn!("⚠️ [WEBSOCKET-IN] Failed to request cancel for thread {}: {}", thread_id, e);
+                    }
+                }
+            }
+        }
 
         // Request thread creation via callback
         let request = ThreadCreationRequest {

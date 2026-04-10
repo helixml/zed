@@ -798,6 +798,37 @@ pub fn setup_thread_handler(
     let acp_history_store_for_open = acp_history_store.clone();
     let fs_for_open = fs.clone();
 
+    // Spawn dedicated cancel task — runs independently of the callback_rx loop so it
+    // can cancel a running turn even while callback_rx.recv().await is blocked.
+    let (cancel_tx, mut cancel_rx) = mpsc::unbounded_channel::<String>();
+    crate::init_cancel_thread_callback(cancel_tx);
+    cx.spawn(async move |cx| {
+        eprintln!("⚡ [CANCEL_TASK] Cancel task started, waiting for cancel requests...");
+        log::info!("⚡ [CANCEL_TASK] Cancel task started, waiting for cancel requests...");
+        while let Some(acp_thread_id) = cancel_rx.recv().await {
+            eprintln!("⚡ [CANCEL_TASK] Received cancel request for thread: {}", acp_thread_id);
+            log::info!("⚡ [CANCEL_TASK] Received cancel request for thread: {}", acp_thread_id);
+            if let Some(thread) = crate::get_thread(&acp_thread_id) {
+                let result = cx.update(|cx| {
+                    thread.update(cx, |t, cx| { t.cancel(cx) })
+                });
+                match result {
+                    Ok(_) => {
+                        eprintln!("✅ [CANCEL_TASK] Cancelled running turn on thread: {}", acp_thread_id);
+                        log::info!("✅ [CANCEL_TASK] Cancelled running turn on thread: {}", acp_thread_id);
+                    }
+                    Err(e) => {
+                        eprintln!("⚠️ [CANCEL_TASK] Failed to cancel thread {}: {}", acp_thread_id, e);
+                        log::warn!("⚠️ [CANCEL_TASK] Failed to cancel thread {}: {}", acp_thread_id, e);
+                    }
+                }
+            } else {
+                eprintln!("⚠️ [CANCEL_TASK] Thread {} not found in registry, skipping cancel", acp_thread_id);
+                log::warn!("⚠️ [CANCEL_TASK] Thread {} not found in registry, skipping cancel", acp_thread_id);
+            }
+        }
+    }).detach();
+
     // Spawn handler task to process thread creation requests
     cx.spawn(async move |cx| {
         eprintln!("🔧 [THREAD_SERVICE] Handler task started, waiting for requests...");
