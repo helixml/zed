@@ -528,6 +528,14 @@ pub fn ensure_thread_subscription(
     let turn_request_id: std::cell::RefCell<String> = std::cell::RefCell::new(
         crate::get_thread_request_id(thread_id).unwrap_or_default()
     );
+    // Tracks the last request_id for which message_completed was already sent.
+    // When Stopped fires for a turn that produced no assistant entries (e.g. the
+    // interrupt turn is immediately cancelled by Claude Code before generating
+    // any tokens), turn_request_id is never updated by NewEntry and still holds
+    // the previous turn's id. Detecting this via last_completed_request_id lets
+    // us fall back to the global THREAD_REQUEST_MAP which already points to the
+    // new turn's request_id.
+    let last_completed_request_id: std::cell::RefCell<String> = std::cell::RefCell::new(String::new());
 
     let sub_entity_id = entity_id;
     cx.subscribe(thread_entity, move |thread_entity, event, cx| {
@@ -717,8 +725,27 @@ pub fn ensure_thread_subscription(
                     }
                 }
 
-                // Use the turn's captured request_id for message_completed too
-                let completed_rid = turn_request_id.borrow().clone();
+                // Use the turn's captured request_id for message_completed.
+                // FALLBACK: if turn_request_id still holds the previous turn's id
+                // (because no assistant NewEntry fired to update it — happens when
+                // the interrupt turn is immediately cancelled with no output), use
+                // the current global THREAD_REQUEST_MAP which points to this turn.
+                let captured_rid = turn_request_id.borrow().clone();
+                let last_completed = last_completed_request_id.borrow().clone();
+                let completed_rid = if !captured_rid.is_empty() && captured_rid == last_completed {
+                    // turn_request_id is stale — the previous turn already used it.
+                    // Use the global map which has the current turn's request_id.
+                    let fallback = crate::get_thread_request_id(&thread_id_for_sub)
+                        .unwrap_or_else(|| captured_rid.clone());
+                    eprintln!(
+                        "📤 [THREAD_SERVICE] Stopped: turn_request_id={} already used, falling back to global={}",
+                        captured_rid, fallback
+                    );
+                    fallback
+                } else {
+                    captured_rid
+                };
+                *last_completed_request_id.borrow_mut() = completed_rid.clone();
                 eprintln!(
                     "📤 [THREAD_SERVICE] Stopped event: sending message_completed for thread {} (request_id={})",
                     thread_id_for_sub, completed_rid
