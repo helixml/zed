@@ -343,6 +343,8 @@ pub struct IncomingChatMessage {
     pub session_id: Option<String>,  // Optional session_id field from API (can be ignored)
     #[serde(default)]
     pub agent_name: Option<String>,  // Which agent to use (zed-agent or qwen) - defaults to zed-agent
+    #[serde(default)]
+    pub interrupt: bool,  // If true, cancel the current running turn before sending this message
 }
 
 /// Response for health check endpoint

@@ -92,6 +92,12 @@ static GLOBAL_THREAD_OPEN_CALLBACK: parking_lot::Mutex<Option<mpsc::UnboundedSen
 static GLOBAL_UI_STATE_QUERY_CALLBACK: parking_lot::Mutex<Option<mpsc::UnboundedSender<UiStateQueryRequest>>> =
     parking_lot::Mutex::new(None);
 
+/// Static global for cancel-thread callback.
+/// Receives an acp_thread_id and immediately cancels that thread's running turn,
+/// bypassing the sequential callback_rx loop (which would be blocked awaiting the turn).
+static GLOBAL_CANCEL_THREAD_CALLBACK: parking_lot::Mutex<Option<mpsc::UnboundedSender<String>>> =
+    parking_lot::Mutex::new(None);
+
 /// Pending UI state queries that arrived before AgentPanel was ready
 static PENDING_UI_STATE_QUERIES: parking_lot::Mutex<Vec<UiStateQueryRequest>> =
     parking_lot::Mutex::new(Vec::new());
@@ -849,6 +855,35 @@ pub fn subscribe_to_context_changes_global(context: Entity<TextThread>, external
     // Store the subscription in global state so it doesn't get dropped
     // TODO: We need a way to store these subscriptions globally
     eprintln!("✅ [SYNC_GLOBAL] Context subscription created for session: {}", external_session_id);
+}
+
+/// Request that the currently running turn on a thread be cancelled immediately.
+/// This bypasses the sequential callback_rx loop (which blocks waiting for turn
+/// completion) by routing through a dedicated cancel GPUI task.
+/// Called when Helix sends a chat_message with interrupt=true.
+pub fn request_cancel_thread(acp_thread_id: String) -> Result<()> {
+    eprintln!("⚡ [CANCEL] request_cancel_thread() called for thread: {}", acp_thread_id);
+    log::info!("⚡ [CANCEL] request_cancel_thread() called for thread: {}", acp_thread_id);
+
+    let sender = GLOBAL_CANCEL_THREAD_CALLBACK.lock().clone();
+    if let Some(sender) = sender {
+        sender.send(acp_thread_id)
+            .map_err(|_| anyhow::anyhow!("Failed to send cancel request"))?;
+        Ok(())
+    } else {
+        // Cancel task not yet initialized — log and ignore. The new message will
+        // be processed sequentially as before (no worse than the old behaviour).
+        eprintln!("⚠️ [CANCEL] Cancel callback not yet initialized, skipping cancel for thread: {}", acp_thread_id);
+        log::warn!("⚠️ [CANCEL] Cancel callback not yet initialized, skipping cancel for thread: {}", acp_thread_id);
+        Ok(())
+    }
+}
+
+/// Initialize the global cancel-thread callback (called from thread_service).
+pub fn init_cancel_thread_callback(sender: mpsc::UnboundedSender<String>) {
+    eprintln!("🔧 [CANCEL] init_cancel_thread_callback() called - registering global callback");
+    log::info!("🔧 [CANCEL] init_cancel_thread_callback() called - registering global callback");
+    *GLOBAL_CANCEL_THREAD_CALLBACK.lock() = Some(sender);
 }
 
 
