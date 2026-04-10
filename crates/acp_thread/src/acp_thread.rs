@@ -1027,6 +1027,10 @@ pub struct RetryStatus {
 struct RunningTurn {
     id: u32,
     send_task: Task<()>,
+    /// Set to true when cancel() has already emitted Stopped(Cancelled) for this
+    /// turn. The run_turn() outer future checks this to avoid a duplicate Stopped
+    /// when the dropped tx causes rx.await to return Err.
+    stopped_emitted: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
 pub struct AcpThread {
@@ -2174,12 +2178,15 @@ impl AcpThread {
 
         self.turn_id += 1;
         let turn_id = self.turn_id;
+        let stopped_emitted = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let stopped_emitted_for_task = stopped_emitted.clone();
         self.running_turn = Some(RunningTurn {
             id: turn_id,
             send_task: cx.spawn(async move |this, cx| {
                 cancel_task.await;
                 tx.send(f(this, cx).await).ok();
             }),
+            stopped_emitted,
         });
 
         cx.spawn(async move |this, cx| {
@@ -2205,7 +2212,14 @@ impl AcpThread {
                     if is_same_turn {
                         this.running_turn.take();
                     }
-                    cx.emit(AcpThreadEvent::Stopped(acp::StopReason::Cancelled));
+                    // Only emit Stopped if cancel() hasn't already done so
+                    // synchronously. cancel() emits Stopped before spawning the
+                    // next turn's send_task so that message_completed reaches the
+                    // server before the interrupt's tokens start — preserving FIFO
+                    // ordering. Without this guard the emission would be duplicated.
+                    if !stopped_emitted_for_task.load(std::sync::atomic::Ordering::Acquire) {
+                        cx.emit(AcpThreadEvent::Stopped(acp::StopReason::Cancelled));
+                    }
                     return Ok(None);
                 };
 
@@ -2299,20 +2313,27 @@ impl AcpThread {
         Self::flush_streaming_text(&mut self.streaming_text_buffer, cx);
         self.mark_pending_tools_as_canceled();
 
+        // Emit Stopped(Cancelled) SYNCHRONOUSLY before dropping the send_task.
+        // This guarantees message_completed is sent to the server BEFORE the
+        // next turn's send_task starts generating tokens, preserving the FIFO
+        // ordering expected by the E2E test (and by the server's isolation logic).
+        //
+        // We set stopped_emitted so the run_turn() outer future skips its own
+        // Stopped emission when rx returns Err (which happens because dropping
+        // send_task drops tx, making rx.await return Err). Without this guard
+        // the Stopped event would fire twice: once here and once from run_turn.
+        turn.stopped_emitted.store(true, std::sync::atomic::Ordering::Release);
+        cx.emit(AcpThreadEvent::Stopped(acp::StopReason::Cancelled));
+
         // Drop the send_task instead of awaiting it. This cancels the prompt
         // future immediately, which drops the oneshot `tx`. The `rx.await` in
-        // run_turn then returns Err, hitting the existing "tx dropped" handler
-        // that emits Stopped(Cancelled) (see the `let Ok(response) = response`
-        // branch in run_turn).
+        // run_turn then returns Err — the guard above suppresses the duplicate
+        // Stopped emission from that path.
         //
         // We still call connection.cancel() above as a courtesy notification
         // to the agent. But we don't wait for the agent to acknowledge it —
         // ACP agents that don't properly handle CancelNotification (see
         // claude-agent-acp#442, #423) would block the next turn indefinitely.
-        //
-        // The previous approach was:
-        //   cx.background_spawn(turn.send_task)
-        // which awaited the prompt future to completion before proceeding.
         drop(turn.send_task);
         Task::ready(())
     }

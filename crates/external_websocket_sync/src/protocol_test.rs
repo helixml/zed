@@ -445,7 +445,3 @@ mod tests {
     // This would test real ACP thread creation like acp_thread tests do
     // For now, protocol tests + code review provide sufficient confidence
 }
-
-entry_type: "text".to_string(),
-                        tool_name: String::new(),
-                        tool_status: String::new(),

@@ -1746,7 +1746,3 @@ mod tests {
         }
     }
 }
-
-entry_type: "text".to_string(),
-                tool_name: String::new(),
-                tool_status: String::new(),

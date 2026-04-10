@@ -1022,21 +1022,51 @@ impl ConversationView {
                                 "📋 [CONV_VIEW] initial_state: registering entity {:?} for session {} (is_resume={})",
                                 entity.entity_id(), session_id, is_resume
                             );
-                            external_websocket_sync::register_thread(session_id.clone(), entity.clone());
 
-                            // When panel restoration resumes a thread, set up the WebSocket
-                            // sync subscription and send agent_ready. Panel restoration
-                            // bypasses the thread_service path (which normally does both),
-                            // so we must do it here. Without agent_ready, the server waits
-                            // 60s before flushing the open_thread/chat_message queue.
                             if is_resume {
-                                external_websocket_sync::ensure_thread_subscription(
-                                    &entity, &session_id, cx,
-                                );
-                                external_websocket_sync::send_agent_ready(
-                                    this.agent.agent_id().0.to_string(),
-                                    Some(session_id),
-                                );
+                                // Try to own the load lock so that open_existing_thread_sync
+                                // waits for us rather than starting a parallel load.
+                                //
+                                // If open_existing_thread_sync already holds the lock for
+                                // THIS thread, it is already loading — skip panel restoration
+                                // entirely so we don't clobber its entity in the registry.
+                                // open_existing_thread_sync's wait-on-lock path will call
+                                // register_thread, ensure_thread_subscription, and send_agent_ready
+                                // once its load completes.
+                                let in_progress = external_websocket_sync::get_load_in_progress_thread();
+                                let other_is_loading_us = in_progress.as_deref() == Some(&session_id);
+
+                                if other_is_loading_us {
+                                    eprintln!(
+                                        "⏭️ [CONV_VIEW] Panel restoration for {} skipped: open_existing_thread_sync already holds the load lock for this thread",
+                                        session_id
+                                    );
+                                    // open_existing_thread_sync will handle register + subscribe + agent_ready.
+                                } else {
+                                    // We win the race (or it's a different thread's load).
+                                    // Acquire lock so open_existing_thread_sync waits for us.
+                                    let lock_acquired = external_websocket_sync::try_acquire_thread_load_lock(&session_id);
+                                    eprintln!(
+                                        "📋 [CONV_VIEW] Panel restoration for {}: lock_acquired={}",
+                                        session_id, lock_acquired
+                                    );
+
+                                    external_websocket_sync::register_thread(session_id.clone(), entity.clone());
+                                    external_websocket_sync::ensure_thread_subscription(
+                                        &entity, &session_id, cx,
+                                    );
+                                    external_websocket_sync::send_agent_ready(
+                                        this.agent.agent_id().0.to_string(),
+                                        Some(session_id.clone()),
+                                    );
+
+                                    if lock_acquired {
+                                        external_websocket_sync::release_thread_load_lock();
+                                    }
+                                }
+                            } else {
+                                // Fresh (non-resumed) thread — just register for routing.
+                                external_websocket_sync::register_thread(session_id.clone(), entity.clone());
                             }
                         }
 

@@ -86,6 +86,11 @@ pub fn release_thread_load_lock() {
     *loading = None;
 }
 
+/// Returns the thread_id currently held in the load lock, if any.
+pub fn get_load_in_progress_thread() -> Option<String> {
+    THREAD_LOAD_IN_PROGRESS.lock().clone()
+}
+
 /// Streaming throttle state per message entry.
 /// Keyed by "{thread_id}:{entry_idx}" to support multi-entry streaming.
 static STREAMING_THROTTLE: parking_lot::Mutex<Option<Arc<RwLock<HashMap<String, StreamingThrottleState>>>>> =
@@ -523,6 +528,14 @@ pub fn ensure_thread_subscription(
     let turn_request_id: std::cell::RefCell<String> = std::cell::RefCell::new(
         crate::get_thread_request_id(thread_id).unwrap_or_default()
     );
+    // Tracks the last request_id for which message_completed was already sent.
+    // When Stopped fires for a turn that produced no assistant entries (e.g. the
+    // interrupt turn is immediately cancelled by Claude Code before generating
+    // any tokens), turn_request_id is never updated by NewEntry and still holds
+    // the previous turn's id. Detecting this via last_completed_request_id lets
+    // us fall back to the global THREAD_REQUEST_MAP which already points to the
+    // new turn's request_id.
+    let last_completed_request_id: std::cell::RefCell<String> = std::cell::RefCell::new(String::new());
 
     let sub_entity_id = entity_id;
     cx.subscribe(thread_entity, move |thread_entity, event, cx| {
@@ -712,8 +725,27 @@ pub fn ensure_thread_subscription(
                     }
                 }
 
-                // Use the turn's captured request_id for message_completed too
-                let completed_rid = turn_request_id.borrow().clone();
+                // Use the turn's captured request_id for message_completed.
+                // FALLBACK: if turn_request_id still holds the previous turn's id
+                // (because no assistant NewEntry fired to update it — happens when
+                // the interrupt turn is immediately cancelled with no output), use
+                // the current global THREAD_REQUEST_MAP which points to this turn.
+                let captured_rid = turn_request_id.borrow().clone();
+                let last_completed = last_completed_request_id.borrow().clone();
+                let completed_rid = if !captured_rid.is_empty() && captured_rid == last_completed {
+                    // turn_request_id is stale — the previous turn already used it.
+                    // Use the global map which has the current turn's request_id.
+                    let fallback = crate::get_thread_request_id(&thread_id_for_sub)
+                        .unwrap_or_else(|| captured_rid.clone());
+                    eprintln!(
+                        "📤 [THREAD_SERVICE] Stopped: turn_request_id={} already used, falling back to global={}",
+                        captured_rid, fallback
+                    );
+                    fallback
+                } else {
+                    captured_rid
+                };
+                *last_completed_request_id.borrow_mut() = completed_rid.clone();
                 eprintln!(
                     "📤 [THREAD_SERVICE] Stopped event: sending message_completed for thread {} (request_id={})",
                     thread_id_for_sub, completed_rid
@@ -1477,13 +1509,62 @@ fn open_existing_thread_sync(
     // async loads race: both pass the registry check above, both spawn load tasks,
     // and the second overwrites the first's entity in the registry — orphaning
     // the first entity's event subscriptions.
+    //
+    // If panel restoration already holds the lock, WAIT for it to finish rather
+    // than skipping — panel restoration registers the entity, and once it releases
+    // the lock we can find the entity via the fast path and just subscribe +
+    // send agent_ready without doing a duplicate load.
     {
         let mut loading = THREAD_LOAD_IN_PROGRESS.lock();
         if let Some(in_progress) = loading.as_ref() {
-            eprintln!("⏳ [THREAD_SERVICE] DUPLICATE LOAD PREVENTED: {} is already loading, skipping load of {}",
+            let in_progress = in_progress.clone();
+            eprintln!("⏳ [THREAD_SERVICE] Load lock held by '{}', waiting for release before handling '{}'",
                       in_progress, request.acp_thread_id);
-            log::warn!("⏳ [THREAD_SERVICE] DUPLICATE LOAD PREVENTED: {} is already loading, skipping load of {}",
+            log::info!("⏳ [THREAD_SERVICE] Load lock held by '{}', waiting for release before handling '{}'",
                        in_progress, request.acp_thread_id);
+            drop(loading); // release parking_lot lock before spawning
+
+            let acp_thread_id = request.acp_thread_id.clone();
+            let agent_name = request.agent_name.clone();
+            cx.spawn(async move |cx| {
+                // Poll until the load lock is released (max 30 s).
+                let deadline = Instant::now() + Duration::from_secs(30);
+                loop {
+                    smol::Timer::after(Duration::from_millis(50)).await;
+                    if THREAD_LOAD_IN_PROGRESS.lock().is_none() {
+                        eprintln!("🔓 [THREAD_SERVICE] Load lock released, rechecking fast path for '{}'", acp_thread_id);
+                        break;
+                    }
+                    if Instant::now() > deadline {
+                        eprintln!("⚠️ [THREAD_SERVICE] Timed out waiting for load lock for '{}', proceeding anyway", acp_thread_id);
+                        break;
+                    }
+                }
+
+                // Recheck registry — whoever held the lock should have registered the entity.
+                if let Some(thread_weak) = get_thread(&acp_thread_id) {
+                    if let Some(thread_entity) = thread_weak.upgrade() {
+                        let flag_was_set = {
+                            let subs = PERSISTENT_SUBSCRIPTIONS.lock();
+                            subs.as_ref().map(|s| s.read().contains(&acp_thread_id)).unwrap_or(false)
+                        };
+                        let entity_id = thread_entity.entity_id();
+                        eprintln!(
+                            "🔍 [THREAD_SERVICE] After lock wait: fast-path entity={:?}, subscription flag was_set={} for '{}'",
+                            entity_id, flag_was_set, acp_thread_id
+                        );
+                        cx.update(|cx| {
+                            ensure_thread_subscription(&thread_entity, &acp_thread_id, cx);
+                        });
+                    }
+                    let agent_name_for_ready = agent_name.unwrap_or_else(|| "zed-agent".to_string());
+                    eprintln!("🚀 [THREAD_SERVICE] Sending agent_ready after lock-wait for '{}'", acp_thread_id);
+                    crate::send_agent_ready(agent_name_for_ready, Some(acp_thread_id));
+                } else {
+                    eprintln!("⚠️ [THREAD_SERVICE] Lock released but entity not in registry for '{}' — no action taken", acp_thread_id);
+                    log::warn!("⚠️ [THREAD_SERVICE] Lock released but entity not in registry for '{}'", acp_thread_id);
+                }
+            }).detach();
             return Ok(());
         }
         eprintln!("🔒 [THREAD_SERVICE] Acquired thread load lock for {}", request.acp_thread_id);
@@ -1624,6 +1705,37 @@ fn open_existing_thread_sync(
         // after a Zed restart the thread loads successfully but its NewEntry /
         // EntryUpdated / Stopped events have no listener, so message_added is
         // never emitted and the interaction stays stuck in "waiting" forever.
+        //
+        // We MUST clear the persistent-subscription flag first.  Panel restoration
+        // may have already called ensure_thread_subscription on a *different* entity
+        // (the one it created before load_session ran here), setting the flag.
+        // If we skip the call because the flag is set, the subscription stays on
+        // the panel-restoration entity while we registered a brand-new entity from
+        // load_session — events on the new entity are never forwarded to Helix.
+        {
+            let flag_was_set = {
+                let subs = PERSISTENT_SUBSCRIPTIONS.lock();
+                subs.as_ref().map(|s| s.read().contains(&acp_thread_id)).unwrap_or(false)
+            };
+            let load_session_entity_id = thread_entity.entity_id();
+            eprintln!(
+                "🔍 [THREAD_SERVICE] open_existing_thread_sync slow path: subscription flag was_set={}, load_session entity={:?} for '{}'",
+                flag_was_set, load_session_entity_id, acp_thread_id
+            );
+            log::info!(
+                "🔍 [THREAD_SERVICE] open_existing_thread_sync slow path: subscription flag was_set={}, load_session entity={:?} for '{}'",
+                flag_was_set, load_session_entity_id, acp_thread_id
+            );
+            // Clear any stale flag from a racing panel restoration that used a
+            // different entity before load_session completed here.
+            let subs = PERSISTENT_SUBSCRIPTIONS.lock();
+            if let Some(s) = subs.as_ref() {
+                if s.write().remove(&acp_thread_id) {
+                    eprintln!("🔄 [THREAD_SERVICE] Cleared stale subscription flag for '{}' (was set on a different entity)", acp_thread_id);
+                    log::info!("🔄 [THREAD_SERVICE] Cleared stale subscription flag for '{}' before re-subscribing on load_session entity", acp_thread_id);
+                }
+            }
+        }
         cx.update(|cx| {
             ensure_thread_subscription(&thread_entity, &acp_thread_id, cx);
         });
