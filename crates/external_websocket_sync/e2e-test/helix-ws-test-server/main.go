@@ -286,6 +286,21 @@ func (d *testDriver) syncEventCallback(sessionID string, syncMsg *types.SyncMess
 		d.round.completions[acpThreadID] = append(d.round.completions[acpThreadID], requestID)
 		currentPhase := d.phase
 
+		// Validate request_id matches the current phase. Without this, stale
+		// completions from phase N (arriving while d.phase is already N+1) would
+		// be misattributed to phase N+1, causing false "phase completed" signals.
+		// For example, a duplicate Phase 11 completion arriving while d.phase=12
+		// would falsely set phase12Completed=true before Phase 12 sends its message.
+		// All request IDs follow the pattern "req-phase{N}-...-{agent}" so prefix
+		// matching works for all phases including 8 and 9 which have sub-IDs.
+		expectedReqPrefix := fmt.Sprintf("req-phase%d-", currentPhase)
+		if !strings.HasPrefix(requestID, expectedReqPrefix) {
+			d.mu.Unlock()
+			log.Printf("[%s] FILTERED completion (wrong phase): req=%s expected prefix=%s phase=%d",
+				agentName, requestID, expectedReqPrefix, currentPhase)
+			return
+		}
+
 		// Phase 8 needs two completions before the test can end: one for the cancelled
 		// initial turn and one for the interrupt response.
 		if currentPhase == 8 && acpThreadID == d.round.phase8ThreadID {
