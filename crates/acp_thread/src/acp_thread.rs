@@ -2287,7 +2287,17 @@ impl AcpThread {
                             }
                         }
 
-                        cx.emit(AcpThreadEvent::Stopped(r.stop_reason));
+                        // Guard against duplicate Stopped emission: cancel()
+                        // may have already emitted Stopped synchronously (and
+                        // set stopped_emitted). Without this check, a race
+                        // between natural completion and cancel() would fire
+                        // Stopped twice, causing duplicate message_completed
+                        // events on the server.
+                        if !stopped_emitted_for_task
+                            .load(std::sync::atomic::Ordering::Acquire)
+                        {
+                            cx.emit(AcpThreadEvent::Stopped(r.stop_reason));
+                        }
                         Ok(Some(r))
                     }
                     Err(e) => {

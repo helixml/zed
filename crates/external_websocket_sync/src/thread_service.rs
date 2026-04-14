@@ -528,6 +528,10 @@ pub fn ensure_thread_subscription(
     let turn_request_id: std::cell::RefCell<String> = std::cell::RefCell::new(
         crate::get_thread_request_id(thread_id).unwrap_or_default()
     );
+    // The previous turn's request_id, kept so that background events
+    // (e.g. async tool completions) for entries from a completed turn
+    // can still be tagged with the correct request_id.
+    let prev_turn_request_id: std::cell::RefCell<String> = std::cell::RefCell::new(String::new());
     // Tracks the last request_id for which message_completed was already sent.
     // When Stopped fires for a turn that produced no assistant entries (e.g. the
     // interrupt turn is immediately cancelled by Claude Code before generating
@@ -570,14 +574,27 @@ pub fn ensure_thread_subscription(
                         }
                         _ => (String::new(), String::new()),
                     };
-                    let rid = crate::get_thread_request_id(&thread_id_for_sub)
-                        .unwrap_or_default();
-                    // Snapshot the request_id when the first assistant entry of a turn appears.
-                    // This ensures the Stopped flush uses the turn's own request_id, not a
-                    // later follow-up's.
+                    // Update turn_request_id from the global map only at turn
+                    // boundaries — i.e. when the current turn_request_id has
+                    // already been used for a message_completed (matches
+                    // last_completed_request_id). This prevents a follow-up
+                    // message that overwrites the global map from poisoning
+                    // the current turn's request_id via a late NewEntry.
                     if role == "assistant" {
-                        *turn_request_id.borrow_mut() = rid.clone();
+                        let current = turn_request_id.borrow().clone();
+                        let completed = last_completed_request_id.borrow().clone();
+                        if current.is_empty() || current == completed {
+                            // Rotate: current → prev before overwriting.
+                            *prev_turn_request_id.borrow_mut() = current;
+                            let global_rid = crate::get_thread_request_id(&thread_id_for_sub)
+                                .unwrap_or_default();
+                            *turn_request_id.borrow_mut() = global_rid;
+                        }
                     }
+                    // Use the turn-scoped request_id for all events, not the
+                    // global THREAD_REQUEST_MAP which can be overwritten by a
+                    // follow-up/interrupt message between turns.
+                    let rid = turn_request_id.borrow().clone();
                     // Re-send preceding entries FROM THE CURRENT TURN with their
                     // current content. flush_streaming_text() was called right before
                     // push_entry(), so all Markdown entities have their complete text.
@@ -648,8 +665,27 @@ pub fn ensure_thread_subscription(
                         }
                         _ => return,
                     };
-                    let rid = crate::get_thread_request_id(&thread_id_for_sub)
-                        .unwrap_or_default();
+                    // Pick the right request_id based on whether this entry
+                    // belongs to the current turn or a previous one.  Claude
+                    // Code can deliver background events (tool completions,
+                    // text flushes) asynchronously via session_notification
+                    // after a turn has ended.  These must be tagged with the
+                    // PREVIOUS turn's request_id so the Helix side routes
+                    // them to the correct interaction.
+                    let entries = thread.entries();
+                    let turn_start = entries.iter().enumerate().rev()
+                        .find_map(|(i, e)| matches!(e, acp_thread::AgentThreadEntry::UserMessage(_)).then_some(i + 1))
+                        .unwrap_or(0);
+                    let rid = if *entry_idx < turn_start {
+                        let prev = prev_turn_request_id.borrow().clone();
+                        if !prev.is_empty() {
+                            prev
+                        } else {
+                            turn_request_id.borrow().clone()
+                        }
+                    } else {
+                        turn_request_id.borrow().clone()
+                    };
                     throttled_send_message_added(
                         &thread_id_for_sub,
                         *entry_idx,
