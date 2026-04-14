@@ -143,6 +143,7 @@ These files contain Helix-specific changes that must be preserved during rebases
 - **`content_only()` method on `AssistantMessage`**: Returns content without the `## Assistant\n\n` heading. Used by thread_service.rs for WebSocket sync to avoid sending the heading to Helix.
 - **`AcpThreadEvent::Stopped` is a tuple variant**: As of the 2026-03-22 upstream merge, `Stopped` takes a `StopReason` argument: `Stopped(acp::StopReason)`. Pattern matches must use `Stopped(_)` and emission must pass a reason, e.g. `cx.emit(AcpThreadEvent::Stopped(acp::StopReason::Cancelled))`.
 - **`cancel()` drops send_task instead of awaiting**: See Critical Fix #8 below.
+- **`run_turn()` normal completion guards Stopped with `stopped_emitted`**: See Critical Fix #9 below.
 
 ### `crates/acp_thread/src/connection.rs`
 - **`wait_for_tools_ready()` on `AgentConnection` trait**: New method added to `AgentConnection`. Default impl returns `Task::ready(())`. `HeadlessConnection` relies on the default. `NativeAgentConnection` implementation in `context_server_registry.rs` waits for all pending MCP tool loads. **When upstream adds methods to `AgentConnection`, `HeadlessConnection` must be updated** — it won't compile otherwise.
@@ -329,6 +330,27 @@ pub fn cancel(&mut self, cx: &mut Context<Self>) -> Task<()> {
 
 **Note:** Even if the claude-agent-acp cancel bugs (#442, #423) are fully fixed upstream, the drop approach should be kept as a defensive measure. Any ACP agent that doesn't properly respond to `CancelNotification` would cause the same deadlock. The drop approach makes Zed resilient to buggy agent implementations without changing protocol semantics (the cancel notification is still sent).
 
+### 9. Guard Normal-Completion Stopped Against Duplicate Emission
+
+**File:** `crates/acp_thread/src/acp_thread.rs` — `run_turn()` outer future
+
+**Bug:** Critical Fix #8 made `cancel()` emit `Stopped(Cancelled)` synchronously and set `stopped_emitted` to prevent the Err/tx-dropped path from re-emitting. However, if `tx.send(Ok(response))` races ahead of the task drop (the prompt completes naturally just before the cancel takes effect), `rx.await` returns `Ok` and enters the **normal completion path** — which emits `Stopped` at line ~2290 without checking `stopped_emitted`. This causes a duplicate `Stopped` event.
+
+The duplicate Stopped triggers the thread_service subscription's stale-detection logic (`turn_request_id == last_completed_request_id`), which falls back to the global `THREAD_REQUEST_MAP` — now pointing to the NEXT turn's request_id. The second `message_completed` is sent with the next turn's request_id, **prematurely completing the next interaction** and shifting all subsequent responses off by one.
+
+**Fix:** Add the same `stopped_emitted_for_task` guard to the normal completion path:
+
+```rust
+// In run_turn(), Ok branch, before emitting Stopped:
+if !stopped_emitted_for_task.load(std::sync::atomic::Ordering::Acquire) {
+    cx.emit(AcpThreadEvent::Stopped(r.stop_reason));
+}
+```
+
+**History:** Detected via container logs showing 3 Stopped events for a single interaction, causing systematic n-1 response shift in a localhost session.
+
+**Symptom:** After an interrupt, all subsequent messages return the response for the _previous_ message. The session appears permanently "off by one."
+
 ## Environment Variables
 
 | Variable | Purpose | Default |
@@ -398,6 +420,7 @@ When rebasing/merging against upstream Zed:
 29. **Check `SyncEvent::UiStateResponse`** — has `mcp_servers` and `active_model` fields
 30. **Check `NativeAgent` multi-project**: `agent.projects.values().next()` to get `ProjectState`; no more flat `agent.project` or `agent.context_server_registry()` fields/methods
 31. **Check `acp_thread.rs` `cancel()`** — must `drop(turn.send_task)` not `cx.background_spawn(turn.send_task)` (Critical Fix #8)
+31a. **Check `acp_thread.rs` `run_turn()` normal completion** — `Stopped` emission must be guarded by `stopped_emitted_for_task` check (Critical Fix #9)
 32. **Run `cargo check --package zed --features external_websocket_sync`** — must compile
 32. **Run `cargo test -p external_websocket_sync`** — unit tests
 33. **Run E2E test** after merge to verify all phases pass
