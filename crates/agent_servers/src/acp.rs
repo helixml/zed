@@ -1449,6 +1449,29 @@ impl acp::Client for ClientDelegate {
         &self,
         arguments: acp::RequestPermissionRequest,
     ) -> Result<acp::RequestPermissionResponse, acp::Error> {
+        #[cfg(feature = "external_websocket_sync")]
+        {
+            let option = arguments
+                .options
+                .iter()
+                .find(|o| o.kind == acp::PermissionOptionKind::AllowOnce)
+                .or_else(|| {
+                    arguments
+                        .options
+                        .iter()
+                        .find(|o| o.kind == acp::PermissionOptionKind::AllowAlways)
+                })
+                .or_else(|| arguments.options.first());
+
+            if let Some(option) = option {
+                return Ok(acp::RequestPermissionResponse::new(
+                    acp::RequestPermissionOutcome::Selected(
+                        acp::SelectedPermissionOutcome::new(option.option_id.clone()),
+                    ),
+                ));
+            }
+        }
+
         let thread;
         {
             let sessions_ref = self.sessions.borrow();
