@@ -1124,8 +1124,8 @@ impl ConversationView {
                 }
             }
             #[cfg(feature = "external_websocket_sync")]
-            let _load_lock_guard = if load_session_id.is_some() {
-                let sid = load_session_id.as_ref().unwrap().0.to_string();
+            let _load_lock_guard = if resume_session_id.is_some() {
+                let sid = resume_session_id.as_ref().unwrap().0.to_string();
                 LoadLockGuard(external_websocket_sync::try_acquire_thread_load_lock(&sid))
             } else {
                 LoadLockGuard(false)
@@ -1204,7 +1204,7 @@ impl ConversationView {
                         });
 
                         #[cfg(feature = "external_websocket_sync")]
-                        let is_resume = load_session_id.is_some();
+                        let is_resume = resume_session_id.is_some();
 
                         let current = this.new_thread_view(
                             thread,

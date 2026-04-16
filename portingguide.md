@@ -108,14 +108,13 @@ These files contain Helix-specific changes that must be preserved during rebases
 
 ### `crates/agent_ui/src/conversation_view.rs`
 
-> **Note:** This was previously `crates/agent_ui/src/acp/thread_view.rs`. The upstream 2026-03-22 merge renamed the `acp` module to `conversation_view`. All Helix changes moved with it.
+> **Note:** Helix changes were previously in `crates/agent_ui/src/acp/thread_view.rs`. The upstream 2026-03-22 merge moved them to `conversation_view.rs`. The old `acp/` directory still exists on disk but is dead code — it's not declared as a module in the crate root (`agent_ui.rs`).
 
-- **`HeadlessConnection`**: No-op `AgentConnection` impl for WebSocket-created threads (cfg-gated). Must implement `agent_id()` and `new_session()` — their signatures must track the `AgentConnection` trait. Default impls handle `wait_for_tools_ready()`.
-- **`from_existing_thread()` constructor**: Creates a `ConversationView` wrapping an existing `Entity<AcpThread>` with a `HeadlessConnection`. Must initialize `thread_id: ThreadId::new()` and `root_session_id: Some(id.clone())` on the struct. Uses `ConnectedServerState` with `connection`, `auth_state`, `active_id`, `threads` HashMap, `conversation` Entity, `history`, and `_connection_entry_subscription` (use `Subscription::new(|| {})`). Takes `connection_store` and `connection_key` parameters.
+- **`from_existing_thread()` constructor**: Creates a `ConversationView` wrapping an existing `Entity<AcpThread>` using the thread's own connection (`thread.read(cx).connection().clone()`). Must initialize `thread_id: ThreadId::new()` and `root_session_id: Some(id.clone())` on the struct. Uses `ConnectedServerState` with `connection`, `auth_state`, `active_id`, `threads` HashMap, `conversation` Entity, `history`, and `_connection_entry_subscription` (use `Subscription::new(|| {})`). Takes `connection_store` and `connection_key` parameters.
 - **Thread registry integration**: Registers threads from both `from_existing_thread` and the connected state into `THREAD_REGISTRY`
 - **History refresh**: Calls `self.history().update(cx, |h, cx| h.refresh(cx))` on `Stopped` events — note `history` is now a method (`history()`) not a field, and must guard with `if let Some(history) = self.history()`.
 - **Thread unregistration on reset/drop**: Calls `external_websocket_sync::unregister_thread()` when the view resets or the entity changes
-- **`is_resume` flag**: Uses `load_session_id.is_some()` (not the removed `resume_thread` variable) to determine whether a thread is being resumed vs created new, for the `UserCreatedThread` WebSocket event gate
+- **`is_resume` flag**: Uses `resume_session_id.is_some()` to determine whether a thread is being resumed vs created new, for the `UserCreatedThread` WebSocket event gate
 
 ### `crates/agent_ui/src/config_options.rs`
 
@@ -146,7 +145,7 @@ These files contain Helix-specific changes that must be preserved during rebases
 - **`run_turn()` normal completion guards Stopped with `stopped_emitted`**: See Critical Fix #9 below.
 
 ### `crates/acp_thread/src/connection.rs`
-- **`wait_for_tools_ready()` on `AgentConnection` trait**: New method added to `AgentConnection`. Default impl returns `Task::ready(())`. `HeadlessConnection` relies on the default. `NativeAgentConnection` implementation in `context_server_registry.rs` waits for all pending MCP tool loads. **When upstream adds methods to `AgentConnection`, `HeadlessConnection` must be updated** — it won't compile otherwise.
+- **`wait_for_tools_ready()` on `AgentConnection` trait**: Method on `AgentConnection`. Default impl returns `Task::ready(())`. `NativeAgentConnection` implementation in `context_server_registry.rs` waits for all pending MCP tool loads.
 - **`new_session()` takes `PathList` not `&Path`**: As of 2026-03-22, signature is `new_session(self: Rc<Self>, project: Entity<Project>, work_dirs: PathList, cx: &mut App)`. Use `PathList::new(&[cwd.clone()])` to construct from a `PathBuf`.
 - **`load_session()` signature changed**: Now `load_session(self: Rc<Self>, session_id: acp::SessionId, project: Entity<Project>, work_dirs: PathList, title: Option<SharedString>, cx: &mut App)`. The old `AgentSessionInfo` wrapper is gone — pass `acp::SessionId::new(id)` directly.
 
@@ -397,9 +396,9 @@ When rebasing/merging against upstream Zed:
 7. **Run `cargo test -p acp_thread test_second_send`** — verifies `Stopped` invariant (Critical Fix #6)
 8. **Check `thread_view.rs` unregistration** — ensure `unregister_thread()` is called when entity changes (Critical Fix #7)
 9. **Check `agent_panel.rs` cfg-gated blocks** — callback setup, `from_existing_thread`, onboarding dismissal, `acp_history_store()`, entity-level split-brain detection, auto-follow activation. Match on `BaseView::AgentThread` (renamed from `ActiveView`). Use `this.base_view` (renamed from `active_view`). Call `set_base_view()` (renamed from `set_active_view`). Use `this.selected_agent = ...` (renamed from `selected_agent_type`). History is now in `OverlayView`, not `BaseView`.
-10. **Check `conversation_view.rs` cfg-gated blocks** — `HeadlessConnection` (needs `agent_id()` + correct `new_session(PathList)` signature), `from_existing_thread()`, THREAD_REGISTRY registration, `self.history()` method call (not field), `is_resume = load_session_id.is_some()` (not `resume_thread`), `unregister_thread()` on reset. Must set `root_session_id` in initial_state THREAD_REGISTRY block.
+10. **Check `conversation_view.rs` cfg-gated blocks** — `from_existing_thread()` (uses thread's own connection, not HeadlessConnection), THREAD_REGISTRY registration, `self.history()` method call (not field), `is_resume = resume_session_id.is_some()`, `unregister_thread()` on reset. Must set `root_session_id` in initial_state THREAD_REGISTRY block.
 11. **Check `from_existing_thread()` matches `ConversationView` struct and `ConnectedServerState`** — struct requires `thread_id: ThreadId::new()` and `root_session_id: Some(id.clone())`. `ConnectedServerState` requires: `connection`, `auth_state`, `active_id`, `threads` HashMap, `conversation` Entity, `history`, `_connection_entry_subscription`. `ConversationView` also requires `connection_store` and `connection_key` fields.
-12. **Check `connection.rs` `AgentConnection` trait** — if upstream added new methods, `HeadlessConnection` must implement them. Currently requires `agent_id()` and `new_session(project, PathList, cx)`. Check for compilation errors.
+12. **Check `connection.rs` `AgentConnection` trait** — if upstream added new methods, any custom `AgentConnection` impls must implement them. Check for compilation errors.
 12a. **Check `AcpThreadEvent::Stopped` usage** — it's a tuple variant `Stopped(StopReason)`. Pattern matches must use `Stopped(_)`, emissions must pass a reason e.g. `AcpThreadEvent::Stopped(acp::StopReason::Cancelled)`.
 13. **Check `thread_service.rs` uses new `AgentServer`/`AgentConnection` APIs** — `AgentServerDelegate::new(store, None)` (2 args), `server.connect(delegate, project, cx)` (3 args, returns `Rc` not tuple), `connection.new_session(project, PathList::new(&[cwd]), cx)`, `connection.load_session(session_id, project, PathList::new(&[cwd]), None, cx)` (5 args), `first_method.id()` (method not field)
 14. **Check `types.rs` `ExternalAgent::server()` uses `CustomAgentServer::new(AgentId(...))`** — `Gemini`/`ClaudeCode` structs removed from `agent_servers`
