@@ -4863,6 +4863,10 @@ impl AgentPanel {
     }
 
     fn should_render_trial_end_upsell(&self, cx: &mut Context<Self>) -> bool {
+        // In Helix builds, AI is configured centrally; don't show Zed Pro ads.
+        if cfg!(feature = "external_websocket_sync") {
+            return false;
+        }
         if TrialEndUpsell::dismissed(cx) {
             return false;
         }
