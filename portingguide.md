@@ -97,13 +97,13 @@ These files contain Helix-specific changes that must be preserved during rebases
 
 ### `crates/agent_ui/src/agent_panel.rs`
 - **Thread display callback**: Receives `ThreadDisplayNotification` from thread_service, calls `from_existing_thread()` to display threads in the panel. Passes `this.connection_store.clone()` and `crate::Agent::NativeAgent` to the constructor (required since the 2026-03-22 upstream merge added these fields to `ConversationView`).
-- **UI state query callback**: Responds to `query_ui_state` with current active_view, thread_id, entry_count, `mcp_servers` map, and `active_model` string. Matches `ActiveView::AgentThread { conversation_view }` (not `server_view` — field was renamed in upstream 2026-03-22 merge).
+- **UI state query callback**: Responds to `query_ui_state` with current active_view, thread_id, entry_count, `mcp_servers` map, and `active_model` string. Matches `BaseView::AgentThread { conversation_view }` (renamed from `ActiveView` in upstream April 2026 merge). History is now checked via `this.overlay_view` (moved from `BaseView` to `OverlayView`).
 - **Thread creation callback**: Wires up thread_service to create threads
 - **Thread open callback**: Wires up thread_service to open existing threads
 - **Onboarding dismissal**: Auto-dismisses `OnboardingUpsell` when WebSocket sync is active
 - **`acp_history_store()`**: Accessor for `ThreadStore` entity, used by WebSocket integration setup (cfg-gated)
-- **Entity-level split-brain detection**: In `ThreadDisplayNotification` handler, compares `Entity` references (not just session IDs) to detect container-restart split-brain where the same thread ID has a new entity. Match on `conversation_view` (not `server_view`) in `ActiveView::AgentThread`.
-- **Auto-follow activation**: After `set_active_view`, calls `workspace.follow(CollaboratorId::Agent)` if `should_be_following` is true — both for new threads and follow-up messages via the "same entity" path
+- **Entity-level split-brain detection**: In `ThreadDisplayNotification` handler, compares `Entity` references (not just session IDs) to detect container-restart split-brain where the same thread ID has a new entity. Match on `conversation_view` (not `server_view`) in `BaseView::AgentThread`.
+- **Auto-follow activation**: After `set_base_view`, calls `workspace.follow(CollaboratorId::Agent)` if `should_be_following` is true — both for new threads and follow-up messages via the "same entity" path
 - **History from connection_store**: `ThreadDisplayNotification` reads history via `this.connection_store.read(cx).entry(&Agent::NativeAgent).and_then(|e| e.read(cx).history().cloned())` — backed by `AcpSessionList`, not `NativeAgentSessionList`.
 
 ### `crates/agent_ui/src/conversation_view.rs`
@@ -111,7 +111,7 @@ These files contain Helix-specific changes that must be preserved during rebases
 > **Note:** This was previously `crates/agent_ui/src/acp/thread_view.rs`. The upstream 2026-03-22 merge renamed the `acp` module to `conversation_view`. All Helix changes moved with it.
 
 - **`HeadlessConnection`**: No-op `AgentConnection` impl for WebSocket-created threads (cfg-gated). Must implement `agent_id()` and `new_session()` — their signatures must track the `AgentConnection` trait. Default impls handle `wait_for_tools_ready()`.
-- **`from_existing_thread()` constructor**: Creates a `ConversationView` wrapping an existing `Entity<AcpThread>` with a `HeadlessConnection`. Uses `ConnectedServerState` with `connection`, `auth_state`, `active_id`, `threads` HashMap, `conversation` Entity, `history`, and `_connection_entry_subscription` (use `Subscription::new(|| {})`). Takes `connection_store` and `connection_key` parameters.
+- **`from_existing_thread()` constructor**: Creates a `ConversationView` wrapping an existing `Entity<AcpThread>` with a `HeadlessConnection`. Must initialize `thread_id: ThreadId::new()` and `root_session_id: Some(id.clone())` on the struct. Uses `ConnectedServerState` with `connection`, `auth_state`, `active_id`, `threads` HashMap, `conversation` Entity, `history`, and `_connection_entry_subscription` (use `Subscription::new(|| {})`). Takes `connection_store` and `connection_key` parameters.
 - **Thread registry integration**: Registers threads from both `from_existing_thread` and the connected state into `THREAD_REGISTRY`
 - **History refresh**: Calls `self.history().update(cx, |h, cx| h.refresh(cx))` on `Stopped` events — note `history` is now a method (`history()`) not a field, and must guard with `if let Some(history) = self.history()`.
 - **Thread unregistration on reset/drop**: Calls `external_websocket_sync::unregister_thread()` when the view resets or the entity changes
@@ -396,9 +396,9 @@ When rebasing/merging against upstream Zed:
 6. **Check `thread_service.rs` streaming path** — ensure stale pending entries are flushed when a new entry starts (Critical Fix #5)
 7. **Run `cargo test -p acp_thread test_second_send`** — verifies `Stopped` invariant (Critical Fix #6)
 8. **Check `thread_view.rs` unregistration** — ensure `unregister_thread()` is called when entity changes (Critical Fix #7)
-9. **Check `agent_panel.rs` cfg-gated blocks** — callback setup, `from_existing_thread`, onboarding dismissal, `acp_history_store()`, entity-level split-brain detection, auto-follow activation
-10. **Check `conversation_view.rs` cfg-gated blocks** — `HeadlessConnection` (needs `agent_id()` + correct `new_session(PathList)` signature), `from_existing_thread()`, THREAD_REGISTRY registration, `self.history()` method call (not field), `is_resume = load_session_id.is_some()` (not `resume_thread`), `unregister_thread()` on reset
-11. **Check `from_existing_thread()` matches `ConnectedServerState` struct** — upstream may change required fields (currently: `connection`, `auth_state`, `active_id`, `threads` HashMap, `conversation` Entity, `history`, `_connection_entry_subscription`). `ConversationView` itself also requires `connection_store` and `connection_key` fields (no `login`/`history` direct fields).
+9. **Check `agent_panel.rs` cfg-gated blocks** — callback setup, `from_existing_thread`, onboarding dismissal, `acp_history_store()`, entity-level split-brain detection, auto-follow activation. Match on `BaseView::AgentThread` (renamed from `ActiveView`). Use `this.base_view` (renamed from `active_view`). Call `set_base_view()` (renamed from `set_active_view`). Use `this.selected_agent = ...` (renamed from `selected_agent_type`). History is now in `OverlayView`, not `BaseView`.
+10. **Check `conversation_view.rs` cfg-gated blocks** — `HeadlessConnection` (needs `agent_id()` + correct `new_session(PathList)` signature), `from_existing_thread()`, THREAD_REGISTRY registration, `self.history()` method call (not field), `is_resume = load_session_id.is_some()` (not `resume_thread`), `unregister_thread()` on reset. Must set `root_session_id` in initial_state THREAD_REGISTRY block.
+11. **Check `from_existing_thread()` matches `ConversationView` struct and `ConnectedServerState`** — struct requires `thread_id: ThreadId::new()` and `root_session_id: Some(id.clone())`. `ConnectedServerState` requires: `connection`, `auth_state`, `active_id`, `threads` HashMap, `conversation` Entity, `history`, `_connection_entry_subscription`. `ConversationView` also requires `connection_store` and `connection_key` fields.
 12. **Check `connection.rs` `AgentConnection` trait** — if upstream added new methods, `HeadlessConnection` must implement them. Currently requires `agent_id()` and `new_session(project, PathList, cx)`. Check for compilation errors.
 12a. **Check `AcpThreadEvent::Stopped` usage** — it's a tuple variant `Stopped(StopReason)`. Pattern matches must use `Stopped(_)`, emissions must pass a reason e.g. `AcpThreadEvent::Stopped(acp::StopReason::Cancelled)`.
 13. **Check `thread_service.rs` uses new `AgentServer`/`AgentConnection` APIs** — `AgentServerDelegate::new(store, None)` (2 args), `server.connect(delegate, project, cx)` (3 args, returns `Rc` not tuple), `connection.new_session(project, PathList::new(&[cwd]), cx)`, `connection.load_session(session_id, project, PathList::new(&[cwd]), None, cx)` (5 args), `first_method.id()` (method not field)
@@ -422,8 +422,14 @@ When rebasing/merging against upstream Zed:
 31. **Check `acp_thread.rs` `cancel()`** — must `drop(turn.send_task)` not `cx.background_spawn(turn.send_task)` (Critical Fix #8)
 31a. **Check `acp_thread.rs` `run_turn()` normal completion** — `Stopped` emission must be guarded by `stopped_emitted_for_task` check (Critical Fix #9)
 32. **Run `cargo check --package zed --features external_websocket_sync`** — must compile
-32. **Run `cargo test -p external_websocket_sync`** — unit tests
-33. **Run E2E test** after merge to verify all phases pass
+33. **Run `cargo test -p external_websocket_sync`** — unit tests
+34. **Run E2E test** after merge to verify all phases pass
+35. **Check for removed upstream crates/imports** — upstream periodically removes crates (e.g., `assistant_text_thread` removed in #52757). Dead `use` statements referencing removed crates will fail to compile.
+36. **Check for removed upstream feature flags** — upstream may remove feature flags (e.g., `AgentV2FeatureFlag` removed in #52792). Any `cx.has_flag::<RemovedFlag>()` calls will fail.
+37. **Check `agent_panel.rs` field/type renames** — upstream renames struct fields and types periodically (e.g., `ActiveView`→`BaseView`, `active_view`→`base_view`, `set_active_view`→`set_base_view`, `selected_agent_type`→`selected_agent`). Helix cfg-gated blocks must use current names.
+38. **Check `context_server_registry.rs` match arms** — upstream may add new `ContextServerStatus` variants (e.g., `AuthRequired`). Helix's `pending_server_starts` tracking match arm must include all stop-like variants. Also check the UI state query match in `agent_panel.rs`.
+39. **Check `agent_panel.rs` onboarding methods** — upstream renames onboarding methods (e.g., `should_render_onboarding`→`should_render_new_user_onboarding`). Helix's cfg-gated early return must be in the current method.
+40. **Check `conversation_view.rs` struct fields** — upstream may add new fields to `ConversationView` (e.g., `thread_id`, `root_session_id`). `from_existing_thread()` must initialize all fields.
 
 ## Building
 
@@ -487,3 +493,23 @@ Helix-specific commits on main (oldest first):
 | `8b033a4451` | **Test: add Stopped emission and mid-stream interrupt E2E tests (Critical Fix #6)** |
 | `85be6df7b6` | **Fix: E2E seed session, user_created_thread tracking, interaction count** |
 | `6e0e6db32b` | **Fix: drop cancel task to prevent deadlock with Claude Code (Critical Fix #8)** |
+| `14c079c266` | Flush pending text before sending new entries to prevent truncated streaming |
+| `73f9af2162` | Re-read current entry content in NewEntry handler |
+| `6e35959201` | Remove streaming text reveal rate-limit to fix WebSocket sync truncation |
+| `bc4921681f` | Scope NewEntry re-send to current turn to prevent cross-interaction leaks |
+| `520f327183` | Fix: serialize correct agent_type for externally-opened threads |
+| `cf4e7d6f78` | Fix: serialize agent_type + wait for WebSocket before panel restoration |
+| `f3a2622736` | Fix: send agent_ready and set up subscription from panel restoration path |
+| `48de0cf877` | Fix: share thread load lock with panel restoration, use agent_id for agent_ready |
+| `0fef8b27c1` | Fix: send agent_ready even when no thread to restore |
+| `47950a9cf8` | Fix: call ensure_thread_subscription in open_existing_thread_sync |
+| `22f94a8bbb` | Fix: clear stale subscription flag before re-subscribing |
+| `d470dac687` | Fix: coordinate panel restoration and open_existing_thread_sync via load lock |
+| `28c48a25e9` | Fix: remove orphaned struct fields left by bad merge |
+| `90bdb6cf75` | **Fix: emit Stopped synchronously in cancel() to fix phase 8 FIFO ordering (Critical Fix #9)** |
+| `a7e4d8b850` | **Fix: implement real interrupt — cancel running turn before queuing new message** |
+| `f96525f558` | Fix: filter stale phase completions in E2E test |
+| `2f182e64d6` | **Fix: prevent request_id desync from background events and duplicate Stopped** |
+| `55f797f2bc` | Auto-approve ACP permission requests when external_websocket_sync is enabled |
+| `a10947e541` | Merge upstream/main (692 commits) into Helix fork |
+| `715cffff16` | Fix post-merge: ActiveView→BaseView, root_session_id, AuthRequired |
