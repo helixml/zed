@@ -2,7 +2,7 @@
 description = "The fast, collaborative code editor."
 edition.workspace = true
 name = "zed"
-version = "0.230.0"
+version = "0.234.0"
 publish.workspace = true
 license = "GPL-3.0-or-later"
 authors = ["Zed Team <hi@zed.dev>"]
@@ -14,6 +14,8 @@ workspace = true
 [features]
 tracy = ["ztracing/tracy"]
 external_websocket_sync = ["agent_ui/external_websocket_sync", "dep:external_websocket_sync", "title_bar/external_websocket_sync", "agent_servers/external_websocket_sync"]
+# LEAK_BACKTRACE=1 cargo run --features zed/track-project-leak --profile release-fast
+track-project-leak = ["gpui/leak-detection"]
 test-support = [
     "gpui/test-support",
     "gpui_platform/screen-capture",
@@ -67,7 +69,7 @@ activity_indicator.workspace = true
 agent.workspace = true
 agent-client-protocol.workspace = true
 agent_settings.workspace = true
-agent_ui.workspace = true
+agent_ui = { workspace = true, features = ["audio"] }
 anyhow.workspace = true
 askpass.workspace = true
 assets.workspace = true
@@ -197,6 +199,7 @@ telemetry.workspace = true
 telemetry_events.workspace = true
 terminal_view.workspace = true
 theme.workspace = true
+theme_settings.workspace = true
 theme_extension.workspace = true
 theme_selector.workspace = true
 time.workspace = true
@@ -239,6 +242,11 @@ gpui = { workspace = true, features = [
     "x11",
 ] }
 ashpd.workspace = true
+image.workspace = true
+
+[target.'cfg(any(target_os = "linux", target_os = "freebsd"))'.build-dependencies]
+image.workspace = true
+
 
 [target.'cfg(target_os = "linux")'.build-dependencies]
 pkg-config = "0.3.22"
@@ -260,6 +268,8 @@ image.workspace = true
 agent_ui = { workspace = true, features = ["test-support"] }
 search = { workspace = true, features = ["test-support"] }
 repl = { workspace = true, features = ["test-support"] }
+
+
 
 [package.metadata.bundle-dev]
 icon = ["resources/app-icon-dev@2x.png", "resources/app-icon-dev.png"]

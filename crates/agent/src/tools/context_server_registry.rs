@@ -301,7 +301,7 @@ impl ContextServerRegistry {
         let project::context_server_store::ServerStatusChangedEvent { server_id, status } = event;
 
         match status {
-            ContextServerStatus::Starting => {}
+            ContextServerStatus::Starting | ContextServerStatus::Authenticating => {}
             ContextServerStatus::Running => {
                 if self.pending_server_starts.remove(server_id) {
                     self.pending_tool_loads = self.pending_tool_loads.saturating_sub(1);
@@ -310,7 +310,9 @@ impl ContextServerRegistry {
                 self.reload_tools_for_server(server_id.clone(), cx);
                 self.reload_prompts_for_server(server_id.clone(), cx);
             }
-            ContextServerStatus::Stopped | ContextServerStatus::Error(_) => {
+            ContextServerStatus::Stopped
+            | ContextServerStatus::Error(_)
+            | ContextServerStatus::AuthRequired => {
                 if self.pending_server_starts.remove(server_id) {
                     self.pending_tool_loads = self.pending_tool_loads.saturating_sub(1);
                     let _ = self.tools_ready_tx.send(self.pending_tool_loads);
