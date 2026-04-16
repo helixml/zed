@@ -100,7 +100,7 @@ These files contain Helix-specific changes that must be preserved during rebases
 - **UI state query callback**: Responds to `query_ui_state` with current active_view, thread_id, entry_count, `mcp_servers` map, and `active_model` string. Matches `BaseView::AgentThread { conversation_view }` (renamed from `ActiveView` in upstream April 2026 merge). History is now checked via `this.overlay_view` (moved from `BaseView` to `OverlayView`).
 - **Thread creation callback**: Wires up thread_service to create threads
 - **Thread open callback**: Wires up thread_service to open existing threads
-- **Onboarding dismissal**: Auto-dismisses `OnboardingUpsell` when WebSocket sync is active
+- **Onboarding/upsell suppression**: Both `should_render_new_user_onboarding()` and `should_render_trial_end_upsell()` return false via `cfg!(feature = "external_websocket_sync")` guard. Auto-dismisses `OnboardingUpsell` when WebSocket sync is active
 - **`acp_history_store()`**: Accessor for `ThreadStore` entity, used by WebSocket integration setup (cfg-gated)
 - **Entity-level split-brain detection**: In `ThreadDisplayNotification` handler, compares `Entity` references (not just session IDs) to detect container-restart split-brain where the same thread ID has a new entity. Match on `conversation_view` (not `server_view`) in `BaseView::AgentThread`.
 - **Auto-follow activation**: After `set_base_view`, calls `workspace.follow(CollaboratorId::Agent)` if `should_be_following` is true — both for new threads and follow-up messages via the "same entity" path
@@ -427,7 +427,7 @@ When rebasing/merging against upstream Zed:
 36. **Check for removed upstream feature flags** — upstream may remove feature flags (e.g., `AgentV2FeatureFlag` removed in #52792). Any `cx.has_flag::<RemovedFlag>()` calls will fail.
 37. **Check `agent_panel.rs` field/type renames** — upstream renames struct fields and types periodically (e.g., `ActiveView`→`BaseView`, `active_view`→`base_view`, `set_active_view`→`set_base_view`, `selected_agent_type`→`selected_agent`). Helix cfg-gated blocks must use current names.
 38. **Check `context_server_registry.rs` match arms** — upstream may add new `ContextServerStatus` variants (e.g., `AuthRequired`). Helix's `pending_server_starts` tracking match arm must include all stop-like variants. Also check the UI state query match in `agent_panel.rs`.
-39. **Check `agent_panel.rs` onboarding methods** — upstream renames onboarding methods (e.g., `should_render_onboarding`→`should_render_new_user_onboarding`). Helix's cfg-gated early return must be in the current method.
+39. **Check `agent_panel.rs` onboarding/upsell methods** — upstream renames or adds promotional UI methods. Both `should_render_new_user_onboarding()` and `should_render_trial_end_upsell()` must have `cfg!(feature = "external_websocket_sync")` early-return guards. Check for any new `should_render_*` methods that show Zed Pro ads.
 40. **Check `conversation_view.rs` struct fields** — upstream may add new fields to `ConversationView` (e.g., `thread_id`, `root_session_id`). `from_existing_thread()` must initialize all fields.
 
 ## Building
