@@ -966,6 +966,8 @@ impl ConversationView {
             project,
             thread_store,
             prompt_store,
+            thread_id: ThreadId::new(),
+            root_session_id: Some(id.clone()),
             server_state: ServerState::Connected(ConnectedServerState {
                 connection,
                 auth_state: AuthState::Ok,

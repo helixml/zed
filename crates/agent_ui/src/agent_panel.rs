@@ -1125,7 +1125,7 @@ impl AgentPanel {
                         // keeps observing the stale entity from state restoration while the
                         // new entity receives live updates — causing a "brain split" where
                         // Helix sees updates but Zed's display is frozen.
-                        if let ActiveView::AgentThread { conversation_view } = &this.active_view {
+                        if let BaseView::AgentThread { conversation_view } = &this.base_view {
                             if let Some(active_thread) = conversation_view.read(cx).active_thread() {
                                 if active_thread.read(cx).thread == notification.thread_entity {
                                     eprintln!("🔄 [AGENT_PANEL] Already showing thread {} with same entity, skipping", incoming_session_id);
@@ -1171,7 +1171,7 @@ impl AgentPanel {
                         // Without this, the panel serializes as NativeAgent, and on next
                         // startup the restoration check goes through the sqlite path (which
                         // fails for ACP agents), preventing thread restoration.
-                        this.selected_agent_type = connection_agent.clone().into();
+                        this.selected_agent = connection_agent.clone();
 
                         let server = connection_agent.server(this.fs.clone(), this.thread_store.clone());
 
@@ -1197,8 +1197,8 @@ impl AgentPanel {
                             )
                         });
 
-                        this.set_active_view(
-                            ActiveView::AgentThread { conversation_view },
+                        this.set_base_view(
+                            BaseView::AgentThread { conversation_view },
                             true,
                             window,
                             cx,
@@ -1210,7 +1210,7 @@ impl AgentPanel {
                         // Activate following for externally-initiated threads.
                         // AcpThreadView defaults should_be_following to true, so new
                         // threads from Helix will auto-follow the agent's location.
-                        if let ActiveView::AgentThread { conversation_view } = &this.active_view {
+                        if let BaseView::AgentThread { conversation_view } = &this.base_view {
                             if let Some(active_thread) = conversation_view.read(cx).active_thread() {
                                 let should_follow = active_thread.read(cx).should_be_following;
                                 if should_follow {
@@ -1253,8 +1253,8 @@ impl AgentPanel {
                 while let Some(query) = query_rx.recv().await {
                     let query_id = query.query_id.clone();
                     this.update(cx, |this, cx| {
-                        let (active_view_str, thread_id, entry_count, active_model) = match &this.active_view {
-                            ActiveView::AgentThread { conversation_view } => {
+                        let (active_view_str, thread_id, entry_count, active_model) = match &this.base_view {
+                            BaseView::AgentThread { conversation_view } => {
                                 if let Some(acp_thread_view) = conversation_view.read(cx).active_thread() {
                                     let active_thread = acp_thread_view.read(cx);
                                     let thread_entity = &active_thread.thread;
@@ -1270,9 +1270,13 @@ impl AgentPanel {
                                     ("agent_thread_loading".to_string(), None, 0, None)
                                 }
                             }
-                            ActiveView::History { .. } => ("history".to_string(), None, 0, None),
-                            ActiveView::Uninitialized => ("uninitialized".to_string(), None, 0, None),
-                            _ => ("other".to_string(), None, 0, None),
+                            BaseView::Uninitialized => {
+                                if matches!(this.overlay_view, Some(OverlayView::History { .. })) {
+                                    ("history".to_string(), None, 0, None)
+                                } else {
+                                    ("uninitialized".to_string(), None, 0, None)
+                                }
+                            }
                         };
 
                         let mcp_servers = {
@@ -1286,6 +1290,7 @@ impl AgentPanel {
                                         project::context_server_store::ContextServerStatus::Starting => "starting",
                                         project::context_server_store::ContextServerStatus::Stopped => "stopped",
                                         project::context_server_store::ContextServerStatus::Error(_) => "error",
+                                        project::context_server_store::ContextServerStatus::AuthRequired => "auth_required",
                                     };
                                     servers.insert(server_id.0.to_string(), status_str.to_string());
                                 }
