@@ -6,7 +6,7 @@
 use anyhow::Result;
 use acp_thread::{AcpThread, AcpThreadEvent};
 use agent::ThreadStore;
-use agent_client_protocol::{self as acp, ContentBlock, TextContent};
+use agent_client_protocol::schema as acp;
 use util::path_list::PathList;
 use gpui::{App, Entity, WeakEntity};
 use parking_lot::RwLock;
@@ -1322,8 +1322,8 @@ fn create_new_thread_sync(
         eprintln!("🔧 [THREAD_SERVICE] About to send message to thread...");
         let send_task = cx.update(|cx| {
             thread_entity.update(cx, |thread: &mut AcpThread, cx| {
-                let message = vec![ContentBlock::Text(
-                    TextContent::new(request_clone.message.clone())
+                let message = vec![acp::ContentBlock::Text(
+                    acp::TextContent::new(request_clone.message.clone())
                 )];
                 eprintln!("🔧 [THREAD_SERVICE] Calling thread.send() with message: {}", request_clone.message);
                 thread.send(message, cx)
@@ -1396,8 +1396,8 @@ async fn handle_follow_up_message(
 
     let send_task = cx.update(|cx| {
         thread.update(cx, |thread: &mut AcpThread, cx| {
-            let message = vec![ContentBlock::Text(
-                TextContent::new(message.clone())
+            let message = vec![acp::ContentBlock::Text(
+                acp::TextContent::new(message.clone())
             )];
             thread.send(message, cx)
         })

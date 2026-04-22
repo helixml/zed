@@ -15,7 +15,6 @@ doctest = false
 [features]
 default = []
 external_websocket_sync = ["dep:external_websocket_sync"]
-stories = ["dep:story"]
 test-support = [
     "call/test-support",
     "client/test-support",

@@ -709,7 +709,6 @@ impl ConversationView {
         project: Entity<Project>,
         thread_store: Option<Entity<ThreadStore>>,
         prompt_store: Option<Entity<PromptStore>>,
-        history: Option<Entity<ThreadHistory>>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
@@ -756,7 +755,6 @@ impl ConversationView {
                 workspace.clone(),
                 project.downgrade(),
                 thread_store.clone(),
-                history.as_ref().map(|h| h.downgrade()),
                 prompt_store.clone(),
                 session_capabilities.clone(),
                 agent_id.clone(),
@@ -880,7 +878,6 @@ impl ConversationView {
         });
         let current = cx.new(|cx| {
             ThreadView::new(
-                None, // parent_id
                 thread.clone(),
                 conversation_entity.clone(),
                 weak,
@@ -899,7 +896,6 @@ impl ConversationView {
                 false, // resumed_without_history
                 project.downgrade(),
                 thread_store.clone(),
-                history.clone(),
                 prompt_store.clone(),
                 None, // initial_content
                 thread_subscriptions,
@@ -929,13 +925,14 @@ impl ConversationView {
             project,
             thread_store,
             prompt_store,
+            thread_id: ThreadId::new(),
+            root_session_id: Some(id.clone()),
             server_state: ServerState::Connected(ConnectedServerState {
                 connection,
                 auth_state: AuthState::Ok,
                 active_id: Some(id.clone()),
                 threads: HashMap::from_iter([(id, current)]),
                 conversation: conversation_entity,
-                history,
                 _connection_entry_subscription: Subscription::new(|| {}),
             }),
             notifications: Vec::new(),
@@ -1093,8 +1090,8 @@ impl ConversationView {
                 }
             }
             #[cfg(feature = "external_websocket_sync")]
-            let _load_lock_guard = if load_session_id.is_some() {
-                let sid = load_session_id.as_ref().unwrap().0.to_string();
+            let _load_lock_guard = if resume_session_id.is_some() {
+                let sid = resume_session_id.as_ref().unwrap().0.to_string();
                 LoadLockGuard(external_websocket_sync::try_acquire_thread_load_lock(&sid))
             } else {
                 LoadLockGuard(false)
@@ -1173,7 +1170,7 @@ impl ConversationView {
                         });
 
                         #[cfg(feature = "external_websocket_sync")]
-                        let is_resume = load_session_id.is_some();
+                        let is_resume = resume_session_id.is_some();
 
                         let current = this.new_thread_view(
                             thread,
@@ -1254,10 +1251,13 @@ impl ConversationView {
                         #[cfg(feature = "external_websocket_sync")]
                         {
                             if !is_resume {
-                                let thread_entity = &current.read(cx).thread;
-                                let acp_thread_id = thread_entity.read(cx).session_id().to_string();
-                                let title = thread_entity.read(cx).title().to_string();
-                                let title_opt = if title.is_empty() { None } else { Some(title) };
+                                let (acp_thread_id, title_opt) = this.active_thread()
+                                    .map(|tv| {
+                                        let thread = &tv.read(cx).thread;
+                                        let t = thread.read(cx);
+                                        (t.session_id().to_string(), t.title().map(|t| t.to_string()))
+                                    })
+                                    .unwrap_or_default();
                                 if let Err(e) = external_websocket_sync::send_websocket_event(
                                     external_websocket_sync::SyncEvent::UserCreatedThread {
                                         acp_thread_id,
@@ -1841,9 +1841,7 @@ impl ConversationView {
                 // Stopped handler in thread_service.rs (create_new_thread_sync /
                 // load_thread_from_agent). No action needed here.
 
-                if let Some(history) = self.history() {
-                    history.update(cx, |history, cx| history.refresh(cx));
-                }
+                // History refresh handled by ThreadView subscription
             }
             AcpThreadEvent::Refusal => {
                 let error = ThreadError::Refusal;
@@ -1916,7 +1914,7 @@ impl ConversationView {
                 #[cfg(feature = "external_websocket_sync")]
                 {
                     let acp_thread_id = thread.read(cx).session_id().to_string();
-                    let title_str = thread.read(cx).title().to_string();
+                    let title_str = thread.read(cx).title().map(|t| t.to_string()).unwrap_or_default();
 
                     if let Err(e) = external_websocket_sync::send_websocket_event(
                         external_websocket_sync::SyncEvent::ThreadTitleChanged {
