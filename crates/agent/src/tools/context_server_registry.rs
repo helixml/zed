@@ -1,5 +1,5 @@
 use crate::{AgentToolOutput, AnyAgentTool, ToolCallEventStream, ToolInput};
-use agent_client_protocol::ToolKind;
+use agent_client_protocol::schema as acp;
 use anyhow::Result;
 use collections::{BTreeMap, HashMap, HashSet};
 use context_server::{ContextServerId, client::NotificationSubscription};
@@ -301,7 +301,7 @@ impl ContextServerRegistry {
         let project::context_server_store::ServerStatusChangedEvent { server_id, status } = event;
 
         match status {
-            ContextServerStatus::Starting => {}
+            ContextServerStatus::Starting | ContextServerStatus::Authenticating => {}
             ContextServerStatus::Running => {
                 if self.pending_server_starts.remove(server_id) {
                     self.pending_tool_loads = self.pending_tool_loads.saturating_sub(1);
@@ -310,7 +310,9 @@ impl ContextServerRegistry {
                 self.reload_tools_for_server(server_id.clone(), cx);
                 self.reload_prompts_for_server(server_id.clone(), cx);
             }
-            ContextServerStatus::Stopped | ContextServerStatus::Error(_) => {
+            ContextServerStatus::Stopped
+            | ContextServerStatus::Error(_)
+            | ContextServerStatus::AuthRequired => {
                 if self.pending_server_starts.remove(server_id) {
                     self.pending_tool_loads = self.pending_tool_loads.saturating_sub(1);
                     let _ = self.tools_ready_tx.send(self.pending_tool_loads);
@@ -358,8 +360,8 @@ impl AnyAgentTool for ContextServerTool {
         self.tool.description.clone().unwrap_or_default().into()
     }
 
-    fn kind(&self) -> ToolKind {
-        ToolKind::Other
+    fn kind(&self) -> acp::ToolKind {
+        acp::ToolKind::Other
     }
 
     fn initial_title(&self, _input: serde_json::Value, _cx: &mut App) -> SharedString {

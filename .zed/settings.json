@@ -49,7 +49,7 @@
   },
   "file_types": {
     "Dockerfile": ["Dockerfile*[!dockerignore]"],
-    "JSONC": ["**/assets/**/*.json", "renovate.json"],
+    "JSONC": ["**/assets/**/*.json"],
     "Git Ignore": ["dockerignore"],
   },
   "hard_tabs": false,
@@ -58,8 +58,7 @@
   "ensure_final_newline_on_save": true,
   "file_scan_exclusions": [
     "crates/agent/src/edit_agent/evals/fixtures",
-    "crates/eval/worktrees/",
-    "crates/eval/repos/",
+    "crates/agent/src/tools/evals/fixtures",
     "**/.git",
     "**/.svn",
     "**/.hg",
