@@ -97,25 +97,24 @@ These files contain Helix-specific changes that must be preserved during rebases
 
 ### `crates/agent_ui/src/agent_panel.rs`
 - **Thread display callback**: Receives `ThreadDisplayNotification` from thread_service, calls `from_existing_thread()` to display threads in the panel. Passes `this.connection_store.clone()` and `crate::Agent::NativeAgent` to the constructor (required since the 2026-03-22 upstream merge added these fields to `ConversationView`).
-- **UI state query callback**: Responds to `query_ui_state` with current active_view, thread_id, entry_count, `mcp_servers` map, and `active_model` string. Matches `ActiveView::AgentThread { conversation_view }` (not `server_view` — field was renamed in upstream 2026-03-22 merge).
+- **UI state query callback**: Responds to `query_ui_state` with current active_view, thread_id, entry_count, `mcp_servers` map, and `active_model` string. Matches `BaseView::AgentThread { conversation_view }` (renamed from `ActiveView` in upstream 2026-04-22 merge). Field is `this.base_view` (not `this.active_view`).
 - **Thread creation callback**: Wires up thread_service to create threads
 - **Thread open callback**: Wires up thread_service to open existing threads
 - **Onboarding dismissal**: Auto-dismisses `OnboardingUpsell` when WebSocket sync is active
 - **`acp_history_store()`**: Accessor for `ThreadStore` entity, used by WebSocket integration setup (cfg-gated)
-- **Entity-level split-brain detection**: In `ThreadDisplayNotification` handler, compares `Entity` references (not just session IDs) to detect container-restart split-brain where the same thread ID has a new entity. Match on `conversation_view` (not `server_view`) in `ActiveView::AgentThread`.
-- **Auto-follow activation**: After `set_active_view`, calls `workspace.follow(CollaboratorId::Agent)` if `should_be_following` is true — both for new threads and follow-up messages via the "same entity" path
-- **History from connection_store**: `ThreadDisplayNotification` reads history via `this.connection_store.read(cx).entry(&Agent::NativeAgent).and_then(|e| e.read(cx).history().cloned())` — backed by `AcpSessionList`, not `NativeAgentSessionList`.
+- **Entity-level split-brain detection**: In `ThreadDisplayNotification` handler, compares `Entity` references (not just session IDs) to detect container-restart split-brain where the same thread ID has a new entity. Match on `conversation_view` in `BaseView::AgentThread` (renamed from `ActiveView` in 2026-04-22 merge).
+- **Auto-follow activation**: After `set_base_view`, calls `workspace.follow(CollaboratorId::Agent)` if `should_be_following` is true — both for new threads and follow-up messages via the "same entity" path
+- **`selected_agent` field**: Uses `this.selected_agent = connection_agent.clone()` (renamed from `selected_agent_type` in 2026-04-22 merge, type changed from needing `.into()` to direct `Agent` assignment).
 
 ### `crates/agent_ui/src/conversation_view.rs`
 
 > **Note:** This was previously `crates/agent_ui/src/acp/thread_view.rs`. The upstream 2026-03-22 merge renamed the `acp` module to `conversation_view`. All Helix changes moved with it.
 
-- **`HeadlessConnection`**: No-op `AgentConnection` impl for WebSocket-created threads (cfg-gated). Must implement `agent_id()` and `new_session()` — their signatures must track the `AgentConnection` trait. Default impls handle `wait_for_tools_ready()`.
-- **`from_existing_thread()` constructor**: Creates a `ConversationView` wrapping an existing `Entity<AcpThread>` with a `HeadlessConnection`. Uses `ConnectedServerState` with `connection`, `auth_state`, `active_id`, `threads` HashMap, `conversation` Entity, `history`, and `_connection_entry_subscription` (use `Subscription::new(|| {})`). Takes `connection_store` and `connection_key` parameters.
+- **`from_existing_thread()` constructor**: Creates a `ConversationView` wrapping an existing `Entity<AcpThread>`. Uses `ConnectedServerState` with `connection`, `auth_state`, `active_id`, `threads` HashMap, `conversation` Entity, and `_connection_entry_subscription` (use `Subscription::new(|| {})`). The `history` field was **removed from `ConnectedServerState`** in the 2026-04-22 merge — do not include it. Must also set `thread_id: ThreadId::new()` and `root_session_id: Some(id.clone())` on the `ConversationView` struct (fields added in 2026-04-22 merge).
 - **Thread registry integration**: Registers threads from both `from_existing_thread` and the connected state into `THREAD_REGISTRY`
-- **History refresh**: Calls `self.history().update(cx, |h, cx| h.refresh(cx))` on `Stopped` events — note `history` is now a method (`history()`) not a field, and must guard with `if let Some(history) = self.history()`.
 - **Thread unregistration on reset/drop**: Calls `external_websocket_sync::unregister_thread()` when the view resets or the entity changes
-- **`is_resume` flag**: Uses `load_session_id.is_some()` (not the removed `resume_thread` variable) to determine whether a thread is being resumed vs created new, for the `UserCreatedThread` WebSocket event gate
+- **`is_resume` flag**: Uses `resume_session_id.is_some()` (renamed from `load_session_id` in 2026-04-22 merge) to determine whether a thread is being resumed vs created new, for the `UserCreatedThread` WebSocket event gate
+- **`title()` returns `Option<SharedString>`**: As of 2026-04-22, `AcpThread::title()` returns `Option<SharedString>` not `SharedString`. Use `.map(|t| t.to_string()).unwrap_or_default()` for String conversion.
 
 ### `crates/agent_ui/src/config_options.rs`
 
@@ -424,6 +423,18 @@ When rebasing/merging against upstream Zed:
 32. **Run `cargo check --package zed --features external_websocket_sync`** — must compile
 32. **Run `cargo test -p external_websocket_sync`** — unit tests
 33. **Run E2E test** after merge to verify all phases pass
+34. **Check `ActiveView` → `BaseView` rename**: All Helix cfg-gated code must use `BaseView::AgentThread { conversation_view }` (not `ActiveView`), `this.base_view` (not `this.active_view`), `this.set_base_view()` (not `this.set_active_view()`). `BaseView` no longer has a `History` variant.
+35. **Check `selected_agent_type` → `selected_agent` rename**: Field type changed from requiring `.into()` to direct `Agent` assignment.
+36. **Check `ConnectedServerState` fields**: The `history` field was removed in 2026-04-22. `from_existing_thread()` must NOT include `history` in the struct init.
+37. **Check `ConversationView` struct fields**: Must include `thread_id: ThreadId::new()` and `root_session_id: Some(id.clone())` (added in 2026-04-22).
+38. **Check `load_session_id` → `resume_session_id` rename**: All cfg-gated uses of `load_session_id` must use `resume_session_id`.
+39. **Check `title()` return type**: `AcpThread::title()` returns `Option<SharedString>` not `SharedString`. Use `.map(|t| t.to_string())`.
+40. **Check `AgentConnectionEntry`**: The `history()` method was removed. Don't try to read history from connection entries.
+41. **Check `ThreadView::new` args**: No longer takes `parent_id` or `history` parameters (removed in 2026-04-22). Pass 23 args not 25.
+42. **Check `EntryViewState::new` args (non-ACP)**: No longer takes `history` parameter. Pass 6 args not 7.
+43. **Check `ContextServerStatus` variants**: `AuthRequired` and `Authenticating` variants added. Match blocks must be exhaustive.
+44. **Check `agent_client_protocol` import path**: Types moved to `schema` submodule. Use `use agent_client_protocol::schema as acp;` not `use agent_client_protocol::{self as acp, ...}`.
+45. **Check `assistant_text_thread` / `assistant_slash_command` crates**: Removed upstream in PR #52757. Remove all deps and dead code referencing these crates.
 
 ## Building
 
@@ -487,3 +498,5 @@ Helix-specific commits on main (oldest first):
 | `8b033a4451` | **Test: add Stopped emission and mid-stream interrupt E2E tests (Critical Fix #6)** |
 | `85be6df7b6` | **Fix: E2E seed session, user_created_thread tracking, interaction count** |
 | `6e0e6db32b` | **Fix: drop cancel task to prevent deadlock with Claude Code (Critical Fix #8)** |
+| `c316ee0799` | Merge upstream zed-industries/zed main (927 commits, Mar 23 – Apr 22 2026) |
+| `d4dcacf9d5` | Fix compilation errors from upstream merge (ActiveView→BaseView, dead text thread code, import paths) |
