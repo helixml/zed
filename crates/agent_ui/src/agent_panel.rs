@@ -44,7 +44,7 @@ use crate::{
     ui::EndTrialUpsell,
 };
 use crate::{
-    Agent, AgentInitialContent, ExternalSourcePrompt, ManageProfiles, NewExternalAgentThread,
+    Agent, AgentInitialContent, ExternalSourcePrompt, NewExternalAgentThread,
     NewNativeAgentThreadFromSummary,
 };
 #[cfg(feature = "external_websocket_sync")]
@@ -1027,6 +1027,7 @@ impl AgentPanel {
         // Setup callback handler for auto-opening threads created by external systems
         #[cfg(feature = "external_websocket_sync")]
         {
+            let window = _window;
             let (callback_tx, mut callback_rx) = mpsc::unbounded_channel::<external_websocket_sync::ThreadDisplayNotification>();
             external_websocket_sync::init_thread_display_callback(callback_tx);
 
@@ -1095,12 +1096,6 @@ impl AgentPanel {
 
                         let server = connection_agent.server(this.fs.clone(), this.thread_store.clone());
 
-                        let history = this
-                            .connection_store
-                            .read(cx)
-                            .entry(&connection_agent)
-                            .and_then(|entry| entry.read(cx).history().cloned());
-
                         let conversation_view = cx.new(|cx| {
                             ConversationView::from_existing_thread(
                                 notification.thread_entity.clone(),
@@ -1111,7 +1106,6 @@ impl AgentPanel {
                                 this.project.clone(),
                                 Some(this.thread_store.clone()),
                                 this.prompt_store.clone(),
-                                history,
                                 window,
                                 cx,
                             )
@@ -1204,6 +1198,8 @@ impl AgentPanel {
                                         project::context_server_store::ContextServerStatus::Starting => "starting",
                                         project::context_server_store::ContextServerStatus::Stopped => "stopped",
                                         project::context_server_store::ContextServerStatus::Error(_) => "error",
+                                        project::context_server_store::ContextServerStatus::AuthRequired => "auth_required",
+                                        project::context_server_store::ContextServerStatus::Authenticating => "authenticating",
                                     };
                                     servers.insert(server_id.0.to_string(), status_str.to_string());
                                 }

@@ -1177,11 +1177,11 @@ impl TitleBar {
 
     pub fn render_organization_menu_button(&mut self, cx: &mut Context<Self>) -> AnyElement {
         let Some(organization) = self.user_store.read(cx).current_organization() else {
-            return Empty.into_any_element();
+            return gpui::Empty.into_any_element();
         };
 
         PopoverMenu::new("organization-menu")
-            .anchor(Corner::TopRight)
+            .anchor(Anchor::TopRight)
             .menu({
                 let user_store = self.user_store.clone();
                 move |window, cx| {
@@ -1251,7 +1251,7 @@ impl TitleBar {
                     .label_size(LabelSize::Small),
                 Tooltip::text("Toggle Organization Menu"),
             )
-            .anchor(gpui::Corner::TopRight)
+            .anchor(gpui::Anchor::TopRight)
             .into_any_element()
     }
 

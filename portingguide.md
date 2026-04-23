@@ -432,6 +432,32 @@ When rebasing/merging against upstream Zed:
 
 ## Building
 
+The recommended way to build and test is via the `stack` command in the Helix repo (`~/pm/helix/stack` or `~/work/helix/stack`), which handles Docker-based compilation with persistent caching:
+
+```bash
+# Build Zed binary (dev mode, ~3 min with warm cache)
+cd ~/pm/helix   # or ~/work/helix
+./stack build-zed dev
+
+# Build Zed binary (release mode, ~12 min)
+./stack build-zed release
+
+# Output: ./zed-build/zed
+```
+
+For running E2E tests, build the binary first then copy it into the test directory:
+
+```bash
+# Build + run E2E tests
+cd ~/pm/helix && ./stack build-zed dev
+cp ~/pm/helix/zed-build/zed ~/pm/zed/crates/external_websocket_sync/e2e-test/zed-binary
+cd ~/pm/zed/crates/external_websocket_sync/e2e-test
+./run_docker_e2e.sh                                # zed-agent only
+E2E_AGENTS="zed-agent,claude" ./run_docker_e2e.sh  # both agents
+```
+
+Direct cargo commands also work if you have a Rust toolchain installed locally:
+
 ```bash
 # Build with Helix features
 cargo build --features external_websocket_sync -p zed
@@ -439,7 +465,7 @@ cargo build --features external_websocket_sync -p zed
 # Run unit tests
 cargo test -p external_websocket_sync
 
-# Run E2E test (requires ANTHROPIC_API_KEY)
+# Run E2E test via Docker directly (alternative to stack)
 docker build -t zed-ws-e2e -f crates/external_websocket_sync/e2e-test/Dockerfile .
 docker run --rm -e ANTHROPIC_API_KEY=sk-ant-... -e TEST_TIMEOUT=120 zed-ws-e2e
 ```

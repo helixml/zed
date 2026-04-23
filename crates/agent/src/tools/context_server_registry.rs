@@ -106,6 +106,14 @@ impl ContextServerRegistry {
         &self.server_store
     }
 
+    pub fn registered_server_count(&self) -> usize {
+        self.registered_servers.len()
+    }
+
+    pub fn has_pending_tool_loads(&self) -> bool {
+        self.registered_servers.values().any(|s| !s.load_tools.is_ready())
+    }
+
     fn get_or_register_server(
         &mut self,
         server_id: &ContextServerId,

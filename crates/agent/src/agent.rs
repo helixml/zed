@@ -1720,8 +1720,6 @@ impl acp_thread::AgentConnection for NativeAgentConnection {
 
     fn wait_for_tools_ready(&self, cx: &mut App) -> Task<()> {
         let agent = self.0.read(cx);
-        // Use the first project state available; in the typical Helix use case
-        // there is exactly one project open at a time.
         let Some(project_state) = agent.projects.values().next() else {
             return Task::ready(());
         };
@@ -1739,15 +1737,11 @@ impl acp_thread::AgentConnection for NativeAgentConnection {
             return Task::ready(());
         }
 
-        let mut receiver = registry.tools_ready_receiver();
         let expected_servers = configured_server_count;
         let registry_handle = project_state.context_server_registry.clone();
         cx.spawn(async move |cx| {
             let wait = async {
                 loop {
-                    if receiver.changed().await.is_err() {
-                        return;
-                    }
                     let all_done = cx.update(|cx| {
                         let reg = registry_handle.read(cx);
                         !reg.has_pending_tool_loads()
@@ -1756,6 +1750,7 @@ impl acp_thread::AgentConnection for NativeAgentConnection {
                     if all_done {
                         return;
                     }
+                    smol::Timer::after(std::time::Duration::from_millis(250)).await;
                 }
             };
             let timeout = async {
