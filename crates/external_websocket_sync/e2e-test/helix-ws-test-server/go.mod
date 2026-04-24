@@ -135,7 +135,7 @@ require (
 	github.com/hashicorp/go-retryablehttp v0.7.8 // indirect
 	github.com/hashicorp/go-version v1.9.0 // indirect
 	github.com/hashicorp/golang-lru/v2 v2.0.7 // indirect
-	github.com/helixml/kodit v1.3.0 // indirect
+	github.com/helixml/kodit v1.3.4 // indirect
 	github.com/huandu/xstrings v1.5.0 // indirect
 	github.com/infracloudio/msbotbuilder-go v0.2.5 // indirect
 	github.com/jackc/pgpassfile v1.0.0 // indirect
