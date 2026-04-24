@@ -6,7 +6,8 @@
 use anyhow::Result;
 use acp_thread::{AcpThread, AcpThreadEvent};
 use agent::ThreadStore;
-use agent_client_protocol::{self as acp, ContentBlock, TextContent};
+use agent_client_protocol::schema as acp;
+use acp::{ContentBlock, TextContent};
 use util::path_list::PathList;
 use gpui::{App, Entity, WeakEntity};
 use parking_lot::RwLock;

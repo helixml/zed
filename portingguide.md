@@ -421,11 +421,42 @@ When rebasing/merging against upstream Zed:
 30. **Check `NativeAgent` multi-project**: `agent.projects.values().next()` to get `ProjectState`; no more flat `agent.project` or `agent.context_server_registry()` fields/methods
 31. **Check `acp_thread.rs` `cancel()`** — must `drop(turn.send_task)` not `cx.background_spawn(turn.send_task)` (Critical Fix #8)
 31a. **Check `acp_thread.rs` `run_turn()` normal completion** — `Stopped` emission must be guarded by `stopped_emitted_for_task` check (Critical Fix #9)
-32. **Run `cargo check --package zed --features external_websocket_sync`** — must compile
-32. **Run `cargo test -p external_websocket_sync`** — unit tests
-33. **Run E2E test** after merge to verify all phases pass
+34. **Check `agent_panel.rs` `request_permission()`** — when `external_websocket_sync` is enabled, auto-select first AllowOnce option and return immediately (ACP auto-approve for autonomous mode)
+35. **Check `agent_panel.rs` agent_type serialization** — correct agent_type must be serialized for externally-opened threads and panel restoration
+36. **Check `thread_service.rs` turn-scoped request_id** — EntryUpdated uses turn-scoped request_id with prev_turn fallback; NewEntry updates turn_request_id only at turn boundaries
+37. **Check `acp_thread.rs` `run_turn()` stopped_emitted_for_task** — normal completion Stopped must check stopped_emitted_for_task to prevent duplicate emission racing with cancel()
+38. **Check trial-end upsell guard** — `suggest_trial_end_upsell()` returns early in Helix builds
+39. **Run `cargo check --package zed --features external_websocket_sync`** — must compile
+40. **Run `cargo test -p external_websocket_sync`** — unit tests
+41. **Run E2E test** after merge to verify all phases pass
 
 ## Building
+
+The recommended way to build and test is via the `stack` command in the Helix repo (`~/pm/helix/stack` or `~/work/helix/stack`), which handles Docker-based compilation with persistent caching:
+
+```bash
+# Build Zed binary (dev mode, ~3 min with warm cache)
+cd ~/pm/helix   # or ~/work/helix
+./stack build-zed dev
+
+# Build Zed binary (release mode, ~12 min)
+./stack build-zed release
+
+# Output: ./zed-build/zed
+```
+
+For running E2E tests, build the binary first then copy it into the test directory:
+
+```bash
+# Build + run E2E tests
+cd ~/pm/helix && ./stack build-zed dev
+cp ~/pm/helix/zed-build/zed ~/pm/zed/crates/external_websocket_sync/e2e-test/zed-binary
+cd ~/pm/zed/crates/external_websocket_sync/e2e-test
+./run_docker_e2e.sh                                # zed-agent only
+E2E_AGENTS="zed-agent,claude" ./run_docker_e2e.sh  # both agents
+```
+
+Direct cargo commands also work if you have a Rust toolchain installed locally:
 
 ```bash
 # Build with Helix features
@@ -434,7 +465,7 @@ cargo build --features external_websocket_sync -p zed
 # Run unit tests
 cargo test -p external_websocket_sync
 
-# Run E2E test (requires ANTHROPIC_API_KEY)
+# Run E2E test via Docker directly (alternative to stack)
 docker build -t zed-ws-e2e -f crates/external_websocket_sync/e2e-test/Dockerfile .
 docker run --rm -e ANTHROPIC_API_KEY=sk-ant-... -e TEST_TIMEOUT=120 zed-ws-e2e
 ```
@@ -487,3 +518,22 @@ Helix-specific commits on main (oldest first):
 | `8b033a4451` | **Test: add Stopped emission and mid-stream interrupt E2E tests (Critical Fix #6)** |
 | `85be6df7b6` | **Fix: E2E seed session, user_created_thread tracking, interaction count** |
 | `6e0e6db32b` | **Fix: drop cancel task to prevent deadlock with Claude Code (Critical Fix #8)** |
+| `71fb5fba73` | Fix: use correct Agent for claude-acp threads in agent_panel |
+| `1a3fc57adc` | Add request_id to message_added events for interaction routing |
+| `255f6b4522` | Fix Stopped flush: use turn-scoped request_id, only flush current turn |
+| `bc4921681f` | Scope NewEntry re-send to current turn to prevent cross-interaction leaks |
+| `6e35959201` | Remove streaming text reveal rate-limit to fix WebSocket sync truncation |
+| `73f9af2162` | Re-read current entry content in NewEntry handler instead of flushing stale pending |
+| `14c079c266` | Flush pending text content before sending new entries to prevent truncated streaming |
+| `520f327183` | Fix: serialize correct agent_type for externally-opened threads |
+| `cf4e7d6f78` | Fix: serialize agent_type + wait for WebSocket before panel restoration |
+| `f3a2622736` | Fix: send agent_ready and set up subscription from panel restoration path |
+| `48de0cf877` | Fix: share thread load lock with panel restoration, use agent_id for agent_ready |
+| `0fef8b27c1` | Fix: send agent_ready even when no thread to restore |
+| `d470dac687` | Fix: coordinate panel restoration and open_existing_thread_sync via load lock |
+| `47950a9cf8` | Fix: call ensure_thread_subscription in open_existing_thread_sync |
+| `90bdb6cf75` | Fix: emit Stopped synchronously in cancel() to fix phase 8 FIFO ordering |
+| `a7e4d8b850` | Fix: implement real interrupt — cancel running turn before queuing new message |
+| `2f182e64d6` | **Fix: prevent request_id desync from background events and duplicate Stopped (Critical Fix #9)** |
+| `f96525f558` | Fix: filter stale phase completions in E2E test |
+| `55f797f2bc` | **Auto-approve ACP permission requests when external_websocket_sync is enabled** |
