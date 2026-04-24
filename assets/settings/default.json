@@ -1191,6 +1191,14 @@
     //
     // Default: true
     "show_merge_conflict_indicator": true,
+    // Whether to show the onboarding experience when the agent panel is first opened.
+    //
+    // Default: true
+    "show_onboarding": true,
+    // Whether to automatically open the agent panel on startup.
+    //
+    // Default: false
+    "auto_open_panel": false,
   },
   // Whether the screen sharing icon is shown in the os status bar.
   "show_call_status_icon": true,

@@ -3,9 +3,9 @@
 use gpui::App;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
-use settings::{Settings, SettingsStore};
+use settings::{RegisterSetting, Settings, SettingsStore};
 
-#[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
+#[derive(Clone, Debug, Serialize, Deserialize, JsonSchema, RegisterSetting)]
 pub struct ExternalSyncSettings {
     /// Whether external WebSocket thread sync is enabled
     #[serde(default)]

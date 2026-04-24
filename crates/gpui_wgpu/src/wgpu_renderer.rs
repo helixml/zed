@@ -1089,16 +1089,15 @@ impl WgpuRenderer {
                 self.failed_frame_count
             );
 
-            // TBD. Does retrying more actually help?
-            if self.failed_frame_count > 5 {
+            if self.failed_frame_count > 10 {
+                panic!("Too many consecutive GPU errors. Last error: {error}");
+            } else if self.failed_frame_count > 5 {
                 if let Some(res) = self.resources.as_mut() {
                     res.invalidate_intermediate_textures();
                 }
                 self.atlas.clear();
                 self.needs_redraw = true;
                 return;
-            } else if self.failed_frame_count > 10 {
-                panic!("Too many consecutive GPU errors. Last error: {error}");
             }
         } else {
             self.failed_frame_count = 0;
