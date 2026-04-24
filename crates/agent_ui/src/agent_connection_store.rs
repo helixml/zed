@@ -155,28 +155,13 @@ impl AgentConnectionStore {
         Receiver<Option<String>>,
         Task<Result<AgentConnectedState, LoadError>>,
     ) {
-        // Note: the watch channel is per-call but only the *first* caller's
-        // delegate is actually wired into `server.connect()` by the cache.
-        // Subsequent callers get the cached connection and never receive
-        // version notifications via this channel. Best-effort UI signal.
         let (new_version_tx, new_version_rx) = watch::channel::<Option<String>>(None);
 
         let agent_server_store = self.project.read(cx).agent_server_store().clone();
         let delegate = AgentServerDelegate::new(agent_server_store, Some(new_version_tx));
 
-        // Route through the process-global cache so UI-driven connects share
-        // a single AgentConnection with external_websocket_sync's thread_service
-        // for the same (project, agent_id). Prevents duplicate `claude-agent-acp`
-        // wrapper spawns.
-        let agent_id = server.agent_id();
-        let shared = agent_servers::AgentConnectionCache::request_connection(
-            cx,
-            self.project.clone(),
-            agent_id,
-            server,
-            delegate,
-        );
-        let connect_task = cx.spawn(async move |_this, cx| match shared.await {
+        let connect_task = server.connect(delegate, self.project.clone(), cx);
+        let connect_task = cx.spawn(async move |_this, cx| match connect_task.await {
             Ok(connection) => cx.update(|cx| {
                 let history = connection
                     .session_list(cx)
@@ -186,7 +171,10 @@ impl AgentConnectionStore {
                     history,
                 })
             }),
-            Err(load_error) => Err(load_error),
+            Err(err) => match err.downcast::<LoadError>() {
+                Ok(load_error) => Err(load_error),
+                Err(err) => Err(LoadError::Other(SharedString::from(err.to_string()))),
+            },
         });
         (new_version_rx, connect_task)
     }
