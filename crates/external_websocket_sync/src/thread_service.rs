@@ -105,6 +105,7 @@ const STREAMING_THROTTLE_INTERVAL: Duration = Duration::from_millis(100);
 struct StreamingThrottleState {
     last_sent: Instant,
     pending_content: Option<PendingMessage>,
+    flush_scheduled: bool,
 }
 
 /// Content waiting to be sent when the throttle window expires.
@@ -215,6 +216,7 @@ fn flush_stale_pending_for_thread(acp_thread_id: &str, exclude_entry_idx: usize)
             if k.starts_with(&thread_prefix) && *k != exclude_key {
                 if let Some(pending) = state.pending_content.take() {
                     state.last_sent = now;
+                    state.flush_scheduled = false;
                     stale_pending.push(pending);
                 }
             }
@@ -258,6 +260,7 @@ fn throttled_send_message_added(
     let mut stale_pending: Vec<PendingMessage> = Vec::new();
     let mut current_to_send: Option<PendingMessage> = None;
     let sent: bool;
+    let mut spawn_flush_timer = false;
 
     {
         let throttle_map = STREAMING_THROTTLE.lock();
@@ -273,13 +276,15 @@ fn throttled_send_message_added(
                 if let Some(pending) = state.pending_content.take() {
                     state.last_sent = now;
                     stale_pending.push(pending);
+                    state.flush_scheduled = false;
                 }
             }
         }
 
-        let state = map.entry(key).or_insert_with(|| StreamingThrottleState {
+        let state = map.entry(key.clone()).or_insert_with(|| StreamingThrottleState {
             last_sent: Instant::now() - STREAMING_THROTTLE_INTERVAL,
             pending_content: None,
+            flush_scheduled: false,
         });
 
         // Tool call entries bypass the throttle — they're infrequent and must
@@ -290,6 +295,7 @@ fn throttled_send_message_added(
         {
             state.last_sent = now;
             state.pending_content = None;
+            state.flush_scheduled = false;
             current_to_send = Some(PendingMessage {
                 acp_thread_id: acp_thread_id.to_string(),
                 message_id: entry_idx.to_string(),
@@ -302,6 +308,10 @@ fn throttled_send_message_added(
             });
             sent = true;
         } else {
+            if !state.flush_scheduled {
+                state.flush_scheduled = true;
+                spawn_flush_timer = true;
+            }
             state.pending_content = Some(PendingMessage {
                 acp_thread_id: acp_thread_id.to_string(),
                 message_id: entry_idx.to_string(),
@@ -346,7 +356,42 @@ fn throttled_send_message_added(
         });
     }
 
+    if spawn_flush_timer {
+        smol::spawn(trailing_flush_timer(key)).detach();
+    }
+
     sent
+}
+
+async fn trailing_flush_timer(key: String) {
+    smol::Timer::after(STREAMING_THROTTLE_INTERVAL).await;
+
+    let pending: Option<PendingMessage> = {
+        let throttle_map = STREAMING_THROTTLE.lock();
+        let Some(map) = throttle_map.as_ref() else { return };
+        let mut map = map.write();
+        let Some(state) = map.get_mut(&key) else { return };
+        state.flush_scheduled = false;
+        let msg = state.pending_content.take();
+        if msg.is_some() {
+            state.last_sent = Instant::now();
+        }
+        msg
+    };
+
+    if let Some(msg) = pending {
+        let _ = crate::send_websocket_event(SyncEvent::MessageAdded {
+            acp_thread_id: msg.acp_thread_id,
+            message_id: msg.message_id,
+            role: msg.role,
+            content: msg.content,
+            request_id: msg.request_id,
+            entry_type: msg.entry_type,
+            tool_name: msg.tool_name,
+            tool_status: msg.tool_status,
+            timestamp: chrono::Utc::now().timestamp(),
+        });
+    }
 }
 
 /// Flush all pending throttled messages for a given thread and clean up throttle state.
