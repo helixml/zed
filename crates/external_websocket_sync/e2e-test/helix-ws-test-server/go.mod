@@ -34,7 +34,6 @@ require (
 	github.com/antchfx/xmlquery v1.3.17 // indirect
 	github.com/antchfx/xpath v1.2.4 // indirect
 	github.com/anthropics/anthropic-sdk-go v1.12.0 // indirect
-	github.com/apapsch/go-jsonmerge/v2 v2.0.0 // indirect
 	github.com/araddon/dateparse v0.0.0-20210429162001-6b43995a97de // indirect
 	github.com/avast/retry-go/v4 v4.5.1 // indirect
 	github.com/bradfitz/gomemcache v0.0.0-20250403215159-8d39553ac7cf // indirect
@@ -135,7 +134,7 @@ require (
 	github.com/hashicorp/go-retryablehttp v0.7.8 // indirect
 	github.com/hashicorp/go-version v1.9.0 // indirect
 	github.com/hashicorp/golang-lru/v2 v2.0.7 // indirect
-	github.com/helixml/kodit v1.3.0 // indirect
+	github.com/helixml/kodit v1.3.6 // indirect
 	github.com/huandu/xstrings v1.5.0 // indirect
 	github.com/infracloudio/msbotbuilder-go v0.2.5 // indirect
 	github.com/jackc/pgpassfile v1.0.0 // indirect
@@ -192,7 +191,6 @@ require (
 	github.com/nats-io/nuid v1.0.1 // indirect
 	github.com/nikoksr/notify v0.41.0 // indirect
 	github.com/nikolalohinski/gonja v1.5.3 // indirect
-	github.com/oapi-codegen/runtime v1.3.1 // indirect
 	github.com/oasdiff/yaml v0.0.0-20250309154309-f31be36b4037 // indirect
 	github.com/oasdiff/yaml3 v0.0.0-20250309153720-d2182401db90 // indirect
 	github.com/oklog/ulid/v2 v2.1.0 // indirect
@@ -201,7 +199,6 @@ require (
 	github.com/otiai10/gosseract/v2 v2.4.1 // indirect
 	github.com/pelletier/go-toml/v2 v2.2.4 // indirect
 	github.com/perimeterx/marshmallow v1.1.5 // indirect
-	github.com/pgvector/pgvector-go v0.2.3 // indirect
 	github.com/pjbgf/sha1cd v0.5.0 // indirect
 	github.com/pkg/errors v0.9.1 // indirect
 	github.com/pkoukk/tiktoken-go v0.1.6 // indirect
@@ -218,7 +215,6 @@ require (
 	github.com/sirupsen/logrus v1.9.3 // indirect
 	github.com/skeema/knownhosts v1.3.2 // indirect
 	github.com/slack-go/slack v0.19.0 // indirect
-	github.com/sony/gobreaker v0.5.0 // indirect
 	github.com/sourcegraph/conc v0.3.0 // indirect
 	github.com/sourcegraph/go-diff v0.7.0 // indirect
 	github.com/spf13/cast v1.10.0 // indirect
@@ -235,7 +231,7 @@ require (
 	github.com/tiktoken-go/tokenizer v0.6.2 // indirect
 	github.com/tmc/langchaingo v0.1.12 // indirect
 	github.com/tsawler/tabula v1.6.6 // indirect
-	github.com/typesense/typesense-go/v2 v2.0.0 // indirect
+	github.com/ugorji/go/codec v1.2.12 // indirect
 	github.com/unknwon/com v1.0.1 // indirect
 	github.com/viant/afs v1.30.0 // indirect
 	github.com/woodsbury/decimal128 v1.3.0 // indirect

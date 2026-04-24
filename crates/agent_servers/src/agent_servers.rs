@@ -1,8 +1,11 @@
 mod acp;
+mod connection_cache;
 mod custom;
 
 #[cfg(any(test, feature = "test-support"))]
 pub mod e2e_tests;
+
+pub use connection_cache::{AgentConnectionCache, init as init_connection_cache};
 
 use client::ProxySettings;
 use collections::{HashMap, HashSet};

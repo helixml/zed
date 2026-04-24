@@ -1110,31 +1110,43 @@ fn create_new_thread_sync(
         let connection: std::rc::Rc<dyn acp_thread::AgentConnection> = {
             let mut attempt = 0u32;
             loop {
-                let connection_task = cx.update(|cx| {
+                let shared = cx.update(|cx| {
                     let server = agent.server(fs.clone(), acp_history_store.clone());
+                    let agent_id = server.agent_id();
                     let agent_server_store = project.read(cx).agent_server_store().clone();
                     let delegate = agent_servers::AgentServerDelegate::new(
                         agent_server_store,
                         None,
                     );
-                    eprintln!("🔌 [THREAD_SERVICE] Calling server.connect() (attempt {}/{})...", attempt + 1, max_retries + 1);
-                    server.connect(delegate, project.clone(), cx)
+                    eprintln!("🔌 [THREAD_SERVICE] Requesting cached connection (attempt {}/{})...", attempt + 1, max_retries + 1);
+                    agent_servers::AgentConnectionCache::request_connection(
+                        cx,
+                        project.clone(),
+                        agent_id,
+                        server,
+                        delegate,
+                    )
                 });
 
                 eprintln!("⏳ [THREAD_SERVICE] Awaiting connection task...");
-                match connection_task.await {
+                match shared.await {
                     Ok(conn) => {
                         eprintln!("✅ [THREAD_SERVICE] Connected to agent successfully");
                         break conn;
                     }
                     Err(e) if attempt < max_retries && e.to_string().contains("not registered") => {
-                        eprintln!("⚠️ [THREAD_SERVICE] Agent not registered yet (attempt {}/{}), retrying in 1s: {}", attempt + 1, max_retries, e);
+                        eprintln!("⚠️ [THREAD_SERVICE] Agent not registered yet (attempt {}/{}), retrying in 1s: {:?}", attempt + 1, max_retries, e);
+                        // Evict the cached failure so the next iteration triggers a fresh connect.
+                        cx.update(|cx| {
+                            let server = agent.server(fs.clone(), acp_history_store.clone());
+                            agent_servers::AgentConnectionCache::evict(cx, project.entity_id(), server.agent_id());
+                        });
                         attempt += 1;
                         cx.background_executor().timer(Duration::from_secs(1)).await;
                     }
                     Err(e) => {
-                        eprintln!("❌ [THREAD_SERVICE] Failed to connect to agent: {}", e);
-                        return Err(e);
+                        eprintln!("❌ [THREAD_SERVICE] Failed to connect to agent: {:?}", e);
+                        return Err(anyhow::anyhow!("agent connect failed: {:?}", e));
                     }
                 }
             }
@@ -1455,14 +1467,21 @@ async fn load_thread_from_agent(
 
     let server = agent.server(fs, acp_history_store.clone());
 
-    // Get agent server store and create connection
-    let (connection_task, cwd) = cx.update(|cx| {
+    // Get agent server store and create (or reuse cached) connection
+    let (shared, cwd) = cx.update(|cx| {
+        let agent_id = server.agent_id();
         let agent_server_store = project.read(cx).agent_server_store().clone();
         let delegate = agent_servers::AgentServerDelegate::new(
             agent_server_store,
             None,
         );
-        let connection_task = server.connect(delegate, project.clone(), cx);
+        let shared = agent_servers::AgentConnectionCache::request_connection(
+            cx,
+            project.clone(),
+            agent_id,
+            server.clone(),
+            delegate,
+        );
         // Use ZED_WORK_DIR for consistency with session storage
         let cwd = std::env::var("ZED_WORK_DIR")
             .ok()
@@ -1472,10 +1491,12 @@ async fn load_thread_from_agent(
                     .map(|wt| wt.read(cx).abs_path().to_path_buf())
                     .unwrap_or_else(|| std::env::current_dir().unwrap_or_default())
             });
-        (connection_task, cwd)
+        (shared, cwd)
     });
 
-    let connection: std::rc::Rc<dyn acp_thread::AgentConnection> = connection_task.await?;
+    let connection: std::rc::Rc<dyn acp_thread::AgentConnection> = shared
+        .await
+        .map_err(|e| anyhow::anyhow!("agent connect failed: {:?}", e))?;
 
     eprintln!("✅ [THREAD_SERVICE] Connected to agent for loading thread");
     log::info!("✅ [THREAD_SERVICE] Connected to agent for loading thread");
@@ -1662,6 +1683,7 @@ fn open_existing_thread_sync(
     log::info!("🔧 [THREAD_SERVICE] Selected agent: {:?}", agent);
 
     let server = agent.server(fs, acp_history_store.clone());
+    let agent_id = server.agent_id();
 
     // Get agent server store from project
     let agent_server_store = project.read(cx).agent_server_store().clone();
@@ -1672,8 +1694,15 @@ fn open_existing_thread_sync(
         None,
     );
 
-    // Connect to get AgentConnection
-    let connection_task = server.connect(delegate, project.clone(), cx);
+    // Get cached connection or create a new one (deduped against concurrent
+    // callers in workspace restore / load_thread_from_agent / agent_connection_store).
+    let shared = agent_servers::AgentConnectionCache::request_connection(
+        cx,
+        project.clone(),
+        agent_id,
+        server.clone(),
+        delegate,
+    );
 
     // Use ZED_WORK_DIR for consistency with session storage
     let cwd = std::env::var("ZED_WORK_DIR")
@@ -1701,12 +1730,12 @@ fn open_existing_thread_sync(
         }
         let _loading_guard = ClearLoadingGuard;
 
-        let connection = match connection_task.await {
+        let connection = match shared.await {
             Ok(result) => result,
             Err(e) => {
-                eprintln!("❌ [THREAD_SERVICE] Failed to connect to agent: {}", e);
-                log::error!("❌ [THREAD_SERVICE] Failed to connect to agent: {}", e);
-                return Err(e);
+                eprintln!("❌ [THREAD_SERVICE] Failed to connect to agent: {:?}", e);
+                log::error!("❌ [THREAD_SERVICE] Failed to connect to agent: {:?}", e);
+                return Err(anyhow::anyhow!("agent connect failed: {:?}", e));
             }
         };
 
