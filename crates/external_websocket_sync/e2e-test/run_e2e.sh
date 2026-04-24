@@ -52,6 +52,19 @@ cleanup() {
             grep -iE "panic|error|fatal" "$ZED_LOG_FILE" | tail -50 || true
             echo "  (full log: $ZED_LOG_FILE)"
         fi
+        # ACP_SPAWN/ACP_DEDUP are at log::info level — surface them explicitly
+        ACP_LINES=$(grep -cE "ACP_SPAWN|ACP_DEDUP" "$ZED_LOG_FILE" 2>/dev/null || echo "0")
+        if [ "$ACP_LINES" -gt 0 ]; then
+            echo ""
+            echo "=================================================="
+            echo "  ACP_SPAWN / ACP_DEDUP ($ACP_LINES lines)"
+            echo "=================================================="
+            grep -E "ACP_SPAWN|ACP_DEDUP" "$ZED_LOG_FILE" || true
+        fi
+        # Persist the full zed log into the mounted screenshots dir for offline inspection
+        if [ -d "$SCREENSHOT_DIR" ]; then
+            cp "$ZED_LOG_FILE" "$SCREENSHOT_DIR/zed-e2e.log" 2>/dev/null || true
+        fi
     fi
 
     # Report screenshots
