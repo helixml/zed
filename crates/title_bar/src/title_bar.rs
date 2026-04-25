@@ -296,7 +296,11 @@ impl Render for TitleBar {
                 .when(
                     user.is_none()
                         && is_signed_out_or_auth_error
-                        && TitleBarSettings::get_global(cx).show_sign_in,
+                        && TitleBarSettings::get_global(cx).show_sign_in
+                        // Helix-driven Zed runs unauthenticated against the
+                        // external agent runtime — the Sign In button has no
+                        // useful destination here and confuses end users.
+                        && !cfg!(feature = "external_websocket_sync"),
                     |this| this.child(self.render_sign_in_button(cx)),
                 )
                 .when(is_signing_in, |this| {
@@ -599,6 +603,13 @@ impl TitleBar {
     }
 
     pub fn render_restricted_mode(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        // Helix-driven Zed auto-trusts every worktree (see can_trust), so the
+        // pill should never appear. Belt-and-braces gate in case a stale
+        // restricted entry is still in memory after a settings change.
+        if cfg!(feature = "external_websocket_sync") {
+            return None;
+        }
+
         let has_restricted_worktrees = TrustedWorktrees::try_get_global(cx)
             .map(|trusted_worktrees| {
                 trusted_worktrees

@@ -19,6 +19,10 @@ required-features = ["test-support"]
 path = "tests/integration/project_tests.rs"
 
 [features]
+# When enabled, Helix-driven Zed flips workspace-trust checks to "always trust".
+# Worktrees are provisioned by the platform inside isolated containers and a
+# Restricted Mode prompt is never actionable in that context.
+external_websocket_sync = []
 test-support = [
     "buffer_diff/test-support",
     "client/test-support",
