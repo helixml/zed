@@ -1741,7 +1741,9 @@ impl acp_thread::AgentConnection for NativeAgentConnection {
 
         let expected_servers = configured_server_count;
         let registry_handle = project_state.context_server_registry.clone();
+        let executor = cx.background_executor().clone();
         cx.spawn(async move |cx| {
+            let poll_executor = executor.clone();
             let wait = async {
                 loop {
                     let all_done = cx.update(|cx| {
@@ -1752,11 +1754,13 @@ impl acp_thread::AgentConnection for NativeAgentConnection {
                     if all_done {
                         return;
                     }
-                    smol::Timer::after(std::time::Duration::from_millis(250)).await;
+                    poll_executor
+                        .timer(std::time::Duration::from_millis(250))
+                        .await;
                 }
             };
             let timeout = async {
-                smol::Timer::after(std::time::Duration::from_secs(30)).await;
+                executor.timer(std::time::Duration::from_secs(30)).await;
                 log::warn!("Timed out waiting for MCP tools to load (30s), proceeding without them");
             };
             futures::future::select(Box::pin(wait), Box::pin(timeout)).await;
