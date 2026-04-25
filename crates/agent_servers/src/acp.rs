@@ -540,8 +540,8 @@ impl AcpConnection {
             child.current_dir(cwd);
         }
         log::info!(
-            "[ACP_SPAWN] About to spawn ACP wrapper agent_id={:?} display_name={:?} path={:?} args={:?}",
-            agent_id, display_name, command.path, command.args
+            "[ACP_SPAWN] About to spawn ACP wrapper agent_id={:?} path={:?} args={:?}",
+            agent_id, original_command.path, original_command.args
         );
         let mut child = Child::spawn(child, Stdio::piped(), Stdio::piped(), Stdio::piped())?;
 
