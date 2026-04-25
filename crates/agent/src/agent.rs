@@ -1310,7 +1310,9 @@ impl NativeAgentConnection {
                                     {
                                         response
                                             .send(outcome)
-                                            .map(|_| anyhow!("authorization receiver was dropped"))
+                                            .map_err(|_| {
+                                                anyhow!("authorization receiver was dropped")
+                                            })
                                             .log_err();
                                     }
                                 })
@@ -1739,7 +1741,9 @@ impl acp_thread::AgentConnection for NativeAgentConnection {
 
         let expected_servers = configured_server_count;
         let registry_handle = project_state.context_server_registry.clone();
+        let executor = cx.background_executor().clone();
         cx.spawn(async move |cx| {
+            let poll_executor = executor.clone();
             let wait = async {
                 loop {
                     let all_done = cx.update(|cx| {
@@ -1750,11 +1754,13 @@ impl acp_thread::AgentConnection for NativeAgentConnection {
                     if all_done {
                         return;
                     }
-                    smol::Timer::after(std::time::Duration::from_millis(250)).await;
+                    poll_executor
+                        .timer(std::time::Duration::from_millis(250))
+                        .await;
                 }
             };
             let timeout = async {
-                smol::Timer::after(std::time::Duration::from_secs(30)).await;
+                executor.timer(std::time::Duration::from_secs(30)).await;
                 log::warn!("Timed out waiting for MCP tools to load (30s), proceeding without them");
             };
             futures::future::select(Box::pin(wait), Box::pin(timeout)).await;
@@ -1785,14 +1791,14 @@ impl acp_thread::AgentTelemetry for NativeAgentConnection {
 
 pub struct NativeAgentSessionList {
     thread_store: Entity<ThreadStore>,
-    updates_tx: smol::channel::Sender<acp_thread::SessionListUpdate>,
-    updates_rx: smol::channel::Receiver<acp_thread::SessionListUpdate>,
+    updates_tx: async_channel::Sender<acp_thread::SessionListUpdate>,
+    updates_rx: async_channel::Receiver<acp_thread::SessionListUpdate>,
     _subscription: Subscription,
 }
 
 impl NativeAgentSessionList {
-    pub fn new(thread_store: Entity<ThreadStore>, cx: &mut App) -> Self {
-        let (tx, rx) = smol::channel::unbounded();
+    fn new(thread_store: Entity<ThreadStore>, cx: &mut App) -> Self {
+        let (tx, rx) = async_channel::unbounded();
         let this_tx = tx.clone();
         let subscription = cx.observe(&thread_store, move |_, _| {
             this_tx
@@ -1844,7 +1850,7 @@ impl AgentSessionList for NativeAgentSessionList {
     fn watch(
         &self,
         _cx: &mut App,
-    ) -> Option<smol::channel::Receiver<acp_thread::SessionListUpdate>> {
+    ) -> Option<async_channel::Receiver<acp_thread::SessionListUpdate>> {
         Some(self.updates_rx.clone())
     }
 

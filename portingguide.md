@@ -426,9 +426,12 @@ When rebasing/merging against upstream Zed:
 36. **Check `thread_service.rs` turn-scoped request_id** — EntryUpdated uses turn-scoped request_id with prev_turn fallback; NewEntry updates turn_request_id only at turn boundaries
 37. **Check `acp_thread.rs` `run_turn()` stopped_emitted_for_task** — normal completion Stopped must check stopped_emitted_for_task to prevent duplicate emission racing with cancel()
 38. **Check trial-end upsell guard** — `suggest_trial_end_upsell()` returns early in Helix builds
-39. **Run `cargo check --package zed --features external_websocket_sync`** — must compile
-40. **Run `cargo test -p external_websocket_sync`** — unit tests
-41. **Run E2E test** after merge to verify all phases pass
+39. **Check `crates/zed/src/main.rs` for `--allow-multiple-instances` CLI flag** — defined as `#[arg(long)] allow_multiple_instances: bool` on `Args`, AND used in the `failed_single_instance_check` short-circuit (`|| args.allow_multiple_instances`). This Helix-only flag was lost in the 001864 merge (re-added by 001909). Without it the e2e-test container can't launch Zed at all.
+40. **Check `Cargo.toml` workspace `rust-embed` features** — must include both `include-exclude` AND `debug-embed`. The `debug-embed` feature was originally added by Helix in commit `9ca797706f` (Oct 2025), lost in a subsequent merge, re-added in 001909. Without it, dev builds panic on startup with `settings/default.json` because RustEmbed tries to read assets from `CARGO_MANIFEST_DIR` at runtime, and that path doesn't exist outside the build directory (e.g. inside the e2e-test container or any deployed binary). Release builds always embed assets so they're unaffected — but debug builds (used by the e2e test, ARM aside) need this feature.
+41. **Check `crates/agent/src/agent.rs` for `smol::Timer::after` references** — must use `cx.background_executor().timer(d).await` instead. Upstream PR #53603 (Apr 2026) removed `smol` from the agent crate's deps. Helix's `wait_for_tools_ready()` previously used `smol::Timer::after` and broke after the merge; fixed in 001909 by switching to the canonical GPUI pattern.
+42. **Run `cargo check --package zed --features external_websocket_sync`** — must compile
+43. **Run `cargo test -p external_websocket_sync`** — unit tests
+44. **Run E2E test** after merge to verify all phases pass (currently 12 phases, run for both `zed-agent` and `claude` rounds)
 
 ## Building
 
@@ -537,3 +540,10 @@ Helix-specific commits on main (oldest first):
 | `2f182e64d6` | **Fix: prevent request_id desync from background events and duplicate Stopped (Critical Fix #9)** |
 | `f96525f558` | Fix: filter stale phase completions in E2E test |
 | `55f797f2bc` | **Auto-approve ACP permission requests when external_websocket_sync is enabled** |
+| `9f0475c6c2` | fix: drop stale display_name reference in [ACP_SPAWN] log |
+| `d7be64fad1` | **fix: stop empty message_completed loop after Zed restart + Helix-mode UI cleanup** |
+| `8428a4399d` | Merge upstream Zed (62bd61a679..e3d1876c06, 86 commits) into 001909-merge-latest-zed |
+| `6ccf3010a6` | **Fix `wait_for_tools_ready`: use `cx.background_executor().timer()` instead of `smol::Timer` (upstream PR #53603 dropped smol)** |
+| `16f2b82053` | **Restore `--allow-multiple-instances` CLI flag (lost in 001864 merge)** |
+| `c7a26c9144` | **Restore `debug-embed` feature on `rust-embed` workspace dep (lost in a prior merge — required for dev/debug builds outside source tree)** |
+| `3cfc2962d1` | Merge `origin/main` into 001909 (incorporates `d7be64fad1`) |
