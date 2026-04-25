@@ -475,6 +475,70 @@ pub fn unregister_thread(acp_thread_id: &str) {
     }
 }
 
+/// Like `unregister_thread` but only removes the registry entry if it currently
+/// holds the entity the caller expected. Use this from `cx.on_release` of a
+/// `ConversationView`/`ThreadView` so an old view being dropped doesn't clobber
+/// a fresh registration that another caller (e.g. `load_session_async` after a
+/// Zed restart) just placed under the same `acp_thread_id`.
+///
+/// Without this guard, the sequence is: panel restoration's old view is
+/// dropped, its `on_release` calls `unregister_thread(session_id)`, which
+/// removes the live entity that `register_thread` placed moments earlier when
+/// Helix sent `open_thread` on reconnect. Subsequent ACP `SessionUpdate`
+/// dispatches reach the live entity but `THREAD_REGISTRY` reports "not found",
+/// the persistent-subscription flag is wrongly cleared, and any future
+/// `ensure_thread_subscription` call creates a duplicate subscription —
+/// duplicating `MessageAdded`/`MessageCompleted` sends on subsequent turns.
+pub fn unregister_thread_if_matches(acp_thread_id: &str, expected_entity_id: gpui::EntityId) {
+    let mut removed_from_registry = false;
+    {
+        let registry = THREAD_REGISTRY.lock();
+        if let Some(reg) = registry.as_ref() {
+            let mut map = reg.write();
+            if let Some(existing) = map.get(acp_thread_id) {
+                if existing.entity_id() == expected_entity_id {
+                    map.remove(acp_thread_id);
+                    removed_from_registry = true;
+                    eprintln!(
+                        "🗑️ [THREAD_SERVICE] unregister_thread_if_matches: removed '{}' (entity={:?})",
+                        acp_thread_id, expected_entity_id
+                    );
+                    log::info!(
+                        "🗑️ [THREAD_SERVICE] unregister_thread_if_matches: removed '{}' (entity={:?})",
+                        acp_thread_id, expected_entity_id
+                    );
+                } else {
+                    eprintln!(
+                        "🛡️ [THREAD_SERVICE] unregister_thread_if_matches: skipping '{}' — registry holds different entity (existing={:?}, dropping={:?})",
+                        acp_thread_id, existing.entity_id(), expected_entity_id
+                    );
+                    log::info!(
+                        "🛡️ [THREAD_SERVICE] unregister_thread_if_matches: skipping '{}' — registry holds different entity (existing={:?}, dropping={:?})",
+                        acp_thread_id, existing.entity_id(), expected_entity_id
+                    );
+                }
+            }
+        }
+    }
+
+    // Only clear the persistent-subscription flag when we actually removed the
+    // registry entry. If we left a different entity in place, its subscription
+    // is still live and the flag must stay set; otherwise a later
+    // `ensure_thread_subscription` call would create a duplicate subscription
+    // on the same entity and double-send sync events to Helix.
+    if removed_from_registry {
+        let subs = PERSISTENT_SUBSCRIPTIONS.lock();
+        if let Some(s) = subs.as_ref() {
+            if s.write().remove(acp_thread_id) {
+                eprintln!(
+                    "🗑️ [THREAD_SERVICE] unregister_thread_if_matches: cleared persistent subscription for '{}'",
+                    acp_thread_id
+                );
+            }
+        }
+    }
+}
+
 /// Get an active thread as weak reference
 pub fn get_thread(acp_thread_id: &str) -> Option<WeakEntity<AcpThread>> {
     // Check the active registry first

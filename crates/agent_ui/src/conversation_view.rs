@@ -728,10 +728,27 @@ impl ConversationView {
         cx.on_release(|this, cx| {
             // Unregister thread from THREAD_REGISTRY so stale entries don't
             // cause split-brain when the same session is loaded via the UI path.
+            //
+            // Only remove the entry if it still points at the thread entity this
+            // view was holding. After a Zed restart, `load_session_async` may
+            // have already replaced the registration with a fresh entity (Y),
+            // and the AgentPanel callback may have just rebound to display Y —
+            // dropping this older view (X). A blind unregister at that moment
+            // would clobber Y's registration, causing later `open_thread`
+            // requests to miss the fast path and the persistent-subscription
+            // flag to be wrongly cleared.
             if let ServerState::Connected(connected) = &this.server_state {
                 if let Some(id) = &connected.active_id {
                     let session_id_str = id.to_string();
-                    external_websocket_sync::unregister_thread(&session_id_str);
+                    if let Some(active_view) = connected.active_view() {
+                        let thread_entity_id = active_view.read(cx).thread.entity_id();
+                        external_websocket_sync::unregister_thread_if_matches(
+                            &session_id_str,
+                            thread_entity_id,
+                        );
+                    } else {
+                        external_websocket_sync::unregister_thread(&session_id_str);
+                    }
                 }
             }
             for window in this.notifications.drain(..) {

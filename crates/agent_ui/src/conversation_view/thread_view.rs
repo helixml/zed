@@ -8722,6 +8722,13 @@ impl ThreadView {
     }
 
     fn render_multi_root_callout(&self, cx: &mut Context<Self>) -> Option<Callout> {
+        // In Helix-driven Zed (external_websocket_sync) the workspace structure
+        // is set up by the platform — multi-root is the normal case and the
+        // user can't act on this warning. Suppress it entirely.
+        if cfg!(feature = "external_websocket_sync") {
+            return None;
+        }
+
         if self.multi_root_callout_dismissed {
             return None;
         }

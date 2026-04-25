@@ -22,7 +22,7 @@ test-support = [
     "workspace/test-support",
     "agent/test-support",
 ]
-external_websocket_sync = ["external_websocket_sync_dep"]
+external_websocket_sync = ["external_websocket_sync_dep", "project/external_websocket_sync"]
 audio = ["dep:audio"]
 unit-eval = []
 

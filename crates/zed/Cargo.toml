@@ -13,7 +13,7 @@ workspace = true
 
 [features]
 tracy = ["ztracing/tracy"]
-external_websocket_sync = ["agent_ui/external_websocket_sync", "dep:external_websocket_sync", "title_bar/external_websocket_sync", "agent_servers/external_websocket_sync"]
+external_websocket_sync = ["agent_ui/external_websocket_sync", "dep:external_websocket_sync", "title_bar/external_websocket_sync", "agent_servers/external_websocket_sync", "project/external_websocket_sync"]
 # LEAK_BACKTRACE=1 cargo run --features zed/track-project-leak --profile release-fast
 track-project-leak = ["gpui/leak-detection"]
 test-support = [

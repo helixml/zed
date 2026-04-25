@@ -455,6 +455,15 @@ impl TrustedWorktreesStore {
         worktree_id: WorktreeId,
         cx: &mut Context<Self>,
     ) -> bool {
+        // In Helix-driven Zed (external_websocket_sync) the workspace is
+        // provisioned by the platform inside an isolated container — there is
+        // no untrusted-content threat model and a Restricted Mode prompt is
+        // never actionable. Auto-trust everything to keep the UI clean and the
+        // agent fully functional.
+        if cfg!(feature = "external_websocket_sync") {
+            return true;
+        }
+
         if ProjectSettings::get_global(cx).session.trust_all_worktrees {
             return true;
         }
