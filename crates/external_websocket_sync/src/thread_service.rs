@@ -684,6 +684,35 @@ pub fn ensure_thread_subscription(
                         }
                         _ => (String::new(), String::new()),
                     };
+                    // A new UserMessage entry is the unambiguous start of a
+                    // new turn — force-rotate turn_request_id from the global
+                    // map regardless of whether the previous turn completed
+                    // cleanly. The chat_message handler updates
+                    // THREAD_REQUEST_MAP when the user's prompt arrives, so by
+                    // the time NewEntry fires for the UserMessage the global
+                    // map already holds the new turn's id.
+                    //
+                    // Without this, an interrupted/cancelled prior turn leaves
+                    // last_completed_request_id stale, the assistant-only
+                    // rotation below never fires, and every assistant entry
+                    // (including the re-emit loop further down) carries the
+                    // PRIOR turn's request_id back to Helix. Helix then routes
+                    // those events to the wrong interaction — fixing this
+                    // resolves both the "messages streaming in Zed don't show
+                    // up in Helix" and the "prefix mangled with another
+                    // message" symptoms.
+                    if role == "user" {
+                        let current = turn_request_id.borrow().clone();
+                        *prev_turn_request_id.borrow_mut() = current;
+                        let global_rid = crate::get_thread_request_id(&thread_id_for_sub)
+                            .unwrap_or_default();
+                        *turn_request_id.borrow_mut() = global_rid;
+                        // Reset completion tracking — the assistant-only
+                        // rotation expects current==completed to detect "I'm
+                        // done with this turn, move on", which is true at the
+                        // start of a fresh turn.
+                        *last_completed_request_id.borrow_mut() = String::new();
+                    }
                     // Update turn_request_id from the global map only at turn
                     // boundaries — i.e. when the current turn_request_id has
                     // already been used for a message_completed (matches
