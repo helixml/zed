@@ -26,7 +26,16 @@ use crate::{
 };
 
 const JSON_RPC_VERSION: &str = "2.0";
-const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
+// Helix fork: bumped from upstream's 60s. Context-server cold-start in our
+// spec-task containers can exceed 60s when several stdio MCPs spawn at the
+// same time as Zed startup — `npx <pkg>@latest` does an npm download on first
+// run, the local API container is still warming up, and CPU is contended by
+// language servers / settings-sync-daemon all booting concurrently. When the
+// initial `initialize` request times out the context_server is marked failed
+// and its tools never appear (e.g. `mcp__chrome-devtools__*` go missing).
+// 180s gives enough headroom for cold-start without making genuine failures
+// noticeably slower to surface.
+const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(180);
 
 // Standard JSON-RPC error codes
 pub const PARSE_ERROR: i32 = -32700;
