@@ -115,7 +115,6 @@ require (
 	github.com/google/go-github/v62 v62.0.0 // indirect
 	github.com/google/go-github/v75 v75.0.0 // indirect
 	github.com/google/go-querystring v1.1.0 // indirect
-	github.com/google/go-tika v0.3.1 // indirect
 	github.com/google/jsonschema-go v0.4.2 // indirect
 	github.com/google/pprof v0.0.0-20260402051712-545e8a4df936 // indirect
 	github.com/google/s2a-go v0.1.9 // indirect
@@ -134,7 +133,7 @@ require (
 	github.com/hashicorp/go-retryablehttp v0.7.8 // indirect
 	github.com/hashicorp/go-version v1.9.0 // indirect
 	github.com/hashicorp/golang-lru/v2 v2.0.7 // indirect
-	github.com/helixml/kodit v1.3.6 // indirect
+	github.com/helixml/kodit v1.3.7 // indirect
 	github.com/huandu/xstrings v1.5.0 // indirect
 	github.com/infracloudio/msbotbuilder-go v0.2.5 // indirect
 	github.com/jackc/pgpassfile v1.0.0 // indirect
@@ -203,7 +202,6 @@ require (
 	github.com/pkg/errors v0.9.1 // indirect
 	github.com/pkoukk/tiktoken-go v0.1.6 // indirect
 	github.com/planetscale/vtprotobuf v0.6.1-0.20240319094008-0393e58bdf10 // indirect
-	github.com/puzpuzpuz/xsync/v3 v3.4.1 // indirect
 	github.com/redis/go-redis/v9 v9.18.0 // indirect
 	github.com/robfig/cron/v3 v3.0.2-0.20210106135023-bc59245fe10e // indirect
 	github.com/rs/zerolog v1.35.0 // indirect
@@ -231,7 +229,6 @@ require (
 	github.com/tiktoken-go/tokenizer v0.6.2 // indirect
 	github.com/tmc/langchaingo v0.1.12 // indirect
 	github.com/tsawler/tabula v1.6.6 // indirect
-	github.com/ugorji/go/codec v1.2.12 // indirect
 	github.com/unknwon/com v1.0.1 // indirect
 	github.com/viant/afs v1.30.0 // indirect
 	github.com/woodsbury/decimal128 v1.3.0 // indirect

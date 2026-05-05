@@ -452,6 +452,7 @@ When rebasing/merging against upstream Zed:
 39. **Check `crates/zed/src/main.rs` for `--allow-multiple-instances` CLI flag** — defined as `#[arg(long)] allow_multiple_instances: bool` on `Args`, AND used in the `failed_single_instance_check` short-circuit (`|| args.allow_multiple_instances`). This Helix-only flag was lost in the 001864 merge (re-added by 001909). Without it the e2e-test container can't launch Zed at all.
 40. **Check `Cargo.toml` workspace `rust-embed` features** — must include both `include-exclude` AND `debug-embed`. The `debug-embed` feature was originally added by Helix in commit `9ca797706f` (Oct 2025), lost in a subsequent merge, re-added in 001909. Without it, dev builds panic on startup with `settings/default.json` because RustEmbed tries to read assets from `CARGO_MANIFEST_DIR` at runtime, and that path doesn't exist outside the build directory (e.g. inside the e2e-test container or any deployed binary). Release builds always embed assets so they're unaffected — but debug builds (used by the e2e test, ARM aside) need this feature.
 41. **Check `crates/agent/src/agent.rs` for `smol::Timer::after` references** — must use `cx.background_executor().timer(d).await` instead. Upstream PR #53603 (Apr 2026) removed `smol` from the agent crate's deps. Helix's `wait_for_tools_ready()` previously used `smol::Timer::after` and broke after the merge; fixed in 001909 by switching to the canonical GPUI pattern.
+41a. **Check `acp_thread.rs` test code for unit-variant `AcpThreadEvent::Stopped` patterns** — `Stopped` is a tuple variant `Stopped(StopReason)` and `matches!(event, AcpThreadEvent::Stopped)` no longer compiles. Production builds skip `#[cfg(test)]` so this fails silently in `cargo build` but breaks `cargo test -p acp_thread test_second_send`. Grep: `grep -n "AcpThreadEvent::Stopped[^(]" crates/acp_thread/src/`. Fixed in 001980; patterns must be `Stopped(_)`.
 42. **Run `cargo check --package zed --features external_websocket_sync`** — must compile
 43. **Run `cargo test -p external_websocket_sync`** — unit tests
 44. **Run E2E test** after merge to verify all phases pass (currently 12 phases, run for both `zed-agent` and `claude` rounds)
@@ -606,4 +607,17 @@ Two intermediate plans (001946, 001947 — both 2026-04-27) were **never execute
 **HEAD change**: none in the conflicting region; only the absence of the new comment.
 **Resolution**: accept upstream — keep the comment.
 **Risk**: none. Helix doesn't touch the wgpu renderer.
+
+### Pre-existing Breakage Repaired
+
+#### `crates/acp_thread/src/acp_thread.rs` — `matches!(event, AcpThreadEvent::Stopped)` (line 5357 + 5429)
+Two test-only call sites in the Helix-added `test_second_send_during_active_turn_emits_stopped_for_both_turns` (Critical Fix #6 verification) and `test_dropped_send_task_clears_running_turn` were using the unit-variant pattern `AcpThreadEvent::Stopped` after `Stopped` became a tuple variant `Stopped(StopReason)`. Updated to `AcpThreadEvent::Stopped(_)`. This was likely broken since the 001864 merge (when `StopReason` was added) but never noticed because production builds don't compile `#[cfg(test)]`.
+
+**Lesson for future merges**: when porting-guide checklist item 12a says "Pattern matches must use `Stopped(_)`", it applies to test code as well. Add a grep to the silent-drift sweep:
+
+```bash
+grep -n "AcpThreadEvent::Stopped\b\([^(]\|$\)" crates/acp_thread/src/acp_thread.rs
+```
+
+(Pattern: any `AcpThreadEvent::Stopped` not followed by `(`.)
 
