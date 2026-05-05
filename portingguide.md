@@ -571,6 +571,9 @@ Helix-specific commits on main (oldest first):
 | `16f2b82053` | **Restore `--allow-multiple-instances` CLI flag (lost in 001864 merge)** |
 | `c7a26c9144` | **Restore `debug-embed` feature on `rust-embed` workspace dep (lost in a prior merge — required for dev/debug builds outside source tree)** |
 | `3cfc2962d1` | Merge `origin/main` into 001909 (incorporates `d7be64fad1`) |
+| `c3e312b056` | Merge upstream Zed (`8428a4399d..1da60a8518`, 172 commits, 10 days) into 001980 — 4 conflicts resolved (`deploy_cloudflare.yml`, `Cargo.lock`, `agent_settings.rs`, `wgpu_renderer.rs`) |
+| `95715a1798` | **Fix `AcpThreadEvent::Stopped` test patterns: tuple variant requires `Stopped(_)` (pre-existing breakage since 001864 — never noticed because `#[cfg(test)]` skipped in production builds)** |
+| `61427db325` | Tidy e2e test server `go.mod` for current helix deps (`kodit v1.3.6 → v1.3.7`, dropped `go-tika`) — runner doesn't tidy itself |
 
 ## Merge 001980 (2026-05-05)
 
