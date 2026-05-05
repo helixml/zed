@@ -570,3 +570,40 @@ Helix-specific commits on main (oldest first):
 | `16f2b82053` | **Restore `--allow-multiple-instances` CLI flag (lost in 001864 merge)** |
 | `c7a26c9144` | **Restore `debug-embed` feature on `rust-embed` workspace dep (lost in a prior merge — required for dev/debug builds outside source tree)** |
 | `3cfc2962d1` | Merge `origin/main` into 001909 (incorporates `d7be64fad1`) |
+
+## Merge 001980 (2026-05-05)
+
+**Divergence at start**:
+- Fork HEAD: `f5fab97857` (PR #47)
+- Upstream HEAD: `1da60a8518` ("editor: Extract Diagnostics code out of `editor.rs` (#55747)")
+- Upstream commits to merge: **172** (10 days of activity since 001909's `e3d1876c06`)
+- Fork commits ahead of upstream: 203 (entire Helix surface)
+
+Two intermediate plans (001946, 001947 — both 2026-04-27) were **never executed**. As a result this merge spans 10 days of upstream activity rather than 2.
+
+### Conflicts and Resolutions
+
+(Updated incrementally as each conflict is resolved.)
+
+#### 1. `.github/workflows/deploy_cloudflare.yml` — modify/delete
+**Upstream change**: deleted the file (Cloudflare deploy workflow retired upstream).
+**HEAD change**: had small unrelated modifications.
+**Resolution**: `git rm` — accept upstream deletion. Helix doesn't use Zed's CI.
+**Risk**: none.
+
+#### 2. `Cargo.lock` — content
+**Resolution**: `git checkout --theirs` (always — regenerated on next build with Helix features).
+**Risk**: none.
+
+#### 3. `crates/agent_settings/src/agent_settings.rs` — content
+**Upstream change**: PR #55575 ("Remove new thread location setting") removed the `NewThreadLocation` import, the `new_thread_location` field on `AgentSettings`, and its initialiser.
+**HEAD change**: Helix-only fields `show_onboarding` and `auto_open_panel` were added in the same struct/initialiser blocks alongside `new_thread_location`.
+**Resolution**: kept Helix's `show_onboarding` and `auto_open_panel`; dropped `new_thread_location` to match upstream removal. Also dropped the now-orphaned `NewThreadLocation` import. The `NewThreadLocation` type no longer exists anywhere in the workspace.
+**Risk**: none. Verified `grep -rn "new_thread_location\|NewThreadLocation" crates/` is clean.
+
+#### 4. `crates/gpui_wgpu/src/wgpu_renderer.rs` — content
+**Upstream change**: comment-only addition (`// TBD. Does retrying more actually help?`) inside a GPU error retry block, plus larger non-conflicting work for BGR subpixel layout and `WgpuContext::new_rejecting_software`.
+**HEAD change**: none in the conflicting region; only the absence of the new comment.
+**Resolution**: accept upstream — keep the comment.
+**Risk**: none. Helix doesn't touch the wgpu renderer.
+
