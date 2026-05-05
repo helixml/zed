@@ -5354,7 +5354,7 @@ mod tests {
                 {
                     let stopped_count = stopped_count.clone();
                     move |_, _, event: &AcpThreadEvent, _| {
-                        if matches!(event, AcpThreadEvent::Stopped) {
+                        if matches!(event, AcpThreadEvent::Stopped(_)) {
                             *stopped_count.borrow_mut() += 1;
                         }
                     }
@@ -5426,7 +5426,7 @@ mod tests {
                 {
                     let stopped_count = stopped_count.clone();
                     move |_, _, event: &AcpThreadEvent, _| {
-                        if matches!(event, AcpThreadEvent::Stopped) {
+                        if matches!(event, AcpThreadEvent::Stopped(_)) {
                             *stopped_count.borrow_mut() += 1;
                         }
                     }
