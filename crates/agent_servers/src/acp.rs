@@ -397,6 +397,14 @@ pub struct AcpConnection {
     child: Option<Child>,
     session_list: Option<Rc<AcpSessionList>>,
     debug_log: AcpDebugLog,
+    /// Serializes ACP `new_session`/`load_session`/`resume_session` calls on
+    /// this connection. Each caller awaits the previous request's response
+    /// before sending its own. Without this, two concurrent session-creation
+    /// requests cause the wrapper (e.g. `claude-agent-acp`) to spawn two
+    /// child SDK processes back-to-back, both racing to `npx`-install the
+    /// same MCP servers — the loser gets no `chrome-devtools-mcp` and the
+    /// active thread is silently missing tools. See helixml/zed#48.
+    session_creation_chain: Rc<RefCell<Option<Shared<Task<()>>>>>,
     _io_task: Task<()>,
     _dispatch_task: Task<()>,
     _wait_task: Task<Result<()>>,
@@ -640,6 +648,25 @@ fn connect_client_future(
         )
 }
 
+/// Drop guard that signals completion of one slot in the
+/// `session_creation_chain`. The next caller's `prev_chain.await` resolves
+/// when this is dropped (success, error, or cancellation — all guarantee
+/// the lock is released, so a stuck session-creation request can't wedge
+/// the chain forever).
+struct SessionCreationGuard {
+    done_tx: Option<futures::channel::oneshot::Sender<()>>,
+    debug_label: SharedString,
+}
+
+impl Drop for SessionCreationGuard {
+    fn drop(&mut self) {
+        if let Some(tx) = self.done_tx.take() {
+            log::info!("[ACP_SESSION_LOCK] releasing slot ({})", self.debug_label);
+            let _ = tx.send(());
+        }
+    }
+}
+
 impl AcpConnection {
     pub fn subscribe_debug_messages(
         &self,
@@ -648,6 +675,53 @@ impl AcpConnection {
         async_channel::Receiver<AcpDebugMessage>,
     ) {
         self.debug_log.subscribe()
+    }
+
+    /// Take the next slot in this connection's session-creation chain.
+    ///
+    /// Returns:
+    /// - `prev_chain`: a future that resolves when the previously-issued
+    ///   session-creation request has finished (or `Task::ready(())` if this
+    ///   is the first call). The caller must await this **before** sending
+    ///   their `session/new` or `session/load` ACP request.
+    /// - `SessionCreationGuard`: hold this until the response has been
+    ///   processed; dropping it releases the slot for the next caller.
+    ///
+    /// This serializes the wrapper's child-process spawning. Without it,
+    /// two concurrent `session/new` calls cause `claude-agent-acp` to
+    /// `spawn(claude --session-id ...)` back-to-back, both of which run
+    /// `npx <pkg>@latest` for stdio MCP servers in parallel. npm's tarball
+    /// extraction isn't safe under concurrent invocations on the same
+    /// cache directory: the loser silently fails to launch its MCP child,
+    /// leaving the active claude SDK process without (e.g.)
+    /// `chrome-devtools-mcp`. See the duplicate-spawn investigation in
+    /// helixml/zed#48.
+    fn acquire_session_creation_slot(
+        &self,
+        cx: &mut App,
+        debug_label: impl Into<SharedString>,
+    ) -> (Shared<Task<()>>, SessionCreationGuard) {
+        let chain = self.session_creation_chain.clone();
+        let prev = chain
+            .borrow()
+            .clone()
+            .unwrap_or_else(|| cx.background_spawn(async move {}).shared());
+        let (done_tx, done_rx) = futures::channel::oneshot::channel::<()>();
+        let this_done: Shared<Task<()>> = cx
+            .background_spawn(async move {
+                let _ = done_rx.await;
+            })
+            .shared();
+        *chain.borrow_mut() = Some(this_done);
+        let label = debug_label.into();
+        log::info!("[ACP_SESSION_LOCK] acquired slot ({})", label);
+        (
+            prev,
+            SessionCreationGuard {
+                done_tx: Some(done_tx),
+                debug_label: label,
+            },
+        )
     }
 
     pub async fn stdio(
@@ -900,6 +974,7 @@ impl AcpConnection {
             default_config_options,
             session_list,
             debug_log,
+            session_creation_chain: Rc::new(RefCell::new(None)),
             _io_task: io_task,
             _dispatch_task: dispatch_task,
             _wait_task: wait_task,
@@ -937,6 +1012,7 @@ impl AcpConnection {
             child: None,
             session_list: None,
             debug_log: AcpDebugLog::default(),
+            session_creation_chain: Rc::new(RefCell::new(None)),
             _io_task: io_task,
             _dispatch_task: dispatch_task,
             _wait_task: Task::ready(Ok(())),
@@ -985,11 +1061,22 @@ impl AcpConnection {
             return Task::ready(Err(anyhow!("Working directory cannot be empty")));
         };
 
+        let (prev_chain, slot_guard) = self.acquire_session_creation_slot(
+            cx,
+            format!("open_or_create_session id={} cwd={}", session_id, cwd.display()),
+        );
+
         let shared_task = cx
             .spawn({
                 let session_id = session_id.clone();
                 let this = self.clone();
                 async move |cx| {
+                    // Wait for any in-flight session creation on this connection
+                    // so we don't trigger a parallel claude SDK spawn that races
+                    // on `npx`-installed MCP servers. See acquire_session_creation_slot.
+                    let _slot_guard = slot_guard;
+                    prev_chain.await;
+
                     let action_log = cx.new(|_| ActionLog::new(project.clone()));
                     let thread: Entity<AcpThread> = cx.new(|cx| {
                         AcpThread::new(
@@ -1279,7 +1366,16 @@ impl AgentConnection for AcpConnection {
         let name = self.id.0.clone();
         let mcp_servers = mcp_servers_for_project(&project, cx);
 
+        let (prev_chain, slot_guard) = self
+            .acquire_session_creation_slot(cx, format!("new_session cwd={}", cwd.display()));
+
         cx.spawn(async move |cx| {
+            // Hold the slot guard until the spawn body returns (success or
+            // error). Awaits below run with the slot held; dropping the
+            // guard signals the next session-creation request to proceed.
+            let _slot_guard = slot_guard;
+            prev_chain.await;
+
             let response = into_foreground_future(
                 self.connection
                     .send_request(acp::NewSessionRequest::new(cwd.clone()).mcp_servers(mcp_servers)),
@@ -2939,6 +3035,77 @@ mod tests {
         assert!(
             !connection.sessions.borrow().contains_key(&session_id),
             "session should be removed after final close"
+        );
+    }
+
+    /// Two distinct-session-id `load_session` calls dispatched back-to-back
+    /// must serialize: the second's RPC must not hit the wire until the
+    /// first's response has come back. Without this, `claude-agent-acp`
+    /// would spawn two child claude SDK processes in parallel, both racing
+    /// to `npx`-install the same stdio MCP servers — and the loser ends
+    /// up with no `chrome-devtools-mcp` (the bug we're fixing).
+    #[gpui::test]
+    async fn test_concurrent_session_creation_is_serialized(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (
+            connection,
+            project,
+            load_count,
+            _close_count,
+            _load_session_updates,
+            load_session_gate,
+            _keep_agent_alive,
+        ) = connect_fake_agent(cx).await;
+
+        // Block the first load_session RPC inside the fake agent's handler.
+        let (gate_tx, gate_rx) = async_channel::bounded::<()>(1);
+        *load_session_gate
+            .lock()
+            .expect("load_session_gate mutex poisoned") = Some(gate_rx);
+
+        let work_dirs = util::path_list::PathList::new(&[std::path::Path::new("/a")]);
+        let session_a = acp::SessionId::new("session-serial-a");
+        let session_b = acp::SessionId::new("session-serial-b");
+
+        let load_a = cx.update(|cx| {
+            connection
+                .clone()
+                .load_session(session_a.clone(), project.clone(), work_dirs.clone(), None, cx)
+        });
+        let load_b = cx.update(|cx| {
+            connection
+                .clone()
+                .load_session(session_b.clone(), project.clone(), work_dirs.clone(), None, cx)
+        });
+
+        cx.run_until_parked();
+        // A is parked at the gate (load_count incremented to 1 inside its
+        // handler before the await). B is parked on the chain — it cannot
+        // send its RPC until A's slot guard drops.
+        assert_eq!(
+            load_count.load(Ordering::SeqCst),
+            1,
+            "second load_session must wait for first to complete; expected 1 RPC, got {}",
+            load_count.load(Ordering::SeqCst)
+        );
+
+        // Release A. Its handler responds, the load_session task completes,
+        // the slot guard drops, B's chain wait resolves, and B's RPC fires.
+        // The fake handler's `take()` semantics mean B sees no gate and
+        // responds immediately.
+        gate_tx.send(()).await.expect("gate send for A failed");
+        drop(gate_tx);
+
+        let _thread_a = load_a.await.expect("load A failed");
+        let _thread_b = load_b.await.expect("load B failed");
+        cx.run_until_parked();
+
+        assert_eq!(
+            load_count.load(Ordering::SeqCst),
+            2,
+            "both load_session RPCs should have been dispatched; got {}",
+            load_count.load(Ordering::SeqCst)
         );
     }
 }
