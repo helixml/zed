@@ -403,7 +403,7 @@ pub struct AcpConnection {
     /// requests cause the wrapper (e.g. `claude-agent-acp`) to spawn two
     /// child SDK processes back-to-back, both racing to `npx`-install the
     /// same MCP servers — the loser gets no `chrome-devtools-mcp` and the
-    /// active thread is silently missing tools. See helixml/zed#48.
+    /// active thread is silently missing tools. See https://github.com/helixml/zed/pull/50.
     session_creation_chain: Rc<RefCell<Option<Shared<Task<()>>>>>,
     _io_task: Task<()>,
     _dispatch_task: Task<()>,
@@ -695,7 +695,7 @@ impl AcpConnection {
     /// cache directory: the loser silently fails to launch its MCP child,
     /// leaving the active claude SDK process without (e.g.)
     /// `chrome-devtools-mcp`. See the duplicate-spawn investigation in
-    /// helixml/zed#48.
+    /// https://github.com/helixml/zed/pull/50.
     fn acquire_session_creation_slot(
         &self,
         cx: &mut App,
