@@ -1752,6 +1752,18 @@ impl AcpThread {
                             markdown.append(&full, cx);
                         });
 
+                        // Notify subscribers (e.g. the WebSocket sync layer) that the
+                        // entry's content has grown. push_chunk emits EntryUpdated when
+                        // the chunk arrives — but the chunk is still in `pending` at that
+                        // point, so subscribers reading markdown.source() see stale text.
+                        // Re-emit here, after the drain, so subscribers can read the
+                        // up-to-date markdown. The downstream throttle will coalesce
+                        // these into its own cadence.
+                        let entries_len = this.entries.len();
+                        if entries_len > 0 {
+                            cx.emit(AcpThreadEvent::EntryUpdated(entries_len - 1));
+                        }
+
                         true
                     })
                     .unwrap_or(false);
