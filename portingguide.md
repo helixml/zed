@@ -374,6 +374,23 @@ const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(180);
 
 **History:** Triggered after the AgentConnection dedup fix landed (PR #46). Once the duplicate-spawn race was fixed and only one ACP wrapper started per session, the surviving wrapper's MCP set still depended on which context_servers had completed their `initialize` handshake before the timeout. Cold-start container = all of them failed.
 
+### 11. Entity-Identity Guard at the Top of `load_agent_thread`
+
+**File:** `crates/agent_ui/src/agent_panel.rs` — first block inside `pub fn load_agent_thread`, gated on `#[cfg(feature = "external_websocket_sync")]`.
+
+**Bug:** The new agents sidebar (added in PR #42 / PR #43) routes user clicks through `panel.load_agent_thread(session_id)`. That function dedups against the active / retained `ConversationView`s by comparing `cv.root_session_id == session_id`. In Helix mode, threads are first brought into the panel by `notify_thread_display` → `ConversationView::from_existing_thread(entity)`, which uses **entity-id** identity, not session-id identity. If `root_session_id` ever desyncs from the live `Entity<AcpThread>` registered in `external_websocket_sync::THREAD_REGISTRY`, the session-id check misses, `external_thread` runs, `connection.load_session()` is issued a second time, and a fresh `Entity<AcpThread>` Y is bound to the panel. The Helix WebSocket subscription stays on the original entity X (events keep flowing to the Helix server) but the panel is now bound to Y (silent) — split-brain.
+
+**Fix:** Before any `has_session` check, look up `external_websocket_sync::get_thread(session_id)`. If a live entity exists, use **entity-id** comparison to (a) detect a no-op, (b) promote a retained CV that observes it, or (c) wrap it via `from_existing_thread` if no CV observes it. This is the same identity check `notify_thread_display` already uses, just applied at the UI entry point so both paths agree.
+
+**Why it must run before the upstream `has_session` block:** The upstream block is correct for pure-Zed sessions but cannot be modified without diverging from upstream. The new guard wraps it so the Helix-mode invariant — *one live `Entity<AcpThread>` per session, observed by exactly one active CV* — holds without touching upstream code.
+
+**Rebase checklist additions:**
+- When `agent_panel.rs::load_agent_thread` is touched upstream, **re-check the new guard sits above the existing `has_session` block**. If upstream restructures the function, the guard must be re-applied; otherwise the bug returns silently.
+- The guard depends on `external_websocket_sync::get_thread`, `register_thread`, and `THREAD_REGISTRY`. If those APIs are renamed in `crates/external_websocket_sync/src/thread_service.rs`, update the guard.
+- Related fix (Critical Fix not numbered, commit `d7be64fad1`): `unregister_thread_if_matches` makes `cx.on_release` safe. Both fixes are required — they cover restart and interactive paths respectively. Don't remove either while the other still exists.
+
+**History:** Detected after PRs #42/#43 landed the new sidebar. User-reported: "if I click the currently-open thread in the new sidebar, it stops updating in Zed but Helix still receives events." Spec task `001913_after-merging-latest-2`.
+
 ## Environment Variables
 
 | Variable | Purpose | Default |
