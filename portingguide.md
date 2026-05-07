@@ -533,6 +533,7 @@ When rebasing/merging against upstream Zed:
    Without these the binary still has the flag but quietly opens windows / dies on `open_window` failure.
 40. **Check `Cargo.toml` workspace `rust-embed` features** — must include both `include-exclude` AND `debug-embed`. The `debug-embed` feature was originally added by Helix in commit `9ca797706f` (Oct 2025), lost in a subsequent merge, re-added in 001909. Without it, dev builds panic on startup with `settings/default.json` because RustEmbed tries to read assets from `CARGO_MANIFEST_DIR` at runtime, and that path doesn't exist outside the build directory (e.g. inside the e2e-test container or any deployed binary). Release builds always embed assets so they're unaffected — but debug builds (used by the e2e test, ARM aside) need this feature.
 41. **Check `crates/agent/src/agent.rs` for `smol::Timer::after` references** — must use `cx.background_executor().timer(d).await` instead. Upstream PR #53603 (Apr 2026) removed `smol` from the agent crate's deps. Helix's `wait_for_tools_ready()` previously used `smol::Timer::after` and broke after the merge; fixed in 001909 by switching to the canonical GPUI pattern.
+41a. **Check `acp_thread.rs` test code for unit-variant `AcpThreadEvent::Stopped` patterns** — `Stopped` is a tuple variant `Stopped(StopReason)` and `matches!(event, AcpThreadEvent::Stopped)` no longer compiles. Production builds skip `#[cfg(test)]` so this fails silently in `cargo build` but breaks `cargo test -p acp_thread test_second_send`. Grep: `grep -n "AcpThreadEvent::Stopped[^(]" crates/acp_thread/src/`. Fixed in 001980; patterns must be `Stopped(_)`.
 42. **Run `cargo check --package zed --features external_websocket_sync`** — must compile
 43. **Run `cargo test -p external_websocket_sync`** — unit tests
 44. **Run E2E test** after merge to verify all phases pass (currently 12 phases, run for both `zed-agent` and `claude` rounds)
@@ -651,3 +652,56 @@ Helix-specific commits on main (oldest first):
 | `16f2b82053` | **Restore `--allow-multiple-instances` CLI flag (lost in 001864 merge)** |
 | `c7a26c9144` | **Restore `debug-embed` feature on `rust-embed` workspace dep (lost in a prior merge — required for dev/debug builds outside source tree)** |
 | `3cfc2962d1` | Merge `origin/main` into 001909 (incorporates `d7be64fad1`) |
+| `c3e312b056` | Merge upstream Zed (`8428a4399d..1da60a8518`, 172 commits, 10 days) into 001980 — 4 conflicts resolved (`deploy_cloudflare.yml`, `Cargo.lock`, `agent_settings.rs`, `wgpu_renderer.rs`) |
+| `95715a1798` | **Fix `AcpThreadEvent::Stopped` test patterns: tuple variant requires `Stopped(_)` (pre-existing breakage since 001864 — never noticed because `#[cfg(test)]` skipped in production builds)** |
+| `61427db325` | Tidy e2e test server `go.mod` for current helix deps (`kodit v1.3.6 → v1.3.7`, dropped `go-tika`) — runner doesn't tidy itself |
+
+## Merge 001980 (2026-05-05)
+
+**Divergence at start**:
+- Fork HEAD: `f5fab97857` (PR #47)
+- Upstream HEAD: `1da60a8518` ("editor: Extract Diagnostics code out of `editor.rs` (#55747)")
+- Upstream commits to merge: **172** (10 days of activity since 001909's `e3d1876c06`)
+- Fork commits ahead of upstream: 203 (entire Helix surface)
+
+Two intermediate plans (001946, 001947 — both 2026-04-27) were **never executed**. As a result this merge spans 10 days of upstream activity rather than 2.
+
+### Conflicts and Resolutions
+
+(Updated incrementally as each conflict is resolved.)
+
+#### 1. `.github/workflows/deploy_cloudflare.yml` — modify/delete
+**Upstream change**: deleted the file (Cloudflare deploy workflow retired upstream).
+**HEAD change**: had small unrelated modifications.
+**Resolution**: `git rm` — accept upstream deletion. Helix doesn't use Zed's CI.
+**Risk**: none.
+
+#### 2. `Cargo.lock` — content
+**Resolution**: `git checkout --theirs` (always — regenerated on next build with Helix features).
+**Risk**: none.
+
+#### 3. `crates/agent_settings/src/agent_settings.rs` — content
+**Upstream change**: PR #55575 ("Remove new thread location setting") removed the `NewThreadLocation` import, the `new_thread_location` field on `AgentSettings`, and its initialiser.
+**HEAD change**: Helix-only fields `show_onboarding` and `auto_open_panel` were added in the same struct/initialiser blocks alongside `new_thread_location`.
+**Resolution**: kept Helix's `show_onboarding` and `auto_open_panel`; dropped `new_thread_location` to match upstream removal. Also dropped the now-orphaned `NewThreadLocation` import. The `NewThreadLocation` type no longer exists anywhere in the workspace.
+**Risk**: none. Verified `grep -rn "new_thread_location\|NewThreadLocation" crates/` is clean.
+
+#### 4. `crates/gpui_wgpu/src/wgpu_renderer.rs` — content
+**Upstream change**: comment-only addition (`// TBD. Does retrying more actually help?`) inside a GPU error retry block, plus larger non-conflicting work for BGR subpixel layout and `WgpuContext::new_rejecting_software`.
+**HEAD change**: none in the conflicting region; only the absence of the new comment.
+**Resolution**: accept upstream — keep the comment.
+**Risk**: none. Helix doesn't touch the wgpu renderer.
+
+### Pre-existing Breakage Repaired
+
+#### `crates/acp_thread/src/acp_thread.rs` — `matches!(event, AcpThreadEvent::Stopped)` (line 5357 + 5429)
+Two test-only call sites in the Helix-added `test_second_send_during_active_turn_emits_stopped_for_both_turns` (Critical Fix #6 verification) and `test_dropped_send_task_clears_running_turn` were using the unit-variant pattern `AcpThreadEvent::Stopped` after `Stopped` became a tuple variant `Stopped(StopReason)`. Updated to `AcpThreadEvent::Stopped(_)`. This was likely broken since the 001864 merge (when `StopReason` was added) but never noticed because production builds don't compile `#[cfg(test)]`.
+
+**Lesson for future merges**: when porting-guide checklist item 12a says "Pattern matches must use `Stopped(_)`", it applies to test code as well. Add a grep to the silent-drift sweep:
+
+```bash
+grep -n "AcpThreadEvent::Stopped\b\([^(]\|$\)" crates/acp_thread/src/acp_thread.rs
+```
+
+(Pattern: any `AcpThreadEvent::Stopped` not followed by `(`.)
+
