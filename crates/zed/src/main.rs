@@ -328,8 +328,8 @@ fn main() {
     #[cfg(windows)]
     check_for_conpty_dll();
 
-    let app =
-        Application::with_platform(gpui_platform::current_platform(false)).with_assets(Assets);
+    let app = Application::with_platform(gpui_platform::current_platform(args.headless))
+        .with_assets(Assets);
 
     let app_db = db::AppDatabase::new();
     let system_id = app.background_executor().spawn(system_id());
@@ -348,6 +348,7 @@ fn main() {
     let failed_single_instance_check = if *zed_env_vars::ZED_STATELESS
         || *release_channel::RELEASE_CHANNEL == ReleaseChannel::Dev
         || args.allow_multiple_instances
+        || args.headless
     {
         false
     } else {
@@ -870,6 +871,11 @@ fn main() {
             async move |cx| authenticate(client, cx).await
         })
         .detach_and_log_err(cx);
+
+        if args.headless {
+            initialize_headless(app_state.clone(), cx);
+            return;
+        }
 
         let urls: Vec<_> = args
             .paths_or_urls
@@ -1411,6 +1417,169 @@ async fn installation_id(db: KeyValueStore) -> Result<IdType> {
     Ok(IdType::New(installation_id))
 }
 
+/// Initialize Zed in headless mode: no windows, no workspace.
+///
+/// Sets up the external WebSocket sync (Helix) and the agent thread handler so the
+/// process can drive ACP threads from the WebSocket without any UI. The GPUI event
+/// loop continues running until the process is signalled.
+///
+/// Without `external_websocket_sync` enabled this is effectively a no-op idle loop —
+/// the flag is mostly useful for the Helix integration.
+fn initialize_headless(app_state: Arc<AppState>, cx: &mut App) {
+    log::info!("🟢 [HEADLESS] Starting Zed in headless mode (no windows, no display)");
+    eprintln!("🟢 [HEADLESS] Starting Zed in headless mode (no windows, no display)");
+
+    #[cfg(feature = "external_websocket_sync")]
+    {
+        use external_websocket_sync::{ExternalSyncSettings, WebSocketSyncConfig};
+        use language_model::LanguageModelRegistry;
+        use parking_lot::Mutex;
+        use project::context_server_store::ContextServerStatus;
+        use std::sync::Arc;
+        use tokio::sync::mpsc;
+
+        let project = project::Project::local(
+            app_state.client.clone(),
+            app_state.node_runtime.clone(),
+            app_state.user_store.clone(),
+            app_state.languages.clone(),
+            app_state.fs.clone(),
+            None,
+            project::LocalProjectFlags {
+                init_worktree_trust: false,
+                watch_global_configs: false,
+            },
+            cx,
+        );
+
+        let thread_store = ThreadStore::global(cx);
+
+        external_websocket_sync::setup_thread_handler(
+            project.clone(),
+            thread_store,
+            app_state.fs.clone(),
+            cx,
+        );
+
+        // Tracks the most recently displayed thread so the headless UI-state responder
+        // can answer `thread_id` and `entry_count` faithfully. Updated by the
+        // thread-display callback below; read by the ui-state callback further down.
+        let active_thread_id: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+
+        // Headless thread-display responder. AgentPanel normally consumes these to
+        // switch the visible thread; without a panel we just record the most recent
+        // one so the ui_state response stays current — and we drain the channel so
+        // it doesn't queue forever (notify_thread_display fires on every follow-up).
+        let (display_tx, mut display_rx) =
+            mpsc::unbounded_channel::<external_websocket_sync::ThreadDisplayNotification>();
+        external_websocket_sync::init_thread_display_callback(display_tx);
+        let active_thread_id_for_display = active_thread_id.clone();
+        cx.background_spawn(async move {
+            while let Some(notification) = display_rx.recv().await {
+                *active_thread_id_for_display.lock() = Some(notification.helix_session_id);
+            }
+        })
+        .detach();
+
+        // Headless UI-state responder. The agent panel normally answers `query_ui_state`
+        // by reading its own view; with no panel we synthesize a response from the
+        // headless project's context_server_store, the most-recently-displayed thread,
+        // and the global LanguageModelRegistry so the E2E suite can validate Phase 6
+        // in --headless mode.
+        let (query_tx, mut query_rx) =
+            mpsc::unbounded_channel::<external_websocket_sync::UiStateQueryRequest>();
+        external_websocket_sync::init_ui_state_query_callback(query_tx);
+        let project_for_query = project.clone();
+        let active_thread_id_for_query = active_thread_id.clone();
+        cx.spawn(async move |cx| {
+            while let Some(query) = query_rx.recv().await {
+                let query_id = query.query_id.clone();
+                let active_thread_id = active_thread_id_for_query.lock().clone();
+                let send_result = cx.update(|cx| {
+                    let mcp_servers = {
+                        let store = project_for_query.read(cx).context_server_store();
+                        let store = store.read(cx);
+                        let mut servers = std::collections::HashMap::new();
+                        for server_id in store.server_ids() {
+                            if let Some(status) = store.status_for_server(server_id) {
+                                let status_str = match status {
+                                    ContextServerStatus::Running => "running",
+                                    ContextServerStatus::Starting => "starting",
+                                    ContextServerStatus::Stopped => "stopped",
+                                    ContextServerStatus::Error(_) => "error",
+                                    ContextServerStatus::AuthRequired => "auth_required",
+                                    ContextServerStatus::Authenticating => "authenticating",
+                                };
+                                servers.insert(server_id.0.to_string(), status_str.to_string());
+                            }
+                        }
+                        servers
+                    };
+
+                    let entry_count = active_thread_id
+                        .as_deref()
+                        .and_then(external_websocket_sync::get_thread)
+                        .and_then(|weak| weak.upgrade())
+                        .map(|thread| thread.read(cx).entries().len())
+                        .unwrap_or(0);
+
+                    let active_model = LanguageModelRegistry::read_global(cx)
+                        .default_model()
+                        .map(|m| m.model.id().0.to_string());
+
+                    external_websocket_sync::send_websocket_event(
+                        external_websocket_sync::SyncEvent::UiStateResponse {
+                            query_id,
+                            active_view: "headless".to_string(),
+                            thread_id: active_thread_id,
+                            entry_count,
+                            mcp_servers,
+                            active_model,
+                        },
+                    )
+                });
+                if let Err(e) = send_result {
+                    log::warn!(
+                        "🟡 [HEADLESS] send_websocket_event(UiStateResponse) failed: {e:#}"
+                    );
+                }
+            }
+        })
+        .detach();
+
+        let settings = ExternalSyncSettings::get_global(cx);
+        if settings.enabled && settings.websocket_sync.enabled {
+            let config = WebSocketSyncConfig {
+                enabled: true,
+                url: settings.websocket_sync.external_url.clone(),
+                auth_token: settings
+                    .websocket_sync
+                    .auth_token
+                    .clone()
+                    .unwrap_or_default(),
+                use_tls: settings.websocket_sync.use_tls,
+                skip_tls_verify: settings.websocket_sync.skip_tls_verify,
+            };
+            external_websocket_sync::init_websocket_service(config);
+            log::info!("🟢 [HEADLESS] WebSocket sync service initialized");
+        } else {
+            log::warn!(
+                "🟡 [HEADLESS] external_websocket_sync feature is built in but settings disable it; \
+                running idle. Set ZED_EXTERNAL_SYNC_ENABLED=1 (and friends) to start the sync."
+            );
+        }
+    }
+
+    #[cfg(not(feature = "external_websocket_sync"))]
+    {
+        let _ = app_state;
+        let _ = cx;
+        log::warn!(
+            "🟡 [HEADLESS] Built without `external_websocket_sync` feature; --headless has nothing to do"
+        );
+    }
+}
+
 pub(crate) async fn restore_or_create_workspace(
     app_state: Arc<AppState>,
     cx: &mut AsyncApp,
@@ -1776,6 +1945,14 @@ struct Args {
     /// Required by the external_websocket_sync E2E test runner.
     #[arg(long)]
     allow_multiple_instances: bool,
+
+    /// Run Zed without any display server (no Wayland, no X11) and without opening any
+    /// windows. Initializes the external WebSocket sync (Helix) and MCP/agent backend
+    /// only. Useful for running Zed as an agent backend on a headless machine.
+    ///
+    /// Implies `--allow-multiple-instances`. The process runs until interrupted.
+    #[arg(long)]
+    headless: bool,
 
     /// Record an ETW trace. Must be run as administrator.
     #[cfg(target_os = "windows")]

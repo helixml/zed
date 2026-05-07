@@ -206,6 +206,7 @@ theme_selector.workspace = true
 time.workspace = true
 time_format.workspace = true
 title_bar.workspace = true
+tokio.workspace = true
 ztracing.workspace = true
 tracing.workspace = true
 toolchain_selector.workspace = true
