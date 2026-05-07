@@ -1384,7 +1384,10 @@ fn initialize_headless(app_state: Arc<AppState>, cx: &mut App) {
     #[cfg(feature = "external_websocket_sync")]
     {
         use external_websocket_sync::{ExternalSyncSettings, WebSocketSyncConfig};
+        use language_model::LanguageModelRegistry;
+        use parking_lot::Mutex;
         use project::context_server_store::ContextServerStatus;
+        use std::sync::Arc;
         use tokio::sync::mpsc;
 
         let project = project::Project::local(
@@ -1410,17 +1413,40 @@ fn initialize_headless(app_state: Arc<AppState>, cx: &mut App) {
             cx,
         );
 
+        // Tracks the most recently displayed thread so the headless UI-state responder
+        // can answer `thread_id` and `entry_count` faithfully. Updated by the
+        // thread-display callback below; read by the ui-state callback further down.
+        let active_thread_id: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+
+        // Headless thread-display responder. AgentPanel normally consumes these to
+        // switch the visible thread; without a panel we just record the most recent
+        // one so the ui_state response stays current — and we drain the channel so
+        // it doesn't queue forever (notify_thread_display fires on every follow-up).
+        let (display_tx, mut display_rx) =
+            mpsc::unbounded_channel::<external_websocket_sync::ThreadDisplayNotification>();
+        external_websocket_sync::init_thread_display_callback(display_tx);
+        let active_thread_id_for_display = active_thread_id.clone();
+        cx.background_spawn(async move {
+            while let Some(notification) = display_rx.recv().await {
+                *active_thread_id_for_display.lock() = Some(notification.helix_session_id);
+            }
+        })
+        .detach();
+
         // Headless UI-state responder. The agent panel normally answers `query_ui_state`
         // by reading its own view; with no panel we synthesize a response from the
-        // headless project's context_server_store and the active thread (if any) so the
-        // E2E suite can still validate Phase 6 in --headless mode.
+        // headless project's context_server_store, the most-recently-displayed thread,
+        // and the global LanguageModelRegistry so the E2E suite can validate Phase 6
+        // in --headless mode.
         let (query_tx, mut query_rx) =
             mpsc::unbounded_channel::<external_websocket_sync::UiStateQueryRequest>();
         external_websocket_sync::init_ui_state_query_callback(query_tx);
         let project_for_query = project.clone();
+        let active_thread_id_for_query = active_thread_id.clone();
         cx.spawn(async move |cx| {
             while let Some(query) = query_rx.recv().await {
                 let query_id = query.query_id.clone();
+                let active_thread_id = active_thread_id_for_query.lock().clone();
                 let send_result = cx.update(|cx| {
                     let mcp_servers = {
                         let store = project_for_query.read(cx).context_server_store();
@@ -1441,14 +1467,26 @@ fn initialize_headless(app_state: Arc<AppState>, cx: &mut App) {
                         }
                         servers
                     };
+
+                    let entry_count = active_thread_id
+                        .as_deref()
+                        .and_then(external_websocket_sync::get_thread)
+                        .and_then(|weak| weak.upgrade())
+                        .map(|thread| thread.read(cx).entries().len())
+                        .unwrap_or(0);
+
+                    let active_model = LanguageModelRegistry::read_global(cx)
+                        .default_model()
+                        .map(|m| m.model.id().0.to_string());
+
                     external_websocket_sync::send_websocket_event(
                         external_websocket_sync::SyncEvent::UiStateResponse {
                             query_id,
                             active_view: "headless".to_string(),
-                            thread_id: None,
-                            entry_count: 0,
+                            thread_id: active_thread_id,
+                            entry_count,
                             mcp_servers,
-                            active_model: None,
+                            active_model,
                         },
                     )
                 });
