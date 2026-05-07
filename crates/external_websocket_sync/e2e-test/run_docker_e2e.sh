@@ -107,6 +107,7 @@ docker run --rm \
     -e ANTHROPIC_API_KEY="$ANTHROPIC_API_KEY" \
     ${ANTHROPIC_BASE_URL_ARG} \
     -e E2E_AGENTS="$E2E_AGENTS" \
+    -e E2E_HEADLESS="${E2E_HEADLESS:-0}" \
     -v "$SCREENSHOTS_DIR:/test/screenshots" \
     $CLAUDE_ACP_MOUNT \
     zed-ws-e2e

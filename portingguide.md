@@ -91,6 +91,28 @@ These files contain Helix-specific changes that must be preserved during rebases
 ### `crates/zed/src/zed.rs`
 - Initialization of WebSocket sync service on startup (cfg-gated)
 
+### `crates/zed/src/main.rs`
+- `--headless` CLI flag and `initialize_headless()` function. Allows Zed to run with no
+  display server (no Wayland, no X11) and no windows, while still initializing the
+  external WebSocket sync (Helix) and the agent/MCP backend. Specifically:
+  - Adds `headless: bool` to the `Args` struct.
+  - Passes `args.headless` to `gpui_platform::current_platform(...)` so GPUI's Linux
+    layer uses `HeadlessClient` (no X11/Wayland connection, no window opening).
+  - Treats `--headless` as implying `--allow-multiple-instances` in the
+    `failed_single_instance_check` short-circuit (otherwise the singleton lock would
+    block headless backends from running alongside a desktop Zed).
+  - In the `app.run` callback, after global init but before workspace creation,
+    branches on `args.headless` and calls `initialize_headless()`. That function
+    constructs a windowless `Project::local`, grabs the global `ThreadStore`, calls
+    `external_websocket_sync::setup_thread_handler`, and then starts the WebSocket
+    service via `init_websocket_service` if `ExternalSyncSettings` says it's enabled.
+    Then it returns; the GPUI event loop continues running the WebSocket / thread
+    tasks until the process is signalled.
+  - The body of `initialize_headless` is `cfg(feature = "external_websocket_sync")`-
+    gated; without the feature it just logs a warning and idles.
+- Also adds `--allow-multiple-instances` (older Helix-only flag — see Critical Fix
+  #39 below).
+
 ### `crates/agent_ui/Cargo.toml`
 - Added `external_websocket_sync` feature flag
 - Added `external_websocket_sync_dep` optional dependency
@@ -386,6 +408,60 @@ const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(180);
 | `ZED_HTTP_INSECURE_TLS` | Skip TLS for all HTTP (enterprise) | `0` |
 | `ZED_WORK_DIR` | Working directory for sessions | auto-detected |
 | `ZED_STATELESS` | Don't persist thread state | not set |
+| `HELIX_SESSION_ID` | Session ID the headless WebSocket client identifies as (required when running `zed --headless`) | none |
+
+## Headless Mode
+
+`zed --headless` runs the binary with no display server (Wayland/X11) and no windows.
+It still:
+- Initializes `external_websocket_sync` and connects to Helix (when settings enable it).
+- Wires up the thread service handler over a windowless `Project::local`.
+- Runs the GPUI event loop until interrupted, so MCP/agent turns can stream as normal.
+
+What it deliberately skips:
+- `restore_or_create_workspace` — no `MultiWorkspace`/`Workspace`/`Window` is ever opened.
+- `OpenListener` second-instance handling (`--headless` implies `--allow-multiple-instances`).
+
+Use cases: running Zed as a Helix agent backend on a server with no GUI; running inside a
+container that doesn't have Sway/Hyprland/X11; smoke-testing the WebSocket protocol without
+a desktop.
+
+Quickstart:
+```bash
+ZED_EXTERNAL_SYNC_ENABLED=1 \
+ZED_HELIX_URL=api.example.com:8080 \
+ZED_HELIX_TOKEN=... \
+HELIX_SESSION_ID=ses_... \
+zed --headless --user-data-dir /var/lib/zed-agent
+```
+
+### Headless mode and the E2E test
+
+The E2E test runner supports `E2E_HEADLESS=1` which skips Xvfb, unsets
+`DISPLAY`, and launches Zed with `--headless`:
+
+```bash
+E2E_HEADLESS=1 ./run_docker_e2e.sh --no-build
+```
+
+All 12 phases pass in headless mode for both `zed-agent` and `claude`. Phase 6
+(`query_ui_state`) works because `initialize_headless()` registers a synthetic
+UI-state responder that returns `active_view: "headless"` plus the real
+`mcp_servers` map read from the headless project's `context_server_store`.
+`thread_id`, `entry_count`, and `active_model` are reported as null/0 (the
+panel is the source of those in headful mode and we don't track them here).
+
+**Recommended CI matrix** — covers both agents and both display modes without
+spending more wall-clock than the original single-mode default:
+
+| Job | Command | Runs | Time |
+|-----|---------|------|------|
+| `e2e-headful` | `./run_docker_e2e.sh` | zed-agent (headful, full 12 phases) | ~3–4 min |
+| `e2e-headless` | `E2E_HEADLESS=1 E2E_AGENTS=claude ./run_docker_e2e.sh` | claude (headless, full 12 phases) | ~3–4 min |
+
+Run them as parallel CI jobs and total wall clock stays at ~3–4 min. If you
+want to test both agents in both modes, expand to a 4-cell matrix. The
+`E2E_AGENTS` and `E2E_HEADLESS` env vars compose freely.
 
 ## Callback Architecture
 
@@ -450,6 +526,11 @@ When rebasing/merging against upstream Zed:
 37. **Check `acp_thread.rs` `run_turn()` stopped_emitted_for_task** — normal completion Stopped must check stopped_emitted_for_task to prevent duplicate emission racing with cancel()
 38. **Check trial-end upsell guard** — `suggest_trial_end_upsell()` returns early in Helix builds
 39. **Check `crates/zed/src/main.rs` for `--allow-multiple-instances` CLI flag** — defined as `#[arg(long)] allow_multiple_instances: bool` on `Args`, AND used in the `failed_single_instance_check` short-circuit (`|| args.allow_multiple_instances`). This Helix-only flag was lost in the 001864 merge (re-added by 001909). Without it the e2e-test container can't launch Zed at all.
+39a. **Check `crates/zed/src/main.rs` for `--headless` CLI flag** — defined as `#[arg(long)] headless: bool` on `Args`. Three call sites must all be present:
+   1. `Application::with_platform(gpui_platform::current_platform(args.headless))` — passes the bool into GPUI so Linux uses `HeadlessClient` instead of trying X11/Wayland.
+   2. `failed_single_instance_check` `|| args.headless` short-circuit — singleton lock must not block the headless backend.
+   3. Inside the `app.run` closure, after `cx.activate(true)` and the `authenticate` spawn, an `if args.headless { initialize_headless(app_state.clone(), cx); return; }` branch that skips workspace/window creation entirely. The `initialize_headless()` function (cfg-gated on `external_websocket_sync`) builds a `Project::local` with no worktrees, grabs `ThreadStore::global(cx)`, calls `external_websocket_sync::setup_thread_handler(...)`, and then starts the sync via `init_websocket_service(WebSocketSyncConfig{...})` when settings enable it.
+   Without these the binary still has the flag but quietly opens windows / dies on `open_window` failure.
 40. **Check `Cargo.toml` workspace `rust-embed` features** — must include both `include-exclude` AND `debug-embed`. The `debug-embed` feature was originally added by Helix in commit `9ca797706f` (Oct 2025), lost in a subsequent merge, re-added in 001909. Without it, dev builds panic on startup with `settings/default.json` because RustEmbed tries to read assets from `CARGO_MANIFEST_DIR` at runtime, and that path doesn't exist outside the build directory (e.g. inside the e2e-test container or any deployed binary). Release builds always embed assets so they're unaffected — but debug builds (used by the e2e test, ARM aside) need this feature.
 41. **Check `crates/agent/src/agent.rs` for `smol::Timer::after` references** — must use `cx.background_executor().timer(d).await` instead. Upstream PR #53603 (Apr 2026) removed `smol` from the agent crate's deps. Helix's `wait_for_tools_ready()` previously used `smol::Timer::after` and broke after the merge; fixed in 001909 by switching to the canonical GPUI pattern.
 42. **Run `cargo check --package zed --features external_websocket_sync`** — must compile

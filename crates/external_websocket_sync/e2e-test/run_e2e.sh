@@ -81,33 +81,41 @@ if [ -z "${DBUS_SESSION_BUS_ADDRESS:-}" ]; then
     echo "[setup] D-Bus session: ${DBUS_SESSION_BUS_ADDRESS:-none}"
 fi
 
-# Start virtual framebuffer if no display
-if ! xdpyinfo -display "${DISPLAY:-}" >/dev/null 2>&1; then
-    echo "[setup] Starting Xvfb on :99..."
-    Xvfb :99 -screen 0 1280x720x24 -ac +extension GLX &
-    XVFB_PID=$!
-    export DISPLAY=:99
-    sleep 1
-    if ! kill -0 "$XVFB_PID" 2>/dev/null; then
-        echo "[error] Xvfb failed to start"
-        exit 1
+# In E2E_HEADLESS=1 mode we skip Xvfb entirely and run Zed with --headless.
+# This validates that the WebSocket sync + agent backend works with no display server.
+if [ "${E2E_HEADLESS:-0}" = "1" ]; then
+    echo "[setup] E2E_HEADLESS=1: skipping Xvfb; Zed will be launched with --headless"
+    unset DISPLAY
+    SCREENSHOT_PID=""
+else
+    # Start virtual framebuffer if no display
+    if ! xdpyinfo -display "${DISPLAY:-}" >/dev/null 2>&1; then
+        echo "[setup] Starting Xvfb on :99..."
+        Xvfb :99 -screen 0 1280x720x24 -ac +extension GLX &
+        XVFB_PID=$!
+        export DISPLAY=:99
+        sleep 1
+        if ! kill -0 "$XVFB_PID" 2>/dev/null; then
+            echo "[error] Xvfb failed to start"
+            exit 1
+        fi
+        echo "[setup] Xvfb started (PID $XVFB_PID)"
     fi
-    echo "[setup] Xvfb started (PID $XVFB_PID)"
-fi
 
-# Start background screenshot capture
-mkdir -p "$SCREENSHOT_DIR"
-(
-    SHOT_NUM=0
-    while true; do
-        sleep "$SCREENSHOT_INTERVAL"
-        SHOT_NUM=$((SHOT_NUM + 1))
-        FILENAME=$(printf "%s/screenshot-%04d.png" "$SCREENSHOT_DIR" "$SHOT_NUM")
-        import -window root "$FILENAME" 2>/dev/null || true
-    done
-) &
-SCREENSHOT_PID=$!
-echo "[screenshots] Background capture started (every ${SCREENSHOT_INTERVAL}s → $SCREENSHOT_DIR)"
+    # Start background screenshot capture
+    mkdir -p "$SCREENSHOT_DIR"
+    (
+        SHOT_NUM=0
+        while true; do
+            sleep "$SCREENSHOT_INTERVAL"
+            SHOT_NUM=$((SHOT_NUM + 1))
+            FILENAME=$(printf "%s/screenshot-%04d.png" "$SCREENSHOT_DIR" "$SHOT_NUM")
+            import -window root "$FILENAME" 2>/dev/null || true
+        done
+    ) &
+    SCREENSHOT_PID=$!
+    echo "[screenshots] Background capture started (every ${SCREENSHOT_INTERVAL}s → $SCREENSHOT_DIR)"
+fi
 
 # Verify binaries exist
 if [ ! -f "$ZED_BINARY" ]; then
@@ -162,8 +170,11 @@ export ZED_HELIX_SKIP_TLS_VERIFY=false
 export HELIX_SESSION_ID="ses_e2e-test-session-001"
 
 # ---- Determine which agents to test ----
-# E2E_AGENTS controls which agent rounds to run. Default: zed-agent only.
-# Set E2E_AGENTS="zed-agent,claude" to also test Claude Code.
+# E2E_AGENTS controls which agent rounds to run. Default: zed-agent only (fastest).
+# Set E2E_AGENTS="zed-agent,claude" to also test Claude Code (adds an LLM round).
+# Recommended CI matrix: zed-agent in headful mode + claude in E2E_HEADLESS=1 mode,
+# parallel jobs, each ~3-4 min — covers both agents and both display modes without
+# adding wall-clock time over the previous single-mode default.
 export E2E_AGENTS="${E2E_AGENTS:-zed-agent}"
 echo "[setup] E2E_AGENTS=$E2E_AGENTS"
 
@@ -240,12 +251,19 @@ echo "[zed]   ZED_EXTERNAL_SYNC_ENABLED=$ZED_EXTERNAL_SYNC_ENABLED"
 echo "[zed]   ZED_STATELESS=${ZED_STATELESS:-not set}"
 echo "[zed]   ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY:+set (${#ANTHROPIC_API_KEY} chars)}"
 echo "[zed]   E2E_AGENTS=$E2E_AGENTS"
+echo "[zed]   E2E_HEADLESS=${E2E_HEADLESS:-0}"
 echo ""
+
+ZED_HEADLESS_ARGS=()
+if [ "${E2E_HEADLESS:-0}" = "1" ]; then
+    ZED_HEADLESS_ARGS=(--headless)
+fi
 
 # Start Zed (capture logs for debugging)
 ZED_LOG_FILE="/tmp/zed-e2e.log"
 "$ZED_BINARY" \
     --allow-multiple-instances \
+    "${ZED_HEADLESS_ARGS[@]}" \
     "$PROJECT_DIR" \
     > "$ZED_LOG_FILE" 2>&1 &
 ZED_PID=$!
@@ -268,6 +286,7 @@ while [ "$ELAPSED" -lt "$TEST_TIMEOUT" ]; do
         echo "[zed] Restarting Zed..."
         "$ZED_BINARY" \
             --allow-multiple-instances \
+            "${ZED_HEADLESS_ARGS[@]}" \
             "$PROJECT_DIR" \
             >> "$ZED_LOG_FILE" 2>&1 &
         ZED_PID=$!
