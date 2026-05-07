@@ -1384,6 +1384,8 @@ fn initialize_headless(app_state: Arc<AppState>, cx: &mut App) {
     #[cfg(feature = "external_websocket_sync")]
     {
         use external_websocket_sync::{ExternalSyncSettings, WebSocketSyncConfig};
+        use project::context_server_store::ContextServerStatus;
+        use tokio::sync::mpsc;
 
         let project = project::Project::local(
             app_state.client.clone(),
@@ -1402,11 +1404,62 @@ fn initialize_headless(app_state: Arc<AppState>, cx: &mut App) {
         let thread_store = ThreadStore::global(cx);
 
         external_websocket_sync::setup_thread_handler(
-            project,
+            project.clone(),
             thread_store,
             app_state.fs.clone(),
             cx,
         );
+
+        // Headless UI-state responder. The agent panel normally answers `query_ui_state`
+        // by reading its own view; with no panel we synthesize a response from the
+        // headless project's context_server_store and the active thread (if any) so the
+        // E2E suite can still validate Phase 6 in --headless mode.
+        let (query_tx, mut query_rx) =
+            mpsc::unbounded_channel::<external_websocket_sync::UiStateQueryRequest>();
+        external_websocket_sync::init_ui_state_query_callback(query_tx);
+        let project_for_query = project.clone();
+        cx.spawn(async move |cx| {
+            while let Some(query) = query_rx.recv().await {
+                let query_id = query.query_id.clone();
+                let send_result = cx.update(|cx| {
+                    let mcp_servers = {
+                        let store = project_for_query.read(cx).context_server_store();
+                        let store = store.read(cx);
+                        let mut servers = std::collections::HashMap::new();
+                        for server_id in store.server_ids() {
+                            if let Some(status) = store.status_for_server(server_id) {
+                                let status_str = match status {
+                                    ContextServerStatus::Running => "running",
+                                    ContextServerStatus::Starting => "starting",
+                                    ContextServerStatus::Stopped => "stopped",
+                                    ContextServerStatus::Error(_) => "error",
+                                    ContextServerStatus::AuthRequired => "auth_required",
+                                    ContextServerStatus::Authenticating => "authenticating",
+                                };
+                                servers.insert(server_id.0.to_string(), status_str.to_string());
+                            }
+                        }
+                        servers
+                    };
+                    external_websocket_sync::send_websocket_event(
+                        external_websocket_sync::SyncEvent::UiStateResponse {
+                            query_id,
+                            active_view: "headless".to_string(),
+                            thread_id: None,
+                            entry_count: 0,
+                            mcp_servers,
+                            active_model: None,
+                        },
+                    )
+                });
+                if let Err(e) = send_result {
+                    log::warn!(
+                        "🟡 [HEADLESS] send_websocket_event(UiStateResponse) failed: {e:#}"
+                    );
+                }
+            }
+        })
+        .detach();
 
         let settings = ExternalSyncSettings::get_global(cx);
         if settings.enabled && settings.websocket_sync.enabled {

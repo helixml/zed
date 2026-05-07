@@ -170,9 +170,12 @@ export ZED_HELIX_SKIP_TLS_VERIFY=false
 export HELIX_SESSION_ID="ses_e2e-test-session-001"
 
 # ---- Determine which agents to test ----
-# E2E_AGENTS controls which agent rounds to run. Default: zed-agent and claude.
-# Set E2E_AGENTS="zed-agent" to skip Claude Code (faster, no extra LLM calls).
-export E2E_AGENTS="${E2E_AGENTS:-zed-agent,claude}"
+# E2E_AGENTS controls which agent rounds to run. Default: zed-agent only (fastest).
+# Set E2E_AGENTS="zed-agent,claude" to also test Claude Code (adds an LLM round).
+# Recommended CI matrix: zed-agent in headful mode + claude in E2E_HEADLESS=1 mode,
+# parallel jobs, each ~3-4 min — covers both agents and both display modes without
+# adding wall-clock time over the previous single-mode default.
+export E2E_AGENTS="${E2E_AGENTS:-zed-agent}"
 echo "[setup] E2E_AGENTS=$E2E_AGENTS"
 
 # ---- Write Zed settings.json for LLM provider ----

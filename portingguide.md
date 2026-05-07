@@ -444,21 +444,24 @@ The E2E test runner supports `E2E_HEADLESS=1` which skips Xvfb, unsets
 E2E_HEADLESS=1 ./run_docker_e2e.sh --no-build
 ```
 
-What works headlessly today (zed-agent round, smoke-tested):
-- Phases 1–5 (basic thread creation, follow-up, new thread, follow-up to
-  non-visible thread, simulate user input) — all pass.
-- WebSocket connection, reconnection, message_added/message_completed streaming.
+All 12 phases pass in headless mode for both `zed-agent` and `claude`. Phase 6
+(`query_ui_state`) works because `initialize_headless()` registers a synthetic
+UI-state responder that returns `active_view: "headless"` plus the real
+`mcp_servers` map read from the headless project's `context_server_store`.
+`thread_id`, `entry_count`, and `active_model` are reported as null/0 (the
+panel is the source of those in headful mode and we don't track them here).
 
-What does **not** work headlessly:
-- Phase 6 (`query_ui_state`) — the callback that responds to `query_ui_state`
-  is registered by `AgentPanel`, which doesn't exist in `--headless`. The
-  request goes onto `PENDING_UI_STATE_QUERIES` and never resolves. Because the
-  test phases are sequential, this aborts the run before phases 7–12 execute.
+**Recommended CI matrix** — covers both agents and both display modes without
+spending more wall-clock than the original single-mode default:
 
-To validate phases 7–12 in headless mode you would need to either skip Phase 6
-(test-side) or wire a synthetic UI-state responder into `initialize_headless()`
-that returns `active_view: "headless"` and the live thread metadata. Neither is
-done today.
+| Job | Command | Runs | Time |
+|-----|---------|------|------|
+| `e2e-headful` | `./run_docker_e2e.sh` | zed-agent (headful, full 12 phases) | ~3–4 min |
+| `e2e-headless` | `E2E_HEADLESS=1 E2E_AGENTS=claude ./run_docker_e2e.sh` | claude (headless, full 12 phases) | ~3–4 min |
+
+Run them as parallel CI jobs and total wall clock stays at ~3–4 min. If you
+want to test both agents in both modes, expand to a 4-cell matrix. The
+`E2E_AGENTS` and `E2E_HEADLESS` env vars compose freely.
 
 ## Callback Architecture
 

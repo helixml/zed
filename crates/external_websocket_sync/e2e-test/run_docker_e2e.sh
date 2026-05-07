@@ -83,7 +83,7 @@ SCREENSHOTS_DIR="$SCRIPT_DIR/screenshots"
 mkdir -p "$SCREENSHOTS_DIR"
 
 # Run E2E test
-E2E_AGENTS="${E2E_AGENTS:-zed-agent,claude}"
+E2E_AGENTS="${E2E_AGENTS:-zed-agent}"
 echo "=== Running E2E test (agents: $E2E_AGENTS) ==="
 
 # Mount local claude-agent-acp if available (for testing local changes).
