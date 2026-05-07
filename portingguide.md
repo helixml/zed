@@ -435,6 +435,31 @@ HELIX_SESSION_ID=ses_... \
 zed --headless --user-data-dir /var/lib/zed-agent
 ```
 
+### Headless mode and the E2E test
+
+The E2E test runner supports `E2E_HEADLESS=1` which skips Xvfb, unsets
+`DISPLAY`, and launches Zed with `--headless`:
+
+```bash
+E2E_HEADLESS=1 ./run_docker_e2e.sh --no-build
+```
+
+What works headlessly today (zed-agent round, smoke-tested):
+- Phases 1–5 (basic thread creation, follow-up, new thread, follow-up to
+  non-visible thread, simulate user input) — all pass.
+- WebSocket connection, reconnection, message_added/message_completed streaming.
+
+What does **not** work headlessly:
+- Phase 6 (`query_ui_state`) — the callback that responds to `query_ui_state`
+  is registered by `AgentPanel`, which doesn't exist in `--headless`. The
+  request goes onto `PENDING_UI_STATE_QUERIES` and never resolves. Because the
+  test phases are sequential, this aborts the run before phases 7–12 execute.
+
+To validate phases 7–12 in headless mode you would need to either skip Phase 6
+(test-side) or wire a synthetic UI-state responder into `initialize_headless()`
+that returns `active_view: "headless"` and the live thread metadata. Neither is
+done today.
+
 ## Callback Architecture
 
 The WebSocket sync layer communicates with the agent panel via global callback channels (using `tokio::sync::mpsc`). This avoids tight coupling:
