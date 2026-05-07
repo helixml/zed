@@ -324,8 +324,8 @@ fn main() {
     #[cfg(windows)]
     check_for_conpty_dll();
 
-    let app =
-        Application::with_platform(gpui_platform::current_platform(false)).with_assets(Assets);
+    let app = Application::with_platform(gpui_platform::current_platform(args.headless))
+        .with_assets(Assets);
 
     let app_db = db::AppDatabase::new();
     let system_id = app.background_executor().spawn(system_id());
@@ -366,6 +366,7 @@ fn main() {
     let failed_single_instance_check = if *zed_env_vars::ZED_STATELESS
         || *release_channel::RELEASE_CHANNEL == ReleaseChannel::Dev
         || args.allow_multiple_instances
+        || args.headless
     {
         false
     } else {
@@ -822,6 +823,11 @@ fn main() {
             async move |cx| authenticate(client, cx).await
         })
         .detach_and_log_err(cx);
+
+        if args.headless {
+            initialize_headless(app_state.clone(), cx);
+            return;
+        }
 
         let urls: Vec<_> = args
             .paths_or_urls
@@ -1363,6 +1369,78 @@ async fn installation_id(db: KeyValueStore) -> Result<IdType> {
     Ok(IdType::New(installation_id))
 }
 
+/// Initialize Zed in headless mode: no windows, no workspace.
+///
+/// Sets up the external WebSocket sync (Helix) and the agent thread handler so the
+/// process can drive ACP threads from the WebSocket without any UI. The GPUI event
+/// loop continues running until the process is signalled.
+///
+/// Without `external_websocket_sync` enabled this is effectively a no-op idle loop —
+/// the flag is mostly useful for the Helix integration.
+fn initialize_headless(app_state: Arc<AppState>, cx: &mut App) {
+    log::info!("🟢 [HEADLESS] Starting Zed in headless mode (no windows, no display)");
+    eprintln!("🟢 [HEADLESS] Starting Zed in headless mode (no windows, no display)");
+
+    #[cfg(feature = "external_websocket_sync")]
+    {
+        use external_websocket_sync::{ExternalSyncSettings, WebSocketSyncConfig};
+
+        let project = project::Project::local(
+            app_state.client.clone(),
+            app_state.node_runtime.clone(),
+            app_state.user_store.clone(),
+            app_state.languages.clone(),
+            app_state.fs.clone(),
+            None,
+            project::LocalProjectFlags {
+                init_worktree_trust: false,
+                watch_global_configs: false,
+            },
+            cx,
+        );
+
+        let thread_store = ThreadStore::global(cx);
+
+        external_websocket_sync::setup_thread_handler(
+            project,
+            thread_store,
+            app_state.fs.clone(),
+            cx,
+        );
+
+        let settings = ExternalSyncSettings::get_global(cx);
+        if settings.enabled && settings.websocket_sync.enabled {
+            let config = WebSocketSyncConfig {
+                enabled: true,
+                url: settings.websocket_sync.external_url.clone(),
+                auth_token: settings
+                    .websocket_sync
+                    .auth_token
+                    .clone()
+                    .unwrap_or_default(),
+                use_tls: settings.websocket_sync.use_tls,
+                skip_tls_verify: settings.websocket_sync.skip_tls_verify,
+            };
+            external_websocket_sync::init_websocket_service(config);
+            log::info!("🟢 [HEADLESS] WebSocket sync service initialized");
+        } else {
+            log::warn!(
+                "🟡 [HEADLESS] external_websocket_sync feature is built in but settings disable it; \
+                running idle. Set ZED_EXTERNAL_SYNC_ENABLED=1 (and friends) to start the sync."
+            );
+        }
+    }
+
+    #[cfg(not(feature = "external_websocket_sync"))]
+    {
+        let _ = app_state;
+        let _ = cx;
+        log::warn!(
+            "🟡 [HEADLESS] Built without `external_websocket_sync` feature; --headless has nothing to do"
+        );
+    }
+}
+
 pub(crate) async fn restore_or_create_workspace(
     app_state: Arc<AppState>,
     cx: &mut AsyncApp,
@@ -1728,6 +1806,14 @@ struct Args {
     /// Required by the external_websocket_sync E2E test runner.
     #[arg(long)]
     allow_multiple_instances: bool,
+
+    /// Run Zed without any display server (no Wayland, no X11) and without opening any
+    /// windows. Initializes the external WebSocket sync (Helix) and MCP/agent backend
+    /// only. Useful for running Zed as an agent backend on a headless machine.
+    ///
+    /// Implies `--allow-multiple-instances`. The process runs until interrupted.
+    #[arg(long)]
+    headless: bool,
 
     /// Record an ETW trace. Must be run as administrator.
     #[cfg(target_os = "windows")]
