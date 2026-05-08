@@ -83,6 +83,10 @@ static GLOBAL_THREAD_OPEN_CALLBACK: parking_lot::Mutex<Option<mpsc::UnboundedSen
 static GLOBAL_UI_STATE_QUERY_CALLBACK: parking_lot::Mutex<Option<mpsc::UnboundedSender<UiStateQueryRequest>>> =
     parking_lot::Mutex::new(None);
 
+/// Static global for cancellation callback (cancels active ACP thread turn by request_id)
+static GLOBAL_CANCELLATION_CALLBACK: parking_lot::Mutex<Option<mpsc::UnboundedSender<CancellationRequest>>> =
+    parking_lot::Mutex::new(None);
+
 /// Static global for cancel-thread callback.
 /// Receives an acp_thread_id and immediately cancels that thread's running turn,
 /// bypassing the sequential callback_rx loop (which would be blocked awaiting the turn).
@@ -119,6 +123,12 @@ pub struct ThreadOpenRequest {
 #[derive(Clone, Debug)]
 pub struct UiStateQueryRequest {
     pub query_id: String,
+}
+
+/// Request to cancel an active ACP thread turn from Helix
+#[derive(Clone, Debug)]
+pub struct CancellationRequest {
+    pub request_id: String,
 }
 
 /// Notification to display a thread in AgentPanel (for auto-select)
@@ -314,6 +324,33 @@ pub fn request_ui_state_query(request: UiStateQueryRequest) -> Result<()> {
         Ok(())
     } else {
         PENDING_UI_STATE_QUERIES.lock().push(request);
+        Ok(())
+    }
+}
+
+/// Initialize the global cancellation callback (called from thread_service)
+pub fn init_cancellation_callback(sender: mpsc::UnboundedSender<CancellationRequest>) {
+    log::info!("[CALLBACK] init_cancellation_callback() called - registering global callback");
+    *GLOBAL_CANCELLATION_CALLBACK.lock() = Some(sender);
+}
+
+/// Request cancellation of an active thread turn (called from WebSocket handler)
+/// Unlike thread creation, cancellation requests are not queued — if the handler
+/// isn't ready, we immediately send back a noop turn_cancelled event.
+pub fn request_thread_cancellation(request: CancellationRequest) -> Result<()> {
+    log::info!("[CALLBACK] request_thread_cancellation() called: request_id={}", request.request_id);
+
+    let sender = GLOBAL_CANCELLATION_CALLBACK.lock().clone();
+    if let Some(sender) = sender {
+        sender.send(request)
+            .map_err(|_| anyhow::anyhow!("Failed to send cancellation request"))?;
+        Ok(())
+    } else {
+        log::warn!("[CALLBACK] Cancellation callback not initialized - sending noop turn_cancelled");
+        send_websocket_event(SyncEvent::TurnCancelled {
+            request_id: request.request_id,
+            status: "noop".to_string(),
+        })?;
         Ok(())
     }
 }

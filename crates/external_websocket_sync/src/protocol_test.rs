@@ -441,6 +441,201 @@ mod tests {
         Ok(())
     }
 
+    #[tokio::test]
+    #[ignore] // Requires HELIX_SESSION_ID env var - run with `cargo test -- --ignored`
+    async fn test_cancel_current_turn_noop() -> Result<()> {
+        let _guard = TEST_LOCK.lock();
+        println!("\n🧪 Testing cancel_current_turn noop (no active thread)\n");
+
+        // 1. Start mock external system WebSocket server
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let addr = listener.local_addr()?;
+        println!("✅ Mock external system listening on {}", addr);
+
+        let (ext_to_zed_tx, mut ext_to_zed_rx) = mpsc::unbounded_channel::<String>();
+        let (_zed_to_ext_tx, mut zed_to_ext_rx) = mpsc::unbounded_channel::<String>();
+
+        let zed_to_ext_tx_for_server = _zed_to_ext_tx.clone();
+
+        // Spawn mock external system server
+        tokio::spawn(async move {
+            let zed_to_ext_tx = zed_to_ext_tx_for_server;
+            let (stream, _) = listener.accept().await.unwrap();
+            let ws_stream = accept_async(stream).await.unwrap();
+            let (mut write, mut read) = ws_stream.split();
+
+            let send_task = tokio::spawn(async move {
+                while let Some(msg) = ext_to_zed_rx.recv().await {
+                    write.send(Message::Text(msg.into())).await.unwrap();
+                }
+            });
+
+            let recv_task = tokio::spawn(async move {
+                while let Some(msg) = read.next().await {
+                    if let Ok(Message::Text(text)) = msg {
+                        zed_to_ext_tx.send(text.to_string()).unwrap();
+                    }
+                }
+            });
+
+            let _ = tokio::join!(send_task, recv_task);
+        });
+
+        // 2. Do NOT init cancellation callback — this forces the noop path
+
+        // 3. Start Zed WebSocket client
+        let config = super::super::websocket_sync::WebSocketSyncConfig {
+            enabled: true,
+            url: format!("localhost:{}", addr.port()),
+            auth_token: String::new(),
+            use_tls: false,
+            skip_tls_verify: false,
+        };
+
+        let _service = super::super::websocket_sync::WebSocketSync::start(config).await?;
+        println!("✅ Zed WebSocket client connected");
+
+        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+
+        // 4. Send cancel_current_turn with a bogus request_id
+        let cancel_command = json!({
+            "type": "cancel_current_turn",
+            "data": {
+                "request_id": "req-nonexistent-001"
+            }
+        });
+
+        ext_to_zed_tx.send(cancel_command.to_string())?;
+        println!("📤 External system sent cancel_current_turn");
+
+        // 5. Expect turn_cancelled response with status=noop
+        let response = tokio::time::timeout(
+            tokio::time::Duration::from_secs(5),
+            zed_to_ext_rx.recv()
+        ).await
+        .map_err(|_| anyhow::anyhow!("Timeout waiting for turn_cancelled"))?
+        .ok_or_else(|| anyhow::anyhow!("No response received"))?;
+
+        println!("📥 Received: {}", response);
+
+        let parsed: serde_json::Value = serde_json::from_str(&response)?;
+        assert_eq!(parsed["type"], "turn_cancelled");
+        assert_eq!(parsed["request_id"], "req-nonexistent-001");
+        assert_eq!(parsed["status"], "noop");
+        println!("✅ turn_cancelled verified (status=noop)");
+
+        println!("\n🎉 CANCEL CURRENT TURN NOOP TEST PASSED!");
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[ignore] // Requires HELIX_SESSION_ID env var - run with `cargo test -- --ignored`
+    async fn test_cancel_current_turn_with_handler() -> Result<()> {
+        let _guard = TEST_LOCK.lock();
+        println!("\n🧪 Testing cancel_current_turn with active handler\n");
+
+        // 1. Start mock external system WebSocket server
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let addr = listener.local_addr()?;
+        println!("✅ Mock external system listening on {}", addr);
+
+        let (ext_to_zed_tx, mut ext_to_zed_rx) = mpsc::unbounded_channel::<String>();
+        let (_zed_to_ext_tx, mut zed_to_ext_rx) = mpsc::unbounded_channel::<String>();
+
+        let zed_to_ext_tx_for_server = _zed_to_ext_tx.clone();
+
+        // Spawn mock external system server
+        tokio::spawn(async move {
+            let zed_to_ext_tx = zed_to_ext_tx_for_server;
+            let (stream, _) = listener.accept().await.unwrap();
+            let ws_stream = accept_async(stream).await.unwrap();
+            let (mut write, mut read) = ws_stream.split();
+
+            let send_task = tokio::spawn(async move {
+                while let Some(msg) = ext_to_zed_rx.recv().await {
+                    write.send(Message::Text(msg.into())).await.unwrap();
+                }
+            });
+
+            let recv_task = tokio::spawn(async move {
+                while let Some(msg) = read.next().await {
+                    if let Ok(Message::Text(text)) = msg {
+                        zed_to_ext_tx.send(text.to_string()).unwrap();
+                    }
+                }
+            });
+
+            let _ = tokio::join!(send_task, recv_task);
+        });
+
+        // 2. Init cancellation callback — spawn handler that simulates cancellation
+        let (cancel_tx, mut cancel_rx) = mpsc::unbounded_channel();
+        super::super::init_cancellation_callback(cancel_tx);
+
+        // Spawn handler: receives CancellationRequest and sends turn_cancelled event
+        tokio::spawn(async move {
+            while let Some(request) = cancel_rx.recv().await {
+                println!("🎯 Received cancellation request: request_id={}", request.request_id);
+                // Simulate successful cancellation by sending turn_cancelled event
+                let event = SyncEvent::TurnCancelled {
+                    request_id: request.request_id,
+                    status: "cancelled".to_string(),
+                };
+                if let Err(err) = super::super::send_websocket_event(event) {
+                    println!("❌ Failed to send turn_cancelled: {}", err);
+                } else {
+                    println!("📤 Sent turn_cancelled (status=cancelled)");
+                }
+            }
+        });
+
+        // 3. Start Zed WebSocket client
+        let config = super::super::websocket_sync::WebSocketSyncConfig {
+            enabled: true,
+            url: format!("localhost:{}", addr.port()),
+            auth_token: String::new(),
+            use_tls: false,
+            skip_tls_verify: false,
+        };
+
+        let _service = super::super::websocket_sync::WebSocketSync::start(config).await?;
+        println!("✅ Zed WebSocket client connected");
+
+        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+
+        // 4. Send cancel_current_turn
+        let cancel_command = json!({
+            "type": "cancel_current_turn",
+            "data": {
+                "request_id": "req-cancel-001"
+            }
+        });
+
+        ext_to_zed_tx.send(cancel_command.to_string())?;
+        println!("📤 External system sent cancel_current_turn");
+
+        // 5. Expect turn_cancelled response with status=cancelled
+        let response = tokio::time::timeout(
+            tokio::time::Duration::from_secs(5),
+            zed_to_ext_rx.recv()
+        ).await
+        .map_err(|_| anyhow::anyhow!("Timeout waiting for turn_cancelled"))?
+        .ok_or_else(|| anyhow::anyhow!("No response received"))?;
+
+        println!("📥 Received: {}", response);
+
+        let parsed: serde_json::Value = serde_json::from_str(&response)?;
+        assert_eq!(parsed["type"], "turn_cancelled");
+        assert_eq!(parsed["request_id"], "req-cancel-001");
+        assert_eq!(parsed["status"], "cancelled");
+        println!("✅ turn_cancelled verified (status=cancelled)");
+
+        println!("\n🎉 CANCEL CURRENT TURN WITH HANDLER TEST PASSED!");
+
+        Ok(())
+    }
+
     // TODO: Add GPUI integration test with FakeAgentConnection
     // This would test real ACP thread creation like acp_thread tests do
     // For now, protocol tests + code review provide sufficient confidence

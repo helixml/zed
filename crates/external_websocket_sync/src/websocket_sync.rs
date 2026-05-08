@@ -402,6 +402,7 @@ impl WebSocketSync {
             "simulate_user_input" => Self::handle_simulate_user_input(command.data).await,
             "open_thread" => Self::handle_open_thread(command.data).await,
             "query_ui_state" => Self::handle_query_ui_state(command.data).await,
+            "cancel_current_turn" => Self::handle_cancel_current_turn(command.data).await,
             _ => {
                 eprintln!("⚠️  [WEBSOCKET-IN] Ignoring unknown command: {}", command.command_type);
                 log::warn!("⚠️  [WEBSOCKET-IN] Ignoring unknown command: {}", command.command_type);
@@ -542,6 +543,20 @@ impl WebSocketSync {
         crate::request_ui_state_query(crate::UiStateQueryRequest { query_id })?;
 
         eprintln!("✅ [WEBSOCKET-IN] query_ui_state request dispatched");
+        Ok(())
+    }
+
+    /// Handle cancel_current_turn command (cancel active ACP thread turn)
+    async fn handle_cancel_current_turn(data: serde_json::Value) -> Result<()> {
+        let request_id = data.get("request_id")
+            .and_then(|v| v.as_str())
+            .unwrap_or("unknown")
+            .to_string();
+
+        log::info!("[WEBSOCKET-IN] Processing cancel_current_turn: request_id={}", request_id);
+
+        crate::request_thread_cancellation(crate::CancellationRequest { request_id })?;
+
         Ok(())
     }
 

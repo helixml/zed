@@ -205,6 +205,25 @@ Sent when Zed fails to load a thread (e.g., thread is already active in the UI, 
 | `request_id` | string | yes | Echoed from the originating command |
 | `error` | string | yes | Human-readable error description |
 
+### `turn_cancelled`
+
+Sent when Zed has processed a `cancel_current_turn` command. Indicates whether the active turn was actually cancelled or there was nothing to cancel.
+
+```json
+{
+  "event_type": "turn_cancelled",
+  "data": {
+    "request_id": "req-001",
+    "status": "cancelled"
+  }
+}
+```
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `request_id` | string | yes | Echoed from the `cancel_current_turn` command |
+| `status` | string | yes | `"cancelled"` if a turn was stopped, `"noop"` if no active turn for that request_id |
+
 ## Helix -> Zed Command Types
 
 ### `chat_message`
@@ -248,6 +267,23 @@ Open/focus an existing thread in Zed's UI. This loads the thread from the databa
 |-------|------|----------|-------------|
 | `acp_thread_id` | string | yes | The thread to open |
 | `agent_name` | string or null | no | Which agent to use when opening the thread |
+
+### `cancel_current_turn`
+
+Cancel an in-progress AI agent turn. Zed stops the active ACP task for the given `request_id` and replies with a `turn_cancelled` event. If no turn is active for that `request_id`, Zed replies with `turn_cancelled` with `status: "noop"`.
+
+```json
+{
+  "type": "cancel_current_turn",
+  "data": {
+    "request_id": "req-001"
+  }
+}
+```
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `request_id` | string | yes | The request_id of the turn to cancel |
 
 ## Readiness Protocol
 
@@ -324,6 +360,19 @@ Zed -> Helix:  user_created_thread { acp_thread_id: "thread-2", title: "My Threa
 ```
 Helix -> Zed:  chat_message { message: "...", request_id: "req-3", acp_thread_id: "thread-1" }
 Zed -> Helix:  thread_load_error { acp_thread_id: "thread-1", request_id: "req-3", error: "Thread already active" }
+```
+
+### Flow 6: Helix Cancels Active Turn
+
+```
+Helix -> Zed:  chat_message { message: "...", request_id: "req-1", acp_thread_id: null }
+Zed -> Helix:  thread_created { acp_thread_id: "thread-1", request_id: "req-1" }
+Zed -> Helix:  message_added { acp_thread_id: "thread-1", message_id: "msg-1", content: "The" }
+Helix -> Zed:  cancel_current_turn { request_id: "req-1" }
+Zed -> Helix:  turn_cancelled { request_id: "req-1", status: "cancelled" }
+Helix -> Zed:  chat_message { message: "...", request_id: "req-2", acp_thread_id: "thread-1" }
+Zed -> Helix:  message_added { ... }
+Zed -> Helix:  message_completed { ..., request_id: "req-2" }
 ```
 
 ## Reconnection

@@ -232,6 +232,13 @@ pub enum SyncEvent {
         /// Optional thread ID if a thread was loaded from session
         thread_id: Option<String>,
     },
+    /// Sent in response to cancel_current_turn command from Helix
+    #[serde(rename = "turn_cancelled")]
+    TurnCancelled {
+        request_id: String,
+        /// "cancelled" if a turn was stopped, "noop" if no active turn for that request_id
+        status: String,
+    },
     /// Response to query_ui_state command — reports current agent panel UI state
     /// Used by E2E tests to verify that threads are correctly displayed
     #[serde(rename = "ui_state_response")]
@@ -311,6 +318,13 @@ impl SyncEvent {
                 serde_json::json!({
                     "agent_name": agent_name,
                     "thread_id": thread_id,
+                })
+            ),
+            SyncEvent::TurnCancelled { request_id, status } => (
+                "turn_cancelled".to_string(),
+                serde_json::json!({
+                    "request_id": request_id,
+                    "status": status,
                 })
             ),
             SyncEvent::UiStateResponse { query_id, active_view, thread_id, entry_count, mcp_servers, active_model } => (
