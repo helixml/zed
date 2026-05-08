@@ -23,6 +23,7 @@ use git::GitHostingProviderRegistry;
 use git_ui::clone::clone_and_open;
 use gpui::{
     App, AppContext, Application, AsyncApp, Focusable as _, QuitMode, Task, UpdateGlobal as _,
+    block_on,
 };
 use gpui_platform;
 
@@ -43,6 +44,7 @@ use recent_projects::{RemoteSettings, open_remote_project};
 use release_channel::{AppCommitSha, AppVersion, ReleaseChannel};
 use session::{AppSession, Session};
 use settings::{BaseKeymap, Settings, SettingsStore, watch_config_file};
+use smol::future::poll_once;
 use std::{
     cell::RefCell,
     env,
@@ -67,7 +69,7 @@ use zed::{
     handle_keymap_file_changes, initialize_workspace, open_paths_with_positions,
 };
 
-use crate::zed::{OpenRequestKind, eager_load_active_theme_and_icon_theme};
+use crate::zed::{CrashHandler, OpenRequestKind, eager_load_active_theme_and_icon_theme};
 
 #[cfg(feature = "mimalloc")]
 #[global_allocator]
@@ -195,7 +197,7 @@ fn main() {
 
     // `zed --crash-handler` Makes zed operate in minidump crash handler mode
     if let Some(socket) = &args.crash_handler {
-        crashes::crash_server(socket.as_path());
+        crashes::crash_server(socket.as_path(), paths::logs_dir().clone());
         return;
     }
 
@@ -299,6 +301,8 @@ fn main() {
             app_version,
             app_commit_sha,
             *release_channel::RELEASE_CHANNEL,
+            client::telemetry::os_name(),
+            client::telemetry::os_version(),
         );
         println!("Zed System Specs (from CLI):\n{}", system_specs);
         return;
@@ -324,8 +328,8 @@ fn main() {
     #[cfg(windows)]
     check_for_conpty_dll();
 
-    let app =
-        Application::with_platform(gpui_platform::current_platform(false)).with_assets(Assets);
+    let app = Application::with_platform(gpui_platform::current_platform(args.headless))
+        .with_assets(Assets);
 
     let app_db = db::AppDatabase::new();
     let system_id = app.background_executor().spawn(system_id());
@@ -338,34 +342,13 @@ fn main() {
         KeyValueStore::from_app_db(&app_db),
     ));
     let background_executor = app.background_executor();
-    crashes::init(
-        InitCrashHandler {
-            session_id,
-            // strip the build and channel information from the version string, we send them separately
-            zed_version: semver::Version::new(
-                app_version.major,
-                app_version.minor,
-                app_version.patch,
-            )
-            .to_string(),
-            binary: "zed".to_string(),
-            release_channel: release_channel::RELEASE_CHANNEL_NAME.clone(),
-            commit_sha: app_commit_sha
-                .as_ref()
-                .map(|sha| sha.full())
-                .unwrap_or_else(|| "no sha".to_owned()),
-        },
-        |task| {
-            app.background_executor().spawn(task).detach();
-        },
-        move |duration| background_executor.timer(duration),
-    );
 
     let (open_listener, mut open_rx) = OpenListener::new();
 
     let failed_single_instance_check = if *zed_env_vars::ZED_STATELESS
         || *release_channel::RELEASE_CHANNEL == ReleaseChannel::Dev
         || args.allow_multiple_instances
+        || args.headless
     {
         false
     } else {
@@ -389,6 +372,46 @@ fn main() {
         println!("zed is already running");
         return;
     }
+
+    let should_install_crash_handler = matches!(
+        env::var("ZED_GENERATE_MINIDUMPS").as_deref(),
+        Ok("true" | "1")
+    ) || *release_channel::RELEASE_CHANNEL
+        != ReleaseChannel::Dev;
+
+    let crash_handler = if should_install_crash_handler {
+        Some(
+            app.background_executor().spawn(crashes::init(
+                InitCrashHandler {
+                    session_id,
+                    // strip the build and channel information from the version string, we send them separately
+                    zed_version: semver::Version::new(
+                        app_version.major,
+                        app_version.minor,
+                        app_version.patch,
+                    )
+                    .to_string(),
+                    binary: "zed".to_string(),
+                    release_channel: release_channel::RELEASE_CHANNEL_NAME.clone(),
+                    commit_sha: app_commit_sha
+                        .as_ref()
+                        .map(|sha| sha.full())
+                        .unwrap_or_else(|| "no sha".to_owned()),
+                },
+                {
+                    let background_executor1 = app.background_executor();
+                    move |task| {
+                        background_executor1.spawn(task).detach();
+                    }
+                },
+                |pid| paths::temp_dir().join(format!("zed-crash-handler-{pid}")),
+                move |duration| background_executor.timer(duration),
+            )),
+        )
+    } else {
+        crashes::force_backtrace();
+        None
+    };
 
     let git_hosting_provider_registry = Arc::new(GitHostingProviderRegistry::new());
     let git_binary_path =
@@ -418,7 +441,7 @@ fn main() {
                 util::load_login_shell_environment().await.log_err();
                 shell_env_loaded_tx.send(()).ok();
             })
-            .detach()
+            .detach();
     } else {
         drop(shell_env_loaded_tx)
     }
@@ -557,6 +580,8 @@ fn main() {
         Client::set_global(client.clone(), cx);
 
         zed::init(cx);
+        #[cfg(target_os = "macos")]
+        zed::move_to_applications::init(cx);
         project::Project::init(&client, cx);
         debugger_ui::init(cx);
         debugger_tools::init(cx);
@@ -576,12 +601,17 @@ fn main() {
         );
         cx.subscribe(&user_store, {
             let telemetry = telemetry.clone();
-            move |_, evt: &client::user::Event, _| match evt {
+            move |_, evt: &client::user::Event, cx| match evt {
                 client::user::Event::PrivateUserInfoUpdated => {
-                    crashes::set_user_info(crashes::UserInfo {
-                        metrics_id: telemetry.metrics_id().map(|s| s.to_string()),
-                        is_staff: telemetry.is_staff(),
-                    });
+                    if let Some(crash_client) = cx.try_global::<CrashHandler>() {
+                        crashes::set_user_info(
+                            &crash_client.0,
+                            crashes::UserInfo {
+                                metrics_id: telemetry.metrics_id().map(|s| s.to_string()),
+                                is_staff: telemetry.is_staff(),
+                            },
+                        );
+                    }
                 }
                 _ => {}
             }
@@ -813,6 +843,25 @@ fn main() {
 
         let menus = app_menus(cx);
         cx.set_menus(menus);
+
+        if let Some(mut crash_handler) = crash_handler {
+            let crash_handler2 = block_on(poll_once(&mut crash_handler));
+            match crash_handler2 {
+                Some(crash_handler) => {
+                    cx.set_global(CrashHandler(crash_handler));
+                }
+                None => {
+                    cx.spawn(async move |cx| {
+                        let client1 = crash_handler.await;
+                        cx.update(|cx| {
+                            cx.set_global(CrashHandler(client1));
+                        });
+                    })
+                    .detach();
+                }
+            }
+        }
+
         initialize_workspace(app_state.clone(), cx);
 
         cx.activate(true);
@@ -822,6 +871,11 @@ fn main() {
             async move |cx| authenticate(client, cx).await
         })
         .detach_and_log_err(cx);
+
+        if args.headless {
+            initialize_headless(app_state.clone(), cx);
+            return;
+        }
 
         let urls: Vec<_> = args
             .paths_or_urls
@@ -1363,6 +1417,169 @@ async fn installation_id(db: KeyValueStore) -> Result<IdType> {
     Ok(IdType::New(installation_id))
 }
 
+/// Initialize Zed in headless mode: no windows, no workspace.
+///
+/// Sets up the external WebSocket sync (Helix) and the agent thread handler so the
+/// process can drive ACP threads from the WebSocket without any UI. The GPUI event
+/// loop continues running until the process is signalled.
+///
+/// Without `external_websocket_sync` enabled this is effectively a no-op idle loop —
+/// the flag is mostly useful for the Helix integration.
+fn initialize_headless(app_state: Arc<AppState>, cx: &mut App) {
+    log::info!("🟢 [HEADLESS] Starting Zed in headless mode (no windows, no display)");
+    eprintln!("🟢 [HEADLESS] Starting Zed in headless mode (no windows, no display)");
+
+    #[cfg(feature = "external_websocket_sync")]
+    {
+        use external_websocket_sync::{ExternalSyncSettings, WebSocketSyncConfig};
+        use language_model::LanguageModelRegistry;
+        use parking_lot::Mutex;
+        use project::context_server_store::ContextServerStatus;
+        use std::sync::Arc;
+        use tokio::sync::mpsc;
+
+        let project = project::Project::local(
+            app_state.client.clone(),
+            app_state.node_runtime.clone(),
+            app_state.user_store.clone(),
+            app_state.languages.clone(),
+            app_state.fs.clone(),
+            None,
+            project::LocalProjectFlags {
+                init_worktree_trust: false,
+                watch_global_configs: false,
+            },
+            cx,
+        );
+
+        let thread_store = ThreadStore::global(cx);
+
+        external_websocket_sync::setup_thread_handler(
+            project.clone(),
+            thread_store,
+            app_state.fs.clone(),
+            cx,
+        );
+
+        // Tracks the most recently displayed thread so the headless UI-state responder
+        // can answer `thread_id` and `entry_count` faithfully. Updated by the
+        // thread-display callback below; read by the ui-state callback further down.
+        let active_thread_id: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+
+        // Headless thread-display responder. AgentPanel normally consumes these to
+        // switch the visible thread; without a panel we just record the most recent
+        // one so the ui_state response stays current — and we drain the channel so
+        // it doesn't queue forever (notify_thread_display fires on every follow-up).
+        let (display_tx, mut display_rx) =
+            mpsc::unbounded_channel::<external_websocket_sync::ThreadDisplayNotification>();
+        external_websocket_sync::init_thread_display_callback(display_tx);
+        let active_thread_id_for_display = active_thread_id.clone();
+        cx.background_spawn(async move {
+            while let Some(notification) = display_rx.recv().await {
+                *active_thread_id_for_display.lock() = Some(notification.helix_session_id);
+            }
+        })
+        .detach();
+
+        // Headless UI-state responder. The agent panel normally answers `query_ui_state`
+        // by reading its own view; with no panel we synthesize a response from the
+        // headless project's context_server_store, the most-recently-displayed thread,
+        // and the global LanguageModelRegistry so the E2E suite can validate Phase 6
+        // in --headless mode.
+        let (query_tx, mut query_rx) =
+            mpsc::unbounded_channel::<external_websocket_sync::UiStateQueryRequest>();
+        external_websocket_sync::init_ui_state_query_callback(query_tx);
+        let project_for_query = project.clone();
+        let active_thread_id_for_query = active_thread_id.clone();
+        cx.spawn(async move |cx| {
+            while let Some(query) = query_rx.recv().await {
+                let query_id = query.query_id.clone();
+                let active_thread_id = active_thread_id_for_query.lock().clone();
+                let send_result = cx.update(|cx| {
+                    let mcp_servers = {
+                        let store = project_for_query.read(cx).context_server_store();
+                        let store = store.read(cx);
+                        let mut servers = std::collections::HashMap::new();
+                        for server_id in store.server_ids() {
+                            if let Some(status) = store.status_for_server(server_id) {
+                                let status_str = match status {
+                                    ContextServerStatus::Running => "running",
+                                    ContextServerStatus::Starting => "starting",
+                                    ContextServerStatus::Stopped => "stopped",
+                                    ContextServerStatus::Error(_) => "error",
+                                    ContextServerStatus::AuthRequired => "auth_required",
+                                    ContextServerStatus::Authenticating => "authenticating",
+                                };
+                                servers.insert(server_id.0.to_string(), status_str.to_string());
+                            }
+                        }
+                        servers
+                    };
+
+                    let entry_count = active_thread_id
+                        .as_deref()
+                        .and_then(external_websocket_sync::get_thread)
+                        .and_then(|weak| weak.upgrade())
+                        .map(|thread| thread.read(cx).entries().len())
+                        .unwrap_or(0);
+
+                    let active_model = LanguageModelRegistry::read_global(cx)
+                        .default_model()
+                        .map(|m| m.model.id().0.to_string());
+
+                    external_websocket_sync::send_websocket_event(
+                        external_websocket_sync::SyncEvent::UiStateResponse {
+                            query_id,
+                            active_view: "headless".to_string(),
+                            thread_id: active_thread_id,
+                            entry_count,
+                            mcp_servers,
+                            active_model,
+                        },
+                    )
+                });
+                if let Err(e) = send_result {
+                    log::warn!(
+                        "🟡 [HEADLESS] send_websocket_event(UiStateResponse) failed: {e:#}"
+                    );
+                }
+            }
+        })
+        .detach();
+
+        let settings = ExternalSyncSettings::get_global(cx);
+        if settings.enabled && settings.websocket_sync.enabled {
+            let config = WebSocketSyncConfig {
+                enabled: true,
+                url: settings.websocket_sync.external_url.clone(),
+                auth_token: settings
+                    .websocket_sync
+                    .auth_token
+                    .clone()
+                    .unwrap_or_default(),
+                use_tls: settings.websocket_sync.use_tls,
+                skip_tls_verify: settings.websocket_sync.skip_tls_verify,
+            };
+            external_websocket_sync::init_websocket_service(config);
+            log::info!("🟢 [HEADLESS] WebSocket sync service initialized");
+        } else {
+            log::warn!(
+                "🟡 [HEADLESS] external_websocket_sync feature is built in but settings disable it; \
+                running idle. Set ZED_EXTERNAL_SYNC_ENABLED=1 (and friends) to start the sync."
+            );
+        }
+    }
+
+    #[cfg(not(feature = "external_websocket_sync"))]
+    {
+        let _ = app_state;
+        let _ = cx;
+        log::warn!(
+            "🟡 [HEADLESS] Built without `external_websocket_sync` feature; --headless has nothing to do"
+        );
+    }
+}
+
 pub(crate) async fn restore_or_create_workspace(
     app_state: Arc<AppState>,
     cx: &mut AsyncApp,
@@ -1728,6 +1945,14 @@ struct Args {
     /// Required by the external_websocket_sync E2E test runner.
     #[arg(long)]
     allow_multiple_instances: bool,
+
+    /// Run Zed without any display server (no Wayland, no X11) and without opening any
+    /// windows. Initializes the external WebSocket sync (Helix) and MCP/agent backend
+    /// only. Useful for running Zed as an agent backend on a headless machine.
+    ///
+    /// Implies `--allow-multiple-instances`. The process runs until interrupted.
+    #[arg(long)]
+    headless: bool,
 
     /// Record an ETW trace. Must be run as administrator.
     #[cfg(target_os = "windows")]
