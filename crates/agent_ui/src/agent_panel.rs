@@ -2489,6 +2489,84 @@ impl AgentPanel {
             }
         }
 
+        // Helix-mode entity-identity guard. The session-id-based dedup below can
+        // miss when the active CV's `root_session_id` is desynced from the live
+        // `Entity<AcpThread>` registered by `external_websocket_sync` (the bug
+        // fixed by this guard: clicking the currently-open thread caused
+        // `external_thread` to issue a duplicate `connection.load_session()`,
+        // splitting the panel from the entity Helix is subscribed to). The
+        // entity-identity check matches what `notify_thread_display` already
+        // does in the helix bring-up callback above.
+        #[cfg(feature = "external_websocket_sync")]
+        if let Some(live) = external_websocket_sync::get_thread(&session_id.to_string())
+            .and_then(|w| w.upgrade())
+        {
+            let live_entity_id = live.entity_id();
+            let observes_live = |cv: &Entity<ConversationView>, cx: &App| -> bool {
+                cv.read(cx)
+                    .active_thread()
+                    .is_some_and(|t| t.read(cx).thread.entity_id() == live_entity_id)
+            };
+
+            if let BaseView::AgentThread { conversation_view } = &self.base_view {
+                if observes_live(conversation_view, cx) {
+                    self.clear_overlay_state();
+                    cx.emit(AgentPanelEvent::ActiveViewChanged);
+                    return;
+                }
+            }
+
+            let retained_key = self
+                .retained_threads
+                .iter()
+                .find(|(_, cv)| observes_live(cv, cx))
+                .map(|(id, _)| *id);
+            if let Some(thread_id) = retained_key {
+                if let Some(conversation_view) = self.retained_threads.remove(&thread_id) {
+                    self.set_base_view(
+                        BaseView::AgentThread { conversation_view },
+                        focus,
+                        window,
+                        cx,
+                    );
+                    return;
+                }
+            }
+
+            // Live entity exists but no view observes it (e.g. all CVs were
+            // evicted from `retained_threads`). Wrap the existing entity via
+            // the same path `notify_thread_display` uses, so we don't issue a
+            // second `connection.load_session()` for a session that's already
+            // loaded.
+            let server = agent.server(self.fs.clone(), self.thread_store.clone());
+            let connection_store = self.connection_store.clone();
+            let workspace = self.workspace.clone();
+            let project = self.project.clone();
+            let thread_store = self.thread_store.clone();
+            let prompt_store = self.prompt_store.clone();
+            let conversation_view = cx.new(|cx| {
+                ConversationView::from_existing_thread(
+                    live,
+                    server,
+                    connection_store,
+                    agent.clone(),
+                    workspace,
+                    project,
+                    Some(thread_store),
+                    prompt_store,
+                    window,
+                    cx,
+                )
+            });
+            self.set_base_view(
+                BaseView::AgentThread { conversation_view },
+                focus,
+                window,
+                cx,
+            );
+            return;
+        }
+
         let has_session = |cv: &Entity<ConversationView>| -> bool {
             cv.read(cx)
                 .root_session_id
