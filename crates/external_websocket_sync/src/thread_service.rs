@@ -6,7 +6,8 @@
 use anyhow::Result;
 use acp_thread::{AcpThread, AcpThreadEvent};
 use agent::ThreadStore;
-use agent_client_protocol::{self as acp, ContentBlock, TextContent};
+use agent_client_protocol::schema as acp;
+use acp::{ContentBlock, TextContent};
 use util::path_list::PathList;
 use gpui::{App, Entity, WeakEntity};
 use parking_lot::RwLock;
@@ -65,6 +66,36 @@ static PERSISTENT_SUBSCRIPTIONS: parking_lot::Mutex<Option<Arc<RwLock<HashSet<St
 static THREAD_LOAD_IN_PROGRESS: parking_lot::Mutex<Option<String>> =
     parking_lot::Mutex::new(None);
 
+/// Try to acquire the thread load lock. Returns true if acquired (no other
+/// load in progress), false if another thread is currently loading.
+/// Must be paired with `release_thread_load_lock` when the load completes.
+pub fn try_acquire_thread_load_lock(thread_id: &str) -> bool {
+    let mut loading = THREAD_LOAD_IN_PROGRESS.lock();
+    if loading.is_some() {
+        eprintln!(
+            "⏳ [THREAD_SERVICE] Thread load lock busy (current={:?}), skipping load of {}",
+            loading, thread_id
+        );
+        false
+    } else {
+        eprintln!("🔒 [THREAD_SERVICE] Acquired thread load lock for {} (from panel restoration)", thread_id);
+        *loading = Some(thread_id.to_string());
+        true
+    }
+}
+
+/// Release the thread load lock after a load completes or fails.
+pub fn release_thread_load_lock() {
+    let mut loading = THREAD_LOAD_IN_PROGRESS.lock();
+    eprintln!("🔓 [THREAD_SERVICE] Released thread load lock (was {:?}, from panel restoration)", loading);
+    *loading = None;
+}
+
+/// Returns the thread_id currently held in the load lock, if any.
+pub fn get_load_in_progress_thread() -> Option<String> {
+    THREAD_LOAD_IN_PROGRESS.lock().clone()
+}
+
 /// Streaming throttle state per message entry.
 /// Keyed by "{thread_id}:{entry_idx}" to support multi-entry streaming.
 static STREAMING_THROTTLE: parking_lot::Mutex<Option<Arc<RwLock<HashMap<String, StreamingThrottleState>>>>> =
@@ -78,6 +109,7 @@ const STREAMING_THROTTLE_INTERVAL: Duration = Duration::from_millis(100);
 struct StreamingThrottleState {
     last_sent: Instant,
     pending_content: Option<PendingMessage>,
+    flush_scheduled: bool,
 }
 
 /// Content waiting to be sent when the throttle window expires.
@@ -173,6 +205,47 @@ fn init_streaming_throttle() {
     }
 }
 
+/// Flush pending throttled content for all entries in a thread OTHER than the
+/// specified entry index. Called from the NewEntry handler to ensure the
+/// preceding text entry's content is sent before a new entry (e.g. tool_call).
+fn flush_stale_pending_for_thread(acp_thread_id: &str, exclude_entry_idx: usize) {
+    init_streaming_throttle();
+    let thread_prefix = format!("{}:", acp_thread_id);
+    let exclude_key = format!("{}:{}", acp_thread_id, exclude_entry_idx);
+    let now = Instant::now();
+
+    let mut stale_pending: Vec<PendingMessage> = Vec::new();
+    {
+        let throttle_map = STREAMING_THROTTLE.lock();
+        let Some(map) = throttle_map.as_ref() else { return };
+        let mut map = map.write();
+
+        for (k, state) in map.iter_mut() {
+            if k.starts_with(&thread_prefix) && *k != exclude_key {
+                if let Some(pending) = state.pending_content.take() {
+                    state.last_sent = now;
+                    state.flush_scheduled = false;
+                    stale_pending.push(pending);
+                }
+            }
+        }
+    }
+
+    for pending in stale_pending {
+        let _ = crate::send_websocket_event(SyncEvent::MessageAdded {
+            acp_thread_id: pending.acp_thread_id,
+            message_id: pending.message_id,
+            role: pending.role,
+            content: pending.content,
+            request_id: pending.request_id,
+            entry_type: pending.entry_type,
+            tool_name: pending.tool_name,
+            tool_status: pending.tool_status,
+            timestamp: chrono::Utc::now().timestamp(),
+        });
+    }
+}
+
 /// Throttled send of message_added events. Only sends if enough time has passed
 /// since the last send for this entry. Otherwise, stores the content as pending.
 /// Returns true if the event was sent, false if throttled.
@@ -195,6 +268,7 @@ fn throttled_send_message_added(
     let mut stale_pending: Vec<PendingMessage> = Vec::new();
     let mut current_to_send: Option<PendingMessage> = None;
     let sent: bool;
+    let mut spawn_flush_timer = false;
 
     {
         let throttle_map = STREAMING_THROTTLE.lock();
@@ -210,18 +284,26 @@ fn throttled_send_message_added(
                 if let Some(pending) = state.pending_content.take() {
                     state.last_sent = now;
                     stale_pending.push(pending);
+                    state.flush_scheduled = false;
                 }
             }
         }
 
-        let state = map.entry(key).or_insert_with(|| StreamingThrottleState {
+        let state = map.entry(key.clone()).or_insert_with(|| StreamingThrottleState {
             last_sent: Instant::now() - STREAMING_THROTTLE_INTERVAL,
             pending_content: None,
+            flush_scheduled: false,
         });
 
-        if now.duration_since(state.last_sent) >= STREAMING_THROTTLE_INTERVAL {
+        // Tool call entries bypass the throttle — they're infrequent and must
+        // arrive promptly so the preceding text entry's stale-pending flush
+        // reaches the API before the tool call does.
+        if now.duration_since(state.last_sent) >= STREAMING_THROTTLE_INTERVAL
+            || entry_type == "tool_call"
+        {
             state.last_sent = now;
             state.pending_content = None;
+            state.flush_scheduled = false;
             current_to_send = Some(PendingMessage {
                 acp_thread_id: acp_thread_id.to_string(),
                 message_id: entry_idx.to_string(),
@@ -234,6 +316,10 @@ fn throttled_send_message_added(
             });
             sent = true;
         } else {
+            if !state.flush_scheduled {
+                state.flush_scheduled = true;
+                spawn_flush_timer = true;
+            }
             state.pending_content = Some(PendingMessage {
                 acp_thread_id: acp_thread_id.to_string(),
                 message_id: entry_idx.to_string(),
@@ -278,7 +364,42 @@ fn throttled_send_message_added(
         });
     }
 
+    if spawn_flush_timer {
+        smol::spawn(trailing_flush_timer(key)).detach();
+    }
+
     sent
+}
+
+async fn trailing_flush_timer(key: String) {
+    smol::Timer::after(STREAMING_THROTTLE_INTERVAL).await;
+
+    let pending: Option<PendingMessage> = {
+        let throttle_map = STREAMING_THROTTLE.lock();
+        let Some(map) = throttle_map.as_ref() else { return };
+        let mut map = map.write();
+        let Some(state) = map.get_mut(&key) else { return };
+        state.flush_scheduled = false;
+        let msg = state.pending_content.take();
+        if msg.is_some() {
+            state.last_sent = Instant::now();
+        }
+        msg
+    };
+
+    if let Some(msg) = pending {
+        let _ = crate::send_websocket_event(SyncEvent::MessageAdded {
+            acp_thread_id: msg.acp_thread_id,
+            message_id: msg.message_id,
+            role: msg.role,
+            content: msg.content,
+            request_id: msg.request_id,
+            entry_type: msg.entry_type,
+            tool_name: msg.tool_name,
+            tool_status: msg.tool_status,
+            timestamp: chrono::Utc::now().timestamp(),
+        });
+    }
 }
 
 /// Flush all pending throttled messages for a given thread and clean up throttle state.
@@ -418,6 +539,70 @@ pub fn unregister_thread(acp_thread_id: &str) {
     }
 }
 
+/// Like `unregister_thread` but only removes the registry entry if it currently
+/// holds the entity the caller expected. Use this from `cx.on_release` of a
+/// `ConversationView`/`ThreadView` so an old view being dropped doesn't clobber
+/// a fresh registration that another caller (e.g. `load_session_async` after a
+/// Zed restart) just placed under the same `acp_thread_id`.
+///
+/// Without this guard, the sequence is: panel restoration's old view is
+/// dropped, its `on_release` calls `unregister_thread(session_id)`, which
+/// removes the live entity that `register_thread` placed moments earlier when
+/// Helix sent `open_thread` on reconnect. Subsequent ACP `SessionUpdate`
+/// dispatches reach the live entity but `THREAD_REGISTRY` reports "not found",
+/// the persistent-subscription flag is wrongly cleared, and any future
+/// `ensure_thread_subscription` call creates a duplicate subscription —
+/// duplicating `MessageAdded`/`MessageCompleted` sends on subsequent turns.
+pub fn unregister_thread_if_matches(acp_thread_id: &str, expected_entity_id: gpui::EntityId) {
+    let mut removed_from_registry = false;
+    {
+        let registry = THREAD_REGISTRY.lock();
+        if let Some(reg) = registry.as_ref() {
+            let mut map = reg.write();
+            if let Some(existing) = map.get(acp_thread_id) {
+                if existing.entity_id() == expected_entity_id {
+                    map.remove(acp_thread_id);
+                    removed_from_registry = true;
+                    eprintln!(
+                        "🗑️ [THREAD_SERVICE] unregister_thread_if_matches: removed '{}' (entity={:?})",
+                        acp_thread_id, expected_entity_id
+                    );
+                    log::info!(
+                        "🗑️ [THREAD_SERVICE] unregister_thread_if_matches: removed '{}' (entity={:?})",
+                        acp_thread_id, expected_entity_id
+                    );
+                } else {
+                    eprintln!(
+                        "🛡️ [THREAD_SERVICE] unregister_thread_if_matches: skipping '{}' — registry holds different entity (existing={:?}, dropping={:?})",
+                        acp_thread_id, existing.entity_id(), expected_entity_id
+                    );
+                    log::info!(
+                        "🛡️ [THREAD_SERVICE] unregister_thread_if_matches: skipping '{}' — registry holds different entity (existing={:?}, dropping={:?})",
+                        acp_thread_id, existing.entity_id(), expected_entity_id
+                    );
+                }
+            }
+        }
+    }
+
+    // Only clear the persistent-subscription flag when we actually removed the
+    // registry entry. If we left a different entity in place, its subscription
+    // is still live and the flag must stay set; otherwise a later
+    // `ensure_thread_subscription` call would create a duplicate subscription
+    // on the same entity and double-send sync events to Helix.
+    if removed_from_registry {
+        let subs = PERSISTENT_SUBSCRIPTIONS.lock();
+        if let Some(s) = subs.as_ref() {
+            if s.write().remove(acp_thread_id) {
+                eprintln!(
+                    "🗑️ [THREAD_SERVICE] unregister_thread_if_matches: cleared persistent subscription for '{}'",
+                    acp_thread_id
+                );
+            }
+        }
+    }
+}
+
 /// Get an active thread as weak reference
 pub fn get_thread(acp_thread_id: &str) -> Option<WeakEntity<AcpThread>> {
     // Check the active registry first
@@ -442,7 +627,7 @@ pub fn get_thread(acp_thread_id: &str) -> Option<WeakEntity<AcpThread>> {
 /// - `NewEntry`: new user/assistant message → send `message_added`
 /// - `EntryUpdated`: streaming tokens / tool call updates → throttled `message_added`
 /// - `Stopped`: turn completed → flush throttle + send `message_completed`
-fn ensure_thread_subscription(
+pub fn ensure_thread_subscription(
     thread_entity: &Entity<AcpThread>,
     thread_id: &str,
     cx: &mut App,
@@ -451,6 +636,16 @@ fn ensure_thread_subscription(
         eprintln!("🔔 [THREAD_SERVICE] Thread {} already has persistent subscription, skipping", thread_id);
         return;
     }
+
+    let entity_id = thread_entity.entity_id();
+    eprintln!(
+        "🔔 [THREAD_SERVICE] Creating NEW subscription for thread {} on entity {:?}",
+        thread_id, entity_id
+    );
+    log::info!(
+        "🔔 [THREAD_SERVICE] Creating NEW subscription for thread {} on entity {:?}",
+        thread_id, entity_id
+    );
 
     let thread_id_for_sub = thread_id.to_string();
     mark_persistent_subscription(thread_id.to_string());
@@ -462,8 +657,26 @@ fn ensure_thread_subscription(
     let turn_request_id: std::cell::RefCell<String> = std::cell::RefCell::new(
         crate::get_thread_request_id(thread_id).unwrap_or_default()
     );
+    // The previous turn's request_id, kept so that background events
+    // (e.g. async tool completions) for entries from a completed turn
+    // can still be tagged with the correct request_id.
+    let prev_turn_request_id: std::cell::RefCell<String> = std::cell::RefCell::new(String::new());
+    // Tracks the last request_id for which message_completed was already sent.
+    // When Stopped fires for a turn that produced no assistant entries (e.g. the
+    // interrupt turn is immediately cancelled by Claude Code before generating
+    // any tokens), turn_request_id is never updated by NewEntry and still holds
+    // the previous turn's id. Detecting this via last_completed_request_id lets
+    // us fall back to the global THREAD_REQUEST_MAP which already points to the
+    // new turn's request_id.
+    let last_completed_request_id: std::cell::RefCell<String> = std::cell::RefCell::new(String::new());
 
+    let sub_entity_id = entity_id;
     cx.subscribe(thread_entity, move |thread_entity, event, cx| {
+        let current_entity_id = thread_entity.entity_id();
+        eprintln!(
+            "🔔 [THREAD_SERVICE] Subscription FIRED for thread {} on entity {:?} (subscribed to {:?}), event: {:?}",
+            thread_id_for_sub, current_entity_id, sub_entity_id, std::mem::discriminant(event)
+        );
         match event {
             AcpThreadEvent::NewEntry => {
                 let thread = thread_entity.read(cx);
@@ -490,14 +703,99 @@ fn ensure_thread_subscription(
                         }
                         _ => (String::new(), String::new()),
                     };
-                    let rid = crate::get_thread_request_id(&thread_id_for_sub)
-                        .unwrap_or_default();
-                    // Snapshot the request_id when the first assistant entry of a turn appears.
-                    // This ensures the Stopped flush uses the turn's own request_id, not a
-                    // later follow-up's.
-                    if role == "assistant" {
-                        *turn_request_id.borrow_mut() = rid.clone();
+                    // A new UserMessage entry is the unambiguous start of a
+                    // new turn — force-rotate turn_request_id from the global
+                    // map regardless of whether the previous turn completed
+                    // cleanly. The chat_message handler updates
+                    // THREAD_REQUEST_MAP when the user's prompt arrives, so by
+                    // the time NewEntry fires for the UserMessage the global
+                    // map already holds the new turn's id.
+                    //
+                    // Without this, an interrupted/cancelled prior turn leaves
+                    // last_completed_request_id stale, the assistant-only
+                    // rotation below never fires, and every assistant entry
+                    // (including the re-emit loop further down) carries the
+                    // PRIOR turn's request_id back to Helix. Helix then routes
+                    // those events to the wrong interaction — fixing this
+                    // resolves both the "messages streaming in Zed don't show
+                    // up in Helix" and the "prefix mangled with another
+                    // message" symptoms.
+                    if role == "user" {
+                        let current = turn_request_id.borrow().clone();
+                        *prev_turn_request_id.borrow_mut() = current;
+                        let global_rid = crate::get_thread_request_id(&thread_id_for_sub)
+                            .unwrap_or_default();
+                        *turn_request_id.borrow_mut() = global_rid;
+                        // Reset completion tracking — the assistant-only
+                        // rotation expects current==completed to detect "I'm
+                        // done with this turn, move on", which is true at the
+                        // start of a fresh turn.
+                        *last_completed_request_id.borrow_mut() = String::new();
                     }
+                    // Update turn_request_id from the global map only at turn
+                    // boundaries — i.e. when the current turn_request_id has
+                    // already been used for a message_completed (matches
+                    // last_completed_request_id). This prevents a follow-up
+                    // message that overwrites the global map from poisoning
+                    // the current turn's request_id via a late NewEntry.
+                    if role == "assistant" {
+                        let current = turn_request_id.borrow().clone();
+                        let completed = last_completed_request_id.borrow().clone();
+                        if current.is_empty() || current == completed {
+                            // Rotate: current → prev before overwriting.
+                            *prev_turn_request_id.borrow_mut() = current;
+                            let global_rid = crate::get_thread_request_id(&thread_id_for_sub)
+                                .unwrap_or_default();
+                            *turn_request_id.borrow_mut() = global_rid;
+                        }
+                    }
+                    // Use the turn-scoped request_id for all events, not the
+                    // global THREAD_REQUEST_MAP which can be overwritten by a
+                    // follow-up/interrupt message between turns.
+                    let rid = turn_request_id.borrow().clone();
+                    // Re-send preceding entries FROM THE CURRENT TURN with their
+                    // current content. flush_streaming_text() was called right before
+                    // push_entry(), so all Markdown entities have their complete text.
+                    // Only send entries after the last UserMessage to avoid leaking
+                    // old turn entries into the current interaction on the Go side.
+                    let entries = thread.entries();
+                    let turn_start = entries.iter().enumerate().rev()
+                        .find_map(|(i, e)| matches!(e, acp_thread::AgentThreadEntry::UserMessage(_)).then_some(i + 1))
+                        .unwrap_or(0);
+                    for prev_idx in turn_start..latest_idx {
+                        if let Some(prev_entry) = thread.entries().get(prev_idx) {
+                            let (prev_role, prev_content, prev_entry_type) = match prev_entry {
+                                acp_thread::AgentThreadEntry::UserMessage(msg) => {
+                                    ("user", msg.content.to_markdown(cx).to_string(), "text")
+                                }
+                                acp_thread::AgentThreadEntry::AssistantMessage(msg) => {
+                                    ("assistant", msg.content_only(cx), "text")
+                                }
+                                acp_thread::AgentThreadEntry::ToolCall(tool_call) => {
+                                    ("assistant", tool_call.to_markdown(cx), "tool_call")
+                                }
+                                _ => continue,
+                            };
+                            let (prev_tool_name, prev_tool_status) = match prev_entry {
+                                acp_thread::AgentThreadEntry::ToolCall(tool_call) => {
+                                    (tool_call.label.read(cx).source().to_string(), tool_call.status.to_string())
+                                }
+                                _ => (String::new(), String::new()),
+                            };
+                            let _ = crate::send_websocket_event(SyncEvent::MessageAdded {
+                                acp_thread_id: thread_id_for_sub.clone(),
+                                message_id: prev_idx.to_string(),
+                                role: prev_role.to_string(),
+                                content: prev_content,
+                                request_id: rid.clone(),
+                                entry_type: prev_entry_type.to_string(),
+                                tool_name: prev_tool_name,
+                                tool_status: prev_tool_status,
+                                timestamp: chrono::Utc::now().timestamp(),
+                            });
+                        }
+                    }
+
                     let _ = crate::send_websocket_event(SyncEvent::MessageAdded {
                         acp_thread_id: thread_id_for_sub.clone(),
                         message_id: latest_idx.to_string(),
@@ -525,8 +823,27 @@ fn ensure_thread_subscription(
                         }
                         _ => return,
                     };
-                    let rid = crate::get_thread_request_id(&thread_id_for_sub)
-                        .unwrap_or_default();
+                    // Pick the right request_id based on whether this entry
+                    // belongs to the current turn or a previous one.  Claude
+                    // Code can deliver background events (tool completions,
+                    // text flushes) asynchronously via session_notification
+                    // after a turn has ended.  These must be tagged with the
+                    // PREVIOUS turn's request_id so the Helix side routes
+                    // them to the correct interaction.
+                    let entries = thread.entries();
+                    let turn_start = entries.iter().enumerate().rev()
+                        .find_map(|(i, e)| matches!(e, acp_thread::AgentThreadEntry::UserMessage(_)).then_some(i + 1))
+                        .unwrap_or(0);
+                    let rid = if *entry_idx < turn_start {
+                        let prev = prev_turn_request_id.borrow().clone();
+                        if !prev.is_empty() {
+                            prev
+                        } else {
+                            turn_request_id.borrow().clone()
+                        }
+                    } else {
+                        turn_request_id.borrow().clone()
+                    };
                     throttled_send_message_added(
                         &thread_id_for_sub,
                         *entry_idx,
@@ -602,8 +919,27 @@ fn ensure_thread_subscription(
                     }
                 }
 
-                // Use the turn's captured request_id for message_completed too
-                let completed_rid = turn_request_id.borrow().clone();
+                // Use the turn's captured request_id for message_completed.
+                // FALLBACK: if turn_request_id still holds the previous turn's id
+                // (because no assistant NewEntry fired to update it — happens when
+                // the interrupt turn is immediately cancelled with no output), use
+                // the current global THREAD_REQUEST_MAP which points to this turn.
+                let captured_rid = turn_request_id.borrow().clone();
+                let last_completed = last_completed_request_id.borrow().clone();
+                let completed_rid = if !captured_rid.is_empty() && captured_rid == last_completed {
+                    // turn_request_id is stale — the previous turn already used it.
+                    // Use the global map which has the current turn's request_id.
+                    let fallback = crate::get_thread_request_id(&thread_id_for_sub)
+                        .unwrap_or_else(|| captured_rid.clone());
+                    eprintln!(
+                        "📤 [THREAD_SERVICE] Stopped: turn_request_id={} already used, falling back to global={}",
+                        captured_rid, fallback
+                    );
+                    fallback
+                } else {
+                    captured_rid
+                };
+                *last_completed_request_id.borrow_mut() = completed_rid.clone();
                 eprintln!(
                     "📤 [THREAD_SERVICE] Stopped event: sending message_completed for thread {} (request_id={})",
                     thread_id_for_sub, completed_rid
@@ -655,6 +991,37 @@ pub fn setup_thread_handler(
     let project_for_open = project.clone();
     let acp_history_store_for_open = acp_history_store.clone();
     let fs_for_open = fs.clone();
+
+    // Spawn dedicated cancel task — runs independently of the callback_rx loop so it
+    // can cancel a running turn even while callback_rx.recv().await is blocked.
+    let (cancel_tx, mut cancel_rx) = mpsc::unbounded_channel::<String>();
+    crate::init_cancel_thread_callback(cancel_tx);
+    cx.spawn(async move |cx| {
+        eprintln!("⚡ [CANCEL_TASK] Cancel task started, waiting for cancel requests...");
+        log::info!("⚡ [CANCEL_TASK] Cancel task started, waiting for cancel requests...");
+        while let Some(acp_thread_id) = cancel_rx.recv().await {
+            eprintln!("⚡ [CANCEL_TASK] Received cancel request for thread: {}", acp_thread_id);
+            log::info!("⚡ [CANCEL_TASK] Received cancel request for thread: {}", acp_thread_id);
+            if let Some(thread) = crate::get_thread(&acp_thread_id) {
+                let result = cx.update(|cx| {
+                    thread.update(cx, |t, cx| { t.cancel(cx) })
+                });
+                match result {
+                    Ok(_) => {
+                        eprintln!("✅ [CANCEL_TASK] Cancelled running turn on thread: {}", acp_thread_id);
+                        log::info!("✅ [CANCEL_TASK] Cancelled running turn on thread: {}", acp_thread_id);
+                    }
+                    Err(e) => {
+                        eprintln!("⚠️ [CANCEL_TASK] Failed to cancel thread {}: {}", acp_thread_id, e);
+                        log::warn!("⚠️ [CANCEL_TASK] Failed to cancel thread {}: {}", acp_thread_id, e);
+                    }
+                }
+            } else {
+                eprintln!("⚠️ [CANCEL_TASK] Thread {} not found in registry, skipping cancel", acp_thread_id);
+                log::warn!("⚠️ [CANCEL_TASK] Thread {} not found in registry, skipping cancel", acp_thread_id);
+            }
+        }
+    }).detach();
 
     // Spawn handler task to process thread creation requests
     cx.spawn(async move |cx| {
@@ -949,31 +1316,43 @@ fn create_new_thread_sync(
         let connection: std::rc::Rc<dyn acp_thread::AgentConnection> = {
             let mut attempt = 0u32;
             loop {
-                let connection_task = cx.update(|cx| {
+                let shared = cx.update(|cx| {
                     let server = agent.server(fs.clone(), acp_history_store.clone());
+                    let agent_id = server.agent_id();
                     let agent_server_store = project.read(cx).agent_server_store().clone();
                     let delegate = agent_servers::AgentServerDelegate::new(
                         agent_server_store,
                         None,
                     );
-                    eprintln!("🔌 [THREAD_SERVICE] Calling server.connect() (attempt {}/{})...", attempt + 1, max_retries + 1);
-                    server.connect(delegate, project.clone(), cx)
+                    eprintln!("🔌 [THREAD_SERVICE] Requesting cached connection (attempt {}/{})...", attempt + 1, max_retries + 1);
+                    agent_servers::AgentConnectionCache::request_connection(
+                        cx,
+                        project.clone(),
+                        agent_id,
+                        server,
+                        delegate,
+                    )
                 });
 
                 eprintln!("⏳ [THREAD_SERVICE] Awaiting connection task...");
-                match connection_task.await {
+                match shared.await {
                     Ok(conn) => {
                         eprintln!("✅ [THREAD_SERVICE] Connected to agent successfully");
                         break conn;
                     }
                     Err(e) if attempt < max_retries && e.to_string().contains("not registered") => {
-                        eprintln!("⚠️ [THREAD_SERVICE] Agent not registered yet (attempt {}/{}), retrying in 1s: {}", attempt + 1, max_retries, e);
+                        eprintln!("⚠️ [THREAD_SERVICE] Agent not registered yet (attempt {}/{}), retrying in 1s: {:?}", attempt + 1, max_retries, e);
+                        // Evict the cached failure so the next iteration triggers a fresh connect.
+                        cx.update(|cx| {
+                            let server = agent.server(fs.clone(), acp_history_store.clone());
+                            agent_servers::AgentConnectionCache::evict(cx, project.entity_id(), server.agent_id());
+                        });
                         attempt += 1;
                         cx.background_executor().timer(Duration::from_secs(1)).await;
                     }
                     Err(e) => {
-                        eprintln!("❌ [THREAD_SERVICE] Failed to connect to agent: {}", e);
-                        return Err(e);
+                        eprintln!("❌ [THREAD_SERVICE] Failed to connect to agent: {:?}", e);
+                        return Err(anyhow::anyhow!("agent connect failed: {:?}", e));
                     }
                 }
             }
@@ -1294,14 +1673,21 @@ async fn load_thread_from_agent(
 
     let server = agent.server(fs, acp_history_store.clone());
 
-    // Get agent server store and create connection
-    let (connection_task, cwd) = cx.update(|cx| {
+    // Get agent server store and create (or reuse cached) connection
+    let (shared, cwd) = cx.update(|cx| {
+        let agent_id = server.agent_id();
         let agent_server_store = project.read(cx).agent_server_store().clone();
         let delegate = agent_servers::AgentServerDelegate::new(
             agent_server_store,
             None,
         );
-        let connection_task = server.connect(delegate, project.clone(), cx);
+        let shared = agent_servers::AgentConnectionCache::request_connection(
+            cx,
+            project.clone(),
+            agent_id,
+            server.clone(),
+            delegate,
+        );
         // Use ZED_WORK_DIR for consistency with session storage
         let cwd = std::env::var("ZED_WORK_DIR")
             .ok()
@@ -1311,10 +1697,12 @@ async fn load_thread_from_agent(
                     .map(|wt| wt.read(cx).abs_path().to_path_buf())
                     .unwrap_or_else(|| std::env::current_dir().unwrap_or_default())
             });
-        (connection_task, cwd)
+        (shared, cwd)
     });
 
-    let connection: std::rc::Rc<dyn acp_thread::AgentConnection> = connection_task.await?;
+    let connection: std::rc::Rc<dyn acp_thread::AgentConnection> = shared
+        .await
+        .map_err(|e| anyhow::anyhow!("agent connect failed: {:?}", e))?;
 
     eprintln!("✅ [THREAD_SERVICE] Connected to agent for loading thread");
     log::info!("✅ [THREAD_SERVICE] Connected to agent for loading thread");
@@ -1415,13 +1803,62 @@ fn open_existing_thread_sync(
     // async loads race: both pass the registry check above, both spawn load tasks,
     // and the second overwrites the first's entity in the registry — orphaning
     // the first entity's event subscriptions.
+    //
+    // If panel restoration already holds the lock, WAIT for it to finish rather
+    // than skipping — panel restoration registers the entity, and once it releases
+    // the lock we can find the entity via the fast path and just subscribe +
+    // send agent_ready without doing a duplicate load.
     {
         let mut loading = THREAD_LOAD_IN_PROGRESS.lock();
         if let Some(in_progress) = loading.as_ref() {
-            eprintln!("⏳ [THREAD_SERVICE] DUPLICATE LOAD PREVENTED: {} is already loading, skipping load of {}",
+            let in_progress = in_progress.clone();
+            eprintln!("⏳ [THREAD_SERVICE] Load lock held by '{}', waiting for release before handling '{}'",
                       in_progress, request.acp_thread_id);
-            log::warn!("⏳ [THREAD_SERVICE] DUPLICATE LOAD PREVENTED: {} is already loading, skipping load of {}",
+            log::info!("⏳ [THREAD_SERVICE] Load lock held by '{}', waiting for release before handling '{}'",
                        in_progress, request.acp_thread_id);
+            drop(loading); // release parking_lot lock before spawning
+
+            let acp_thread_id = request.acp_thread_id.clone();
+            let agent_name = request.agent_name.clone();
+            cx.spawn(async move |cx| {
+                // Poll until the load lock is released (max 30 s).
+                let deadline = Instant::now() + Duration::from_secs(30);
+                loop {
+                    smol::Timer::after(Duration::from_millis(50)).await;
+                    if THREAD_LOAD_IN_PROGRESS.lock().is_none() {
+                        eprintln!("🔓 [THREAD_SERVICE] Load lock released, rechecking fast path for '{}'", acp_thread_id);
+                        break;
+                    }
+                    if Instant::now() > deadline {
+                        eprintln!("⚠️ [THREAD_SERVICE] Timed out waiting for load lock for '{}', proceeding anyway", acp_thread_id);
+                        break;
+                    }
+                }
+
+                // Recheck registry — whoever held the lock should have registered the entity.
+                if let Some(thread_weak) = get_thread(&acp_thread_id) {
+                    if let Some(thread_entity) = thread_weak.upgrade() {
+                        let flag_was_set = {
+                            let subs = PERSISTENT_SUBSCRIPTIONS.lock();
+                            subs.as_ref().map(|s| s.read().contains(&acp_thread_id)).unwrap_or(false)
+                        };
+                        let entity_id = thread_entity.entity_id();
+                        eprintln!(
+                            "🔍 [THREAD_SERVICE] After lock wait: fast-path entity={:?}, subscription flag was_set={} for '{}'",
+                            entity_id, flag_was_set, acp_thread_id
+                        );
+                        cx.update(|cx| {
+                            ensure_thread_subscription(&thread_entity, &acp_thread_id, cx);
+                        });
+                    }
+                    let agent_name_for_ready = agent_name.unwrap_or_else(|| "zed-agent".to_string());
+                    eprintln!("🚀 [THREAD_SERVICE] Sending agent_ready after lock-wait for '{}'", acp_thread_id);
+                    crate::send_agent_ready(agent_name_for_ready, Some(acp_thread_id));
+                } else {
+                    eprintln!("⚠️ [THREAD_SERVICE] Lock released but entity not in registry for '{}' — no action taken", acp_thread_id);
+                    log::warn!("⚠️ [THREAD_SERVICE] Lock released but entity not in registry for '{}'", acp_thread_id);
+                }
+            }).detach();
             return Ok(());
         }
         eprintln!("🔒 [THREAD_SERVICE] Acquired thread load lock for {}", request.acp_thread_id);
@@ -1452,6 +1889,7 @@ fn open_existing_thread_sync(
     log::info!("🔧 [THREAD_SERVICE] Selected agent: {:?}", agent);
 
     let server = agent.server(fs, acp_history_store.clone());
+    let agent_id = server.agent_id();
 
     // Get agent server store from project
     let agent_server_store = project.read(cx).agent_server_store().clone();
@@ -1462,8 +1900,15 @@ fn open_existing_thread_sync(
         None,
     );
 
-    // Connect to get AgentConnection
-    let connection_task = server.connect(delegate, project.clone(), cx);
+    // Get cached connection or create a new one (deduped against concurrent
+    // callers in workspace restore / load_thread_from_agent / agent_connection_store).
+    let shared = agent_servers::AgentConnectionCache::request_connection(
+        cx,
+        project.clone(),
+        agent_id,
+        server.clone(),
+        delegate,
+    );
 
     // Use ZED_WORK_DIR for consistency with session storage
     let cwd = std::env::var("ZED_WORK_DIR")
@@ -1491,12 +1936,12 @@ fn open_existing_thread_sync(
         }
         let _loading_guard = ClearLoadingGuard;
 
-        let connection = match connection_task.await {
+        let connection = match shared.await {
             Ok(result) => result,
             Err(e) => {
-                eprintln!("❌ [THREAD_SERVICE] Failed to connect to agent: {}", e);
-                log::error!("❌ [THREAD_SERVICE] Failed to connect to agent: {}", e);
-                return Err(e);
+                eprintln!("❌ [THREAD_SERVICE] Failed to connect to agent: {:?}", e);
+                log::error!("❌ [THREAD_SERVICE] Failed to connect to agent: {:?}", e);
+                return Err(anyhow::anyhow!("agent connect failed: {:?}", e));
             }
         };
 
@@ -1556,6 +2001,46 @@ fn open_existing_thread_sync(
             eprintln!("📋 [THREAD_SERVICE] Registered thread: {} (strong reference)", acp_thread_id);
             log::info!("📋 [THREAD_SERVICE] Registered thread: {} (strong reference)", acp_thread_id);
         }
+
+        // CRITICAL: Subscribe to thread events so streaming responses sync to Helix.
+        // This mirrors create_new_thread_sync (line ~1218). Without this call,
+        // after a Zed restart the thread loads successfully but its NewEntry /
+        // EntryUpdated / Stopped events have no listener, so message_added is
+        // never emitted and the interaction stays stuck in "waiting" forever.
+        //
+        // We MUST clear the persistent-subscription flag first.  Panel restoration
+        // may have already called ensure_thread_subscription on a *different* entity
+        // (the one it created before load_session ran here), setting the flag.
+        // If we skip the call because the flag is set, the subscription stays on
+        // the panel-restoration entity while we registered a brand-new entity from
+        // load_session — events on the new entity are never forwarded to Helix.
+        {
+            let flag_was_set = {
+                let subs = PERSISTENT_SUBSCRIPTIONS.lock();
+                subs.as_ref().map(|s| s.read().contains(&acp_thread_id)).unwrap_or(false)
+            };
+            let load_session_entity_id = thread_entity.entity_id();
+            eprintln!(
+                "🔍 [THREAD_SERVICE] open_existing_thread_sync slow path: subscription flag was_set={}, load_session entity={:?} for '{}'",
+                flag_was_set, load_session_entity_id, acp_thread_id
+            );
+            log::info!(
+                "🔍 [THREAD_SERVICE] open_existing_thread_sync slow path: subscription flag was_set={}, load_session entity={:?} for '{}'",
+                flag_was_set, load_session_entity_id, acp_thread_id
+            );
+            // Clear any stale flag from a racing panel restoration that used a
+            // different entity before load_session completed here.
+            let subs = PERSISTENT_SUBSCRIPTIONS.lock();
+            if let Some(s) = subs.as_ref() {
+                if s.write().remove(&acp_thread_id) {
+                    eprintln!("🔄 [THREAD_SERVICE] Cleared stale subscription flag for '{}' (was set on a different entity)", acp_thread_id);
+                    log::info!("🔄 [THREAD_SERVICE] Cleared stale subscription flag for '{}' before re-subscribing on load_session entity", acp_thread_id);
+                }
+            }
+        }
+        cx.update(|cx| {
+            ensure_thread_subscription(&thread_entity, &acp_thread_id, cx);
+        });
 
         // Send agent_ready event to Helix (signals that agent is ready to receive prompts)
         // (THREAD_LOAD_IN_PROGRESS is cleared by the ClearLoadingGuard drop guard)

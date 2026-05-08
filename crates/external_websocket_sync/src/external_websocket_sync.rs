@@ -4,18 +4,11 @@
 //! with external services via WebSocket connections, enabling real-time collaboration
 //! and integration with AI platforms and other external tools.
 
-use anyhow::{Context, Result};
-use assistant_text_thread::{TextThread, TextThreadId, TextThreadStore, MessageId};
-use assistant_slash_command::SlashCommandWorkingSet;
-use clock::ReplicaId;
-use collections::HashMap;
-use gpui::{App, Entity, EventEmitter, Global, Subscription, Task};
+use anyhow::Result;
+use gpui::{App, EventEmitter, Global};
 use tokio::sync::mpsc;
 
-use language_model;
 use parking_lot::RwLock;
-use project::Project;
-use prompt_store::PromptBuilder;
 use serde::{Deserialize, Serialize};
 use session::AppSession;
 use std::sync::Arc;
@@ -43,8 +36,6 @@ pub use sync_settings::*;
 pub use websocket_sync::*;
 pub use tungstenite;
 
-/// Type alias for backwards compatibility with existing code
-pub type ContextId = TextThreadId;
 
 /// Global WebSocket sender for sending responses back to external system
 #[derive(Clone)]
@@ -92,8 +83,14 @@ static GLOBAL_THREAD_OPEN_CALLBACK: parking_lot::Mutex<Option<mpsc::UnboundedSen
 static GLOBAL_UI_STATE_QUERY_CALLBACK: parking_lot::Mutex<Option<mpsc::UnboundedSender<UiStateQueryRequest>>> =
     parking_lot::Mutex::new(None);
 
-/// Static global for cancellation callback (cancels active ACP thread turn)
+/// Static global for cancellation callback (cancels active ACP thread turn by request_id)
 static GLOBAL_CANCELLATION_CALLBACK: parking_lot::Mutex<Option<mpsc::UnboundedSender<CancellationRequest>>> =
+    parking_lot::Mutex::new(None);
+
+/// Static global for cancel-thread callback.
+/// Receives an acp_thread_id and immediately cancels that thread's running turn,
+/// bypassing the sequential callback_rx loop (which would be blocked awaiting the turn).
+static GLOBAL_CANCEL_THREAD_CALLBACK: parking_lot::Mutex<Option<mpsc::UnboundedSender<String>>> =
     parking_lot::Mutex::new(None);
 
 /// Pending UI state queries that arrived before AgentPanel was ready
@@ -394,13 +391,8 @@ pub type HelixIntegration = ExternalWebSocketSync;
 /// Main external WebSocket thread sync service
 pub struct ExternalWebSocketSync {
     session: Arc<AppSession>,
-    context_store: Option<Entity<TextThreadStore>>,
-    project: Entity<Project>,
-    prompt_builder: Arc<PromptBuilder>,
-    active_contexts: Arc<RwLock<HashMap<TextThreadId, Entity<TextThread>>>>,
     websocket_sync: Option<WebSocketSync>,
     sync_clients: Arc<RwLock<Vec<String>>>,
-    _subscriptions: Vec<Subscription>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -424,103 +416,13 @@ impl Default for ExternalSyncConfig {
 }
 
 impl ExternalWebSocketSync {
-    /// Initialize external WebSocket sync with project and prompt builder
-    pub fn init_with_project(
-        app: &mut App, 
-        session: Arc<AppSession>, 
-        project: Entity<Project>,
-        prompt_builder: Arc<PromptBuilder>
-    ) {
-        let sync_service = Self::new(session, project, prompt_builder);
-        app.set_global(sync_service);
-        
-        // Initialize sync service synchronously for now
-        log::info!("External WebSocket sync initialized - async startup deferred");
-    }
-
     /// Create new external WebSocket sync instance
-    pub fn new(session: Arc<AppSession>, project: Entity<Project>, prompt_builder: Arc<PromptBuilder>) -> Self {
-        log::warn!("External WebSocket sync creation - using placeholder values due to API changes");
+    pub fn new(session: Arc<AppSession>) -> Self {
         Self {
             session,
-            context_store: None,
-            project,
-            prompt_builder,
-            active_contexts: Arc::new(RwLock::new(HashMap::default())),
             websocket_sync: None,
             sync_clients: Arc::new(RwLock::new(Vec::new())),
-            _subscriptions: Vec::new(),
         }
-    }
-
-    /// Subscribe to context changes and emit sync events to Helix
-    pub fn subscribe_to_text_thread_changes(&mut self, text_thread: Entity<TextThread>, external_session_id: String, cx: &mut App) {
-        let session_id_clone = external_session_id.clone();
-        eprintln!("🔔 [SYNC] Subscribing to text thread changes for external session: {}", external_session_id);
-
-        let subscription = cx.subscribe(&text_thread, move |_text_thread, _event, _cx| {
-            eprintln!("🔔 [SYNC] Text thread changed for session: {}", session_id_clone);
-
-            // TODO: Extract text thread content and send sync event to Helix
-            eprintln!("✅ [SYNC] Sending text thread update to Helix for session: {}", session_id_clone);
-            // This is where we'll implement the sync back to Helix
-            // We'll send the complete thread state back to Helix
-        });
-
-        self._subscriptions.push(subscription);
-        eprintln!("✅ [SYNC] Successfully subscribed to text thread changes for session: {}", external_session_id);
-    }
-
-    /// Initialize context store with project
-    pub async fn init_context_store(&mut self, cx: &mut App) -> Result<()> {
-        if self.context_store.is_some() {
-            return Ok(()); // Already initialized
-        }
-
-        let project = self.project.clone();
-        let prompt_builder = self.prompt_builder.clone();
-        // let slash_commands = Arc::new(SlashCommandWorkingSet::default());
-
-        log::info!("Initializing text thread store for Helix integration");
-
-        let slash_commands = Arc::new(SlashCommandWorkingSet::default());
-        let text_thread_store = TextThreadStore::new(project, prompt_builder, slash_commands, cx).await?;
-        self.context_store = Some(text_thread_store);
-        log::info!("Text thread store initialized successfully");
-        Ok(())
-    }
-
-    /// Initialize text thread store and return a task
-    pub fn init_text_thread_store_task(&self, cx: &mut App) -> Task<Result<Entity<TextThreadStore>>> {
-        let project = self.project.clone();
-        let prompt_builder = self.prompt_builder.clone();
-
-        log::info!("Initializing text thread store for Helix integration");
-
-        let slash_commands = Arc::new(SlashCommandWorkingSet::default());
-        TextThreadStore::new(project, prompt_builder, slash_commands, cx)
-    }
-
-    /// Start the sync service (DEPRECATED - use init_websocket_service instead)
-    #[allow(dead_code)]
-    pub async fn start(&mut self, _cx: &mut App) -> Result<()> {
-        log::warn!("ExternalWebSocketSync::start() is deprecated - use websocket_sync::init_websocket_service()");
-        Ok(())
-    }
-
-    /// Stop the sync service
-    pub async fn stop(&self) -> Result<()> {
-        log::info!("Stopping external WebSocket sync service");
-
-        // Note: This would need proper mutable access in a real implementation
-        // For now, just log the stop request
-        log::info!("Stop requested for external WebSocket sync service");
-
-        // Clear active contexts
-        self.active_contexts.write().clear();
-
-        log::info!("External WebSocket sync service stopped");
-        Ok(())
     }
 
     /// Load configuration from settings
@@ -553,172 +455,9 @@ impl ExternalWebSocketSync {
         SessionInfo {
             session_id: self.session.id().to_string(),
             last_session_id: self.session.last_session_id().map(|s| s.to_string()),
-            active_contexts: self.active_contexts.read().len(),
-            websocket_connected: false, // TODO: check if websocket service is active
+            active_contexts: 0,
+            websocket_connected: false,
             sync_clients: self.sync_clients.read().len(),
-        }
-    }
-
-    /// Get all active conversation contexts
-    pub fn get_contexts(&self) -> Vec<ContextInfo> {
-        let contexts = self.active_contexts.read();
-        contexts
-            .iter()
-            .map(|(id, _context)| {
-                // TODO: Read actual context data once assistant_context integration is complete
-                ContextInfo {
-                    id: id.to_proto(),
-                    title: "Conversation".to_string(),
-                    message_count: 0,
-                    last_message_at: chrono::Utc::now(),
-                    status: "active".to_string(),
-                }
-            })
-            .collect()
-    }
-
-    /// Create a new conversation context
-    pub fn create_context(&self, title: Option<String>, _cx: &mut App) -> Result<ContextId> {
-        let context_id = ContextId::new();
-        
-        // TODO: Implement real context creation when API is fixed
-        // For now, just create a placeholder context ID
-        log::info!("Created new conversation context: {} ({})", 
-                  context_id.to_proto(), 
-                  title.as_deref().unwrap_or("Untitled"));
-        
-        Ok(context_id)
-
-    }
-
-    /// Delete a conversation context
-    pub fn delete_context(&mut self, context_id: &ContextId) -> Result<()> {
-        if self.active_contexts.write().remove(context_id).is_some() {
-            self.notify_context_deleted(context_id);
-            Ok(())
-        } else {
-            anyhow::bail!("Context not found: {}", context_id.to_proto())
-        }
-    }
-
-    /// Get messages from a context
-    pub fn get_context_messages(&self, context_id: &ContextId, cx: &App) -> Result<Vec<MessageInfo>> {
-        let contexts = self.active_contexts.read();
-        let context = contexts
-            .get(context_id)
-            .with_context(|| format!("Context not found: {}", context_id.to_proto()))?;
-
-        // Read actual messages from the assistant context
-        let messages: Vec<MessageInfo> = context.read(cx).messages(cx)
-            .map(|message| MessageInfo {
-                id: message.id.as_u64(),
-                context_id: context_id.to_proto(),
-                role: match message.role {
-                    language_model::Role::User => "user".to_string(),
-                    language_model::Role::Assistant => "assistant".to_string(),
-                    language_model::Role::System => "system".to_string(),
-                },
-                content: "placeholder message content".to_string(), // TODO: Get actual message content from buffer
-                created_at: chrono::Utc::now(), // TODO: Get actual timestamp from message
-                status: match message.status {
-                    assistant_text_thread::MessageStatus::Pending => "pending".to_string(),
-                    assistant_text_thread::MessageStatus::Done => "done".to_string(),
-                    assistant_text_thread::MessageStatus::Error(_) => "error".to_string(),
-                    assistant_text_thread::MessageStatus::Canceled => "canceled".to_string(),
-                },
-                metadata: std::collections::HashMap::new(),
-            })
-            .collect();
-
-        Ok(messages)
-    }
-
-    /// Add a message to a context
-    pub fn add_message_to_context(
-        &mut self,
-        context_id: &ContextId,
-        content: String,
-        role: String,
-        cx: &mut App,
-    ) -> Result<MessageId> {
-        let contexts = self.active_contexts.read();
-        let context = contexts
-            .get(context_id)
-            .with_context(|| format!("Context not found: {}", context_id.to_proto()))?
-            .clone();
-
-        drop(contexts);
-
-        // Add the actual message to the assistant context
-        let message_id = context.update(cx, |context, cx| {
-            // Add the user's message to the buffer (same as agent panel does)
-            context.buffer().update(cx, |buffer, cx| {
-                let end_offset = buffer.len();
-                buffer.edit([(end_offset..end_offset, format!("{}\n", content))], None, cx);
-            });
-
-            // If this is a user message, trigger AI assistant response
-            if role == "user" {
-                log::info!("🤖 [WEBSOCKET_SYNC] Triggering AI assistant for user message: {}", content);
-                context.assist(cx);
-            }
-
-            // Create a message ID (for now just use a placeholder)
-            MessageId(clock::Lamport::new(ReplicaId::new(1)))
-        });
-
-        // Notify via WebSocket
-        self.notify_message_added(context_id, &message_id);
-
-        Ok(message_id)
-    }
-
-    /// Notify WebSocket of context creation (DEPRECATED - use thread_created)
-    #[allow(dead_code)]
-    fn notify_context_created(&self, _context_id: &ContextId) {
-        // Context creation now sends thread_created event via the callback mechanism
-    }
-
-    /// Notify WebSocket of context deletion (DEPRECATED)
-    #[allow(dead_code)]
-    fn notify_context_deleted(&self, _context_id: &ContextId) {
-        // Not part of the simplified protocol
-    }
-
-    /// Notify WebSocket of message addition
-    fn notify_message_added(&self, context_id: &ContextId, message_id: &MessageId) {
-        if let Some(websocket_sync) = &self.websocket_sync {
-            let event = SyncEvent::MessageAdded {
-                acp_thread_id: context_id.to_proto(),
-                message_id: message_id.as_u64().to_string(),
-                role: "assistant".to_string(),
-                entry_type: "text".to_string(),
-                tool_name: String::new(),
-                tool_status: String::new(),
-                content: String::new(), // TODO: get actual content
-                request_id: String::new(),
-                timestamp: chrono::Utc::now().timestamp(),
-            };
-            if let Err(e) = websocket_sync.send_event(event) {
-                log::warn!("Failed to send message added event: {}", e);
-            }
-        }
-    }
-
-    /// Notify WebSocket of message completion
-    pub fn notify_message_completed(&self, context_id: &ContextId, message_id: &MessageId) {
-        if let Some(websocket_sync) = &self.websocket_sync {
-            // Flush any pending throttled messages before completion
-            flush_streaming_throttle(&context_id.to_proto());
-
-            let event = SyncEvent::MessageCompleted {
-                acp_thread_id: context_id.to_proto(),
-                message_id: message_id.as_u64().to_string(),
-                request_id: String::new(), // TODO: track request_id
-            };
-            if let Err(e) = websocket_sync.send_event(event) {
-                log::warn!("Failed to send message completed event: {}", e);
-            }
         }
     }
 }
@@ -797,39 +536,6 @@ pub fn init(cx: &mut App) {
 }
 
 
-/// Initialize the external WebSocket sync with full assistant support (DEPRECATED)
-#[allow(dead_code)]
-pub fn init_full(
-    _session: Arc<AppSession>,
-    _project: Entity<Project>,
-    _prompt_builder: Arc<PromptBuilder>,
-    _cx: &mut App
-) -> Result<()> {
-    log::warn!("init_full() is deprecated - use websocket_sync::init_websocket_service()");
-    Ok(())
-}
-
-/// Initialize with session and prompt builder, store for later use
-pub async fn init_with_session(
-    _session: Arc<AppSession>,
-    _prompt_builder: Arc<PromptBuilder>,
-) -> Result<()> {
-    log::info!("Session and prompt builder will be passed directly to initialization methods");
-    Ok(())
-}
-
-/// Initialize with project when available (DEPRECATED)
-#[allow(dead_code)]
-pub fn init_with_project_when_available(
-    _project: Entity<Project>,
-    _session: Arc<AppSession>,
-    _prompt_builder: Arc<PromptBuilder>,
-    _cx: &mut App
-) -> Result<()> {
-    log::warn!("init_with_project_when_available() is deprecated");
-    Ok(())
-}
-
 /// Get the global external WebSocket sync instance
 pub fn get_global_sync_service(cx: &App) -> Option<&ExternalWebSocketSync> {
     cx.try_global::<ExternalWebSocketSync>()
@@ -841,51 +547,33 @@ pub mod mock_helix_server;
 #[cfg(test)]
 mod protocol_test;
 
-/// Execute a function with the global sync service if available
-pub fn with_sync_service<T>(
-    cx: &App,
-    f: impl FnOnce(&ExternalWebSocketSync) -> T,
-) -> Option<T> {
-    get_global_sync_service(cx).map(f)
+/// Request that the currently running turn on a thread be cancelled immediately.
+/// This bypasses the sequential callback_rx loop (which blocks waiting for turn
+/// completion) by routing through a dedicated cancel GPUI task.
+/// Called when Helix sends a chat_message with interrupt=true.
+pub fn request_cancel_thread(acp_thread_id: String) -> Result<()> {
+    eprintln!("⚡ [CANCEL] request_cancel_thread() called for thread: {}", acp_thread_id);
+    log::info!("⚡ [CANCEL] request_cancel_thread() called for thread: {}", acp_thread_id);
+
+    let sender = GLOBAL_CANCEL_THREAD_CALLBACK.lock().clone();
+    if let Some(sender) = sender {
+        sender.send(acp_thread_id)
+            .map_err(|_| anyhow::anyhow!("Failed to send cancel request"))?;
+        Ok(())
+    } else {
+        // Cancel task not yet initialized — log and ignore. The new message will
+        // be processed sequentially as before (no worse than the old behaviour).
+        eprintln!("⚠️ [CANCEL] Cancel callback not yet initialized, skipping cancel for thread: {}", acp_thread_id);
+        log::warn!("⚠️ [CANCEL] Cancel callback not yet initialized, skipping cancel for thread: {}", acp_thread_id);
+        Ok(())
+    }
 }
 
-/// Execute an async function with the global sync service if available
-pub async fn with_sync_service_async<T>(
-    cx: &App,
-    f: impl FnOnce(&ExternalWebSocketSync) -> T,
-) -> Option<T> {
-    get_global_sync_service(cx).map(f)
-}
-
-/// Subscribe to context changes for an external session (called from AgentPanel)
-pub fn subscribe_to_context_changes_global(context: Entity<TextThread>, external_session_id: String, cx: &mut App) {
-    let session_id_clone = external_session_id.clone();
-    eprintln!("🔔 [SYNC_GLOBAL] Setting up global context subscription for session: {}", external_session_id);
-    
-    // Create a subscription that will send sync events when the context changes
-    let _subscription = cx.subscribe(&context, move |context_entity, _event, cx| {
-        eprintln!("🔔 [SYNC_GLOBAL] Context changed for session: {}", session_id_clone);
-        
-        // Extract the current context content
-        let context_content = context_entity.read(cx);
-        let messages = context_content.messages(cx);
-        
-        let messages: Vec<_> = messages.collect();
-        eprintln!("🔔 [SYNC_GLOBAL] Context has {} messages, syncing to Helix...", messages.len());
-        
-        // TODO: Send sync event to Helix via WebSocket
-        // This is where we'll implement the actual sync back to Helix
-        // We need to:
-        // 1. Extract all messages from the context
-        // 2. Format them as Helix-compatible messages
-        // 3. Send them via WebSocket to update the Helix session
-        
-        eprintln!("✅ [SYNC_GLOBAL] Context sync completed for session: {}", session_id_clone);
-    });
-    
-    // Store the subscription in global state so it doesn't get dropped
-    // TODO: We need a way to store these subscriptions globally
-    eprintln!("✅ [SYNC_GLOBAL] Context subscription created for session: {}", external_session_id);
+/// Initialize the global cancel-thread callback (called from thread_service).
+pub fn init_cancel_thread_callback(sender: mpsc::UnboundedSender<String>) {
+    eprintln!("🔧 [CANCEL] init_cancel_thread_callback() called - registering global callback");
+    log::info!("🔧 [CANCEL] init_cancel_thread_callback() called - registering global callback");
+    *GLOBAL_CANCEL_THREAD_CALLBACK.lock() = Some(sender);
 }
 
 

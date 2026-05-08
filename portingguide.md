@@ -91,6 +91,28 @@ These files contain Helix-specific changes that must be preserved during rebases
 ### `crates/zed/src/zed.rs`
 - Initialization of WebSocket sync service on startup (cfg-gated)
 
+### `crates/zed/src/main.rs`
+- `--headless` CLI flag and `initialize_headless()` function. Allows Zed to run with no
+  display server (no Wayland, no X11) and no windows, while still initializing the
+  external WebSocket sync (Helix) and the agent/MCP backend. Specifically:
+  - Adds `headless: bool` to the `Args` struct.
+  - Passes `args.headless` to `gpui_platform::current_platform(...)` so GPUI's Linux
+    layer uses `HeadlessClient` (no X11/Wayland connection, no window opening).
+  - Treats `--headless` as implying `--allow-multiple-instances` in the
+    `failed_single_instance_check` short-circuit (otherwise the singleton lock would
+    block headless backends from running alongside a desktop Zed).
+  - In the `app.run` callback, after global init but before workspace creation,
+    branches on `args.headless` and calls `initialize_headless()`. That function
+    constructs a windowless `Project::local`, grabs the global `ThreadStore`, calls
+    `external_websocket_sync::setup_thread_handler`, and then starts the WebSocket
+    service via `init_websocket_service` if `ExternalSyncSettings` says it's enabled.
+    Then it returns; the GPUI event loop continues running the WebSocket / thread
+    tasks until the process is signalled.
+  - The body of `initialize_headless` is `cfg(feature = "external_websocket_sync")`-
+    gated; without the feature it just logs a warning and idles.
+- Also adds `--allow-multiple-instances` (older Helix-only flag — see Critical Fix
+  #39 below).
+
 ### `crates/agent_ui/Cargo.toml`
 - Added `external_websocket_sync` feature flag
 - Added `external_websocket_sync_dep` optional dependency
@@ -143,6 +165,7 @@ These files contain Helix-specific changes that must be preserved during rebases
 - **`content_only()` method on `AssistantMessage`**: Returns content without the `## Assistant\n\n` heading. Used by thread_service.rs for WebSocket sync to avoid sending the heading to Helix.
 - **`AcpThreadEvent::Stopped` is a tuple variant**: As of the 2026-03-22 upstream merge, `Stopped` takes a `StopReason` argument: `Stopped(acp::StopReason)`. Pattern matches must use `Stopped(_)` and emission must pass a reason, e.g. `cx.emit(AcpThreadEvent::Stopped(acp::StopReason::Cancelled))`.
 - **`cancel()` drops send_task instead of awaiting**: See Critical Fix #8 below.
+- **`run_turn()` normal completion guards Stopped with `stopped_emitted`**: See Critical Fix #9 below.
 
 ### `crates/acp_thread/src/connection.rs`
 - **`wait_for_tools_ready()` on `AgentConnection` trait**: New method added to `AgentConnection`. Default impl returns `Task::ready(())`. `HeadlessConnection` relies on the default. `NativeAgentConnection` implementation in `context_server_registry.rs` waits for all pending MCP tool loads. **When upstream adds methods to `AgentConnection`, `HeadlessConnection` must be updated** — it won't compile otherwise.
@@ -190,6 +213,9 @@ These files contain Helix-specific changes that must be preserved during rebases
 ### `crates/agent_settings/src/agent_settings.rs`
 - **`show_onboarding`**: Setting to control onboarding visibility
 - **`auto_open_panel`**: Setting to control agent panel auto-open
+
+### `crates/context_server/src/client.rs`
+- **`DEFAULT_REQUEST_TIMEOUT`**: Bumped from upstream's 60s to 180s for spec-task cold-start (see Critical Fix #10)
 
 ### `.dockerignore`
 - Simplified for Helix build context
@@ -329,6 +355,47 @@ pub fn cancel(&mut self, cx: &mut Context<Self>) -> Task<()> {
 
 **Note:** Even if the claude-agent-acp cancel bugs (#442, #423) are fully fixed upstream, the drop approach should be kept as a defensive measure. Any ACP agent that doesn't properly respond to `CancelNotification` would cause the same deadlock. The drop approach makes Zed resilient to buggy agent implementations without changing protocol semantics (the cancel notification is still sent).
 
+### 9. Guard Normal-Completion Stopped Against Duplicate Emission
+
+**File:** `crates/acp_thread/src/acp_thread.rs` — `run_turn()` outer future
+
+**Bug:** Critical Fix #8 made `cancel()` emit `Stopped(Cancelled)` synchronously and set `stopped_emitted` to prevent the Err/tx-dropped path from re-emitting. However, if `tx.send(Ok(response))` races ahead of the task drop (the prompt completes naturally just before the cancel takes effect), `rx.await` returns `Ok` and enters the **normal completion path** — which emits `Stopped` at line ~2290 without checking `stopped_emitted`. This causes a duplicate `Stopped` event.
+
+The duplicate Stopped triggers the thread_service subscription's stale-detection logic (`turn_request_id == last_completed_request_id`), which falls back to the global `THREAD_REQUEST_MAP` — now pointing to the NEXT turn's request_id. The second `message_completed` is sent with the next turn's request_id, **prematurely completing the next interaction** and shifting all subsequent responses off by one.
+
+**Fix:** Add the same `stopped_emitted_for_task` guard to the normal completion path:
+
+```rust
+// In run_turn(), Ok branch, before emitting Stopped:
+if !stopped_emitted_for_task.load(std::sync::atomic::Ordering::Acquire) {
+    cx.emit(AcpThreadEvent::Stopped(r.stop_reason));
+}
+```
+
+**History:** Detected via container logs showing 3 Stopped events for a single interaction, causing systematic n-1 response shift in a localhost session.
+
+**Symptom:** After an interrupt, all subsequent messages return the response for the _previous_ message. The session appears permanently "off by one."
+
+### 10. Bump Context-Server Request Timeout to 180s
+
+**File:** `crates/context_server/src/client.rs` — `DEFAULT_REQUEST_TIMEOUT` constant
+
+**Bug:** Upstream's 60s timeout on the JSON-RPC `initialize` request to a context_server is too short for our spec-task container cold-start scenario. When Zed boots, several stdio MCPs (`chrome-devtools`, `github`) spawn concurrently via `npx <pkg>@latest`, which triggers an npm download on first run. At the same time the local Helix API container (serving HTTP MCPs like `helixos`) is still warming up and the host is CPU-contended by Zed itself, settings-sync-daemon, language servers, etc. All three context_servers routinely exceed 60s and fire `Context server request timeout` simultaneously. The store marks them failed and their tools never appear — most visibly, `mcp__chrome-devtools__*` is missing for the entire session, so the model reports `Error: No such tool available: mcp__chrome-devtools__navigate_page`. Toggling the server off/on in settings appears to fix it because by then npm has cached the package, but that's a manual workaround the user shouldn't need.
+
+**Fix:** Bump the constant to 180s:
+
+```rust
+const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(180);
+```
+
+**Why 180s:** Cold-start `npx chrome-devtools-mcp@latest` is typically 60–90s on a contended container. 180s gives ~2x headroom without making genuine failures noticeably slower to surface in the UI.
+
+**Why not per-server `request_timeout` in settings:** Upstream's `ContextServerSettings` has no `request_timeout` field — this would be a much larger change touching settings schema, project store, and `ContextServer::new_with_timeout`. The constant bump is one line.
+
+**Symptom:** After starting a fresh spec-task, model reports `<tool_use_error>Error: No such tool available: mcp__chrome-devtools__*</tool_use_error>` for any chrome-devtools call. `Zed.log` shows three `cancelled csp request task for "initialize" id 0 which took over 60s` errors all firing at the same instant, exactly 60s after Zed startup.
+
+**History:** Triggered after the AgentConnection dedup fix landed (PR #46). Once the duplicate-spawn race was fixed and only one ACP wrapper started per session, the surviving wrapper's MCP set still depended on which context_servers had completed their `initialize` handshake before the timeout. Cold-start container = all of them failed.
+
 ## Environment Variables
 
 | Variable | Purpose | Default |
@@ -341,6 +408,60 @@ pub fn cancel(&mut self, cx: &mut Context<Self>) -> Task<()> {
 | `ZED_HTTP_INSECURE_TLS` | Skip TLS for all HTTP (enterprise) | `0` |
 | `ZED_WORK_DIR` | Working directory for sessions | auto-detected |
 | `ZED_STATELESS` | Don't persist thread state | not set |
+| `HELIX_SESSION_ID` | Session ID the headless WebSocket client identifies as (required when running `zed --headless`) | none |
+
+## Headless Mode
+
+`zed --headless` runs the binary with no display server (Wayland/X11) and no windows.
+It still:
+- Initializes `external_websocket_sync` and connects to Helix (when settings enable it).
+- Wires up the thread service handler over a windowless `Project::local`.
+- Runs the GPUI event loop until interrupted, so MCP/agent turns can stream as normal.
+
+What it deliberately skips:
+- `restore_or_create_workspace` — no `MultiWorkspace`/`Workspace`/`Window` is ever opened.
+- `OpenListener` second-instance handling (`--headless` implies `--allow-multiple-instances`).
+
+Use cases: running Zed as a Helix agent backend on a server with no GUI; running inside a
+container that doesn't have Sway/Hyprland/X11; smoke-testing the WebSocket protocol without
+a desktop.
+
+Quickstart:
+```bash
+ZED_EXTERNAL_SYNC_ENABLED=1 \
+ZED_HELIX_URL=api.example.com:8080 \
+ZED_HELIX_TOKEN=... \
+HELIX_SESSION_ID=ses_... \
+zed --headless --user-data-dir /var/lib/zed-agent
+```
+
+### Headless mode and the E2E test
+
+The E2E test runner supports `E2E_HEADLESS=1` which skips Xvfb, unsets
+`DISPLAY`, and launches Zed with `--headless`:
+
+```bash
+E2E_HEADLESS=1 ./run_docker_e2e.sh --no-build
+```
+
+All 12 phases pass in headless mode for both `zed-agent` and `claude`. Phase 6
+(`query_ui_state`) works because `initialize_headless()` registers a synthetic
+UI-state responder that returns `active_view: "headless"` plus the real
+`mcp_servers` map read from the headless project's `context_server_store`.
+`thread_id`, `entry_count`, and `active_model` are reported as null/0 (the
+panel is the source of those in headful mode and we don't track them here).
+
+**Recommended CI matrix** — covers both agents and both display modes without
+spending more wall-clock than the original single-mode default:
+
+| Job | Command | Runs | Time |
+|-----|---------|------|------|
+| `e2e-headful` | `./run_docker_e2e.sh` | zed-agent (headful, full 12 phases) | ~3–4 min |
+| `e2e-headless` | `E2E_HEADLESS=1 E2E_AGENTS=claude ./run_docker_e2e.sh` | claude (headless, full 12 phases) | ~3–4 min |
+
+Run them as parallel CI jobs and total wall clock stays at ~3–4 min. If you
+want to test both agents in both modes, expand to a 4-cell matrix. The
+`E2E_AGENTS` and `E2E_HEADLESS` env vars compose freely.
 
 ## Callback Architecture
 
@@ -398,11 +519,52 @@ When rebasing/merging against upstream Zed:
 29. **Check `SyncEvent::UiStateResponse`** — has `mcp_servers` and `active_model` fields
 30. **Check `NativeAgent` multi-project**: `agent.projects.values().next()` to get `ProjectState`; no more flat `agent.project` or `agent.context_server_registry()` fields/methods
 31. **Check `acp_thread.rs` `cancel()`** — must `drop(turn.send_task)` not `cx.background_spawn(turn.send_task)` (Critical Fix #8)
-32. **Run `cargo check --package zed --features external_websocket_sync`** — must compile
-32. **Run `cargo test -p external_websocket_sync`** — unit tests
-33. **Run E2E test** after merge to verify all phases pass
+31a. **Check `acp_thread.rs` `run_turn()` normal completion** — `Stopped` emission must be guarded by `stopped_emitted_for_task` check (Critical Fix #9)
+34. **Check `agent_panel.rs` `request_permission()`** — when `external_websocket_sync` is enabled, auto-select first AllowOnce option and return immediately (ACP auto-approve for autonomous mode)
+35. **Check `agent_panel.rs` agent_type serialization** — correct agent_type must be serialized for externally-opened threads and panel restoration
+36. **Check `thread_service.rs` turn-scoped request_id** — EntryUpdated uses turn-scoped request_id with prev_turn fallback; NewEntry updates turn_request_id only at turn boundaries
+37. **Check `acp_thread.rs` `run_turn()` stopped_emitted_for_task** — normal completion Stopped must check stopped_emitted_for_task to prevent duplicate emission racing with cancel()
+38. **Check trial-end upsell guard** — `suggest_trial_end_upsell()` returns early in Helix builds
+39. **Check `crates/zed/src/main.rs` for `--allow-multiple-instances` CLI flag** — defined as `#[arg(long)] allow_multiple_instances: bool` on `Args`, AND used in the `failed_single_instance_check` short-circuit (`|| args.allow_multiple_instances`). This Helix-only flag was lost in the 001864 merge (re-added by 001909). Without it the e2e-test container can't launch Zed at all.
+39a. **Check `crates/zed/src/main.rs` for `--headless` CLI flag** — defined as `#[arg(long)] headless: bool` on `Args`. Three call sites must all be present:
+   1. `Application::with_platform(gpui_platform::current_platform(args.headless))` — passes the bool into GPUI so Linux uses `HeadlessClient` instead of trying X11/Wayland.
+   2. `failed_single_instance_check` `|| args.headless` short-circuit — singleton lock must not block the headless backend.
+   3. Inside the `app.run` closure, after `cx.activate(true)` and the `authenticate` spawn, an `if args.headless { initialize_headless(app_state.clone(), cx); return; }` branch that skips workspace/window creation entirely. The `initialize_headless()` function (cfg-gated on `external_websocket_sync`) builds a `Project::local` with no worktrees, grabs `ThreadStore::global(cx)`, calls `external_websocket_sync::setup_thread_handler(...)`, and then starts the sync via `init_websocket_service(WebSocketSyncConfig{...})` when settings enable it.
+   Without these the binary still has the flag but quietly opens windows / dies on `open_window` failure.
+40. **Check `Cargo.toml` workspace `rust-embed` features** — must include both `include-exclude` AND `debug-embed`. The `debug-embed` feature was originally added by Helix in commit `9ca797706f` (Oct 2025), lost in a subsequent merge, re-added in 001909. Without it, dev builds panic on startup with `settings/default.json` because RustEmbed tries to read assets from `CARGO_MANIFEST_DIR` at runtime, and that path doesn't exist outside the build directory (e.g. inside the e2e-test container or any deployed binary). Release builds always embed assets so they're unaffected — but debug builds (used by the e2e test, ARM aside) need this feature.
+41. **Check `crates/agent/src/agent.rs` for `smol::Timer::after` references** — must use `cx.background_executor().timer(d).await` instead. Upstream PR #53603 (Apr 2026) removed `smol` from the agent crate's deps. Helix's `wait_for_tools_ready()` previously used `smol::Timer::after` and broke after the merge; fixed in 001909 by switching to the canonical GPUI pattern.
+41a. **Check `acp_thread.rs` test code for unit-variant `AcpThreadEvent::Stopped` patterns** — `Stopped` is a tuple variant `Stopped(StopReason)` and `matches!(event, AcpThreadEvent::Stopped)` no longer compiles. Production builds skip `#[cfg(test)]` so this fails silently in `cargo build` but breaks `cargo test -p acp_thread test_second_send`. Grep: `grep -n "AcpThreadEvent::Stopped[^(]" crates/acp_thread/src/`. Fixed in 001980; patterns must be `Stopped(_)`.
+42. **Run `cargo check --package zed --features external_websocket_sync`** — must compile
+43. **Run `cargo test -p external_websocket_sync`** — unit tests
+44. **Run E2E test** after merge to verify all phases pass (currently 12 phases, run for both `zed-agent` and `claude` rounds)
 
 ## Building
+
+The recommended way to build and test is via the `stack` command in the Helix repo (`~/pm/helix/stack` or `~/work/helix/stack`), which handles Docker-based compilation with persistent caching:
+
+```bash
+# Build Zed binary (dev mode, ~3 min with warm cache)
+cd ~/pm/helix   # or ~/work/helix
+./stack build-zed dev
+
+# Build Zed binary (release mode, ~12 min)
+./stack build-zed release
+
+# Output: ./zed-build/zed
+```
+
+For running E2E tests, build the binary first then copy it into the test directory:
+
+```bash
+# Build + run E2E tests
+cd ~/pm/helix && ./stack build-zed dev
+cp ~/pm/helix/zed-build/zed ~/pm/zed/crates/external_websocket_sync/e2e-test/zed-binary
+cd ~/pm/zed/crates/external_websocket_sync/e2e-test
+./run_docker_e2e.sh                                # zed-agent only
+E2E_AGENTS="zed-agent,claude" ./run_docker_e2e.sh  # both agents
+```
+
+Direct cargo commands also work if you have a Rust toolchain installed locally:
 
 ```bash
 # Build with Helix features
@@ -411,7 +573,7 @@ cargo build --features external_websocket_sync -p zed
 # Run unit tests
 cargo test -p external_websocket_sync
 
-# Run E2E test (requires ANTHROPIC_API_KEY)
+# Run E2E test via Docker directly (alternative to stack)
 docker build -t zed-ws-e2e -f crates/external_websocket_sync/e2e-test/Dockerfile .
 docker run --rm -e ANTHROPIC_API_KEY=sk-ant-... -e TEST_TIMEOUT=120 zed-ws-e2e
 ```
@@ -464,3 +626,82 @@ Helix-specific commits on main (oldest first):
 | `8b033a4451` | **Test: add Stopped emission and mid-stream interrupt E2E tests (Critical Fix #6)** |
 | `85be6df7b6` | **Fix: E2E seed session, user_created_thread tracking, interaction count** |
 | `6e0e6db32b` | **Fix: drop cancel task to prevent deadlock with Claude Code (Critical Fix #8)** |
+| `71fb5fba73` | Fix: use correct Agent for claude-acp threads in agent_panel |
+| `1a3fc57adc` | Add request_id to message_added events for interaction routing |
+| `255f6b4522` | Fix Stopped flush: use turn-scoped request_id, only flush current turn |
+| `bc4921681f` | Scope NewEntry re-send to current turn to prevent cross-interaction leaks |
+| `6e35959201` | Remove streaming text reveal rate-limit to fix WebSocket sync truncation |
+| `73f9af2162` | Re-read current entry content in NewEntry handler instead of flushing stale pending |
+| `14c079c266` | Flush pending text content before sending new entries to prevent truncated streaming |
+| `520f327183` | Fix: serialize correct agent_type for externally-opened threads |
+| `cf4e7d6f78` | Fix: serialize agent_type + wait for WebSocket before panel restoration |
+| `f3a2622736` | Fix: send agent_ready and set up subscription from panel restoration path |
+| `48de0cf877` | Fix: share thread load lock with panel restoration, use agent_id for agent_ready |
+| `0fef8b27c1` | Fix: send agent_ready even when no thread to restore |
+| `d470dac687` | Fix: coordinate panel restoration and open_existing_thread_sync via load lock |
+| `47950a9cf8` | Fix: call ensure_thread_subscription in open_existing_thread_sync |
+| `90bdb6cf75` | Fix: emit Stopped synchronously in cancel() to fix phase 8 FIFO ordering |
+| `a7e4d8b850` | Fix: implement real interrupt — cancel running turn before queuing new message |
+| `2f182e64d6` | **Fix: prevent request_id desync from background events and duplicate Stopped (Critical Fix #9)** |
+| `f96525f558` | Fix: filter stale phase completions in E2E test |
+| `55f797f2bc` | **Auto-approve ACP permission requests when external_websocket_sync is enabled** |
+| `9f0475c6c2` | fix: drop stale display_name reference in [ACP_SPAWN] log |
+| `d7be64fad1` | **fix: stop empty message_completed loop after Zed restart + Helix-mode UI cleanup** |
+| `8428a4399d` | Merge upstream Zed (62bd61a679..e3d1876c06, 86 commits) into 001909-merge-latest-zed |
+| `6ccf3010a6` | **Fix `wait_for_tools_ready`: use `cx.background_executor().timer()` instead of `smol::Timer` (upstream PR #53603 dropped smol)** |
+| `16f2b82053` | **Restore `--allow-multiple-instances` CLI flag (lost in 001864 merge)** |
+| `c7a26c9144` | **Restore `debug-embed` feature on `rust-embed` workspace dep (lost in a prior merge — required for dev/debug builds outside source tree)** |
+| `3cfc2962d1` | Merge `origin/main` into 001909 (incorporates `d7be64fad1`) |
+| `c3e312b056` | Merge upstream Zed (`8428a4399d..1da60a8518`, 172 commits, 10 days) into 001980 — 4 conflicts resolved (`deploy_cloudflare.yml`, `Cargo.lock`, `agent_settings.rs`, `wgpu_renderer.rs`) |
+| `95715a1798` | **Fix `AcpThreadEvent::Stopped` test patterns: tuple variant requires `Stopped(_)` (pre-existing breakage since 001864 — never noticed because `#[cfg(test)]` skipped in production builds)** |
+| `61427db325` | Tidy e2e test server `go.mod` for current helix deps (`kodit v1.3.6 → v1.3.7`, dropped `go-tika`) — runner doesn't tidy itself |
+
+## Merge 001980 (2026-05-05)
+
+**Divergence at start**:
+- Fork HEAD: `f5fab97857` (PR #47)
+- Upstream HEAD: `1da60a8518` ("editor: Extract Diagnostics code out of `editor.rs` (#55747)")
+- Upstream commits to merge: **172** (10 days of activity since 001909's `e3d1876c06`)
+- Fork commits ahead of upstream: 203 (entire Helix surface)
+
+Two intermediate plans (001946, 001947 — both 2026-04-27) were **never executed**. As a result this merge spans 10 days of upstream activity rather than 2.
+
+### Conflicts and Resolutions
+
+(Updated incrementally as each conflict is resolved.)
+
+#### 1. `.github/workflows/deploy_cloudflare.yml` — modify/delete
+**Upstream change**: deleted the file (Cloudflare deploy workflow retired upstream).
+**HEAD change**: had small unrelated modifications.
+**Resolution**: `git rm` — accept upstream deletion. Helix doesn't use Zed's CI.
+**Risk**: none.
+
+#### 2. `Cargo.lock` — content
+**Resolution**: `git checkout --theirs` (always — regenerated on next build with Helix features).
+**Risk**: none.
+
+#### 3. `crates/agent_settings/src/agent_settings.rs` — content
+**Upstream change**: PR #55575 ("Remove new thread location setting") removed the `NewThreadLocation` import, the `new_thread_location` field on `AgentSettings`, and its initialiser.
+**HEAD change**: Helix-only fields `show_onboarding` and `auto_open_panel` were added in the same struct/initialiser blocks alongside `new_thread_location`.
+**Resolution**: kept Helix's `show_onboarding` and `auto_open_panel`; dropped `new_thread_location` to match upstream removal. Also dropped the now-orphaned `NewThreadLocation` import. The `NewThreadLocation` type no longer exists anywhere in the workspace.
+**Risk**: none. Verified `grep -rn "new_thread_location\|NewThreadLocation" crates/` is clean.
+
+#### 4. `crates/gpui_wgpu/src/wgpu_renderer.rs` — content
+**Upstream change**: comment-only addition (`// TBD. Does retrying more actually help?`) inside a GPU error retry block, plus larger non-conflicting work for BGR subpixel layout and `WgpuContext::new_rejecting_software`.
+**HEAD change**: none in the conflicting region; only the absence of the new comment.
+**Resolution**: accept upstream — keep the comment.
+**Risk**: none. Helix doesn't touch the wgpu renderer.
+
+### Pre-existing Breakage Repaired
+
+#### `crates/acp_thread/src/acp_thread.rs` — `matches!(event, AcpThreadEvent::Stopped)` (line 5357 + 5429)
+Two test-only call sites in the Helix-added `test_second_send_during_active_turn_emits_stopped_for_both_turns` (Critical Fix #6 verification) and `test_dropped_send_task_clears_running_turn` were using the unit-variant pattern `AcpThreadEvent::Stopped` after `Stopped` became a tuple variant `Stopped(StopReason)`. Updated to `AcpThreadEvent::Stopped(_)`. This was likely broken since the 001864 merge (when `StopReason` was added) but never noticed because production builds don't compile `#[cfg(test)]`.
+
+**Lesson for future merges**: when porting-guide checklist item 12a says "Pattern matches must use `Stopped(_)`", it applies to test code as well. Add a grep to the silent-drift sweep:
+
+```bash
+grep -n "AcpThreadEvent::Stopped\b\([^(]\|$\)" crates/acp_thread/src/acp_thread.rs
+```
+
+(Pattern: any `AcpThreadEvent::Stopped` not followed by `(`.)
+

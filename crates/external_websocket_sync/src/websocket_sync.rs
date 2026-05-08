@@ -424,10 +424,27 @@ impl WebSocketSync {
             return Ok(());
         }
 
-        eprintln!("💬 [WEBSOCKET-IN] Processing chat_message: acp_thread_id={:?}, request_id={}, message_len={}",
-                   chat_msg.acp_thread_id, chat_msg.request_id, chat_msg.message.len());
-        log::info!("💬 [WEBSOCKET-IN] Processing chat_message: acp_thread_id={:?}, request_id={}, message_len={}",
-                   chat_msg.acp_thread_id, chat_msg.request_id, chat_msg.message.len());
+        eprintln!("💬 [WEBSOCKET-IN] Processing chat_message: acp_thread_id={:?}, request_id={}, message_len={}, interrupt={}",
+                   chat_msg.acp_thread_id, chat_msg.request_id, chat_msg.message.len(), chat_msg.interrupt);
+        log::info!("💬 [WEBSOCKET-IN] Processing chat_message: acp_thread_id={:?}, request_id={}, message_len={}, interrupt={}",
+                   chat_msg.acp_thread_id, chat_msg.request_id, chat_msg.message.len(), chat_msg.interrupt);
+
+        // If this is an interrupt message and we have an existing thread, cancel its
+        // running turn immediately via the dedicated cancel task (which runs independently
+        // of the sequential callback_rx loop, so it can fire even while the loop is
+        // blocked awaiting the previous turn's response).
+        if chat_msg.interrupt {
+            if let Some(ref thread_id) = chat_msg.acp_thread_id {
+                if !thread_id.is_empty() {
+                    eprintln!("⚡ [WEBSOCKET-IN] Interrupt flag set — cancelling running turn on thread: {}", thread_id);
+                    log::info!("⚡ [WEBSOCKET-IN] Interrupt flag set — cancelling running turn on thread: {}", thread_id);
+                    if let Err(e) = crate::request_cancel_thread(thread_id.clone()) {
+                        eprintln!("⚠️ [WEBSOCKET-IN] Failed to request cancel for thread {}: {}", thread_id, e);
+                        log::warn!("⚠️ [WEBSOCKET-IN] Failed to request cancel for thread {}: {}", thread_id, e);
+                    }
+                }
+            }
+        }
 
         // Request thread creation via callback
         let request = ThreadCreationRequest {
@@ -705,3 +722,30 @@ pub fn get_websocket_connection_status() -> WebSocketConnectionStatus {
         None => WebSocketConnectionStatus::NotInitialized,
     }
 }
+
+/// Wait for the WebSocket to connect, with a timeout.
+/// Returns true if connected, false if timed out.
+/// Called during panel deserialization to ensure the WebSocket is ready
+/// before the panel tries to restore threads. This guarantees the
+/// agent_ready → open_thread handshake can complete.
+pub async fn wait_for_websocket_connected(timeout: std::time::Duration) -> bool {
+    let start = std::time::Instant::now();
+    let poll_interval = std::time::Duration::from_millis(50);
+
+    loop {
+        match get_websocket_connection_status() {
+            WebSocketConnectionStatus::Connected => {
+                log::info!("✅ [WEBSOCKET] wait_for_websocket_connected: connected after {:?}", start.elapsed());
+                return true;
+            }
+            _ => {
+                if start.elapsed() >= timeout {
+                    log::warn!("⚠️ [WEBSOCKET] wait_for_websocket_connected: timed out after {:?}", timeout);
+                    return false;
+                }
+                smol::Timer::after(poll_interval).await;
+            }
+        }
+    }
+}
+

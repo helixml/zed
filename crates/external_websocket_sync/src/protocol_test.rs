@@ -635,4 +635,8 @@ mod tests {
 
         Ok(())
     }
+
+    // TODO: Add GPUI integration test with FakeAgentConnection
+    // This would test real ACP thread creation like acp_thread tests do
+    // For now, protocol tests + code review provide sufficient confidence
 }

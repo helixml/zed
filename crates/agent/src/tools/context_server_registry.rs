@@ -1,10 +1,11 @@
 use crate::{AgentToolOutput, AnyAgentTool, ToolCallEventStream, ToolInput};
-use agent_client_protocol::ToolKind;
+use agent_client_protocol::schema as acp;
 use anyhow::Result;
-use collections::{BTreeMap, HashMap, HashSet};
+use collections::{BTreeMap, HashMap};
 use context_server::{ContextServerId, client::NotificationSubscription};
 use futures::FutureExt as _;
 use gpui::{App, AppContext, AsyncApp, Context, Entity, EventEmitter, SharedString, Task};
+use language_model::LanguageModelToolResultContent;
 use project::context_server_store::{ContextServerStatus, ContextServerStore};
 use std::sync::Arc;
 use util::ResultExt;
@@ -31,9 +32,6 @@ impl EventEmitter<ContextServerRegistryEvent> for ContextServerRegistry {}
 pub struct ContextServerRegistry {
     server_store: Entity<ContextServerStore>,
     registered_servers: HashMap<ContextServerId, RegisteredContextServer>,
-    pending_tool_loads: usize,
-    pending_server_starts: HashSet<ContextServerId>,
-    tools_ready_tx: watch::Sender<usize>,
     _subscription: gpui::Subscription,
 }
 
@@ -47,53 +45,16 @@ struct RegisteredContextServer {
 
 impl ContextServerRegistry {
     pub fn new(server_store: Entity<ContextServerStore>, cx: &mut Context<Self>) -> Self {
-        let (tools_ready_tx, _) = watch::channel(0usize);
         let mut this = Self {
             server_store: server_store.clone(),
             registered_servers: HashMap::default(),
-            pending_tool_loads: 0,
-            pending_server_starts: HashSet::default(),
-            tools_ready_tx,
             _subscription: cx.subscribe(&server_store, Self::handle_context_server_store_event),
         };
-        let (running_servers, starting_server_ids) = {
-            let store = server_store.read(cx);
-            let running = store.running_servers();
-            let starting: Vec<_> = store
-                .server_ids()
-                .iter()
-                .filter(|id| {
-                    matches!(
-                        store.status_for_server(id),
-                        Some(ContextServerStatus::Starting)
-                    )
-                })
-                .cloned()
-                .collect();
-            (running, starting)
-        };
-        for server in running_servers {
+        for server in server_store.read(cx).running_servers() {
             this.reload_tools_for_server(server.id(), cx);
             this.reload_prompts_for_server(server.id(), cx);
         }
-        for server_id in starting_server_ids {
-            this.pending_server_starts.insert(server_id);
-            this.pending_tool_loads += 1;
-        }
-        let _ = this.tools_ready_tx.send(this.pending_tool_loads);
         this
-    }
-
-    pub fn has_pending_tool_loads(&self) -> bool {
-        self.pending_tool_loads > 0
-    }
-
-    pub fn registered_server_count(&self) -> usize {
-        self.registered_servers.len()
-    }
-
-    pub fn tools_ready_receiver(&self) -> watch::Receiver<usize> {
-        self.tools_ready_tx.receiver()
     }
 
     pub fn tools_for_server(
@@ -144,6 +105,14 @@ impl ContextServerRegistry {
 
     pub fn server_store(&self) -> &Entity<ContextServerStore> {
         &self.server_store
+    }
+
+    pub fn registered_server_count(&self) -> usize {
+        self.registered_servers.len()
+    }
+
+    pub fn has_pending_tool_loads(&self) -> bool {
+        self.registered_servers.values().any(|s| !s.load_tools.is_ready())
     }
 
     fn get_or_register_server(
@@ -214,9 +183,6 @@ impl ContextServerRegistry {
             return;
         }
 
-        self.pending_tool_loads += 1;
-        let _ = self.tools_ready_tx.send(self.pending_tool_loads);
-
         let registered_server = self.get_or_register_server(&server_id, cx);
         registered_server.load_tools = cx.spawn(async move |this, cx| {
             let response = client
@@ -225,8 +191,6 @@ impl ContextServerRegistry {
 
             this.update(cx, |this, cx| {
                 let Some(registered_server) = this.registered_servers.get_mut(&server_id) else {
-                    this.pending_tool_loads = this.pending_tool_loads.saturating_sub(1);
-                    let _ = this.tools_ready_tx.send(this.pending_tool_loads);
                     return;
                 };
 
@@ -243,9 +207,6 @@ impl ContextServerRegistry {
                     cx.emit(ContextServerRegistryEvent::ToolsChanged);
                     cx.notify();
                 }
-
-                this.pending_tool_loads = this.pending_tool_loads.saturating_sub(1);
-                let _ = this.tools_ready_tx.send(this.pending_tool_loads);
             })
         });
     }
@@ -301,20 +262,14 @@ impl ContextServerRegistry {
         let project::context_server_store::ServerStatusChangedEvent { server_id, status } = event;
 
         match status {
-            ContextServerStatus::Starting => {}
+            ContextServerStatus::Starting | ContextServerStatus::Authenticating => {}
             ContextServerStatus::Running => {
-                if self.pending_server_starts.remove(server_id) {
-                    self.pending_tool_loads = self.pending_tool_loads.saturating_sub(1);
-                    let _ = self.tools_ready_tx.send(self.pending_tool_loads);
-                }
                 self.reload_tools_for_server(server_id.clone(), cx);
                 self.reload_prompts_for_server(server_id.clone(), cx);
             }
-            ContextServerStatus::Stopped | ContextServerStatus::Error(_) => {
-                if self.pending_server_starts.remove(server_id) {
-                    self.pending_tool_loads = self.pending_tool_loads.saturating_sub(1);
-                    let _ = self.tools_ready_tx.send(self.pending_tool_loads);
-                }
+            ContextServerStatus::Stopped
+            | ContextServerStatus::Error(_)
+            | ContextServerStatus::AuthRequired => {
                 if let Some(registered_server) = self.registered_servers.remove(server_id) {
                     if !registered_server.tools.is_empty() {
                         cx.emit(ContextServerRegistryEvent::ToolsChanged);
@@ -358,8 +313,8 @@ impl AnyAgentTool for ContextServerTool {
         self.tool.description.clone().unwrap_or_default().into()
     }
 
-    fn kind(&self) -> ToolKind {
-        ToolKind::Other
+    fn kind(&self) -> acp::ToolKind {
+        acp::ToolKind::Other
     }
 
     fn initial_title(&self, _input: serde_json::Value, _cx: &mut App) -> SharedString {
@@ -390,7 +345,7 @@ impl AnyAgentTool for ContextServerTool {
         cx: &mut App,
     ) -> Task<Result<AgentToolOutput, AgentToolOutput>> {
         let Some(server) = self.store.read(cx).get_running_server(&self.server_id) else {
-            return Task::ready(Err(AgentToolOutput::from_error("Context server not found")));
+            return Task::ready(Err(anyhow::anyhow!("Context server not found").into()));
         };
         let tool_name = self.tool.name.clone();
         let tool_id = mcp_tool_id(&self.server_id.0, &self.tool.name);
@@ -400,14 +355,17 @@ impl AnyAgentTool for ContextServerTool {
             event_stream.authorize_third_party_tool(initial_title, tool_id, display_name, cx);
 
         cx.spawn(async move |_cx| {
-            let input = input.recv().await.map_err(|e| {
-                AgentToolOutput::from_error(format!("Failed to receive tool input: {e}"))
-            })?;
+            let input = input
+                .recv()
+                .await
+                .map_err(|e| anyhow::anyhow!(e.to_string()))?;
 
-            authorize.await.map_err(|e| AgentToolOutput::from_error(e.to_string()))?;
+            authorize
+                .await
+                .map_err(|e| anyhow::anyhow!(e.to_string()))?;
 
             let Some(protocol) = server.client() else {
-                return Err(AgentToolOutput::from_error("Context server not initialized"));
+                return Err(anyhow::anyhow!("Context server not initialized").into());
             };
 
             let arguments = if let serde_json::Value::Object(map) = input {
@@ -431,23 +389,25 @@ impl AnyAgentTool for ContextServerTool {
             );
 
             let response = futures::select! {
-                response = request.fuse() => response.map_err(|e| AgentToolOutput::from_error(e.to_string()))?,
+                response = request.fuse() => response?,
                 _ = event_stream.cancelled_by_user().fuse() => {
-                    return Err(AgentToolOutput::from_error("MCP tool cancelled by user"));
+                    return Err(anyhow::anyhow!("MCP tool cancelled by user").into());
                 }
             };
 
             if response.is_error == Some(true) {
                 let error_message: String =
                     response.content.iter().filter_map(|c| c.text()).collect();
-                return Err(AgentToolOutput::from_error(error_message));
+                return Err(anyhow::anyhow!(error_message).into());
             }
 
-            let mut result = String::new();
+            let mut llm_output = Vec::new();
+            let mut concatenated_text = String::new();
             for content in response.content {
                 match content {
                     context_server::types::ToolResponseContent::Text { text } => {
-                        result.push_str(&text);
+                        concatenated_text.push_str(&text);
+                        llm_output.push(LanguageModelToolResultContent::Text(text.into()));
                     }
                     context_server::types::ToolResponseContent::Image { .. } => {
                         log::warn!("Ignoring image content from tool response");
@@ -458,11 +418,15 @@ impl AnyAgentTool for ContextServerTool {
                     context_server::types::ToolResponseContent::Resource { .. } => {
                         log::warn!("Ignoring resource content from tool response");
                     }
+                    context_server::types::ToolResponseContent::ResourceLink { .. } => {
+                        log::warn!("Ignoring resource link content from tool response");
+                    }
                 }
             }
+            let raw_output = serde_json::Value::String(concatenated_text);
             Ok(AgentToolOutput {
-                raw_output: result.clone().into(),
-                llm_output: result.into(),
+                raw_output,
+                llm_output,
             })
         })
     }

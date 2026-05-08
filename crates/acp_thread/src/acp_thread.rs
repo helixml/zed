@@ -3,11 +3,12 @@ mod diff;
 mod mention;
 mod terminal;
 use action_log::{ActionLog, ActionLogTelemetry};
-use agent_client_protocol::{self as acp};
+use agent_client_protocol::schema as acp;
 use anyhow::{Context as _, Result, anyhow};
 use collections::HashSet;
 pub use connection::*;
 pub use diff::*;
+use feature_flags::{AcpBetaFeatureFlag, FeatureFlagAppExt as _};
 use futures::{FutureExt, channel::oneshot, future::BoxFuture};
 use gpui::{AppContext, AsyncApp, Context, Entity, EventEmitter, SharedString, Task, WeakEntity};
 use itertools::Itertools;
@@ -35,6 +36,18 @@ use util::markdown::MarkdownEscaped;
 use util::path_list::PathList;
 use util::{ResultExt, get_default_system_shell_preferring_bash, paths::PathStyle};
 use uuid::Uuid;
+
+/// Returned when the model stops because it exhausted its output token budget.
+#[derive(Debug)]
+pub struct MaxOutputTokensError;
+
+impl std::fmt::Display for MaxOutputTokensError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "output token limit reached")
+    }
+}
+
+impl std::error::Error for MaxOutputTokensError {}
 
 /// Key used in ACP ToolCall meta to store the tool's programmatic name.
 /// This is a workaround since ACP's ToolCall doesn't have a dedicated name field.
@@ -169,6 +182,7 @@ pub enum AgentThreadEntry {
     UserMessage(UserMessage),
     AssistantMessage(AssistantMessage),
     ToolCall(ToolCall),
+    CompletedPlan(Vec<PlanEntry>),
 }
 
 impl AgentThreadEntry {
@@ -177,6 +191,7 @@ impl AgentThreadEntry {
             Self::UserMessage(message) => message.indented,
             Self::AssistantMessage(message) => message.indented,
             Self::ToolCall(_) => false,
+            Self::CompletedPlan(_) => false,
         }
     }
 
@@ -185,6 +200,14 @@ impl AgentThreadEntry {
             Self::UserMessage(message) => message.to_markdown(cx),
             Self::AssistantMessage(message) => message.to_markdown(cx),
             Self::ToolCall(tool_call) => tool_call.to_markdown(cx),
+            Self::CompletedPlan(entries) => {
+                let mut md = String::from("## Plan\n\n");
+                for entry in entries {
+                    let source = entry.content.read(cx).source().to_string();
+                    md.push_str(&format!("- [x] {}\n", source));
+                }
+                md
+            }
         }
     }
 
@@ -285,10 +308,15 @@ impl ToolCall {
 
         let subagent_session_info = subagent_session_info_from_meta(&tool_call.meta);
 
+        let label = if tool_call.kind == acp::ToolKind::Execute {
+            cx.new(|cx| Markdown::new_text(title.into(), cx))
+        } else {
+            cx.new(|cx| Markdown::new(title.into(), Some(language_registry.clone()), None, cx))
+        };
+
         let result = Self {
             id: tool_call.tool_call_id,
-            label: cx
-                .new(|cx| Markdown::new(title.into(), Some(language_registry.clone()), None, cx)),
+            label,
             kind: tool_call.kind,
             content,
             locations: tool_call.locations,
@@ -522,13 +550,15 @@ pub enum SelectedPermissionParams {
 #[derive(Debug)]
 pub struct SelectedPermissionOutcome {
     pub option_id: acp::PermissionOptionId,
+    pub option_kind: acp::PermissionOptionKind,
     pub params: Option<SelectedPermissionParams>,
 }
 
 impl SelectedPermissionOutcome {
-    pub fn new(option_id: acp::PermissionOptionId) -> Self {
+    pub fn new(option_id: acp::PermissionOptionId, option_kind: acp::PermissionOptionKind) -> Self {
         Self {
             option_id,
+            option_kind,
             params: None,
         }
     }
@@ -536,12 +566,6 @@ impl SelectedPermissionOutcome {
     pub fn params(mut self, params: Option<SelectedPermissionParams>) -> Self {
         self.params = params;
         self
-    }
-}
-
-impl From<acp::PermissionOptionId> for SelectedPermissionOutcome {
-    fn from(option_id: acp::PermissionOptionId) -> Self {
-        Self::new(option_id)
     }
 }
 
@@ -944,6 +968,7 @@ impl Plan {
                 }
                 acp::PlanEntryStatus::InProgress => {
                     stats.in_progress_entry = stats.in_progress_entry.or(Some(entry));
+                    stats.pending += 1;
                 }
                 acp::PlanEntryStatus::Completed => {
                     stats.completed += 1;
@@ -973,13 +998,19 @@ impl PlanEntry {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TokenUsage {
     pub max_tokens: u64,
     pub used_tokens: u64,
     pub input_tokens: u64,
     pub output_tokens: u64,
     pub max_output_tokens: Option<u64>,
+}
+
+#[derive(Debug, Clone)]
+pub struct SessionCost {
+    pub amount: f64,
+    pub currency: SharedString,
 }
 
 pub const TOKEN_USAGE_WARNING_THRESHOLD: f32 = 0.8;
@@ -1027,13 +1058,17 @@ pub struct RetryStatus {
 struct RunningTurn {
     id: u32,
     send_task: Task<()>,
+    /// Set to true when cancel() has already emitted Stopped(Cancelled) for this
+    /// turn. The run_turn() outer future checks this to avoid a duplicate Stopped
+    /// when the dropped tx causes rx.await to return Err.
+    stopped_emitted: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
 pub struct AcpThread {
     session_id: acp::SessionId,
     work_dirs: Option<PathList>,
     parent_session_id: Option<acp::SessionId>,
-    title: SharedString,
+    title: Option<SharedString>,
     provisional_title: Option<SharedString>,
     entries: Vec<AgentThreadEntry>,
     plan: Plan,
@@ -1044,7 +1079,9 @@ pub struct AcpThread {
     running_turn: Option<RunningTurn>,
     connection: Rc<dyn AgentConnection>,
     token_usage: Option<TokenUsage>,
+    cost: Option<SessionCost>,
     prompt_capabilities: acp::PromptCapabilities,
+    available_commands: Vec<acp::AvailableCommand>,
     _observe_prompt_capabilities: Task<anyhow::Result<()>>,
     terminals: HashMap<acp::TerminalId, Entity<Terminal>>,
     pending_terminal_output: HashMap<acp::TerminalId, Vec<Vec<u8>>>,
@@ -1064,8 +1101,6 @@ pub struct AcpThread {
 struct StreamingTextBuffer {
     /// Text received from the model but not yet appended to the Markdown source.
     pending: String,
-    /// The number of bytes to reveal per timer turn.
-    bytes_to_reveal_per_tick: usize,
     /// The Markdown entity being streamed into.
     target: Entity<Markdown>,
     /// Timer task that periodically moves text from `pending` into `source`.
@@ -1073,11 +1108,10 @@ struct StreamingTextBuffer {
 }
 
 impl StreamingTextBuffer {
-    /// The number of milliseconds between each timer tick, controlling how quickly
-    /// text is revealed.
+    /// The number of milliseconds between each timer tick. The timer batches
+    /// incoming tokens so we don't call `markdown.append` per-character, but
+    /// each tick drains the entire pending buffer.
     const TASK_UPDATE_MS: u64 = 16;
-    /// The time in milliseconds to reveal the entire pending text.
-    const REVEAL_TARGET: f32 = 200.0;
 }
 
 impl From<&AcpThread> for ActionLogTelemetry {
@@ -1091,6 +1125,7 @@ impl From<&AcpThread> for ActionLogTelemetry {
 
 #[derive(Debug)]
 pub enum AcpThreadEvent {
+    PromptUpdated,
     NewEntry,
     TitleUpdated,
     TokenUsageUpdated,
@@ -1108,6 +1143,7 @@ pub enum AcpThreadEvent {
     AvailableCommandsUpdated(Vec<acp::AvailableCommand>),
     ModeUpdated(acp::SessionModeId),
     ConfigOptionsUpdated(Vec<acp::SessionConfigOption>),
+    WorkingDirectoriesUpdated,
 }
 
 impl EventEmitter<AcpThreadEvent> for AcpThread {}
@@ -1167,6 +1203,7 @@ pub enum LoadError {
     FailedToInstall(SharedString),
     Exited {
         status: ExitStatus,
+        stderr: Option<SharedString>,
     },
     Other(SharedString),
 }
@@ -1185,7 +1222,7 @@ impl Display for LoadError {
                 )
             }
             LoadError::FailedToInstall(msg) => write!(f, "Failed to install: {msg}"),
-            LoadError::Exited { status } => write!(f, "Server exited with status {status}"),
+            LoadError::Exited { status, .. } => write!(f, "Server exited with status {status}"),
             LoadError::Other(msg) => write!(f, "{msg}"),
         }
     }
@@ -1196,7 +1233,7 @@ impl Error for LoadError {}
 impl AcpThread {
     pub fn new(
         parent_session_id: Option<acp::SessionId>,
-        title: impl Into<SharedString>,
+        title: Option<SharedString>,
         work_dirs: Option<PathList>,
         connection: Rc<dyn AgentConnection>,
         project: Entity<Project>,
@@ -1223,7 +1260,7 @@ impl AcpThread {
             shared_buffers: Default::default(),
             entries: Default::default(),
             plan: Default::default(),
-            title: title.into(),
+            title,
             provisional_title: None,
             project,
             running_turn: None,
@@ -1231,7 +1268,9 @@ impl AcpThread {
             connection,
             session_id,
             token_usage: None,
+            cost: None,
             prompt_capabilities,
+            available_commands: Vec::new(),
             _observe_prompt_capabilities: task,
             terminals: HashMap::default(),
             pending_terminal_output: HashMap::default(),
@@ -1251,11 +1290,24 @@ impl AcpThread {
         self.prompt_capabilities.clone()
     }
 
+    pub fn available_commands(&self) -> &[acp::AvailableCommand] {
+        &self.available_commands
+    }
+
+    pub fn is_draft_thread(&self) -> bool {
+        self.entries().is_empty()
+    }
+
     pub fn draft_prompt(&self) -> Option<&[acp::ContentBlock]> {
         self.draft_prompt.as_deref()
     }
 
-    pub fn set_draft_prompt(&mut self, prompt: Option<Vec<acp::ContentBlock>>) {
+    pub fn set_draft_prompt(
+        &mut self,
+        prompt: Option<Vec<acp::ContentBlock>>,
+        cx: &mut Context<Self>,
+    ) {
+        cx.emit(AcpThreadEvent::PromptUpdated);
         self.draft_prompt = prompt;
     }
 
@@ -1279,10 +1331,10 @@ impl AcpThread {
         &self.project
     }
 
-    pub fn title(&self) -> SharedString {
-        self.provisional_title
+    pub fn title(&self) -> Option<SharedString> {
+        self.title
             .clone()
-            .unwrap_or_else(|| self.title.clone())
+            .or_else(|| self.provisional_title.clone())
     }
 
     pub fn has_provisional_title(&self) -> bool {
@@ -1297,8 +1349,17 @@ impl AcpThread {
         &self.session_id
     }
 
+    pub fn supports_truncate(&self, cx: &App) -> bool {
+        self.connection.truncate(&self.session_id, cx).is_some()
+    }
+
     pub fn work_dirs(&self) -> Option<&PathList> {
         self.work_dirs.as_ref()
+    }
+
+    pub fn set_work_dirs(&mut self, work_dirs: PathList, cx: &mut Context<Self>) {
+        self.work_dirs = Some(work_dirs);
+        cx.emit(AcpThreadEvent::WorkingDirectoriesUpdated)
     }
 
     pub fn status(&self) -> ThreadStatus {
@@ -1321,7 +1382,9 @@ impl AcpThread {
                     status: ToolCallStatus::WaitingForConfirmation { .. },
                     ..
                 }) => return true,
-                AgentThreadEntry::ToolCall(_) | AgentThreadEntry::AssistantMessage(_) => {}
+                AgentThreadEntry::ToolCall(_)
+                | AgentThreadEntry::AssistantMessage(_)
+                | AgentThreadEntry::CompletedPlan(_) => {}
             }
         }
         false
@@ -1329,6 +1392,10 @@ impl AcpThread {
 
     pub fn token_usage(&self) -> Option<&TokenUsage> {
         self.token_usage.as_ref()
+    }
+
+    pub fn cost(&self) -> Option<&SessionCost> {
+        self.cost.as_ref()
     }
 
     pub fn has_pending_edit_tool_calls(&self) -> bool {
@@ -1343,7 +1410,9 @@ impl AcpThread {
                 ) if call.diffs().next().is_some() => {
                     return true;
                 }
-                AgentThreadEntry::ToolCall(_) | AgentThreadEntry::AssistantMessage(_) => {}
+                AgentThreadEntry::ToolCall(_)
+                | AgentThreadEntry::AssistantMessage(_)
+                | AgentThreadEntry::CompletedPlan(_) => {}
             }
         }
 
@@ -1360,7 +1429,9 @@ impl AcpThread {
                 }) => {
                     return true;
                 }
-                AgentThreadEntry::ToolCall(_) | AgentThreadEntry::AssistantMessage(_) => {}
+                AgentThreadEntry::ToolCall(_)
+                | AgentThreadEntry::AssistantMessage(_)
+                | AgentThreadEntry::CompletedPlan(_) => {}
             }
         }
 
@@ -1371,7 +1442,9 @@ impl AcpThread {
         for entry in self.entries.iter().rev() {
             match entry {
                 AgentThreadEntry::UserMessage(..) => return false,
-                AgentThreadEntry::AssistantMessage(..) => continue,
+                AgentThreadEntry::AssistantMessage(..) | AgentThreadEntry::CompletedPlan(..) => {
+                    continue;
+                }
                 AgentThreadEntry::ToolCall(..) => return true,
             }
         }
@@ -1386,7 +1459,17 @@ impl AcpThread {
     ) -> Result<(), acp::Error> {
         match update {
             acp::SessionUpdate::UserMessageChunk(acp::ContentChunk { content, .. }) => {
-                self.push_user_content_block(None, content, cx);
+                // We optimistically add the full user prompt before calling `prompt`.
+                // Some ACP servers echo user chunks back over updates. Skip the chunk if
+                // it's already present in the current user message to avoid duplicating content.
+                let already_in_user_message = self
+                    .entries
+                    .last()
+                    .and_then(|entry| entry.user_message())
+                    .is_some_and(|message| message.chunks.contains(&content));
+                if !already_in_user_message {
+                    self.push_user_content_block(None, content, cx);
+                }
             }
             acp::SessionUpdate::AgentMessageChunk(acp::ContentChunk { content, .. }) => {
                 self.push_assistant_content_block(content, false, cx);
@@ -1407,8 +1490,8 @@ impl AcpThread {
                 if let acp::MaybeUndefined::Value(title) = info_update.title {
                     let had_provisional = self.provisional_title.take().is_some();
                     let title: SharedString = title.into();
-                    if title != self.title {
-                        self.title = title;
+                    if self.title.as_ref() != Some(&title) {
+                        self.title = Some(title);
                         cx.emit(AcpThreadEvent::TitleUpdated);
                     } else if had_provisional {
                         cx.emit(AcpThreadEvent::TitleUpdated);
@@ -1418,7 +1501,10 @@ impl AcpThread {
             acp::SessionUpdate::AvailableCommandsUpdate(acp::AvailableCommandsUpdate {
                 available_commands,
                 ..
-            }) => cx.emit(AcpThreadEvent::AvailableCommandsUpdated(available_commands)),
+            }) => {
+                self.available_commands = available_commands.clone();
+                cx.emit(AcpThreadEvent::AvailableCommandsUpdated(available_commands));
+            }
             acp::SessionUpdate::CurrentModeUpdate(acp::CurrentModeUpdate {
                 current_mode_id,
                 ..
@@ -1427,6 +1513,18 @@ impl AcpThread {
                 config_options,
                 ..
             }) => cx.emit(AcpThreadEvent::ConfigOptionsUpdated(config_options)),
+            acp::SessionUpdate::UsageUpdate(update) if cx.has_flag::<AcpBetaFeatureFlag>() => {
+                let usage = self.token_usage.get_or_insert_with(Default::default);
+                usage.max_tokens = update.size;
+                usage.used_tokens = update.used;
+                if let Some(cost) = update.cost {
+                    self.cost = Some(SessionCost {
+                        amount: cost.amount,
+                        currency: cost.currency.into(),
+                    });
+                }
+                cx.emit(AcpThreadEvent::TokenUsageUpdated);
+            }
             _ => {}
         }
         Ok(())
@@ -1603,11 +1701,6 @@ impl AcpThread {
         if let Some(buffer) = &mut self.streaming_text_buffer {
             if buffer.target.entity_id() == markdown.entity_id() {
                 buffer.pending.push_str(&text);
-
-                buffer.bytes_to_reveal_per_tick = (buffer.pending.len() as f32
-                    / StreamingTextBuffer::REVEAL_TARGET
-                    * StreamingTextBuffer::TASK_UPDATE_MS as f32)
-                    .ceil() as usize;
                 return;
             }
             Self::flush_streaming_text(&mut self.streaming_text_buffer, cx);
@@ -1615,13 +1708,8 @@ impl AcpThread {
 
         let target = markdown.clone();
         let _reveal_task = self.start_streaming_reveal(cx);
-        let pending_len = text.len();
-        let bytes_to_reveal = (pending_len as f32 / StreamingTextBuffer::REVEAL_TARGET
-            * StreamingTextBuffer::TASK_UPDATE_MS as f32)
-            .ceil() as usize;
         self.streaming_text_buffer = Some(StreamingTextBuffer {
             pending: text,
-            bytes_to_reveal_per_tick: bytes_to_reveal,
             target,
             _reveal_task,
         });
@@ -1661,16 +1749,13 @@ impl AcpThread {
                             return true;
                         }
 
-                        let pending_len = buffer.pending.len();
-
-                        let byte_boundary = buffer
-                            .pending
-                            .ceil_char_boundary(buffer.bytes_to_reveal_per_tick)
-                            .min(pending_len);
-
+                        // Drain the entire pending buffer each tick. The 16ms timer
+                        // still batches (avoids per-character appends), but we never
+                        // withhold bytes — content_only(cx) reads markdown.source()
+                        // so any unrevealed bytes would be invisible to WebSocket sync.
+                        let full = std::mem::take(&mut buffer.pending);
                         buffer.target.update(cx, |markdown: &mut Markdown, cx| {
-                            markdown.append(&buffer.pending[..byte_boundary], cx);
-                            buffer.pending.drain(..byte_boundary);
+                            markdown.append(&full, cx);
                         });
 
                         true
@@ -1696,8 +1781,8 @@ impl AcpThread {
 
     pub fn set_title(&mut self, title: SharedString, cx: &mut Context<Self>) -> Task<Result<()>> {
         let had_provisional = self.provisional_title.take().is_some();
-        if title != self.title {
-            self.title = title.clone();
+        if self.title.as_ref() != Some(&title) {
+            self.title = Some(title.clone());
             cx.emit(AcpThreadEvent::TitleUpdated);
             if let Some(set_title) = self.connection.set_title(&self.session_id, cx) {
                 return set_title.run(title, cx);
@@ -1723,6 +1808,9 @@ impl AcpThread {
     }
 
     pub fn update_token_usage(&mut self, usage: Option<TokenUsage>, cx: &mut Context<Self>) {
+        if usage.is_none() {
+            self.cost = None;
+        }
         self.token_usage = usage;
         cx.emit(AcpThreadEvent::TokenUsageUpdated);
     }
@@ -2032,14 +2120,13 @@ impl AcpThread {
         &mut self,
         id: acp::ToolCallId,
         outcome: SelectedPermissionOutcome,
-        option_kind: acp::PermissionOptionKind,
         cx: &mut Context<Self>,
     ) {
         let Some((ix, call)) = self.tool_call_mut(&id) else {
             return;
         };
 
-        let new_status = match option_kind {
+        let new_status = match outcome.option_kind {
             acp::PermissionOptionKind::RejectOnce | acp::PermissionOptionKind::RejectAlways => {
                 ToolCallStatus::Rejected
             }
@@ -2052,9 +2139,7 @@ impl AcpThread {
         let curr_status = mem::replace(&mut call.status, new_status);
 
         if let ToolCallStatus::WaitingForConfirmation { respond_tx, .. } = curr_status {
-            respond_tx.send(outcome).log_err();
-        } else if cfg!(debug_assertions) {
-            panic!("tried to authorize an already authorized tool call");
+            respond_tx.send(outcome).ok();
         }
 
         cx.emit(AcpThreadEvent::EntryUpdated(ix));
@@ -2089,10 +2174,22 @@ impl AcpThread {
         cx.notify();
     }
 
+    pub fn snapshot_completed_plan(&mut self, cx: &mut Context<Self>) {
+        if !self.plan.is_empty() && self.plan.stats().pending == 0 {
+            let completed_entries = std::mem::take(&mut self.plan.entries);
+            self.push_entry(AgentThreadEntry::CompletedPlan(completed_entries), cx);
+        }
+    }
+
     fn clear_completed_plan_entries(&mut self, cx: &mut Context<Self>) {
         self.plan
             .entries
             .retain(|entry| !matches!(entry.status, acp::PlanEntryStatus::Completed));
+        cx.notify();
+    }
+
+    pub fn clear_plan(&mut self, cx: &mut Context<Self>) {
+        self.plan.entries.clear();
         cx.notify();
     }
 
@@ -2119,17 +2216,13 @@ impl AcpThread {
         let request = acp::PromptRequest::new(self.session_id.clone(), message.clone());
         let git_store = self.project.read(cx).git_store().clone();
 
-        let message_id = if self.connection.truncate(&self.session_id, cx).is_some() {
-            Some(UserMessageId::new())
-        } else {
-            None
-        };
+        let message_id = UserMessageId::new();
 
         self.run_turn(cx, async move |this, cx| {
             this.update(cx, |this, cx| {
                 this.push_entry(
                     AgentThreadEntry::UserMessage(UserMessage {
-                        id: message_id.clone(),
+                        id: Some(message_id.clone()),
                         content: block,
                         chunks: message,
                         checkpoint: None,
@@ -2190,12 +2283,15 @@ impl AcpThread {
 
         self.turn_id += 1;
         let turn_id = self.turn_id;
+        let stopped_emitted = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let stopped_emitted_for_task = stopped_emitted.clone();
         self.running_turn = Some(RunningTurn {
             id: turn_id,
             send_task: cx.spawn(async move |this, cx| {
                 cancel_task.await;
                 tx.send(f(this, cx).await).ok();
             }),
+            stopped_emitted,
         });
 
         cx.spawn(async move |this, cx| {
@@ -2221,7 +2317,14 @@ impl AcpThread {
                     if is_same_turn {
                         this.running_turn.take();
                     }
-                    cx.emit(AcpThreadEvent::Stopped(acp::StopReason::Cancelled));
+                    // Only emit Stopped if cancel() hasn't already done so
+                    // synchronously. cancel() emits Stopped before spawning the
+                    // next turn's send_task so that message_completed reaches the
+                    // server before the interrupt's tokens start — preserving FIFO
+                    // ordering. Without this guard the emission would be duplicated.
+                    if !stopped_emitted_for_task.load(std::sync::atomic::Ordering::Acquire) {
+                        cx.emit(AcpThreadEvent::Stopped(acp::StopReason::Cancelled));
+                    }
                     return Ok(None);
                 };
 
@@ -2245,12 +2348,31 @@ impl AcpThread {
                             this.had_error = true;
                             cx.emit(AcpThreadEvent::Error);
                             log::error!("Max tokens reached. Usage: {:?}", this.token_usage);
-                            return Err(anyhow!("Max tokens reached"));
+
+                            let exceeded_max_output_tokens =
+                                this.token_usage.as_ref().is_some_and(|u| {
+                                    u.max_output_tokens
+                                        .is_some_and(|max| u.output_tokens >= max)
+                                });
+
+                            if exceeded_max_output_tokens {
+                                log::error!(
+                                    "Max output tokens reached. Usage: {:?}",
+                                    this.token_usage
+                                );
+                            } else {
+                                log::error!("Max tokens reached. Usage: {:?}", this.token_usage);
+                            }
+                            return Err(anyhow!(MaxOutputTokensError));
                         }
 
                         let canceled = matches!(r.stop_reason, acp::StopReason::Cancelled);
                         if canceled {
                             this.mark_pending_tools_as_canceled();
+                        }
+
+                        if !canceled {
+                            this.snapshot_completed_plan(cx);
                         }
 
                         // Handle refusal - distinguish between user prompt and tool call refusals
@@ -2289,7 +2411,26 @@ impl AcpThread {
                             }
                         }
 
-                        cx.emit(AcpThreadEvent::Stopped(r.stop_reason));
+                        if cx.has_flag::<AcpBetaFeatureFlag>()
+                            && let Some(response_usage) = &r.usage
+                        {
+                            let usage = this.token_usage.get_or_insert_with(Default::default);
+                            usage.input_tokens = response_usage.input_tokens;
+                            usage.output_tokens = response_usage.output_tokens;
+                            cx.emit(AcpThreadEvent::TokenUsageUpdated);
+                        }
+
+                        // Guard against duplicate Stopped emission: cancel()
+                        // may have already emitted Stopped synchronously (and
+                        // set stopped_emitted). Without this check, a race
+                        // between natural completion and cancel() would fire
+                        // Stopped twice, causing duplicate message_completed
+                        // events on the server.
+                        if !stopped_emitted_for_task
+                            .load(std::sync::atomic::Ordering::Acquire)
+                        {
+                            cx.emit(AcpThreadEvent::Stopped(r.stop_reason));
+                        }
                         Ok(Some(r))
                     }
                     Err(e) => {
@@ -2315,20 +2456,27 @@ impl AcpThread {
         Self::flush_streaming_text(&mut self.streaming_text_buffer, cx);
         self.mark_pending_tools_as_canceled();
 
+        // Emit Stopped(Cancelled) SYNCHRONOUSLY before dropping the send_task.
+        // This guarantees message_completed is sent to the server BEFORE the
+        // next turn's send_task starts generating tokens, preserving the FIFO
+        // ordering expected by the E2E test (and by the server's isolation logic).
+        //
+        // We set stopped_emitted so the run_turn() outer future skips its own
+        // Stopped emission when rx returns Err (which happens because dropping
+        // send_task drops tx, making rx.await return Err). Without this guard
+        // the Stopped event would fire twice: once here and once from run_turn.
+        turn.stopped_emitted.store(true, std::sync::atomic::Ordering::Release);
+        cx.emit(AcpThreadEvent::Stopped(acp::StopReason::Cancelled));
+
         // Drop the send_task instead of awaiting it. This cancels the prompt
         // future immediately, which drops the oneshot `tx`. The `rx.await` in
-        // run_turn then returns Err, hitting the existing "tx dropped" handler
-        // that emits Stopped(Cancelled) (see the `let Ok(response) = response`
-        // branch in run_turn).
+        // run_turn then returns Err — the guard above suppresses the duplicate
+        // Stopped emission from that path.
         //
         // We still call connection.cancel() above as a courtesy notification
         // to the agent. But we don't wait for the agent to acknowledge it —
         // ACP agents that don't properly handle CancelNotification (see
         // claude-agent-acp#442, #423) would block the next turn indefinitely.
-        //
-        // The previous approach was:
-        //   cx.background_spawn(turn.send_task)
-        // which awaited the prompt future to completion before proceeding.
         drop(turn.send_task);
         Task::ready(())
     }
@@ -2608,7 +2756,7 @@ impl AcpThread {
                     text_diff(old_text.as_str(), &content)
                         .into_iter()
                         .map(|(range, replacement)| {
-                            (snapshot.anchor_range_around(range), replacement)
+                            (snapshot.anchor_range_inside(range), replacement)
                         })
                         .collect::<Vec<_>>()
                 })
@@ -2637,11 +2785,8 @@ impl AcpThread {
                 let format_on_save = buffer.update(cx, |buffer, cx| {
                     buffer.edit(edits, None, cx);
 
-                    let settings = language::language_settings::language_settings(
-                        buffer.language().map(|l| l.name()),
-                        buffer.file(),
-                        cx,
-                    );
+                    let settings =
+                        language::language_settings::LanguageSettings::for_buffer(buffer, cx);
 
                     settings.format_on_save != FormatOnSave::Off
                 });
@@ -3103,6 +3248,7 @@ fn format_shell_output(output: &serde_json::Value) -> Option<String> {
 mod tests {
     use super::*;
     use anyhow::anyhow;
+    use futures::stream::StreamExt as _;
     use futures::{channel::mpsc, future::LocalBoxFuture, select};
     use gpui::{App, AsyncApp, TestAppContext, WeakEntity};
     use indoc::indoc;
@@ -3110,7 +3256,6 @@ mod tests {
     use rand::{distr, prelude::*};
     use serde_json::json;
     use settings::SettingsStore;
-    use smol::stream::StreamExt as _;
     use std::{
         any::Any,
         cell::RefCell,
@@ -3315,7 +3460,7 @@ mod tests {
 
         // Create a real PTY terminal that runs a command which prints output then sleeps
         // We use printf instead of echo and chain with && sleep to ensure proper execution
-        let (completion_tx, _completion_rx) = smol::channel::unbounded();
+        let (completion_tx, _completion_rx) = async_channel::unbounded();
         let (program, args) = ShellBuilder::new(&Shell::System, false).build(
             Some("printf 'output_before_kill\\n' && sleep 60".to_owned()),
             &[],
@@ -3364,9 +3509,27 @@ mod tests {
             );
         });
 
-        // Wait for the printf command to execute and produce output
-        // Use real time since parking is enabled
-        cx.executor().timer(Duration::from_millis(500)).await;
+        // Poll until the printf command produces output, rather than using a
+        // fixed sleep which is flaky on loaded machines.
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            let has_output = thread.read_with(cx, |thread, cx| {
+                let term = thread
+                    .terminals
+                    .get(&terminal_id)
+                    .expect("terminal not found");
+                let content = term.read(cx).inner().read(cx).get_content();
+                content.contains("output_before_kill")
+            });
+            if has_output {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "Timed out waiting for printf output to appear in terminal",
+            );
+            cx.executor().timer(Duration::from_millis(50)).await;
+        }
 
         // Get the acp_thread Terminal and kill it
         let wait_for_exit = thread.update(cx, |thread, cx| {
@@ -3541,6 +3704,52 @@ mod tests {
 
             "#}
         );
+    }
+
+    #[gpui::test]
+    async fn test_ignore_echoed_user_message_chunks_during_active_turn(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        init_test(cx);
+
+        let fs = FakeFs::new(cx.executor());
+        let project = Project::test(fs, [], cx).await;
+        let connection = Rc::new(FakeAgentConnection::new().on_user_message(
+            |request, thread, mut cx| {
+                async move {
+                    let prompt = request.prompt.first().cloned().unwrap_or_else(|| "".into());
+
+                    thread.update(&mut cx, |thread, cx| {
+                        thread
+                            .handle_session_update(
+                                acp::SessionUpdate::UserMessageChunk(acp::ContentChunk::new(
+                                    prompt,
+                                )),
+                                cx,
+                            )
+                            .unwrap();
+                    })?;
+
+                    Ok(acp::PromptResponse::new(acp::StopReason::EndTurn))
+                }
+                .boxed_local()
+            },
+        ));
+
+        let thread = cx
+            .update(|cx| {
+                connection.new_session(project, PathList::new(&[Path::new(path!("/test"))]), cx)
+            })
+            .await
+            .unwrap();
+
+        thread
+            .update(cx, |thread, cx| thread.send_raw("Hello from Zed!", cx))
+            .await
+            .unwrap();
+
+        let output = thread.read_with(cx, |thread, cx| thread.to_markdown(cx));
+        assert_eq!(output.matches("Hello from Zed!").count(), 1);
     }
 
     #[gpui::test]
@@ -4403,6 +4612,7 @@ mod tests {
     #[derive(Clone, Default)]
     struct FakeAgentConnection {
         auth_methods: Vec<acp::AuthMethod>,
+        supports_truncate: bool,
         sessions: Arc<parking_lot::Mutex<HashMap<acp::SessionId, WeakEntity<AcpThread>>>>,
         set_title_calls: Rc<RefCell<Vec<SharedString>>>,
         on_user_message: Option<
@@ -4421,10 +4631,16 @@ mod tests {
         fn new() -> Self {
             Self {
                 auth_methods: Vec::new(),
+                supports_truncate: true,
                 on_user_message: None,
                 sessions: Arc::default(),
                 set_title_calls: Default::default(),
             }
+        }
+
+        fn without_truncate_support(mut self) -> Self {
+            self.supports_truncate = false;
+            self
         }
 
         #[expect(unused)]
@@ -4477,7 +4693,7 @@ mod tests {
             let thread = cx.new(|cx| {
                 AcpThread::new(
                     None,
-                    "Test",
+                    None,
                     Some(work_dirs),
                     self.clone(),
                     project,
@@ -4506,7 +4722,7 @@ mod tests {
 
         fn prompt(
             &self,
-            _id: Option<UserMessageId>,
+            _id: UserMessageId,
             params: acp::PromptRequest,
             cx: &mut App,
         ) -> Task<gpui::Result<acp::PromptResponse>> {
@@ -4528,9 +4744,11 @@ mod tests {
             session_id: &acp::SessionId,
             _cx: &App,
         ) -> Option<Rc<dyn AgentSessionTruncate>> {
-            Some(Rc::new(FakeAgentSessionEditor {
-                _session_id: session_id.clone(),
-            }))
+            self.supports_truncate.then(|| {
+                Rc::new(FakeAgentSessionEditor {
+                    _session_id: session_id.clone(),
+                }) as Rc<dyn AgentSessionTruncate>
+            })
         }
 
         fn set_title(
@@ -5136,7 +5354,7 @@ mod tests {
                 {
                     let stopped_count = stopped_count.clone();
                     move |_, _, event: &AcpThreadEvent, _| {
-                        if matches!(event, AcpThreadEvent::Stopped) {
+                        if matches!(event, AcpThreadEvent::Stopped(_)) {
                             *stopped_count.borrow_mut() += 1;
                         }
                     }
@@ -5208,7 +5426,7 @@ mod tests {
                 {
                     let stopped_count = stopped_count.clone();
                     move |_, _, event: &AcpThreadEvent, _| {
-                        if matches!(event, AcpThreadEvent::Stopped) {
+                        if matches!(event, AcpThreadEvent::Stopped(_)) {
                             *stopped_count.borrow_mut() += 1;
                         }
                     }
@@ -5245,6 +5463,37 @@ mod tests {
         // running_turn was already taken by our manual drop above,
         // but the key assertion is that the outer future completed
         // (didn't hang) and emitted Stopped.
+    }
+
+    #[gpui::test]
+    async fn test_send_assigns_message_id_without_truncate_support(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let fs = FakeFs::new(cx.executor());
+        let project = Project::test(fs, [], cx).await;
+
+        let connection = Rc::new(FakeAgentConnection::new().without_truncate_support());
+        let thread = cx
+            .update(|cx| {
+                connection.new_session(project, PathList::new(&[Path::new(path!("/test"))]), cx)
+            })
+            .await
+            .unwrap();
+
+        let response = thread
+            .update(cx, |thread, cx| thread.send_raw("test message", cx))
+            .await;
+
+        assert!(response.is_ok(), "send should not fail: {response:?}");
+        thread.read_with(cx, |thread, _| {
+            let AgentThreadEntry::UserMessage(message) = &thread.entries[0] else {
+                panic!("expected first entry to be a user message")
+            };
+            assert!(
+                message.id.is_some(),
+                "user message should always have an id"
+            );
+        });
     }
 
     #[gpui::test]
@@ -5341,7 +5590,7 @@ mod tests {
 
         // Initial title is the default.
         thread.read_with(cx, |thread, _| {
-            assert_eq!(thread.title().as_ref(), "Test");
+            assert_eq!(thread.title(), None);
         });
 
         // Setting a provisional title updates the display title.
@@ -5349,7 +5598,10 @@ mod tests {
             thread.set_provisional_title("Hello, can you help…".into(), cx);
         });
         thread.read_with(cx, |thread, _| {
-            assert_eq!(thread.title().as_ref(), "Hello, can you help…");
+            assert_eq!(
+                thread.title().as_ref().map(|s| s.as_str()),
+                Some("Hello, can you help…")
+            );
         });
 
         // The provisional title should NOT have propagated to the connection.
@@ -5366,7 +5618,10 @@ mod tests {
         });
         task.await.expect("set_title should succeed");
         thread.read_with(cx, |thread, _| {
-            assert_eq!(thread.title().as_ref(), "Helping with Rust question");
+            assert_eq!(
+                thread.title().as_ref().map(|s| s.as_str()),
+                Some("Helping with Rust question")
+            );
         });
         assert_eq!(
             set_title_calls.borrow().as_slice(),
@@ -5430,7 +5685,10 @@ mod tests {
         result.expect("session info update should succeed");
 
         thread.read_with(cx, |thread, _| {
-            assert_eq!(thread.title().as_ref(), "Helping with Rust question");
+            assert_eq!(
+                thread.title().as_ref().map(|s| s.as_str()),
+                Some("Helping with Rust question")
+            );
             assert!(
                 !thread.has_provisional_title(),
                 "session info title update should clear provisional title"
@@ -5446,5 +5704,174 @@ mod tests {
             connection.set_title_calls.borrow().is_empty(),
             "session info title update should not propagate back to the connection"
         );
+    }
+
+    #[gpui::test]
+    async fn test_usage_update_populates_token_usage_and_cost(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let fs = FakeFs::new(cx.executor());
+        let project = Project::test(fs, [], cx).await;
+        let connection = Rc::new(FakeAgentConnection::new());
+        let thread = cx
+            .update(|cx| {
+                connection.new_session(project, PathList::new(&[Path::new(path!("/test"))]), cx)
+            })
+            .await
+            .unwrap();
+
+        thread.update(cx, |thread, cx| {
+            thread
+                .handle_session_update(
+                    acp::SessionUpdate::UsageUpdate(
+                        acp::UsageUpdate::new(5000, 10000).cost(acp::Cost::new(0.42, "USD")),
+                    ),
+                    cx,
+                )
+                .unwrap();
+        });
+
+        thread.read_with(cx, |thread, _| {
+            let usage = thread.token_usage().expect("token_usage should be set");
+            assert_eq!(usage.max_tokens, 10000);
+            assert_eq!(usage.used_tokens, 5000);
+
+            let cost = thread.cost().expect("cost should be set");
+            assert!((cost.amount - 0.42).abs() < f64::EPSILON);
+            assert_eq!(cost.currency.as_ref(), "USD");
+        });
+    }
+
+    #[gpui::test]
+    async fn test_usage_update_without_cost_preserves_existing_cost(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let fs = FakeFs::new(cx.executor());
+        let project = Project::test(fs, [], cx).await;
+        let connection = Rc::new(FakeAgentConnection::new());
+        let thread = cx
+            .update(|cx| {
+                connection.new_session(project, PathList::new(&[Path::new(path!("/test"))]), cx)
+            })
+            .await
+            .unwrap();
+
+        thread.update(cx, |thread, cx| {
+            thread
+                .handle_session_update(
+                    acp::SessionUpdate::UsageUpdate(
+                        acp::UsageUpdate::new(1000, 10000).cost(acp::Cost::new(0.10, "USD")),
+                    ),
+                    cx,
+                )
+                .unwrap();
+
+            thread
+                .handle_session_update(
+                    acp::SessionUpdate::UsageUpdate(acp::UsageUpdate::new(2000, 10000)),
+                    cx,
+                )
+                .unwrap();
+        });
+
+        thread.read_with(cx, |thread, _| {
+            let usage = thread.token_usage().expect("token_usage should be set");
+            assert_eq!(usage.used_tokens, 2000);
+
+            let cost = thread.cost().expect("cost should be preserved");
+            assert!((cost.amount - 0.10).abs() < f64::EPSILON);
+        });
+    }
+
+    #[gpui::test]
+    async fn test_response_usage_does_not_clobber_session_usage(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let fs = FakeFs::new(cx.executor());
+        let project = Project::test(fs, [], cx).await;
+        let connection = Rc::new(FakeAgentConnection::new().on_user_message(
+            move |_, thread, mut cx| {
+                async move {
+                    thread.update(&mut cx, |thread, cx| {
+                        thread
+                            .handle_session_update(
+                                acp::SessionUpdate::UsageUpdate(
+                                    acp::UsageUpdate::new(3000, 10000)
+                                        .cost(acp::Cost::new(0.05, "EUR")),
+                                ),
+                                cx,
+                            )
+                            .unwrap();
+                    })?;
+                    Ok(acp::PromptResponse::new(acp::StopReason::EndTurn)
+                        .usage(acp::Usage::new(500, 200, 300)))
+                }
+                .boxed_local()
+            },
+        ));
+
+        let thread = cx
+            .update(|cx| {
+                connection.new_session(project, PathList::new(&[Path::new(path!("/test"))]), cx)
+            })
+            .await
+            .unwrap();
+
+        thread
+            .update(cx, |thread, cx| thread.send_raw("hello", cx))
+            .await
+            .unwrap();
+
+        thread.read_with(cx, |thread, _| {
+            let usage = thread.token_usage().expect("token_usage should be set");
+            assert_eq!(usage.max_tokens, 10000, "max_tokens from UsageUpdate");
+            assert_eq!(usage.used_tokens, 3000, "used_tokens from UsageUpdate");
+            assert_eq!(usage.input_tokens, 200, "input_tokens from response usage");
+            assert_eq!(
+                usage.output_tokens, 300,
+                "output_tokens from response usage"
+            );
+
+            let cost = thread.cost().expect("cost should be set");
+            assert!((cost.amount - 0.05).abs() < f64::EPSILON);
+            assert_eq!(cost.currency.as_ref(), "EUR");
+        });
+    }
+
+    #[gpui::test]
+    async fn test_clearing_token_usage_also_clears_cost(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let fs = FakeFs::new(cx.executor());
+        let project = Project::test(fs, [], cx).await;
+        let connection = Rc::new(FakeAgentConnection::new());
+        let thread = cx
+            .update(|cx| {
+                connection.new_session(project, PathList::new(&[Path::new(path!("/test"))]), cx)
+            })
+            .await
+            .unwrap();
+
+        thread.update(cx, |thread, cx| {
+            thread
+                .handle_session_update(
+                    acp::SessionUpdate::UsageUpdate(
+                        acp::UsageUpdate::new(1000, 10000).cost(acp::Cost::new(0.25, "USD")),
+                    ),
+                    cx,
+                )
+                .unwrap();
+
+            assert!(thread.token_usage().is_some());
+            assert!(thread.cost().is_some());
+
+            thread.update_token_usage(None, cx);
+
+            assert!(thread.token_usage().is_none());
+            assert!(
+                thread.cost().is_none(),
+                "cost should be cleared when token usage is cleared"
+            );
+        });
     }
 }
