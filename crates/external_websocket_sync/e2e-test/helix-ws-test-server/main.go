@@ -1543,10 +1543,16 @@ func (d *testDriver) validateRound() roundResult {
 		log.Printf("[%s] Phase 15: %d assistant message_added samples for thread=%s",
 			agent, len(d.round.phase15Adds), truncate(d.round.phase15ThreadID, 12))
 
-		// Assert 1: at least 5 distinct message_added events arrived for the
-		// assistant turn. The bug pattern produces 1–2 events (one or two stale
-		// snapshots, then a single Stopped re-send) so this catches it cleanly.
-		const minSamples = 5
+		// Assert 1: at least 40 distinct message_added events arrived for the
+		// assistant turn. Calibration: against zed-agent + claude-sonnet-4-5
+		// streaming a ~2.5 KB prose response, the with-fix baseline is ~58
+		// samples (one per LLM chunk PLUS one per 16ms streaming-reveal
+		// drain tick, throttled to 100ms). Without the cx.emit(EntryUpdated)
+		// re-emit after drain, only push_chunk emissions reach WS sync —
+		// observed baseline ~31 samples. 40 sits comfortably between the two
+		// with margin for LLM/throttle variance, so the test fails reliably
+		// when the cherry-pick is missing and passes when it's present.
+		const minSamples = 40
 		if len(d.round.phase15Adds) < minSamples {
 			errors = append(errors, fmt.Sprintf(
 				"Phase 15: only %d assistant message_added events arrived for streaming response (need >= %d) — text drained into markdown is invisible to WS sync until next chunk",
