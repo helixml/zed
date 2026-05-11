@@ -672,8 +672,28 @@ Helix-specific commits on main (oldest first):
 | `c3e312b056` | Merge upstream Zed (`8428a4399d..1da60a8518`, 172 commits, 10 days) into 001980 — 4 conflicts resolved (`deploy_cloudflare.yml`, `Cargo.lock`, `agent_settings.rs`, `wgpu_renderer.rs`) |
 | `95715a1798` | **Fix `AcpThreadEvent::Stopped` test patterns: tuple variant requires `Stopped(_)` (pre-existing breakage since 001864 — never noticed because `#[cfg(test)]` skipped in production builds)** |
 | `61427db325` | Tidy e2e test server `go.mod` for current helix deps (`kodit v1.3.6 → v1.3.7`, dropped `go-tika`) — runner doesn't tidy itself |
+| `bf544922aa` | Merge upstream Zed (`1da60a8518..8bdd78e023`, 127 commits, 3 days) into 001996 — 1 conflict resolved (`acp_thread.rs` cancel/Stopped path; folded upstream PR #55562 reorder with Helix Critical Fixes #6/#8/#9 dropped-tx Stopped emission) |
 
-## Merge 001980 (2026-05-05)
+## Merge 001996 (2026-05-11)
+
+**Divergence at start**:
+- Fork HEAD: `fe8f4f4e3f` (PR #53 — sidebar split-brain Critical Fix #11)
+- Upstream HEAD: `8bdd78e023` ("opencode: Update Free models (#56328)")
+- Upstream commits to merge: **127** (3 days of activity since 001980's `1da60a8518`)
+- Helix-only commits since 001980: 3 (PRs #51 `--headless`, #52 `cancel_current_turn`, #53 sidebar split-brain)
+
+### Conflicts and Resolutions
+
+(Updated incrementally as each conflict is resolved.)
+
+#### 1. `crates/acp_thread/src/acp_thread.rs` — `run_turn()` cancel/Stopped path
+**Upstream change**: PR #55562 (`0a52f80824` "acp_thread: Clear `running_turn` when prompt task drops tx") reordered the `run_turn` post-spawn block so `running_turn.take()` runs **before** the `let Ok(response) = response else { return Ok(None); }` early return. Without this, dropping the inner `send_task` left `running_turn` populated and the panel stuck in `Generating`.
+**HEAD change**: Helix had a separate (earlier) early return for the dropped-tx case that did its own same-turn cleanup AND emitted `Stopped(Cancelled)` guarded by `stopped_emitted_for_task` (Critical Fixes #6, #8, #9 — exactly one Stopped per send, even on rapid cancel/interrupt).
+**Resolution**: kept upstream's reorder (single same-turn `running_turn.take()` block before the early return) and folded Helix's `Stopped(Cancelled)` emission with `stopped_emitted_for_task` guard into the dropped-tx branch. The Helix duplicate-guard for the natural-completion `Stopped` emission a few hundred lines below was untouched (no conflict there).
+**Risk**: medium. This is the highest-traffic code path in the merge (Phase 8/9/13/14 of E2E). The combined logic is functionally a strict superset of both sides; the Helix-only invariant "exactly one `Stopped` per `send()`" is preserved. Validation: E2E phases 8 (mid-stream interrupt), 9 (rapid 3-turn cancel), 13 (`cancel_current_turn` happy path), and 14 (`cancel_current_turn` no-op) all stress this path.
+**Reasoning trail**: see commit `bf544922aa` and the `stopped_emitted_for_task` documentation in the code.
+
+
 
 **Divergence at start**:
 - Fork HEAD: `f5fab97857` (PR #47)
