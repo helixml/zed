@@ -11,7 +11,7 @@ set -euo pipefail
 #
 # Environment variables:
 #   ZED_BINARY              - Path to Zed binary (default: /usr/local/bin/zed)
-#   TEST_TIMEOUT            - Timeout in seconds (default: 240)
+#   TEST_TIMEOUT            - Timeout in seconds (default: 300)
 #   HELIX_WS_TEST_SERVER    - Path to Go test server binary (default: /usr/local/bin/helix-ws-test-server)
 
 echo "============================================"
@@ -20,9 +20,10 @@ echo "============================================"
 echo ""
 
 ZED_BINARY="${ZED_BINARY:-/usr/local/bin/zed}"
-# Default timeout scales with number of agent rounds (each round takes ~120s)
+# Default timeout scales with number of agent rounds (each round takes ~150s
+# including Phase 15's long-form prose streaming).
 AGENT_COUNT=$(echo "${E2E_AGENTS:-zed-agent}" | tr ',' '\n' | wc -l)
-DEFAULT_TIMEOUT=$((240 * AGENT_COUNT))
+DEFAULT_TIMEOUT=$((300 * AGENT_COUNT))
 TEST_TIMEOUT="${TEST_TIMEOUT:-$DEFAULT_TIMEOUT}"
 MOCK_SERVER="${HELIX_WS_TEST_SERVER:-/usr/local/bin/helix-ws-test-server}"
 PROJECT_DIR="/test/project"
