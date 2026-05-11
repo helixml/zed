@@ -673,6 +673,8 @@ Helix-specific commits on main (oldest first):
 | `95715a1798` | **Fix `AcpThreadEvent::Stopped` test patterns: tuple variant requires `Stopped(_)` (pre-existing breakage since 001864 — never noticed because `#[cfg(test)]` skipped in production builds)** |
 | `61427db325` | Tidy e2e test server `go.mod` for current helix deps (`kodit v1.3.6 → v1.3.7`, dropped `go-tika`) — runner doesn't tidy itself |
 | `bf544922aa` | Merge upstream Zed (`1da60a8518..8bdd78e023`, 127 commits, 3 days) into 001996 — 1 conflict resolved (`acp_thread.rs` cancel/Stopped path; folded upstream PR #55562 reorder with Helix Critical Fixes #6/#8/#9 dropped-tx Stopped emission) |
+| `1828cea13c` | Fix: handle `BaseView::Terminal` in Helix UI state query (upstream added the variant; the cfg-gated match in `agent_panel.rs:1270` was non-exhaustive — caught by build, not by silent-drift sweep) |
+| `a7ad11ec00` | Fix Phase 13 race: cancel handler now probes `thread.status()` and sends `turn_cancelled` BEFORE calling `cancel()` so Helix marks the interaction as Interrupted before message_completed (triggered by the synchronously-emitted Stopped) arrives and races it into Completed — discovered by E2E Phase 13 failing on the first run |
 
 ## Merge 001996 (2026-05-11)
 
@@ -692,6 +694,22 @@ Helix-specific commits on main (oldest first):
 **Resolution**: kept upstream's reorder (single same-turn `running_turn.take()` block before the early return) and folded Helix's `Stopped(Cancelled)` emission with `stopped_emitted_for_task` guard into the dropped-tx branch. The Helix duplicate-guard for the natural-completion `Stopped` emission a few hundred lines below was untouched (no conflict there).
 **Risk**: medium. This is the highest-traffic code path in the merge (Phase 8/9/13/14 of E2E). The combined logic is functionally a strict superset of both sides; the Helix-only invariant "exactly one `Stopped` per `send()`" is preserved. Validation: E2E phases 8 (mid-stream interrupt), 9 (rapid 3-turn cancel), 13 (`cancel_current_turn` happy path), and 14 (`cancel_current_turn` no-op) all stress this path.
 **Reasoning trail**: see commit `bf544922aa` and the `stopped_emitted_for_task` documentation in the code.
+
+### Pre-existing Breakage Repaired
+
+#### `crates/agent_ui/src/agent_panel.rs` — `BaseView` non-exhaustive match (Helix UI state query)
+**Upstream change**: added a third `BaseView::Terminal { terminal_id }` variant to support the new agent-panel-as-terminal mode (PR #56233 area).
+**HEAD change**: the Helix UI state query loop (cfg-gated, callback handler set up in `AgentPanel::new()`, around `agent_panel.rs:1270`) only matched `BaseView::AgentThread { conversation_view }` and `BaseView::Uninitialized`.
+**Resolution**: added a `BaseView::Terminal { .. } => ("terminal".to_string(), None, 0, None)` arm. Reports the active view as `"terminal"` with no thread/entry/model context (matches the headless responder's pattern of just reporting the active surface name).
+**Risk**: low. The `terminal` active_view value is new in the protocol — Helix server may need to teach itself that this is a known value. For now the test only asserts on `agent_thread`/`agent_thread_loading`/`uninitialized`, so this is forward-compatible.
+**Lesson for future merges**: when upstream adds a variant to a Helix-touched enum, the silent-drift sweep won't catch it (sweep is for renames/removals). Build-driven discovery is the only safety net here. Add `BaseView` to the post-merge enum-arm review list.
+
+#### `crates/external_websocket_sync/src/thread_service.rs` — Phase 13 race
+**Discovered by**: E2E Phase 13 failing on the first run with this merge — `message_completed` arrived BEFORE `turn_cancelled` on the wire, so `handleTurnCancelled` saw `interaction.State == Completed` (not `Waiting`) and never transitioned to `Interrupted`.
+**Root cause**: GPUI flushes queued events at the END of an entity update closure, BEFORE the outer `cx.update` returns. The cancellation handler used to call `thread.cancel(cx)` (which emits `Stopped(Cancelled)` synchronously) and only THEN send `turn_cancelled`. The persistent `AcpThreadEvent::Stopped(_)` subscription's `MessageCompleted` send always won the race.
+**Resolution**: probe `thread.status()` first; if `Generating`, send `turn_cancelled{status:cancelled}` BEFORE invoking `cancel()`; if not running, send `turn_cancelled{status:noop}`. The cancel itself still fires Stopped → MessageCompleted, but Helix has already marked the interaction Interrupted by then, and the State refresh in `handleMessageCompleted`'s flush path (`websocket_external_agent_sync.go:1765-1772`) prevents it from clobbering.
+**Risk**: low — the new ordering is strictly better; the noop branch is also more accurate now (was previously sending `cancelled` for a thread that exists but has no running turn).
+**Note**: this race likely existed since PR #52 added Phase 13/14 (Apr 2026). Whether the test ever passed is unclear; may have been masked by faster LLM responses or different upstream timing.
 
 
 
