@@ -4,7 +4,7 @@
 // tests and production.
 //
 // The server runs multiple "rounds", one per agent type (zed-agent, claude, etc.).
-// Each round executes the same 14 test phases:
+// Each round executes the same 15 test phases:
 //
 //	Phase 1: Basic thread creation (new chat_message, no thread ID)
 //	Phase 2: Follow-up on existing thread (same thread ID)
@@ -20,6 +20,10 @@
 //	Phase 12: Reconnect test (kill Zed, wait for reconnection, send message to existing thread, verify delivery)
 //	Phase 13: Helix-initiated cancel (send chat_message, then cancel_current_turn, verify turn_cancelled with status cancelled)
 //	Phase 14: Cancel no-op (send cancel_current_turn with bogus request_id, verify turn_cancelled with status noop)
+//	Phase 15: Streaming patches arrive incrementally (long-form prose response — assert message_added events
+//	          arrive throughout the response, not bunched at the end. Catches the regression where Zed's
+//	          streaming-reveal task drains text into the markdown entity without re-emitting EntryUpdated,
+//	          so external_websocket_sync only sees stale snapshots until message_completed.)
 //
 // Exit codes: 0 = all tests passed, 1 = test failure
 package main
@@ -96,6 +100,21 @@ type roundState struct {
 	// Phase 14: cancel no-op (request_id not found)
 	phase14TurnCancelled bool   // whether turn_cancelled event was received
 	phase14CancelStatus  string // status from turn_cancelled (expected "noop")
+
+	// Phase 15: streaming-cadence regression test
+	phase15ThreadID    string             // thread ID created in phase 15
+	phase15ChatSentAt  time.Time          // when we sent the chat_message
+	phase15CompletedAt time.Time          // when message_completed arrived
+	phase15Adds        []phase15AddSample // per message_added: timestamp + content length
+	phase15FinalLen    int                // length of the final assistant content
+}
+
+// phase15AddSample records a single message_added event tied to phase 15's
+// assistant turn — used to assert streaming patches arrive throughout the
+// response and not in a single burst at the end.
+type phase15AddSample struct {
+	ts         time.Time
+	contentLen int
 }
 
 func newRoundState(agentName string) *roundState {
@@ -192,6 +211,11 @@ func (d *testDriver) syncEventCallback(sessionID string, syncMsg *types.SyncMess
 				d.round.phase13ThreadID = acpThreadID
 				log.Printf("[%s] Phase 13: Captured thread ID: %s", d.round.agentName, truncate(acpThreadID, 16))
 			}
+			// Capture the thread created for phase 15 (streaming-cadence test).
+			if d.phase == 15 && d.round.phase15ThreadID == "" {
+				d.round.phase15ThreadID = acpThreadID
+				log.Printf("[%s] Phase 15: Captured thread ID: %s", d.round.agentName, truncate(acpThreadID, 16))
+			}
 		}
 
 	case "user_created_thread":
@@ -216,13 +240,30 @@ func (d *testDriver) syncEventCallback(sessionID string, syncMsg *types.SyncMess
 				break
 			}
 		}
-		// Also check phase 8/9 thread IDs (they may not be in threadIDs yet)
-		if addedThreadID == d.round.phase8ThreadID || addedThreadID == d.round.phase9ThreadID || addedThreadID == d.round.phase13ThreadID {
+		// Also check phase 8/9/13/15 thread IDs (they may not be in threadIDs yet)
+		if addedThreadID == d.round.phase8ThreadID || addedThreadID == d.round.phase9ThreadID || addedThreadID == d.round.phase13ThreadID || addedThreadID == d.round.phase15ThreadID {
 			isCurrentRoundThread = true
 		}
 		if !isCurrentRoundThread && addedThreadID != "" {
 			d.mu.Unlock()
 			return // silently ignore stale events
+		}
+
+		// Phase 15: record (timestamp, content_length) for every assistant
+		// message_added event on the phase 15 thread. The validator asserts
+		// these arrive throughout the streaming response, not bunched at the
+		// end. Catches regressions where text drained from
+		// streaming_text_buffer.pending into the markdown entity isn't seen
+		// by external_websocket_sync until the next chunk arrives.
+		if d.phase == 15 && addedThreadID != "" && addedThreadID == d.round.phase15ThreadID {
+			role, _ := syncMsg.Data["role"].(string)
+			if role == "assistant" {
+				content, _ := syncMsg.Data["content"].(string)
+				d.round.phase15Adds = append(d.round.phase15Adds, phase15AddSample{
+					ts:         time.Now(),
+					contentLen: len(content),
+				})
+			}
 		}
 
 		// Phase 8: send an interrupt as soon as the first assistant token arrives for
@@ -306,7 +347,7 @@ func (d *testDriver) syncEventCallback(sessionID string, syncMsg *types.SyncMess
 				break
 			}
 		}
-		if acpThreadID == d.round.phase8ThreadID || acpThreadID == d.round.phase9ThreadID || acpThreadID == d.round.phase13ThreadID {
+		if acpThreadID == d.round.phase8ThreadID || acpThreadID == d.round.phase9ThreadID || acpThreadID == d.round.phase13ThreadID || acpThreadID == d.round.phase15ThreadID {
 			isCurrentRoundThread = true
 		}
 		if !isCurrentRoundThread && acpThreadID != "" {
@@ -369,6 +410,19 @@ func (d *testDriver) syncEventCallback(sessionID string, syncMsg *types.SyncMess
 				}()
 			}
 			return
+		}
+
+		// Phase 15: capture completion timestamp + final assistant content
+		// length so the validator can compare them against the streaming
+		// samples recorded in phase15Adds.
+		if currentPhase == 15 && acpThreadID == d.round.phase15ThreadID {
+			d.round.phase15CompletedAt = time.Now()
+			if n := len(d.round.phase15Adds); n > 0 {
+				// The Stopped handler in Zed re-sends every entry with its final
+				// content, so the last assistant sample carries the full response
+				// length. (We use this as the denominator for the % check below.)
+				d.round.phase15FinalLen = d.round.phase15Adds[n-1].contentLen
+			}
 		}
 
 		d.mu.Unlock()
@@ -680,6 +734,9 @@ func (d *testDriver) advanceAfterCompletion(completedPhase int) {
 		d.phase = 13
 		d.mu.Unlock()
 		d.runPhase13()
+	case 15:
+		// Phase 15 completed normally — final phase of the round.
+		d.advanceToNextRound()
 	}
 }
 
@@ -1149,9 +1206,40 @@ func (d *testDriver) advanceAfterPhase14() {
 	time.Sleep(1 * time.Second)
 	d.mu.Lock()
 	agentName := d.round.agentName
+	d.phase = 15
 	d.mu.Unlock()
-	log.Printf("[%s] Phase 14: ✅ turn_cancelled (noop) received, round complete", agentName)
-	d.advanceToNextRound()
+	log.Printf("[%s] Phase 14: ✅ turn_cancelled (noop) received, advancing to phase 15", agentName)
+	d.runPhase15()
+}
+
+func (d *testDriver) runPhase15() {
+	agent := d.round.agentName
+	log.Printf("\n==================================================")
+	log.Printf("  [%s] PHASE 15: Streaming patches arrive incrementally", agent)
+	log.Printf("==================================================")
+	d.startPhaseTimeout(15)
+	log.Println("  Sends a long prose prompt and records the timestamp +")
+	log.Println("  content length of every assistant message_added event.")
+	log.Println("  Asserts streaming patches arrive throughout the response,")
+	log.Println("  not bunched at the end (i.e. the streaming-reveal task in")
+	log.Println("  acp_thread.rs re-emits EntryUpdated after each drain so")
+	log.Println("  external_websocket_sync sees fresh content as it grows).")
+
+	d.mu.Lock()
+	d.round.phase15ChatSentAt = time.Now()
+	d.mu.Unlock()
+
+	// Long-form, plain-prose prompt with NO tool calls. ~400 words gives ~30+
+	// streaming chunks at typical model token rates, well above the >=5 sample
+	// threshold. The "no tools" instruction matters: tool calls would split the
+	// response into many short text entries and obscure the streaming-cadence
+	// signal we want to assert on.
+	d.sendChatMessage(
+		"Write a 400-word essay about the history of the printing press in plain prose. "+
+			"No headings, no bullet lists, no tool calls — just a single flowing essay.",
+		d.round.reqID("phase15"),
+		agent,
+	)
 }
 
 // --- Per-round validation ---
@@ -1437,11 +1525,87 @@ func (d *testDriver) validateRound() roundResult {
 		}
 	}
 
-	// Thread count: at minimum 4 threads (phases 1, 3, 8, 13). ACP agents that don't
-	// support session reload (like Claude Code) may create additional threads when
-	// follow-up messages fall through to create_new_thread (phases 4, 7, 11).
-	if len(threadCreatedEvents) > 4 {
-		log.Printf("[%s] Note: %d thread_created events (>4 expected for agents that don't retain sessions)",
+	// Phase 15: streaming patches arrive incrementally
+	//
+	// This guards against the regression fixed by `Emit EntryUpdated after
+	// streaming-reveal drain so WS sync sees fresh content`. Without that
+	// fix, text drained from `streaming_text_buffer.pending` into the
+	// markdown entity is invisible to external_websocket_sync until the next
+	// chunk arrives — so the bulk of content reaches Helix only at the
+	// `Stopped` re-send right before `message_completed`. The three asserts
+	// below catch that pattern with comfortable margin so they don't flake
+	// on slow LLM streaming.
+	if !d.hasRoundCompletion(d.round.reqID("phase15")) {
+		errors = append(errors, "Phase 15: No message_completed for "+d.round.reqID("phase15"))
+	} else if d.round.phase15ThreadID == "" {
+		errors = append(errors, "Phase 15: No thread_created event captured (phase 15 may not have run)")
+	} else {
+		log.Printf("[%s] Phase 15: %d assistant message_added samples for thread=%s",
+			agent, len(d.round.phase15Adds), truncate(d.round.phase15ThreadID, 12))
+
+		// Assert 1: at least 5 distinct message_added events arrived for the
+		// assistant turn. The bug pattern produces 1–2 events (one or two stale
+		// snapshots, then a single Stopped re-send) so this catches it cleanly.
+		const minSamples = 5
+		if len(d.round.phase15Adds) < minSamples {
+			errors = append(errors, fmt.Sprintf(
+				"Phase 15: only %d assistant message_added events arrived for streaming response (need >= %d) — text drained into markdown is invisible to WS sync until next chunk",
+				len(d.round.phase15Adds), minSamples))
+		} else {
+			// Assert 2: the longest gap between consecutive message_added events
+			// (between the first sample and message_completed) is bounded. The
+			// bug shows up as a multi-minute gap where the model is producing
+			// chunks but they're not surfacing through external_websocket_sync.
+			const maxGap = 20 * time.Second
+			var worstGap time.Duration
+			for i := 1; i < len(d.round.phase15Adds); i++ {
+				gap := d.round.phase15Adds[i].ts.Sub(d.round.phase15Adds[i-1].ts)
+				if gap > worstGap {
+					worstGap = gap
+				}
+			}
+			log.Printf("[%s] Phase 15: longest inter-message gap = %s (limit %s)",
+				agent, worstGap, maxGap)
+			if worstGap > maxGap {
+				errors = append(errors, fmt.Sprintf(
+					"Phase 15: longest gap between consecutive message_added events = %s (limit %s) — streaming arrival stalled",
+					worstGap, maxGap))
+			}
+
+			// Assert 3: by the midpoint between sending the prompt and receiving
+			// message_completed, at least 30% of the final content length must
+			// already have been observed. The bug pattern shows ~0% mid-stream
+			// then 100% in the final burst.
+			if !d.round.phase15ChatSentAt.IsZero() && !d.round.phase15CompletedAt.IsZero() && d.round.phase15FinalLen > 0 {
+				midpoint := d.round.phase15ChatSentAt.Add(
+					d.round.phase15CompletedAt.Sub(d.round.phase15ChatSentAt) / 2)
+				lenAtMidpoint := 0
+				for _, s := range d.round.phase15Adds {
+					if s.ts.After(midpoint) {
+						break
+					}
+					if s.contentLen > lenAtMidpoint {
+						lenAtMidpoint = s.contentLen
+					}
+				}
+				pctAtMidpoint := 100 * lenAtMidpoint / d.round.phase15FinalLen
+				const minPctAtMidpoint = 30
+				log.Printf("[%s] Phase 15: %d/%d bytes (%d%%) observed by midpoint (limit >= %d%%)",
+					agent, lenAtMidpoint, d.round.phase15FinalLen, pctAtMidpoint, minPctAtMidpoint)
+				if pctAtMidpoint < minPctAtMidpoint {
+					errors = append(errors, fmt.Sprintf(
+						"Phase 15: only %d%% of final content (%d/%d bytes) was observed by the streaming midpoint (need >= %d%%) — content arrived in a single burst at the end",
+						pctAtMidpoint, lenAtMidpoint, d.round.phase15FinalLen, minPctAtMidpoint))
+				}
+			}
+		}
+	}
+
+	// Thread count: at minimum 5 threads (phases 1, 3, 8, 13, 15). ACP agents that
+	// don't support session reload (like Claude Code) may create additional threads
+	// when follow-up messages fall through to create_new_thread (phases 4, 7, 11).
+	if len(threadCreatedEvents) > 5 {
+		log.Printf("[%s] Note: %d thread_created events (>5 expected for agents that don't retain sessions)",
 			agent, len(threadCreatedEvents))
 	}
 
@@ -1477,6 +1641,7 @@ func (d *testDriver) validateRound() roundResult {
 	completionPhases := []string{
 		d.round.reqID("phase1"), d.round.reqID("phase2"), d.round.reqID("phase3"),
 		d.round.reqID("phase4"), d.round.reqID("phase5"), d.round.reqID("phase7"),
+		d.round.reqID("phase15"),
 	}
 	for _, reqID := range completionPhases {
 		firstAddedIdx := -1
@@ -1527,6 +1692,7 @@ func (d *testDriver) validateRound() roundResult {
 		log.Printf("[%s] Phase 12: Reconnect test - PASSED", agent)
 		log.Printf("[%s] Phase 13: Helix-initiated cancel - PASSED", agent)
 		log.Printf("[%s] Phase 14: Cancel no-op - PASSED", agent)
+		log.Printf("[%s] Phase 15: Streaming patches arrive incrementally - PASSED", agent)
 	}
 
 	totalCompletions := 0
@@ -1571,8 +1737,8 @@ func (d *testDriver) validateStore() bool {
 	log.Printf("[store] Sessions in store: %d", len(sessions))
 	log.Printf("[store] Interactions in store: %d", len(interactions))
 
-	// Each round creates 4 threads (phases 1, 3, 8, 13) = 4 sessions per round.
-	expectedSessions := 4 * len(d.agentRounds)
+	// Each round creates 5 threads (phases 1, 3, 8, 13, 15) = 5 sessions per round.
+	expectedSessions := 5 * len(d.agentRounds)
 	if len(sessions) < expectedSessions {
 		errors = append(errors, fmt.Sprintf("Expected at least %d sessions (%d rounds * 4 threads), got %d",
 			expectedSessions, len(d.agentRounds), len(sessions)))
@@ -1684,7 +1850,7 @@ func (d *testDriver) validateStore() bool {
 		}
 	}
 
-	// Expect at least 7 completed interactions per round:
+	// Expect at least 8 completed interactions per round:
 	//   - Phase 1:  thread_created → new session + interaction
 	//   - Phase 2:  sendChatMessageToExternalAgent creates interaction for follow-up
 	//   - Phase 3:  thread_created → new session + interaction
@@ -1694,13 +1860,14 @@ func (d *testDriver) validateStore() bool {
 	//   - Phase 8:  thread_created → new session + interaction
 	//   - Phase 9:  on-the-fly interaction (from user interrupt)
 	//   - Phase 11: sendChatMessageToExternalAgent via spectask routing
-	expectedCompleted := 7 * len(d.agentRounds)
+	//   - Phase 15: thread_created → new session + interaction (streaming-cadence)
+	expectedCompleted := 8 * len(d.agentRounds)
 	if completedInteractions < expectedCompleted {
 		errors = append(errors, fmt.Sprintf("Expected at least %d completed interactions, got %d", expectedCompleted, completedInteractions))
 	}
 
-	// Expect at least 7 interactions WITH content per round.
-	expectedWithContent := 7 * len(d.agentRounds)
+	// Expect at least 8 interactions WITH content per round.
+	expectedWithContent := 8 * len(d.agentRounds)
 	if completedWithContent < expectedWithContent {
 		errors = append(errors, fmt.Sprintf("Expected at least %d completed interactions with content, got %d (accumulation may be broken)",
 			expectedWithContent, completedWithContent))
@@ -1991,10 +2158,11 @@ func main() {
 		}
 	}()
 
-	// Increase timeout for multi-agent runs
-	timeout := 300 * time.Second
+	// Increase timeout for multi-agent runs. Phase 15 adds ~30–60s of
+	// streaming time per agent, so the per-agent budget is bumped to 360s.
+	timeout := 360 * time.Second
 	if len(agents) > 1 {
-		timeout = time.Duration(300*len(agents)) * time.Second
+		timeout = time.Duration(360*len(agents)) * time.Second
 	}
 
 	select {
