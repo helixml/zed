@@ -1284,6 +1284,7 @@ impl AgentPanel {
                                     ("agent_thread_loading".to_string(), None, 0, None)
                                 }
                             }
+                            BaseView::Terminal { .. } => ("terminal".to_string(), None, 0, None),
                             BaseView::Uninitialized => ("uninitialized".to_string(), None, 0, None),
                         };
 
