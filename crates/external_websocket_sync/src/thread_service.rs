@@ -1237,22 +1237,54 @@ pub fn setup_thread_handler(
 
             match thread {
                 Some(weak_thread) => {
-                    let task = cx.update(|cx| {
+                    // Probe whether there is a turn actually in flight BEFORE issuing
+                    // the cancel. This decides whether we report "cancelled" or "noop"
+                    // back to Helix, and lets us emit turn_cancelled BEFORE message_completed.
+                    let was_running = cx.update(|cx| {
                         if let Some(thread_entity) = weak_thread.upgrade() {
-                            thread_entity.update(cx, |thread, cx| {
-                                thread.cancel(cx)
+                            thread_entity.update(cx, |thread, _cx| {
+                                matches!(thread.status(), acp_thread::ThreadStatus::Generating)
                             })
                         } else {
-                            gpui::Task::ready(())
+                            false
                         }
                     });
-                    task.await;
-                    log::info!("[THREAD_SERVICE] Cancelled turn for request_id={}", request.request_id);
-                    if let Err(e) = crate::send_websocket_event(SyncEvent::TurnCancelled {
-                        request_id: request.request_id,
-                        status: "cancelled".to_string(),
-                    }) {
-                        log::error!("[THREAD_SERVICE] Failed to send turn_cancelled event: {}", e);
+
+                    if was_running {
+                        // Send turn_cancelled FIRST so Helix marks the interaction as
+                        // Interrupted before message_completed (triggered by the
+                        // synchronously-emitted Stopped(Cancelled)) arrives and would
+                        // otherwise race it into the Completed terminal state.
+                        // GPUI flushes queued events at the end of the entity update
+                        // closure below, so the subscription that fans Stopped out as
+                        // message_completed would otherwise win the race against the
+                        // turn_cancelled send that follows.
+                        if let Err(e) = crate::send_websocket_event(SyncEvent::TurnCancelled {
+                            request_id: request.request_id.clone(),
+                            status: "cancelled".to_string(),
+                        }) {
+                            log::error!("[THREAD_SERVICE] Failed to send turn_cancelled event: {}", e);
+                        }
+
+                        let task = cx.update(|cx| {
+                            if let Some(thread_entity) = weak_thread.upgrade() {
+                                thread_entity.update(cx, |thread, cx| {
+                                    thread.cancel(cx)
+                                })
+                            } else {
+                                gpui::Task::ready(())
+                            }
+                        });
+                        task.await;
+                        log::info!("[THREAD_SERVICE] Cancelled turn for request_id={}", request.request_id);
+                    } else {
+                        log::info!("[THREAD_SERVICE] Thread exists but no turn running for request_id={}, sending noop", request.request_id);
+                        if let Err(e) = crate::send_websocket_event(SyncEvent::TurnCancelled {
+                            request_id: request.request_id,
+                            status: "noop".to_string(),
+                        }) {
+                            log::error!("[THREAD_SERVICE] Failed to send turn_cancelled noop event: {}", e);
+                        }
                     }
                 }
                 None => {
