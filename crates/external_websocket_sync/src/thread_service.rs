@@ -66,6 +66,83 @@ static PERSISTENT_SUBSCRIPTIONS: parking_lot::Mutex<Option<Arc<RwLock<HashSet<St
 static THREAD_LOAD_IN_PROGRESS: parking_lot::Mutex<Option<String>> =
     parking_lot::Mutex::new(None);
 
+/// Pending `UserCreatedThread` emissions for draft threads.
+///
+/// The agent panel speculatively creates a "draft" thread (via
+/// `agent_panel::activate_draft` → `ConversationView::new` with
+/// `resume_session_id=None`) every time the panel is shown — even when
+/// the user is not asking for a new chat. Emitting `UserCreatedThread`
+/// to Helix at thread-creation time made every container restart leak
+/// an empty "New Chat" `helix_session` row in `spec_task_zed_threads`,
+/// each one tying to a duplicate Claude ACP spawn that races against
+/// the existing one for the npm `_npx/<hash>` cache. See
+/// `helix/design/2026-05-13-mcp-cache-contention-and-duplicate-claude-spawn.md`.
+///
+/// Fix: when the draft thread is created we register the (acp_thread_id,
+/// title) tuple here instead of emitting immediately. The existing
+/// `ensure_thread_subscription` `NewEntry` handler checks this map on
+/// every new entry; on the first user-role entry the emit is flushed and
+/// the entry removed. Threads the user never types into are never
+/// announced to Helix and never produce a phantom session row.
+static PENDING_USER_CREATED_EMITS: std::sync::LazyLock<parking_lot::Mutex<HashMap<String, Option<String>>>> =
+    std::sync::LazyLock::new(|| parking_lot::Mutex::new(HashMap::new()));
+
+/// Defer the `UserCreatedThread` emission for `acp_thread_id` until the
+/// first user-role `NewEntry` arrives on the thread. Called from
+/// `ConversationView::initial_state` for the `!is_resume` branch.
+pub fn defer_user_created_thread(acp_thread_id: String, title: Option<String>) {
+    eprintln!(
+        "📌 [THREAD_SERVICE] Deferring UserCreatedThread for {} (title={:?}) until first user message",
+        acp_thread_id, title
+    );
+    log::info!(
+        "📌 [THREAD_SERVICE] Deferring UserCreatedThread for {} (title={:?}) until first user message",
+        acp_thread_id, title
+    );
+    PENDING_USER_CREATED_EMITS
+        .lock()
+        .insert(acp_thread_id, title);
+}
+
+/// Flush a deferred `UserCreatedThread` emission if one is pending for
+/// this acp_thread_id. Called from the `ensure_thread_subscription`
+/// `NewEntry` handler the first time a user-role entry is observed on
+/// the thread. Returns true if an emission was flushed.
+fn try_flush_pending_user_created_thread(acp_thread_id: &str) -> bool {
+    let pending = PENDING_USER_CREATED_EMITS.lock().remove(acp_thread_id);
+    let Some(title) = pending else {
+        return false;
+    };
+    eprintln!(
+        "📤 [THREAD_SERVICE] Flushing deferred UserCreatedThread for {} on first user message",
+        acp_thread_id
+    );
+    log::info!(
+        "📤 [THREAD_SERVICE] Flushing deferred UserCreatedThread for {} on first user message",
+        acp_thread_id
+    );
+    if let Err(e) = crate::send_websocket_event(crate::SyncEvent::UserCreatedThread {
+        acp_thread_id: acp_thread_id.to_string(),
+        title,
+    }) {
+        log::error!(
+            "Failed to send deferred UserCreatedThread WebSocket event for {}: {}",
+            acp_thread_id, e
+        );
+    }
+    true
+}
+
+/// Drop a pending `UserCreatedThread` emission without firing it. Used
+/// when a thread that was registered for deferred emission is being
+/// disposed (e.g. the user dismisses the draft without ever typing).
+pub fn drop_pending_user_created_thread(acp_thread_id: &str) -> bool {
+    PENDING_USER_CREATED_EMITS
+        .lock()
+        .remove(acp_thread_id)
+        .is_some()
+}
+
 /// Try to acquire the thread load lock. Returns true if acquired (no other
 /// load in progress), false if another thread is currently loading.
 /// Must be paired with `release_thread_load_lock` when the load completes.
@@ -721,6 +798,12 @@ pub fn ensure_thread_subscription(
                     // up in Helix" and the "prefix mangled with another
                     // message" symptoms.
                     if role == "user" {
+                        // First user message in a draft thread is the cue
+                        // to flush the deferred UserCreatedThread emit.
+                        // See `defer_user_created_thread` for the reason
+                        // we don't emit at thread-creation time.
+                        try_flush_pending_user_created_thread(&thread_id_for_sub);
+
                         let current = turn_request_id.borrow().clone();
                         *prev_turn_request_id.borrow_mut() = current;
                         let global_rid = crate::get_thread_request_id(&thread_id_for_sub)
@@ -2099,4 +2182,154 @@ fn open_existing_thread_sync(
     }).detach();
 
     Ok(())
+}
+
+#[cfg(test)]
+mod pending_user_created_emit_tests {
+    //! Regression tests for the deferred-emission machinery that backs Fix 1a
+    //! in `helix/design/2026-05-13-mcp-cache-contention-and-duplicate-claude-spawn.md`.
+    //!
+    //! These tests fail if `defer_user_created_thread` is replaced with an
+    //! immediate `send_websocket_event(SyncEvent::UserCreatedThread { … })` call
+    //! at the conversation_view.rs / acp/thread_view.rs sites — because then
+    //! the pending map would never be populated and the assertions below
+    //! would fail.
+    //!
+    //! The user-visible bug pattern these guard against:
+    //! - Zed's agent panel `activate_draft` always creates a non-resume
+    //!   ConversationView for the empty input editor.
+    //! - Pre-fix that fired `UserCreatedThread` to Helix immediately, even
+    //!   though the user had not typed anything.
+    //! - Helix dutifully recorded a phantom `helix_session` +
+    //!   `spec_task_zed_threads` row per container restart, plus a duplicate
+    //!   Claude ACP spawn whose npm exec children raced with the existing
+    //!   ones for the `_npx/<hash>` cache → 180s `chrome-devtools/github
+    //!   context server failed to start: Context server request timeout`.
+
+    use super::{
+        defer_user_created_thread,
+        drop_pending_user_created_thread,
+        try_flush_pending_user_created_thread,
+        PENDING_USER_CREATED_EMITS,
+    };
+
+    /// Each test gets a unique acp_thread_id so they don't trip over one
+    /// another (the pending-emits map is a process-global static).
+    fn fresh_thread_id(label: &str) -> String {
+        format!(
+            "test-{}-{}",
+            label,
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        )
+    }
+
+    #[test]
+    fn defer_registers_in_pending_map_without_sending() {
+        let id = fresh_thread_id("defer-only");
+        assert!(
+            !PENDING_USER_CREATED_EMITS.lock().contains_key(&id),
+            "pending map must not contain id before defer"
+        );
+
+        defer_user_created_thread(id.clone(), Some("draft".to_string()));
+
+        let pending = PENDING_USER_CREATED_EMITS.lock();
+        assert!(
+            pending.contains_key(&id),
+            "defer_user_created_thread MUST register the id in the pending map; \
+             if this assertion fails it means the conversation_view.rs site has \
+             reverted to immediate send_websocket_event(UserCreatedThread {{…}}) \
+             — see helix/design/2026-05-13-mcp-cache-contention-and-duplicate-claude-spawn.md"
+        );
+        assert_eq!(
+            pending.get(&id).cloned().flatten(),
+            Some("draft".to_string()),
+            "title should be preserved verbatim"
+        );
+    }
+
+    #[test]
+    fn flush_clears_the_pending_entry_and_returns_true() {
+        let id = fresh_thread_id("flush");
+        defer_user_created_thread(id.clone(), Some("draft".to_string()));
+        assert!(PENDING_USER_CREATED_EMITS.lock().contains_key(&id));
+
+        let flushed = try_flush_pending_user_created_thread(&id);
+        assert!(flushed, "flush must return true when an entry was pending");
+        assert!(
+            !PENDING_USER_CREATED_EMITS.lock().contains_key(&id),
+            "flush must remove the entry from the pending map"
+        );
+    }
+
+    #[test]
+    fn flush_is_a_noop_when_nothing_is_pending() {
+        let id = fresh_thread_id("noop");
+        let flushed = try_flush_pending_user_created_thread(&id);
+        assert!(
+            !flushed,
+            "flush must return false when no pending entry exists for the id"
+        );
+    }
+
+    #[test]
+    fn drop_removes_pending_entry_without_flushing() {
+        let id = fresh_thread_id("drop");
+        defer_user_created_thread(id.clone(), Some("draft".to_string()));
+
+        let dropped = drop_pending_user_created_thread(&id);
+        assert!(dropped, "drop returns true when an entry existed");
+        assert!(
+            !PENDING_USER_CREATED_EMITS.lock().contains_key(&id),
+            "drop must remove the entry"
+        );
+
+        // A subsequent flush should be a no-op since drop already cleared.
+        let flushed = try_flush_pending_user_created_thread(&id);
+        assert!(
+            !flushed,
+            "flush after drop must return false — the entry has been disposed"
+        );
+    }
+
+    #[test]
+    fn flush_only_fires_once_per_pending_entry() {
+        // The NewEntry handler in ensure_thread_subscription calls
+        // try_flush_pending_user_created_thread on EVERY user-role NewEntry
+        // (not just the first), so the implementation MUST self-cleanup
+        // after the first successful flush. Otherwise the second
+        // user message in a draft would re-emit UserCreatedThread to Helix
+        // and Helix would create a duplicate session.
+        let id = fresh_thread_id("once");
+        defer_user_created_thread(id.clone(), None);
+
+        let first = try_flush_pending_user_created_thread(&id);
+        assert!(first, "first flush must succeed");
+
+        let second = try_flush_pending_user_created_thread(&id);
+        assert!(
+            !second,
+            "second flush must NOT re-emit — the entry was consumed by the first flush"
+        );
+    }
+
+    #[test]
+    fn defer_overwrites_existing_pending_entry_with_new_title() {
+        // If the same acp_thread_id is somehow registered twice (shouldn't
+        // happen in practice, but defensive), the second defer wins —
+        // ensures we don't leak stale title metadata.
+        let id = fresh_thread_id("overwrite");
+        defer_user_created_thread(id.clone(), Some("first".to_string()));
+        defer_user_created_thread(id.clone(), Some("second".to_string()));
+
+        let pending = PENDING_USER_CREATED_EMITS.lock();
+        assert_eq!(
+            pending.get(&id).cloned().flatten(),
+            Some("second".to_string()),
+            "later defer must overwrite the earlier entry"
+        );
+    }
 }

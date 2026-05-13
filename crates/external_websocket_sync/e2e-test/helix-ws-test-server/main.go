@@ -36,6 +36,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"os/exec"
 	"sort"
 	"strings"
 	"sync"
@@ -107,6 +108,20 @@ type roundState struct {
 	phase15CompletedAt time.Time          // when message_completed arrived
 	phase15Adds        []phase15AddSample // per message_added: timestamp + content length
 	phase15FinalLen    int                // length of the final assistant content
+
+	// Phase 16: regression for the speculative-draft `user_created_thread`
+	// emit. Pre-Fix-1a (helixml/zed PR #56), every Zed startup fired a
+	// spontaneous `user_created_thread` for the agent panel's
+	// `activate_draft` ConversationView — see
+	// https://github.com/helixml/helix/blob/main/design/2026-05-13-mcp-cache-contention-and-duplicate-claude-spawn.md
+	// for the full diagnosis. Post-fix, no spontaneous emit should arrive
+	// because emission is deferred until the user actually sends a message
+	// in the draft. We assert spontaneousUserCreatedThreadCount == 0 at
+	// the end of each round; Phase 10 does its own user_created_thread
+	// injection via ProcessSyncEvent and is not counted here (it bypasses
+	// the WebSocket).
+	spontaneousUserCreatedThreadCount int
+	spontaneousUserCreatedThreadIDs   []string
 }
 
 // phase15AddSample records a single message_added event tied to phase 15's
@@ -227,6 +242,16 @@ func (d *testDriver) syncEventCallback(sessionID string, syncMsg *types.SyncMess
 		acpThreadID, _ := syncMsg.Data["acp_thread_id"].(string)
 		if acpThreadID != "" {
 			log.Printf("[%s] Spontaneous user_created_thread: %s (not tracked for phases)", d.round.agentName, truncate(acpThreadID, 16))
+			// Phase 16: count these for the deferred-emit regression
+			// assertion. Post-Fix-1a there should be zero of these per
+			// round — emission is deferred until the user actually
+			// sends in the draft thread, which never happens in our
+			// test sequence (we drive the threads via chat_message
+			// instead). See `spontaneousUserCreatedThreadCount` doc.
+			d.round.spontaneousUserCreatedThreadCount++
+			d.round.spontaneousUserCreatedThreadIDs = append(
+				d.round.spontaneousUserCreatedThreadIDs, acpThreadID,
+			)
 		}
 
 	case "message_added":
@@ -1578,30 +1603,41 @@ func (d *testDriver) validateRound() roundResult {
 					worstGap, maxGap))
 			}
 
-			// Assert 3: by the midpoint between sending the prompt and receiving
-			// message_completed, at least 30% of the final content length must
-			// already have been observed. The bug pattern shows ~0% mid-stream
-			// then 100% in the final burst.
+			// Assert 3: the bug pattern is "almost-everything-arrives-in-the-final-burst".
+			// We catch it by asserting that NO MORE than 90% of the final content length
+			// is contributed by the LAST 20% of streaming time. With the
+			// streaming-reveal fix the curve is reasonably even and the final-window
+			// share is well below 50%. Without the fix it pegs at ~100% (everything
+			// arrives in the closing Stopped re-emit).
+			//
+			// We use this end-of-window threshold rather than a midpoint check
+			// because some agents legitimately stream non-prose content first
+			// (e.g. claude_code emits internal thinking before the prose answer
+			// for long responses), which makes the midpoint metric agent-specific.
+			// The "did everything land in the final burst?" question is the actual
+			// regression signal we care about and works uniformly across agents.
 			if !d.round.phase15ChatSentAt.IsZero() && !d.round.phase15CompletedAt.IsZero() && d.round.phase15FinalLen > 0 {
-				midpoint := d.round.phase15ChatSentAt.Add(
-					d.round.phase15CompletedAt.Sub(d.round.phase15ChatSentAt) / 2)
-				lenAtMidpoint := 0
+				totalElapsed := d.round.phase15CompletedAt.Sub(d.round.phase15ChatSentAt)
+				finalWindowStart := d.round.phase15CompletedAt.Add(-totalElapsed / 5) // last 20%
+
+				lenBeforeFinalWindow := 0
 				for _, s := range d.round.phase15Adds {
-					if s.ts.After(midpoint) {
+					if s.ts.After(finalWindowStart) {
 						break
 					}
-					if s.contentLen > lenAtMidpoint {
-						lenAtMidpoint = s.contentLen
+					if s.contentLen > lenBeforeFinalWindow {
+						lenBeforeFinalWindow = s.contentLen
 					}
 				}
-				pctAtMidpoint := 100 * lenAtMidpoint / d.round.phase15FinalLen
-				const minPctAtMidpoint = 30
-				log.Printf("[%s] Phase 15: %d/%d bytes (%d%%) observed by midpoint (limit >= %d%%)",
-					agent, lenAtMidpoint, d.round.phase15FinalLen, pctAtMidpoint, minPctAtMidpoint)
-				if pctAtMidpoint < minPctAtMidpoint {
+				bytesInFinalWindow := d.round.phase15FinalLen - lenBeforeFinalWindow
+				pctInFinalWindow := 100 * bytesInFinalWindow / d.round.phase15FinalLen
+				const maxPctInFinalWindow = 90
+				log.Printf("[%s] Phase 15: %d/%d bytes (%d%%) arrived in the FINAL 20%% of stream time (limit <= %d%%)",
+					agent, bytesInFinalWindow, d.round.phase15FinalLen, pctInFinalWindow, maxPctInFinalWindow)
+				if pctInFinalWindow > maxPctInFinalWindow {
 					errors = append(errors, fmt.Sprintf(
-						"Phase 15: only %d%% of final content (%d/%d bytes) was observed by the streaming midpoint (need >= %d%%) — content arrived in a single burst at the end",
-						pctAtMidpoint, lenAtMidpoint, d.round.phase15FinalLen, minPctAtMidpoint))
+						"Phase 15: %d%% of final content (%d/%d bytes) arrived in the LAST 20%% of stream time (limit <= %d%%) — content arrived in a single burst at the end",
+						pctInFinalWindow, bytesInFinalWindow, d.round.phase15FinalLen, maxPctInFinalWindow))
 				}
 			}
 		}
@@ -1613,6 +1649,97 @@ func (d *testDriver) validateRound() roundResult {
 	if len(threadCreatedEvents) > 5 {
 		log.Printf("[%s] Note: %d thread_created events (>5 expected for agents that don't retain sessions)",
 			agent, len(threadCreatedEvents))
+	}
+
+	// Phase 16 — DEFERRED-EMIT REGRESSION ASSERTION (Fix 1a).
+	//
+	// Zed's agent panel `activate_draft` creates a non-resume
+	// `ConversationView` for the empty input editor every time the panel
+	// is shown. Pre-Fix-1a (helixml/zed PR #56), that load_task's
+	// completion handler emitted `SyncEvent::UserCreatedThread`
+	// immediately for the `!is_resume` branch even though the user had
+	// not typed anything. Helix recorded a phantom `helix_session` per
+	// container restart, plus a duplicate Claude ACP spawn whose npm
+	// exec children raced against the existing ones for the
+	// `_npx/<hash>` cache → 180s context_server timeouts. Post-Fix-1a,
+	// `defer_user_created_thread` registers the emit in a pending map
+	// flushed only on the first user-role NewEntry — and this e2e drives
+	// all phases via chat_message (which goes through
+	// create_new_thread_sync → register_thread, NOT through the
+	// activate_draft path), so the panel's draft never sees a user
+	// message and its emit stays pending forever.
+	//
+	// Phase 10 injects user_created_thread directly via ProcessSyncEvent
+	// (bypasses WebSocket entirely), so it does not increment this
+	// counter — see roundState.spontaneousUserCreatedThreadCount doc.
+	//
+	// To verify this assertion's regression power: revert
+	// `defer_user_created_thread` calls in conversation_view.rs and
+	// acp/thread_view.rs back to immediate
+	// `send_websocket_event(SyncEvent::UserCreatedThread {…})` and
+	// re-run; this assertion will fail with the draft thread's UUID
+	// in the diagnostic.
+	//
+	// Full diagnosis: helix/design/2026-05-13-mcp-cache-contention-and-duplicate-claude-spawn.md
+	if d.round.spontaneousUserCreatedThreadCount > 0 {
+		errors = append(errors, fmt.Sprintf(
+			"Phase 16 (deferred-emit regression): received %d spontaneous user_created_thread event(s) — Zed agent panel's draft ConversationView is emitting UserCreatedThread eagerly instead of deferring until first user message. Phantom acp_thread_id(s): %v. See helixml/zed PR #56 / helix/design/2026-05-13-mcp-cache-contention-and-duplicate-claude-spawn.md",
+			d.round.spontaneousUserCreatedThreadCount,
+			d.round.spontaneousUserCreatedThreadIDs,
+		))
+	} else {
+		log.Printf("[%s] Phase 16: 0 spontaneous user_created_thread events — Fix 1a deferred-emit working as expected", agent)
+	}
+
+	// Phase 17 — LIVE CLAUDE PROCESS COUNT (Fix 1b regression).
+	//
+	// Counts how many `claude --output-format` processes are alive in
+	// the test container right now. Each ACP `new_session()` call against
+	// the Claude wrapper spawns one Claude child; the wrapper itself
+	// (npm exec @agentclientprotocol/claude-agent-acp) is shared across
+	// sessions. So the live Claude count == number of distinct Claude
+	// ACP sessions that haven't been disposed.
+	//
+	// EXPECTATION: this number should equal the number of distinct
+	// thread_created events we observed for the current agent's round
+	// (one Claude per real conversation thread). If it's HIGHER than
+	// expected, the agent panel's draft `activate_draft` is spawning
+	// extra Claude processes on top of the user's actual conversations
+	// — that's the Fix 1b regression we're guarding against. Each extra
+	// Claude brings its own MCP child tree and contends for the npm
+	// `_npx/<hash>` cache, eventually surfacing as 180s
+	// `chrome-devtools/github context server failed to start` timeouts
+	// in long-running spec_tasks.
+	//
+	// IMPORTANT: this assertion currently DOES catch the ambient draft
+	// Claude that spawns on Zed startup — Fix 1b (defer
+	// connection.new_session() until first user input in the draft) is
+	// not yet implemented. Until that lands, this assertion will report
+	// `expected N, got N+1` per agent round and fail. That failure is
+	// the deliberate tracked-failure regression-test for Fix 1b. Once
+	// Fix 1b lands the assertion passes and continues to guard against
+	// future regression. See:
+	// helix/design/2026-05-13-mcp-cache-contention-and-duplicate-claude-spawn.md
+	// section "Why Fix 1b was deferred" for the implementation plan.
+	if agent == "claude" {
+		liveClaudes, err := countLiveClaudeProcesses()
+		if err != nil {
+			log.Printf("[%s] Phase 17: WARNING failed to count Claude processes: %v", agent, err)
+		} else {
+			expectedClaudes := len(d.round.threadIDs) +
+				boolToInt(d.round.phase8ThreadID != "" && !contains(d.round.threadIDs, d.round.phase8ThreadID)) +
+				boolToInt(d.round.phase13ThreadID != "" && !contains(d.round.threadIDs, d.round.phase13ThreadID)) +
+				boolToInt(d.round.phase15ThreadID != "" && !contains(d.round.threadIDs, d.round.phase15ThreadID)) +
+				boolToInt(d.round.phase10NewThreadID != "" && !contains(d.round.threadIDs, d.round.phase10NewThreadID))
+			log.Printf("[%s] Phase 17: %d live Claude processes (expected %d)", agent, liveClaudes, expectedClaudes)
+			if liveClaudes > expectedClaudes {
+				extra := liveClaudes - expectedClaudes
+				errors = append(errors, fmt.Sprintf(
+					"Phase 17 (Fix 1b regression): %d Claude processes alive but only %d real conversation threads exist (%d extras). Likely the agent panel's `activate_draft` is spawning a Claude for the empty input editor before the user types. Each extra Claude child brings its own MCP server tree and contends for the `_npx/<hash>` cache → 180s context_server timeouts in long-running spec_tasks. Fix 1b (defer connection.new_session() until first user input in draft) is not yet implemented; once it lands this assertion will pass without the +1 ambient draft. See helix/design/2026-05-13-mcp-cache-contention-and-duplicate-claude-spawn.md.",
+					liveClaudes, expectedClaudes, extra,
+				))
+			}
+		}
 	}
 
 	// --- MCP TOOLS WAIT VALIDATION (first round only) ---
@@ -2219,4 +2346,41 @@ func main() {
 	} else {
 		os.Exit(1)
 	}
+}
+
+// countLiveClaudeProcesses returns the number of `claude --output-format`
+// processes currently alive in the test container. Each ACP `new_session()`
+// against the Claude wrapper spawns one such process; the wrapper itself
+// (npm exec @agentclientprotocol/claude-agent-acp) is shared across
+// sessions. Used by Phase 17 to assert there are no extra "draft" Claude
+// processes spawned by the agent panel beyond the real conversation
+// threads the test created.
+func countLiveClaudeProcesses() (int, error) {
+	out, err := exec.Command("ps", "-eo", "args").Output()
+	if err != nil {
+		return 0, fmt.Errorf("ps failed: %w", err)
+	}
+	count := 0
+	for _, line := range strings.Split(string(out), "\n") {
+		if strings.Contains(line, "claude --output-format") {
+			count++
+		}
+	}
+	return count, nil
+}
+
+func boolToInt(b bool) int {
+	if b {
+		return 1
+	}
+	return 0
+}
+
+func contains(haystack []string, needle string) bool {
+	for _, s := range haystack {
+		if s == needle {
+			return true
+		}
+	}
+	return false
 }

@@ -1329,9 +1329,26 @@ impl ConversationView {
                             cx,
                         );
 
-                        // Notify external system when user created a new thread (not resume).
-                        // Send unconditionally for non-resume — even for empty threads.
-                        // Helix needs to know about the new thread to create a session for it.
+                        // Notify the external system about a new (non-resume) thread,
+                        // BUT defer the emit until the user actually sends their first
+                        // message in the thread.
+                        //
+                        // The agent panel speculatively creates a "draft" ConversationView
+                        // (via `agent_panel::activate_draft`) every time the panel is shown
+                        // to back its empty input editor. Emitting UserCreatedThread eagerly
+                        // for those drafts caused every container restart of a Helix
+                        // spec-task to register a phantom empty `helix_session`/`zed_thread`
+                        // row and spawn a duplicate Claude ACP process whose npm exec races
+                        // against the existing one for the `_npx/<hash>` cache, surfacing as
+                        // 180s `chrome-devtools/github context server failed to start`
+                        // timeouts. See:
+                        //   helix/design/2026-05-13-mcp-cache-contention-and-duplicate-claude-spawn.md
+                        //
+                        // `defer_user_created_thread` registers the (acp_thread_id, title)
+                        // tuple in a pending map; the existing thread subscription's
+                        // `NewEntry` handler flushes the emit on the first user-role
+                        // entry. Threads the user never types into are never announced
+                        // to Helix.
                         #[cfg(feature = "external_websocket_sync")]
                         {
                             if !is_resume {
@@ -1339,14 +1356,10 @@ impl ConversationView {
                                 let acp_thread_id = thread_entity.read(cx).session_id().to_string();
                                 let title = thread_entity.read(cx).title().unwrap_or_default().to_string();
                                 let title_opt = if title.is_empty() { None } else { Some(title) };
-                                if let Err(e) = external_websocket_sync::send_websocket_event(
-                                    external_websocket_sync::SyncEvent::UserCreatedThread {
-                                        acp_thread_id,
-                                        title: title_opt,
-                                    }
-                                ) {
-                                    log::error!("Failed to send UserCreatedThread WebSocket event: {}", e);
-                                }
+                                external_websocket_sync::defer_user_created_thread(
+                                    acp_thread_id,
+                                    title_opt,
+                                );
                             }
                         }
                     }
