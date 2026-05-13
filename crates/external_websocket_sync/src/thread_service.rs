@@ -66,6 +66,83 @@ static PERSISTENT_SUBSCRIPTIONS: parking_lot::Mutex<Option<Arc<RwLock<HashSet<St
 static THREAD_LOAD_IN_PROGRESS: parking_lot::Mutex<Option<String>> =
     parking_lot::Mutex::new(None);
 
+/// Pending `UserCreatedThread` emissions for draft threads.
+///
+/// The agent panel speculatively creates a "draft" thread (via
+/// `agent_panel::activate_draft` → `ConversationView::new` with
+/// `resume_session_id=None`) every time the panel is shown — even when
+/// the user is not asking for a new chat. Emitting `UserCreatedThread`
+/// to Helix at thread-creation time made every container restart leak
+/// an empty "New Chat" `helix_session` row in `spec_task_zed_threads`,
+/// each one tying to a duplicate Claude ACP spawn that races against
+/// the existing one for the npm `_npx/<hash>` cache. See
+/// `helix/design/2026-05-13-mcp-cache-contention-and-duplicate-claude-spawn.md`.
+///
+/// Fix: when the draft thread is created we register the (acp_thread_id,
+/// title) tuple here instead of emitting immediately. The existing
+/// `ensure_thread_subscription` `NewEntry` handler checks this map on
+/// every new entry; on the first user-role entry the emit is flushed and
+/// the entry removed. Threads the user never types into are never
+/// announced to Helix and never produce a phantom session row.
+static PENDING_USER_CREATED_EMITS: std::sync::LazyLock<parking_lot::Mutex<HashMap<String, Option<String>>>> =
+    std::sync::LazyLock::new(|| parking_lot::Mutex::new(HashMap::new()));
+
+/// Defer the `UserCreatedThread` emission for `acp_thread_id` until the
+/// first user-role `NewEntry` arrives on the thread. Called from
+/// `ConversationView::initial_state` for the `!is_resume` branch.
+pub fn defer_user_created_thread(acp_thread_id: String, title: Option<String>) {
+    eprintln!(
+        "📌 [THREAD_SERVICE] Deferring UserCreatedThread for {} (title={:?}) until first user message",
+        acp_thread_id, title
+    );
+    log::info!(
+        "📌 [THREAD_SERVICE] Deferring UserCreatedThread for {} (title={:?}) until first user message",
+        acp_thread_id, title
+    );
+    PENDING_USER_CREATED_EMITS
+        .lock()
+        .insert(acp_thread_id, title);
+}
+
+/// Flush a deferred `UserCreatedThread` emission if one is pending for
+/// this acp_thread_id. Called from the `ensure_thread_subscription`
+/// `NewEntry` handler the first time a user-role entry is observed on
+/// the thread. Returns true if an emission was flushed.
+fn try_flush_pending_user_created_thread(acp_thread_id: &str) -> bool {
+    let pending = PENDING_USER_CREATED_EMITS.lock().remove(acp_thread_id);
+    let Some(title) = pending else {
+        return false;
+    };
+    eprintln!(
+        "📤 [THREAD_SERVICE] Flushing deferred UserCreatedThread for {} on first user message",
+        acp_thread_id
+    );
+    log::info!(
+        "📤 [THREAD_SERVICE] Flushing deferred UserCreatedThread for {} on first user message",
+        acp_thread_id
+    );
+    if let Err(e) = crate::send_websocket_event(crate::SyncEvent::UserCreatedThread {
+        acp_thread_id: acp_thread_id.to_string(),
+        title,
+    }) {
+        log::error!(
+            "Failed to send deferred UserCreatedThread WebSocket event for {}: {}",
+            acp_thread_id, e
+        );
+    }
+    true
+}
+
+/// Drop a pending `UserCreatedThread` emission without firing it. Used
+/// when a thread that was registered for deferred emission is being
+/// disposed (e.g. the user dismisses the draft without ever typing).
+pub fn drop_pending_user_created_thread(acp_thread_id: &str) -> bool {
+    PENDING_USER_CREATED_EMITS
+        .lock()
+        .remove(acp_thread_id)
+        .is_some()
+}
+
 /// Try to acquire the thread load lock. Returns true if acquired (no other
 /// load in progress), false if another thread is currently loading.
 /// Must be paired with `release_thread_load_lock` when the load completes.
@@ -721,6 +798,12 @@ pub fn ensure_thread_subscription(
                     // up in Helix" and the "prefix mangled with another
                     // message" symptoms.
                     if role == "user" {
+                        // First user message in a draft thread is the cue
+                        // to flush the deferred UserCreatedThread emit.
+                        // See `defer_user_created_thread` for the reason
+                        // we don't emit at thread-creation time.
+                        try_flush_pending_user_created_thread(&thread_id_for_sub);
+
                         let current = turn_request_id.borrow().clone();
                         *prev_turn_request_id.borrow_mut() = current;
                         let global_rid = crate::get_thread_request_id(&thread_id_for_sub)
