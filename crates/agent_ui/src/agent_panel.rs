@@ -3413,6 +3413,31 @@ impl Panel for AgentPanel {
 impl AgentPanel {
     fn ensure_thread_initialized(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if matches!(self.base_view, BaseView::Uninitialized) {
+            // Fix 1b: when running inside the Helix sync surface, do NOT
+            // speculatively spawn a draft ConversationView (which would call
+            // connection.new_session() → spawn a Claude ACP child + its full
+            // MCP server tree) just because the panel became active. The
+            // panel becoming active fires every time Zed restores its
+            // workspace state (e.g. on container restart), and on
+            // long-running Helix spec_tasks that meant a fresh Claude
+            // process per restart, contending with the user's real Claudes
+            // for the npm `_npx/<hash>` cache → 180s
+            // `chrome-devtools/github context server failed to start`
+            // timeouts. Helix drives all real conversations through the
+            // chat_message WebSocket path (which goes via
+            // create_new_thread_sync, not via activate_draft), so leaving
+            // the panel Uninitialized until the user explicitly clicks
+            // "New Chat" / Ctrl+N causes no functional regression for
+            // spec-task agents. See:
+            //   helix/design/2026-05-13-mcp-cache-contention-and-duplicate-claude-spawn.md
+            //   helixml/zed PR #56
+            #[cfg(feature = "external_websocket_sync")]
+            {
+                let _ = window;
+                let _ = cx;
+                return;
+            }
+            #[cfg(not(feature = "external_websocket_sync"))]
             self.activate_draft(false, "agent_panel", window, cx);
         }
     }
