@@ -2183,3 +2183,153 @@ fn open_existing_thread_sync(
 
     Ok(())
 }
+
+#[cfg(test)]
+mod pending_user_created_emit_tests {
+    //! Regression tests for the deferred-emission machinery that backs Fix 1a
+    //! in `helix/design/2026-05-13-mcp-cache-contention-and-duplicate-claude-spawn.md`.
+    //!
+    //! These tests fail if `defer_user_created_thread` is replaced with an
+    //! immediate `send_websocket_event(SyncEvent::UserCreatedThread { … })` call
+    //! at the conversation_view.rs / acp/thread_view.rs sites — because then
+    //! the pending map would never be populated and the assertions below
+    //! would fail.
+    //!
+    //! The user-visible bug pattern these guard against:
+    //! - Zed's agent panel `activate_draft` always creates a non-resume
+    //!   ConversationView for the empty input editor.
+    //! - Pre-fix that fired `UserCreatedThread` to Helix immediately, even
+    //!   though the user had not typed anything.
+    //! - Helix dutifully recorded a phantom `helix_session` +
+    //!   `spec_task_zed_threads` row per container restart, plus a duplicate
+    //!   Claude ACP spawn whose npm exec children raced with the existing
+    //!   ones for the `_npx/<hash>` cache → 180s `chrome-devtools/github
+    //!   context server failed to start: Context server request timeout`.
+
+    use super::{
+        defer_user_created_thread,
+        drop_pending_user_created_thread,
+        try_flush_pending_user_created_thread,
+        PENDING_USER_CREATED_EMITS,
+    };
+
+    /// Each test gets a unique acp_thread_id so they don't trip over one
+    /// another (the pending-emits map is a process-global static).
+    fn fresh_thread_id(label: &str) -> String {
+        format!(
+            "test-{}-{}",
+            label,
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        )
+    }
+
+    #[test]
+    fn defer_registers_in_pending_map_without_sending() {
+        let id = fresh_thread_id("defer-only");
+        assert!(
+            !PENDING_USER_CREATED_EMITS.lock().contains_key(&id),
+            "pending map must not contain id before defer"
+        );
+
+        defer_user_created_thread(id.clone(), Some("draft".to_string()));
+
+        let pending = PENDING_USER_CREATED_EMITS.lock();
+        assert!(
+            pending.contains_key(&id),
+            "defer_user_created_thread MUST register the id in the pending map; \
+             if this assertion fails it means the conversation_view.rs site has \
+             reverted to immediate send_websocket_event(UserCreatedThread {{…}}) \
+             — see helix/design/2026-05-13-mcp-cache-contention-and-duplicate-claude-spawn.md"
+        );
+        assert_eq!(
+            pending.get(&id).cloned().flatten(),
+            Some("draft".to_string()),
+            "title should be preserved verbatim"
+        );
+    }
+
+    #[test]
+    fn flush_clears_the_pending_entry_and_returns_true() {
+        let id = fresh_thread_id("flush");
+        defer_user_created_thread(id.clone(), Some("draft".to_string()));
+        assert!(PENDING_USER_CREATED_EMITS.lock().contains_key(&id));
+
+        let flushed = try_flush_pending_user_created_thread(&id);
+        assert!(flushed, "flush must return true when an entry was pending");
+        assert!(
+            !PENDING_USER_CREATED_EMITS.lock().contains_key(&id),
+            "flush must remove the entry from the pending map"
+        );
+    }
+
+    #[test]
+    fn flush_is_a_noop_when_nothing_is_pending() {
+        let id = fresh_thread_id("noop");
+        let flushed = try_flush_pending_user_created_thread(&id);
+        assert!(
+            !flushed,
+            "flush must return false when no pending entry exists for the id"
+        );
+    }
+
+    #[test]
+    fn drop_removes_pending_entry_without_flushing() {
+        let id = fresh_thread_id("drop");
+        defer_user_created_thread(id.clone(), Some("draft".to_string()));
+
+        let dropped = drop_pending_user_created_thread(&id);
+        assert!(dropped, "drop returns true when an entry existed");
+        assert!(
+            !PENDING_USER_CREATED_EMITS.lock().contains_key(&id),
+            "drop must remove the entry"
+        );
+
+        // A subsequent flush should be a no-op since drop already cleared.
+        let flushed = try_flush_pending_user_created_thread(&id);
+        assert!(
+            !flushed,
+            "flush after drop must return false — the entry has been disposed"
+        );
+    }
+
+    #[test]
+    fn flush_only_fires_once_per_pending_entry() {
+        // The NewEntry handler in ensure_thread_subscription calls
+        // try_flush_pending_user_created_thread on EVERY user-role NewEntry
+        // (not just the first), so the implementation MUST self-cleanup
+        // after the first successful flush. Otherwise the second
+        // user message in a draft would re-emit UserCreatedThread to Helix
+        // and Helix would create a duplicate session.
+        let id = fresh_thread_id("once");
+        defer_user_created_thread(id.clone(), None);
+
+        let first = try_flush_pending_user_created_thread(&id);
+        assert!(first, "first flush must succeed");
+
+        let second = try_flush_pending_user_created_thread(&id);
+        assert!(
+            !second,
+            "second flush must NOT re-emit — the entry was consumed by the first flush"
+        );
+    }
+
+    #[test]
+    fn defer_overwrites_existing_pending_entry_with_new_title() {
+        // If the same acp_thread_id is somehow registered twice (shouldn't
+        // happen in practice, but defensive), the second defer wins —
+        // ensures we don't leak stale title metadata.
+        let id = fresh_thread_id("overwrite");
+        defer_user_created_thread(id.clone(), Some("first".to_string()));
+        defer_user_created_thread(id.clone(), Some("second".to_string()));
+
+        let pending = PENDING_USER_CREATED_EMITS.lock();
+        assert_eq!(
+            pending.get(&id).cloned().flatten(),
+            Some("second".to_string()),
+            "later defer must overwrite the earlier entry"
+        );
+    }
+}
