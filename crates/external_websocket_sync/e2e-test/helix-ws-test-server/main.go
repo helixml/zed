@@ -107,6 +107,20 @@ type roundState struct {
 	phase15CompletedAt time.Time          // when message_completed arrived
 	phase15Adds        []phase15AddSample // per message_added: timestamp + content length
 	phase15FinalLen    int                // length of the final assistant content
+
+	// Phase 16: regression for the speculative-draft `user_created_thread`
+	// emit. Pre-Fix-1a (helixml/zed PR #56), every Zed startup fired a
+	// spontaneous `user_created_thread` for the agent panel's
+	// `activate_draft` ConversationView — see
+	// https://github.com/helixml/helix/blob/main/design/2026-05-13-mcp-cache-contention-and-duplicate-claude-spawn.md
+	// for the full diagnosis. Post-fix, no spontaneous emit should arrive
+	// because emission is deferred until the user actually sends a message
+	// in the draft. We assert spontaneousUserCreatedThreadCount == 0 at
+	// the end of each round; Phase 10 does its own user_created_thread
+	// injection via ProcessSyncEvent and is not counted here (it bypasses
+	// the WebSocket).
+	spontaneousUserCreatedThreadCount int
+	spontaneousUserCreatedThreadIDs   []string
 }
 
 // phase15AddSample records a single message_added event tied to phase 15's
@@ -227,6 +241,16 @@ func (d *testDriver) syncEventCallback(sessionID string, syncMsg *types.SyncMess
 		acpThreadID, _ := syncMsg.Data["acp_thread_id"].(string)
 		if acpThreadID != "" {
 			log.Printf("[%s] Spontaneous user_created_thread: %s (not tracked for phases)", d.round.agentName, truncate(acpThreadID, 16))
+			// Phase 16: count these for the deferred-emit regression
+			// assertion. Post-Fix-1a there should be zero of these per
+			// round — emission is deferred until the user actually
+			// sends in the draft thread, which never happens in our
+			// test sequence (we drive the threads via chat_message
+			// instead). See `spontaneousUserCreatedThreadCount` doc.
+			d.round.spontaneousUserCreatedThreadCount++
+			d.round.spontaneousUserCreatedThreadIDs = append(
+				d.round.spontaneousUserCreatedThreadIDs, acpThreadID,
+			)
 		}
 
 	case "message_added":
@@ -1613,6 +1637,54 @@ func (d *testDriver) validateRound() roundResult {
 	if len(threadCreatedEvents) > 5 {
 		log.Printf("[%s] Note: %d thread_created events (>5 expected for agents that don't retain sessions)",
 			agent, len(threadCreatedEvents))
+	}
+
+	// Phase 16 — DEFERRED-EMIT REGRESSION ASSERTION.
+	//
+	// Zed's agent panel `activate_draft` (agent_panel.rs:1923) creates a
+	// non-resume `ConversationView` for the empty input editor every time
+	// the panel is shown. Pre-Fix-1a (helixml/zed PR #56), that load_task's
+	// completion handler at conversation_view.rs:1336 emitted
+	// `SyncEvent::UserCreatedThread` immediately for the `!is_resume`
+	// branch — even though the user had not typed anything in the draft.
+	//
+	// Helix's `handleUserCreatedThread` then created a phantom
+	// `helix_session` + `spec_task_zed_threads` row per container restart
+	// of a long-running spec_task, plus a duplicate Claude ACP child
+	// process whose npm exec children raced with the existing ones for
+	// the npm `_npx/<hash>` cache → 180s `chrome-devtools/github context
+	// server failed to start: Context server request timeout`.
+	//
+	// Post-Fix-1a, `defer_user_created_thread` registers the (acp_thread_id,
+	// title) tuple in a pending map; emission is flushed only when the
+	// `NewEntry` handler in `ensure_thread_subscription` observes the
+	// first user-role entry. In our e2e test the user-driven path goes
+	// through `chat_message` (which routes to `create_new_thread_sync`
+	// → `register_thread`, not through `defer_user_created_thread`), so
+	// the panel's draft thread never sees a user message and its emit
+	// stays pending forever. The assertion below is therefore exact: zero
+	// spontaneous `user_created_thread` events should reach us.
+	//
+	// Phase 10 injects user_created_thread directly via ProcessSyncEvent
+	// (bypasses WebSocket entirely), so it does not increment this
+	// counter — see roundState.spontaneousUserCreatedThreadCount doc.
+	//
+	// To verify this assertion's regression power: revert
+	// `defer_user_created_thread` calls in conversation_view.rs and
+	// acp/thread_view.rs back to immediate
+	// `send_websocket_event(SyncEvent::UserCreatedThread {…})` and
+	// re-run; this assertion will fail with the draft thread's UUID
+	// in the diagnostic.
+	//
+	// Full diagnosis: helix/design/2026-05-13-mcp-cache-contention-and-duplicate-claude-spawn.md
+	if d.round.spontaneousUserCreatedThreadCount > 0 {
+		errors = append(errors, fmt.Sprintf(
+			"Phase 16 (deferred-emit regression): received %d spontaneous user_created_thread event(s) — Zed agent panel's draft ConversationView is emitting UserCreatedThread eagerly instead of deferring until first user message. Phantom acp_thread_id(s): %v. See helixml/zed PR #56 / helix/design/2026-05-13-mcp-cache-contention-and-duplicate-claude-spawn.md",
+			d.round.spontaneousUserCreatedThreadCount,
+			d.round.spontaneousUserCreatedThreadIDs,
+		))
+	} else {
+		log.Printf("[%s] Phase 16: 0 spontaneous user_created_thread events — Fix 1a deferred-emit working as expected", agent)
 	}
 
 	// --- MCP TOOLS WAIT VALIDATION (first round only) ---
