@@ -117,9 +117,9 @@ type roundState struct {
 	// for the full diagnosis. Post-fix, no spontaneous emit should arrive
 	// because emission is deferred until the user actually sends a message
 	// in the draft. We assert spontaneousUserCreatedThreadCount == 0 at
-	// the end of each round; Phase 10 does its own user_created_thread
-	// injection via ProcessSyncEvent and is not counted here (it bypasses
-	// the WebSocket).
+	// the end of each round; Phase 10's own ProcessSyncEvent injection
+	// fires the same syncEventHook, so the user_created_thread case
+	// filters Phase 10's synthetic ID out of this counter explicitly.
 	spontaneousUserCreatedThreadCount int
 	spontaneousUserCreatedThreadIDs   []string
 }
@@ -241,6 +241,16 @@ func (d *testDriver) syncEventCallback(sessionID string, syncMsg *types.SyncMess
 		// ProcessSyncEvent injection.
 		acpThreadID, _ := syncMsg.Data["acp_thread_id"].(string)
 		if acpThreadID != "" {
+			// Phase 10's own injection goes through ProcessSyncEvent, which
+			// fires the same syncEventHook as real WebSocket-delivered events
+			// — so we have to filter it out by ID here. The synthetic format
+			// (`user-thread-{agent}-{nanos}`, see runPhase10) is generated
+			// only by the test driver, never by Zed (which uses ACP UUIDs),
+			// so this exclusion cannot mask a real Zed regression.
+			if acpThreadID == d.round.phase10NewThreadID {
+				log.Printf("[%s] Phase 10 injected user_created_thread: %s (excluded from Phase 16 counter)", d.round.agentName, truncate(acpThreadID, 16))
+				break
+			}
 			log.Printf("[%s] Spontaneous user_created_thread: %s (not tracked for phases)", d.round.agentName, truncate(acpThreadID, 16))
 			// Phase 16: count these for the deferred-emit regression
 			// assertion. Post-Fix-1a there should be zero of these per
