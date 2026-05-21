@@ -214,8 +214,7 @@ These files contain Helix-specific changes that must be preserved during rebases
 - **`show_onboarding`**: Setting to control onboarding visibility
 - **`auto_open_panel`**: Setting to control agent panel auto-open
 
-### `crates/context_server/src/client.rs`
-- **`DEFAULT_REQUEST_TIMEOUT`**: Bumped from upstream's 60s to 180s for spec-task cold-start (see Critical Fix #10)
+### ~~`crates/context_server/src/client.rs`~~ (no longer modified — see retired Critical Fix #10)
 
 ### `.dockerignore`
 - Simplified for Helix build context
@@ -376,25 +375,11 @@ if !stopped_emitted_for_task.load(std::sync::atomic::Ordering::Acquire) {
 
 **Symptom:** After an interrupt, all subsequent messages return the response for the _previous_ message. The session appears permanently "off by one."
 
-### 10. Bump Context-Server Request Timeout to 180s
+### 10. ~~Bump Context-Server Request Timeout to 180s~~ (RETIRED 2026-05-21 — commit `e60a1b2789`)
 
-**File:** `crates/context_server/src/client.rs` — `DEFAULT_REQUEST_TIMEOUT` constant
+**Status:** **Reverted.** The 180s bump was based on a wrong diagnosis (npm cold-start headroom). The real failure was `npx -y <pkg>` finding `<pkg>` already on PATH — npm shells out and exits, breaking stdio for the MCP client tracking the spawned PID. The MCP child died in <1s in that case; 180s just delayed the failure surfacing by ~3 minutes and made it harder to notice. With MCP configs fixed to invoke installed binaries directly (the correct pattern already used by chrome-devtools and the frontend presets), upstream's 60s is ample headroom for genuine cold-starts and lets real failures surface fast.
 
-**Bug:** Upstream's 60s timeout on the JSON-RPC `initialize` request to a context_server is too short for our spec-task container cold-start scenario. When Zed boots, several stdio MCPs (`chrome-devtools`, `github`) spawn concurrently via `npx <pkg>@latest`, which triggers an npm download on first run. At the same time the local Helix API container (serving HTTP MCPs like `helixos`) is still warming up and the host is CPU-contended by Zed itself, settings-sync-daemon, language servers, etc. All three context_servers routinely exceed 60s and fire `Context server request timeout` simultaneously. The store marks them failed and their tools never appear — most visibly, `mcp__chrome-devtools__*` is missing for the entire session, so the model reports `Error: No such tool available: mcp__chrome-devtools__navigate_page`. Toggling the server off/on in settings appears to fix it because by then npm has cached the package, but that's a manual workaround the user shouldn't need.
-
-**Fix:** Bump the constant to 180s:
-
-```rust
-const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(180);
-```
-
-**Why 180s:** Cold-start `npx chrome-devtools-mcp@latest` is typically 60–90s on a contended container. 180s gives ~2x headroom without making genuine failures noticeably slower to surface in the UI.
-
-**Why not per-server `request_timeout` in settings:** Upstream's `ContextServerSettings` has no `request_timeout` field — this would be a much larger change touching settings schema, project store, and `ContextServer::new_with_timeout`. The constant bump is one line.
-
-**Symptom:** After starting a fresh spec-task, model reports `<tool_use_error>Error: No such tool available: mcp__chrome-devtools__*</tool_use_error>` for any chrome-devtools call. `Zed.log` shows three `cancelled csp request task for "initialize" id 0 which took over 60s` errors all firing at the same instant, exactly 60s after Zed startup.
-
-**History:** Triggered after the AgentConnection dedup fix landed (PR #46). Once the duplicate-spawn race was fixed and only one ACP wrapper started per session, the surviving wrapper's MCP set still depended on which context_servers had completed their `initialize` handshake before the timeout. Cold-start container = all of them failed.
+**Action for future merges:** none — the fix has been retired. Do NOT re-apply the 180s bump. `DEFAULT_REQUEST_TIMEOUT` should match upstream.
 
 ### 11. Entity-Identity Guard at the Top of `load_agent_thread`
 
