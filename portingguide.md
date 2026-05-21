@@ -760,3 +760,53 @@ grep -n "AcpThreadEvent::Stopped\b\([^(]\|$\)" crates/acp_thread/src/acp_thread.
 
 (Pattern: any `AcpThreadEvent::Stopped` not followed by `(`.)
 
+## Merge 002029 (2026-05-21)
+
+**Divergence at start**:
+- Fork HEAD: `fd26c1a113` (Dockerfile.ci helix-org fix)
+- Upstream HEAD: `1399540715` ("settings_ui: Display scope in the breadcrumb (#57437)")
+- Upstream commits to merge: **261** (10 days of activity since 001996's `8bdd78e023`)
+- Helix-only commits since 001996: 5 (PRs #50 `session_creation_chain`, #55 streaming-reveal `EntryUpdated`, #56 deferred-emit + Fix 1b draft suppression, #57 Phase 16 counter fix, direct `fd26c1a113` Dockerfile.ci)
+
+### Conflicts and Resolutions
+
+(Updated incrementally as each conflict is resolved.)
+
+#### 1. `.github/workflows/compare_perf.yml` and `release_nightly.yml`
+**Resolution**: `git checkout --theirs` for both — Helix doesn't use Zed's CI.
+
+#### 2. `crates/title_bar/Cargo.toml`
+**Upstream change**: removed `feature_flags.workspace = true` (Skills feature flag was the only consumer, removed by `2e70059cd9`).
+**HEAD change**: Helix added `external_websocket_sync = { workspace = true, optional = true }` (cfg-gated WS connection-status icon).
+**Resolution**: kept Helix `external_websocket_sync` line; dropped `feature_flags.workspace = true` (no remaining consumer in `title_bar.rs`).
+**Risk**: none.
+
+#### 3. `crates/title_bar/src/title_bar.rs` — `render_restricted_mode`
+**Upstream change**: `TrustedWorktrees::has_restricted_worktrees` became a free function taking the worktree_store directly (no `try_get_global`, no `read(cx)`).
+**HEAD change**: Helix added a cfg-gated `if cfg!(feature = "external_websocket_sync") { return None; }` at the top — Helix auto-trusts every worktree so the pill is meaningless.
+**Resolution**: kept Helix's early-return; adopted upstream's new API for the body underneath.
+**Risk**: none.
+
+#### 4. `crates/project/src/agent_server_store.rs` — `reregister_agents` destructure
+**Upstream change**: `c84c22dab5` "Deprecate ACP extensions" removed the `extension_agents` field from `AgentServerStoreState::Local`; switched to `..` in the destructure pattern.
+**HEAD change**: Helix HEAD destructured three named fields (`extension_agents`, `_subscriptions`, `registry_subscribed`).
+**Resolution**: dropped `extension_agents` (no longer a field anywhere); kept `_subscriptions` and `registry_subscribed` (still referenced in the body below); added trailing `..` for forward-compat.
+**Risk**: none — compile-driven; if any remaining body code references the removed field it will fail to build.
+
+#### 5. `crates/agent_ui/src/agent_panel.rs` — `load_panel` thread-restoration logic
+**Upstream change**: PR `589dc95c87` "Restore last active agent panel entry" (#57150) rewrote thread restoration: introduces `thread_to_restore` (with `has_open_project && terminal_to_restore.is_none()` guard, primary `thread_id` lookup with `session_id` fallback, archived filtering, await on the metadata-store reload task); calls `panel.load_agent_thread(...)` with `thread_id` instead of `session_id`; adds `panel.restore_new_draft(new_draft_thread_id, ...)` for restoring draft UI state.
+**HEAD change**: Helix HEAD had its own restoration path: WebSocket-wait at start; session-id-based `is_restorable` check; draft-prompt resurrection via `create_agent_thread(..., initial_content)` with `panel.draft_thread = Some(...)` and conditional `set_base_view`; `send_agent_ready` in the no-restore branch to unblock the server queue.
+**Resolution**: kept Helix's `wait_for_websocket_connected` at the top (must precede ANY thread restoration so the agent_ready→open_thread handshake can complete). Adopted upstream's `thread_to_restore` (strictly more robust — terminal/thread exclusivity, primary+fallback lookup, archived filter). Adopted upstream's `panel.load_agent_thread(thread_id, ...)` call site. Adopted upstream's `restore_new_draft` for `new_draft_thread_id` (subsumes Helix's `draft_prompt`/`was_draft_active` logic; under `external_websocket_sync` the draft path is suppressed by Fix 1b anyway). **Kept Helix's `send_agent_ready` in the new `else` branch (when neither terminal nor thread restored) — critical: without it, the WS server waits 60s for agent_ready and the user perceives a stuck session.**
+**Risk**: medium. The Helix WS-wait-then-restore flow is functionally preserved but now goes through upstream's new helper. Validation: E2E Phase 1 (basic creation), Phase 7 (open_thread), Phase 12 (reconnect) all exercise the panel-load + restore path.
+
+#### 6. `crates/agent_ui/src/agent_panel.rs` — `load_agent_thread` entity-identity guard (Critical Fix #11)
+**Upstream change**: PR `589dc95c87` changed `load_agent_thread` to take `thread_id: ThreadId` (not `session_id: SessionId`); rewrote the dedup to compare `conversation_view.read(cx).thread_id == thread_id`.
+**HEAD change**: Helix Critical Fix #11 had a `#[cfg(feature = "external_websocket_sync")]` entity-identity guard at the top that called `external_websocket_sync::get_thread(&session_id.to_string())` — but `session_id` is no longer a parameter.
+**Resolution**: prepended a `ThreadMetadataStore::try_global(cx).read(cx).entry(thread_id).and_then(|e| e.session_id.clone())` lookup. If the thread has an ACP session_id (i.e. it's been registered with the server), do the Helix entity-identity dance; otherwise fall through to upstream's thread_id-based dedup. Drafts that don't yet have a session_id naturally skip the guard.
+**Risk**: medium. The guard's behavior is preserved for the bug it was designed to catch (sidebar split-brain on click of the currently-open thread). Validation: regression-test by clicking the active thread in the sidebar after a fresh container start.
+
+#### 7. `crates/agent_ui/src/agent_panel.rs` — `ensure_thread_initialized` (Helix Fix 1b)
+**Upstream change**: PR `589dc95c87` rewrote `ensure_thread_initialized` body — was a single `self.activate_draft(...)` call, now branches on `self.pending_terminal_spawn`, `self.should_create_terminal_for_new_entry(cx)` (deferred terminal spawn via `cx.defer_in`), else falls through to `activate_draft`. Also added `create_initial_terminal` and `spawn_initial_terminal` helpers.
+**HEAD change**: Helix PR #56 Fix 1b had a `#[cfg(feature = "external_websocket_sync")] { return; }` guard inside the `BaseView::Uninitialized` branch to prevent speculative draft Claude spawn.
+**Resolution**: kept the Helix cfg-gated `return;` as the **first statement** inside `if matches!(BaseView::Uninitialized)`, BEFORE the new terminal-spawn branches. This is critical — upstream's new terminal-spawn path also calls `connection.new_session()` indirectly via `spawn_terminal`, which would re-introduce the duplicate-Claude bug Fix 1b was created to prevent. Adopted upstream's terminal-spawn branches and new helper functions verbatim for the non-WS-sync build. Also adopted upstream's signature change for `activate_draft` (string `"agent_panel"` → enum `AgentThreadSource::AgentPanel`).
+**Risk**: HIGH. This is the regression we explicitly planned for. Validation: **E2E Phase 17 (live Claude process count == real thread count) is the hard gate**. If Phase 17 fails for either `zed-agent` or `claude`, this resolution lost the suppression.

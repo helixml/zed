@@ -359,10 +359,10 @@ impl AcpThreadHistory {
         self.sessions.iter().take(limit).cloned().collect()
     }
 
-    pub fn supports_delete(&self) -> bool {
+    pub fn supports_delete(&self, cx: &App) -> bool {
         self.session_list
             .as_ref()
-            .map(|sl| sl.supports_delete())
+            .map(|sl| sl.supports_delete(cx))
             .unwrap_or(false)
     }
 
@@ -560,7 +560,7 @@ impl AcpThreadHistory {
         let Some(session_list) = self.session_list.as_ref() else {
             return;
         };
-        if !session_list.supports_delete() {
+        if !session_list.supports_delete(cx) {
             return;
         }
         let task = session_list.delete_session(&entry.session_id, cx);
@@ -571,7 +571,7 @@ impl AcpThreadHistory {
         let Some(session_list) = self.session_list.as_ref() else {
             return;
         };
-        if !session_list.supports_delete() {
+        if !session_list.supports_delete(cx) {
             return;
         }
         session_list.delete_sessions(cx).detach_and_log_err(cx);
@@ -697,7 +697,7 @@ impl AcpThreadHistory {
 
                         cx.notify();
                     }))
-                    .end_slot::<IconButton>(if hovered && self.supports_delete() {
+                    .end_slot::<IconButton>(if hovered && self.supports_delete(cx) {
                         Some(
                             IconButton::new("delete", IconName::Trash)
                                 .shape(IconButtonShape::Square)
@@ -794,7 +794,7 @@ impl Render for AcpThreadHistory {
                     .vertical_scrollbar_for(&self.scroll_handle, window, cx)
                 }
             })
-            .when(!has_no_history && self.supports_delete(), |this| {
+            .when(!has_no_history && self.supports_delete(cx), |this| {
                 this.child(
                     h_flex()
                         .p_2()
