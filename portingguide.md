@@ -675,6 +675,8 @@ Helix-specific commits on main (oldest first):
 | `bf544922aa` | Merge upstream Zed (`1da60a8518..8bdd78e023`, 127 commits, 3 days) into 001996 — 1 conflict resolved (`acp_thread.rs` cancel/Stopped path; folded upstream PR #55562 reorder with Helix Critical Fixes #6/#8/#9 dropped-tx Stopped emission) |
 | `1828cea13c` | Fix: handle `BaseView::Terminal` in Helix UI state query (upstream added the variant; the cfg-gated match in `agent_panel.rs:1270` was non-exhaustive — caught by build, not by silent-drift sweep) |
 | `a7ad11ec00` | Fix Phase 13 race: cancel handler now probes `thread.status()` and sends `turn_cancelled` BEFORE calling `cancel()` so Helix marks the interaction as Interrupted before message_completed (triggered by the synchronously-emitted Stopped) arrives and races it into Completed — discovered by E2E Phase 13 failing on the first run |
+| `6b39672e5f` | Merge upstream Zed (`8bdd78e023..1399540715`, 261 commits, 10 days) into 002029 — 6 conflicts resolved: workflows (theirs), title_bar Cargo.toml (kept Helix external_websocket_sync dep, dropped feature_flags), title_bar.rs `render_restricted_mode` (kept Helix early-return + adopted upstream's free-function API), agent_server_store.rs reregister_agents destructure (dropped `extension_agents`, kept `_subscriptions`/`registry_subscribed`, added `..`), agent_panel.rs load_panel restoration (kept Helix WS-wait + send_agent_ready, adopted upstream thread_to_restore + load_agent_thread + restore_new_draft), agent_panel.rs load_agent_thread (adapted Critical Fix #11 entity-identity guard to upstream's thread_id signature via ThreadMetadataStore session_id lookup), agent_panel.rs ensure_thread_initialized (Helix Fix 1b early-return as FIRST statement, before upstream 589dc95c87's new terminal-spawn branches) |
+| `edbc05cf99` | Build fixes for upstream signature drift: agent_servers/acp.rs PR #50 chain log-labels now use `directories.cwd` (upstream c3951af24f removed local `cwd` binding); agent_ui/conversation_view.rs from_existing_thread adapted to new ThreadView::new signature (root_thread_id first arg), 3-arg SessionCapabilities::new, and new ConversationView fields (draft_prompt_persist_task, last_theme_id); agent_ui/agent_panel.rs + zed/main.rs added ContextServerStatus::ClientSecretRequired arm |
 
 ## Merge 001996 (2026-05-11)
 
@@ -831,3 +833,14 @@ grep -n "AcpThreadEvent::Stopped\b\([^(]\|$\)" crates/acp_thread/src/acp_thread.
 **Resolution**: added a `ClientSecretRequired { .. } => "client_secret_required"` arm to both. Reports the active state as a known short string (consistent with the other variants).
 **Risk**: none. Helix server is forward-compatible — it doesn't enumerate the strings, just records them.
 **Lesson for future merges**: same lesson as 001996's `BaseView::Terminal` repair — when upstream adds a variant to an enum the Helix code matches exhaustively, the silent-drift sweep doesn't catch it. Build-driven discovery is the only safety net.
+
+### Notes on other upstream changes that did NOT require Helix action (002029)
+
+#### `c84c22dab5` "Deprecate ACP extensions" — Helix bypass markers retained
+The 80-line deletion in `extensions_ui.rs` reshaped the surrounding code but did NOT remove the lines Helix's `// HELIX: External agent ...` comments guard. Markers still present at lines 221, 243, 1513 — keep them as documentation of Helix's intent (no agent keywords / no upsells visible to corporate-LLM users).
+
+#### `f2df3f9e18` "ACP logout" — no Helix override needed
+Upstream's default impls (`supports_logout() -> false`, `logout() -> Err("Logout is not supported")`) are correct for Helix mode. No Helix-mode `AcpConnection` impl overrides them. UI gates the logout button on `supports_logout(cx)` so nothing surfaces in Helix builds. Confirm visually in the next user-facing change to the agent panel.
+
+#### `supports_delete(&self)` → `supports_delete(&self, &App)` signature change (`23231879cd`)
+Trait signature migration applied at 4 sites: trait default impl (`acp_thread/src/connection.rs:335`), upstream impl on NativeAgentConnection (`agent/src/agent.rs:2520`), upstream impl on AcpConnection (`agent_servers/src/acp.rs:558`), Helix UI wrapper on AcpThreadHistory (`agent_ui/src/acp/thread_history.rs:362`). Compile-driven; all call sites updated in a single sweep.
