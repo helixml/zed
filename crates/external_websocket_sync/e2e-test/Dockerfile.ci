@@ -9,12 +9,14 @@
 #   helix-go.mod — Helix go.mod (for helix-ws-test-server replace directive)
 #   helix-go.sum — Helix go.sum
 #   helix-api/   — Helix api/ source tree
+#   helix-org/   — Helix helix-org/ subdirectory (api/pkg/server imports it)
 
 # Stage 1: Build Go test server with real Helix server code
 FROM golang:1.25-alpine AS go-builder
 COPY helix-go.mod /helix/go.mod
 COPY helix-go.sum /helix/go.sum
 COPY helix-api /helix/api
+COPY helix-org /helix/helix-org
 COPY helix-ws-test-server /app
 WORKDIR /app
 RUN apk add --no-cache gcc g++ musl-dev && \
