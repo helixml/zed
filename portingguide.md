@@ -810,3 +810,24 @@ grep -n "AcpThreadEvent::Stopped\b\([^(]\|$\)" crates/acp_thread/src/acp_thread.
 **HEAD change**: Helix PR #56 Fix 1b had a `#[cfg(feature = "external_websocket_sync")] { return; }` guard inside the `BaseView::Uninitialized` branch to prevent speculative draft Claude spawn.
 **Resolution**: kept the Helix cfg-gated `return;` as the **first statement** inside `if matches!(BaseView::Uninitialized)`, BEFORE the new terminal-spawn branches. This is critical — upstream's new terminal-spawn path also calls `connection.new_session()` indirectly via `spawn_terminal`, which would re-introduce the duplicate-Claude bug Fix 1b was created to prevent. Adopted upstream's terminal-spawn branches and new helper functions verbatim for the non-WS-sync build. Also adopted upstream's signature change for `activate_draft` (string `"agent_panel"` → enum `AgentThreadSource::AgentPanel`).
 **Risk**: HIGH. This is the regression we explicitly planned for. Validation: **E2E Phase 17 (live Claude process count == real thread count) is the hard gate**. If Phase 17 fails for either `zed-agent` or `claude`, this resolution lost the suppression.
+
+### Pre-existing Breakage Repaired (002029)
+
+#### `crates/agent_servers/src/acp.rs` — `acquire_session_creation_slot` debug-label `cwd` binding
+**Upstream change**: PR `c3951af24f` "Support additional session directories" removed the local `cwd: PathBuf` binding from `open_or_create_session` and `new_session` (now uses `directories: SessionDirectories`).
+**HEAD change**: PR #50 `acquire_session_creation_slot` log-label format strings reference the removed `cwd` binding.
+**Resolution**: changed both format strings to use `directories.cwd.display()` instead.
+**Risk**: none — debug labels only.
+
+#### `crates/agent_ui/src/conversation_view.rs` — `from_existing_thread` signature drift
+**Upstream change**: PR `589dc95c87` "Restore last active agent panel entry" added `root_thread_id: ThreadId` as the first parameter of `ThreadView::new`; PR added `draft_prompt_persist_task: Option<Task<()>>` and `last_theme_id: Option<String>` to `ConversationView`. Independently, `SessionCapabilities::new` now takes three arguments (added `available_skills: Vec<AvailableSkill>`) — from the agent-skills work.
+**HEAD change**: Helix `from_existing_thread` constructor was bound to the older 2-arg `SessionCapabilities::new`, the 23-arg `ThreadView::new`, and didn't initialise the new struct fields.
+**Resolution**: added `vec![]` for `available_skills`; hoisted `let root_thread_id = ThreadId::new();` before the `ThreadView::new` call and passed it as the first arg; set `thread_id: root_thread_id` and added `last_theme_id: Some(cx.theme().id.clone())`, `draft_prompt_persist_task: None` to the `Self { ... }` literal.
+**Risk**: low — UI-only fields with safe defaults. `last_theme_id` may force a redundant first re-render on a theme reload, but that's an existing pattern across the codebase.
+
+#### `crates/agent_ui/src/agent_panel.rs` and `crates/zed/src/main.rs` — `ContextServerStatus` exhaustive match
+**Upstream change**: upstream MCP work added `ContextServerStatus::ClientSecretRequired { .. }` variant.
+**HEAD change**: two Helix UI-state-query loops (agent_panel.rs UI state callback; main.rs headless responder) matched the prior 6 variants exhaustively, no wildcard.
+**Resolution**: added a `ClientSecretRequired { .. } => "client_secret_required"` arm to both. Reports the active state as a known short string (consistent with the other variants).
+**Risk**: none. Helix server is forward-compatible — it doesn't enumerate the strings, just records them.
+**Lesson for future merges**: same lesson as 001996's `BaseView::Terminal` repair — when upstream adds a variant to an enum the Helix code matches exhaustively, the silent-drift sweep doesn't catch it. Build-driven discovery is the only safety net.

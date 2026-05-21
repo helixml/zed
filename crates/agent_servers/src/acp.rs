@@ -1195,7 +1195,11 @@ impl AcpConnection {
 
         let (prev_chain, slot_guard) = self.acquire_session_creation_slot(
             cx,
-            format!("open_or_create_session id={} cwd={}", session_id, cwd.display()),
+            format!(
+                "open_or_create_session id={} cwd={}",
+                session_id,
+                directories.cwd.display()
+            ),
         );
 
         let shared_task = cx
@@ -1576,7 +1580,10 @@ impl AgentConnection for AcpConnection {
         let mcp_servers = mcp_servers_for_project(&project, cx);
 
         let (prev_chain, slot_guard) = self
-            .acquire_session_creation_slot(cx, format!("new_session cwd={}", cwd.display()));
+            .acquire_session_creation_slot(
+                cx,
+                format!("new_session cwd={}", directories.cwd.display()),
+            );
 
         cx.spawn(async move |cx| {
             // Hold the slot guard until the spawn body returns (success or

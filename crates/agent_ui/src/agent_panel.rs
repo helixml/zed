@@ -1455,6 +1455,7 @@ impl AgentPanel {
                                         project::context_server_store::ContextServerStatus::Error(_) => "error",
                                         project::context_server_store::ContextServerStatus::AuthRequired => "auth_required",
                                         project::context_server_store::ContextServerStatus::Authenticating => "authenticating",
+                                        project::context_server_store::ContextServerStatus::ClientSecretRequired { .. } => "client_secret_required",
                                     };
                                     servers.insert(server_id.0.to_string(), status_str.to_string());
                                 }

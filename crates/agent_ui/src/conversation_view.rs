@@ -847,6 +847,7 @@ impl ConversationView {
         let session_capabilities = Arc::new(RwLock::new(SessionCapabilities::new(
             thread.read(cx).prompt_capabilities(),
             vec![],
+            vec![],
         )));
 
         let entry_view_state = cx.new(|_| {
@@ -975,8 +976,10 @@ impl ConversationView {
             conv.register_thread(thread.clone(), cx);
             conv
         });
+        let root_thread_id = ThreadId::new();
         let current = cx.new(|cx| {
             ThreadView::new(
+                root_thread_id,
                 thread.clone(),
                 conversation_entity.clone(),
                 weak,
@@ -1024,7 +1027,7 @@ impl ConversationView {
             project,
             thread_store,
             prompt_store,
-            thread_id: ThreadId::new(),
+            thread_id: root_thread_id,
             root_session_id: Some(id.clone()),
             server_state: ServerState::Connected(ConnectedServerState {
                 connection,
@@ -1039,6 +1042,8 @@ impl ConversationView {
             auth_task: None,
             _subscriptions: subscriptions,
             focus_handle: cx.focus_handle(),
+            last_theme_id: Some(cx.theme().id.clone()),
+            draft_prompt_persist_task: None,
         }
     }
 

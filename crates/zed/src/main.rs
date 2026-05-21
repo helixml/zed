@@ -1577,6 +1577,7 @@ fn initialize_headless(app_state: Arc<AppState>, cx: &mut App) {
                                     ContextServerStatus::Error(_) => "error",
                                     ContextServerStatus::AuthRequired => "auth_required",
                                     ContextServerStatus::Authenticating => "authenticating",
+                                    ContextServerStatus::ClientSecretRequired { .. } => "client_secret_required",
                                 };
                                 servers.insert(server_id.0.to_string(), status_str.to_string());
                             }
