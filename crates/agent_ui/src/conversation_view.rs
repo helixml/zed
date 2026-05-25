@@ -821,6 +821,7 @@ impl ConversationView {
         cx: &mut Context<Self>,
     ) -> Self {
         let agent_server_store = project.read(cx).agent_server_store().clone();
+        let code_span_resolver = AgentCodeSpanResolver::new(&project.downgrade(), cx);
         let subscriptions = vec![
             cx.observe_global_in::<SettingsStore>(window, Self::agent_ui_font_size_changed),
             cx.observe_global_in::<AgentUiFontSize>(window, Self::agent_ui_font_size_changed),
@@ -1024,6 +1025,7 @@ impl ConversationView {
                 session_capabilities,
                 false, // resumed_without_history
                 project.downgrade(),
+                code_span_resolver.clone(),
                 thread_store.clone(),
                 prompt_store.clone(),
                 None, // initial_content
@@ -1071,6 +1073,7 @@ impl ConversationView {
             focus_handle: cx.focus_handle(),
             last_theme_id: Some(cx.theme().id.clone()),
             draft_prompt_persist_task: None,
+            code_span_resolver,
         }
     }
 
