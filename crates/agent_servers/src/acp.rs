@@ -517,7 +517,6 @@ impl AgentSessionList for AcpSessionList {
         cx: &mut App,
     ) -> Task<Result<AgentSessionListResponse>> {
         let conn = self.connection.clone();
-        let include_additional_directories = cx.has_flag::<AcpBetaFeatureFlag>();
         cx.foreground_executor().spawn(async move {
             let acp_request = acp::ListSessionsRequest::new()
                 .cwd(request.cwd)
@@ -533,11 +532,7 @@ impl AgentSessionList for AcpSessionList {
                         session_id: s.session_id,
                         work_dirs: Some(work_dirs_from_session_info(
                             s.cwd,
-                            if include_additional_directories {
-                                s.additional_directories
-                            } else {
-                                vec![]
-                            },
+                            s.additional_directories,
                         )),
                         title: s.title.map(Into::into),
                         updated_at: s.updated_at.and_then(|date_str| {
@@ -1146,9 +1141,8 @@ impl AcpConnection {
     fn session_directories_from_work_dirs(
         &self,
         work_dirs: &PathList,
-        cx: &App,
     ) -> Result<SessionDirectories> {
-        let supports_additional_directories = self.supports_session_additional_directories(cx);
+        let supports_additional_directories = self.supports_session_additional_directories();
         session_directories_from_work_dirs(work_dirs, supports_additional_directories)
     }
 
@@ -1188,7 +1182,7 @@ impl AcpConnection {
             }
         }
 
-        let directories = match self.session_directories_from_work_dirs(&work_dirs, cx) {
+        let directories = match self.session_directories_from_work_dirs(&work_dirs) {
             Ok(directories) => directories,
             Err(error) => return Task::ready(Err(error)),
         };
@@ -1572,7 +1566,7 @@ impl AgentConnection for AcpConnection {
         work_dirs: PathList,
         cx: &mut App,
     ) -> Task<Result<Entity<AcpThread>>> {
-        let directories = match self.session_directories_from_work_dirs(&work_dirs, cx) {
+        let directories = match self.session_directories_from_work_dirs(&work_dirs) {
             Ok(directories) => directories,
             Err(error) => return Task::ready(Err(error)),
         };
@@ -1750,13 +1744,11 @@ impl AgentConnection for AcpConnection {
             .is_some()
     }
 
-    fn supports_session_additional_directories(&self, cx: &App) -> bool {
-        cx.has_flag::<AcpBetaFeatureFlag>()
-            && self
-                .agent_capabilities
-                .session_capabilities
-                .additional_directories
-                .is_some()
+    fn supports_session_additional_directories(&self) -> bool {
+        self.agent_capabilities
+            .session_capabilities
+            .additional_directories
+            .is_some()
     }
 
     fn load_session(
@@ -1962,12 +1954,12 @@ impl AgentConnection for AcpConnection {
         })
     }
 
-    fn supports_logout(&self, cx: &App) -> bool {
-        cx.has_flag::<AcpBetaFeatureFlag>() && self.agent_capabilities.auth.logout.is_some()
+    fn supports_logout(&self) -> bool {
+        self.agent_capabilities.auth.logout.is_some()
     }
 
     fn logout(&self, cx: &mut App) -> Task<Result<()>> {
-        if !self.supports_logout(cx) {
+        if !self.supports_logout() {
             return Task::ready(Err(anyhow!("Logout is not supported by this agent.")));
         }
 
@@ -2310,8 +2302,8 @@ pub mod test_support {
             self.inner.supports_resume_session()
         }
 
-        fn supports_session_additional_directories(&self, cx: &App) -> bool {
-            self.inner.supports_session_additional_directories(cx)
+        fn supports_session_additional_directories(&self) -> bool {
+            self.inner.supports_session_additional_directories()
         }
 
         fn resume_session(
@@ -2343,8 +2335,8 @@ pub mod test_support {
             self.inner.authenticate(method, cx)
         }
 
-        fn supports_logout(&self, cx: &App) -> bool {
-            self.inner.supports_logout(cx)
+        fn supports_logout(&self) -> bool {
+            self.inner.supports_logout()
         }
 
         fn logout(&self, cx: &mut App) -> Task<Result<()>> {
@@ -2877,10 +2869,9 @@ mod tests {
     }
 
     #[gpui::test]
-    async fn session_list_includes_additional_directories_in_work_dirs_when_beta_enabled(
+    async fn session_list_includes_additional_directories_in_work_dirs(
         cx: &mut gpui::TestAppContext,
     ) {
-        cx.update(|cx| set_acp_beta_override(cx, "on"));
         let connection = connect_session_list_test_agent(
             vec![
                 acp::SessionInfo::new("session-1", "/workspace-b").additional_directories(vec![
@@ -2915,43 +2906,6 @@ mod tests {
                 std::path::PathBuf::from("/workspace-a"),
                 std::path::PathBuf::from("/workspace-c"),
             ]
-        );
-    }
-
-    #[gpui::test]
-    async fn session_list_excludes_additional_directories_in_work_dirs_when_beta_disabled(
-        cx: &mut gpui::TestAppContext,
-    ) {
-        cx.update(|cx| set_acp_beta_override(cx, "off"));
-
-        let connection = connect_session_list_test_agent(
-            vec![
-                acp::SessionInfo::new("session-1", "/workspace-b").additional_directories(vec![
-                    std::path::PathBuf::from("/workspace-a"),
-                    std::path::PathBuf::from("/workspace-c"),
-                ]),
-            ],
-            cx,
-        )
-        .await;
-        let session_list = AcpSessionList::new(connection, false);
-
-        let response = cx
-            .update(|cx| session_list.list_sessions(AgentSessionListRequest::default(), cx))
-            .await
-            .expect("session list should load");
-        let session = response
-            .sessions
-            .first()
-            .expect("session list should include the returned session");
-        let work_dirs = session
-            .work_dirs
-            .as_ref()
-            .expect("session should include work dirs");
-
-        assert_eq!(
-            work_dirs.ordered_paths().cloned().collect::<Vec<_>>(),
-            vec![std::path::PathBuf::from("/workspace-b")]
         );
     }
 
@@ -3014,16 +2968,12 @@ mod tests {
     }
 
     #[gpui::test]
-    async fn additional_directories_support_requires_beta_flag_and_agent_capability(
+    async fn additional_directories_support_respects_agent_capability(
         cx: &mut gpui::TestAppContext,
     ) {
         cx.update(|cx| {
             let store = settings::SettingsStore::test(cx);
             cx.set_global(store);
-            settings::SettingsStore::update_global(cx, |store, _| {
-                store.register_setting::<feature_flags::FeatureFlagsSettings>();
-            });
-            feature_flags::FeatureFlagStore::init(cx);
         });
 
         let fs = fs::FakeFs::new(cx.executor());
@@ -3031,24 +2981,15 @@ mod tests {
             .await;
         let project = project::Project::test(fs, [std::path::Path::new("/a")], cx).await;
         let mut harness = test_support::connect_fake_acp_connection(project, cx).await;
-        cx.update(|cx| {
-            settings::SettingsStore::update_global(cx, |store, _| {
-                store.register_setting::<feature_flags::FeatureFlagsSettings>();
-            });
-            feature_flags::FeatureFlagStore::init(cx);
-        });
 
         let work_dirs = PathList::new(&[
             std::path::PathBuf::from("/workspace-b"),
             std::path::PathBuf::from("/workspace-a"),
         ]);
 
-        let missing_capability = cx
-            .update(|cx| {
-                harness
-                    .connection
-                    .session_directories_from_work_dirs(&work_dirs, cx)
-            })
+        let missing_capability = harness
+            .connection
+            .session_directories_from_work_dirs(&work_dirs)
             .expect("work dirs should convert");
         assert!(missing_capability.additional_directories.is_empty());
 
@@ -3058,44 +2999,12 @@ mod tests {
             .session_capabilities
             .additional_directories = Some(acp::SessionAdditionalDirectoriesCapabilities::new());
 
-        cx.update(|cx| {
-            settings::SettingsStore::update_global(cx, |store, cx| {
-                store.update_user_settings(cx, |content| {
-                    content
-                        .feature_flags
-                        .get_or_insert_default()
-                        .insert("acp-beta".to_string(), "off".to_string());
-                });
-            });
-        });
-        let disabled = cx
-            .update(|cx| {
-                harness
-                    .connection
-                    .session_directories_from_work_dirs(&work_dirs, cx)
-            })
-            .expect("work dirs should convert");
-        assert!(disabled.additional_directories.is_empty());
-
-        cx.update(|cx| {
-            settings::SettingsStore::update_global(cx, |store, cx| {
-                store.update_user_settings(cx, |content| {
-                    content
-                        .feature_flags
-                        .get_or_insert_default()
-                        .insert("acp-beta".to_string(), "on".to_string());
-                });
-            });
-        });
-        let enabled = cx
-            .update(|cx| {
-                harness
-                    .connection
-                    .session_directories_from_work_dirs(&work_dirs, cx)
-            })
+        let supported = harness
+            .connection
+            .session_directories_from_work_dirs(&work_dirs)
             .expect("work dirs should convert");
         assert_eq!(
-            enabled,
+            supported,
             SessionDirectories {
                 cwd: std::path::PathBuf::from("/workspace-b"),
                 additional_directories: vec![std::path::PathBuf::from("/workspace-a")],
@@ -3226,28 +3135,16 @@ mod tests {
     }
 
     #[gpui::test]
-    async fn logout_is_gated_by_beta_flag_and_agent_capability(cx: &mut gpui::TestAppContext) {
-        cx.update(|cx| {
-            let store = settings::SettingsStore::test(cx);
-            cx.set_global(store);
-            settings::SettingsStore::update_global(cx, |store, _| {
-                store.register_setting::<feature_flags::FeatureFlagsSettings>();
-            });
-            feature_flags::FeatureFlagStore::init(cx);
-        });
+    async fn logout_support_requires_agent_capability(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| set_acp_beta_override(cx, "off"));
+        assert!(!cx.update(|cx| cx.has_flag::<AcpBetaFeatureFlag>()));
 
         let fs = fs::FakeFs::new(cx.executor());
         fs.insert_tree("/", serde_json::json!({ "a": {} })).await;
         let project = project::Project::test(fs, [std::path::Path::new("/a")], cx).await;
         let mut harness = test_support::connect_fake_acp_connection(project, cx).await;
-        cx.update(|cx| {
-            settings::SettingsStore::update_global(cx, |store, _| {
-                store.register_setting::<feature_flags::FeatureFlagsSettings>();
-            });
-            feature_flags::FeatureFlagStore::init(cx);
-        });
 
-        assert!(!cx.update(|cx| harness.connection.supports_logout(cx)));
+        assert!(!harness.connection.supports_logout());
         let unsupported_logout = cx.update(|cx| harness.connection.logout(cx));
         let error = unsupported_logout
             .await
@@ -3260,35 +3157,7 @@ mod tests {
             .agent_capabilities
             .auth = acp::AgentAuthCapabilities::new().logout(acp::LogoutCapabilities::new());
 
-        cx.update(|cx| {
-            settings::SettingsStore::update_global(cx, |store, cx| {
-                store.update_user_settings(cx, |content| {
-                    content
-                        .feature_flags
-                        .get_or_insert_default()
-                        .insert("acp-beta".to_string(), "off".to_string());
-                });
-            });
-        });
-        assert!(!cx.update(|cx| harness.connection.supports_logout(cx)));
-        let disabled_logout = cx.update(|cx| harness.connection.logout(cx));
-        let error = disabled_logout
-            .await
-            .expect_err("logout should be rejected when acp-beta is disabled");
-        assert_eq!(error.to_string(), "Logout is not supported by this agent.");
-        assert_eq!(harness.logout_count.load(Ordering::SeqCst), 0);
-
-        cx.update(|cx| {
-            settings::SettingsStore::update_global(cx, |store, cx| {
-                store.update_user_settings(cx, |content| {
-                    content
-                        .feature_flags
-                        .get_or_insert_default()
-                        .insert("acp-beta".to_string(), "on".to_string());
-                });
-            });
-        });
-        assert!(cx.update(|cx| harness.connection.supports_logout(cx)));
+        assert!(harness.connection.supports_logout());
         cx.update(|cx| harness.connection.logout(cx))
             .await
             .expect("logout should be sent when the agent advertises support");
