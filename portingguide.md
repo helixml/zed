@@ -747,6 +747,34 @@ grep -n "AcpThreadEvent::Stopped\b\([^(]\|$\)" crates/acp_thread/src/acp_thread.
 
 (Pattern: any `AcpThreadEvent::Stopped` not followed by `(`.)
 
+## Merge 002029-extension (2026-05-25)
+
+A second upstream merge stacked onto the 002029 feature branch before that PR landed (the original 002029 PR was still open; reviewer asked to roll a fresh upstream into the same branch rather than spin up a new task).
+
+**Divergence at start (of extension)**:
+- Branch HEAD: `8692f073b2` (002029 first-round merge, post `e60a1b2789` re-merge)
+- Upstream HEAD: `13e7c11768` ("ep: Fix bugs in the `split-commit` command (#57604)")
+- Upstream commits to merge: **287** (3 days since 002029's `1399540715`)
+
+**Merge result**: `git merge upstream/main` resolved entirely via the `ort` strategy — **no manual conflicts**. The Helix surface in `agent_panel.rs`, `conversation_view.rs`, `agent_servers/acp.rs`, `connection.rs`, `agent.rs`, `workspace.rs` all auto-merged cleanly. Critical Fix #11, Fix 1b, PR #50 `session_creation_chain`, the title_bar restricted-mode override, and the extensions_ui Helix bypass markers all survived intact (verified by grep).
+
+**Pre-existing Breakage Repaired** — one signature drift, applied in `f226fe7604`:
+
+- `crates/agent_ui/src/conversation_view.rs::from_existing_thread`: upstream `cfd0461b5a` ("Prefix `read_file` tool output with line numbers") added a `code_span_resolver: AgentCodeSpanResolver` field to `ConversationView` and a new positional argument to `ThreadView::new` (now 25 args). Mirror what upstream's `new()` does at line 725: build the resolver via `AgentCodeSpanResolver::new(&project.downgrade(), cx)`, pass it as a `.clone()` between `project.downgrade()` and `thread_store.clone()` in the `ThreadView::new` call, and add `code_span_resolver` to the trailing `Self { ... }`. The upstream `new()` also wires a `project::Event::Worktree*` subscription that calls `resolver.clear_cache()` — Helix's `from_existing_thread` does not currently bind a `Conversation`-level project subscription, so we don't add one (the resolver cache will simply persist for the lifetime of the headless wrapper; acceptable for the WebSocket-sync path where worktrees are not user-mutated mid-session).
+
+**Ancillary upstream notes (no Helix action required)**:
+
+- `91531fad6d` "ACP logout" — adds `supports_logout`/`logout` defaults to the `AgentConnection` trait. Helix's UI-state query loops in `agent_panel.rs` and `zed/main.rs` don't enumerate logout, so no exhaustiveness break.
+- `dee596fa96` "ACP additional directories" — extends the `additional_directories` capability already wired through `SessionDirectories`. Composes with PR #50 with no chain-wrapper changes needed.
+- `6753eb1736` "Update skill settings immediately after changes" — touches `agent.rs` but only inside upstream-only paths; no Helix surface affected.
+- `cfd0461b5a`, `f78f6da255` — `conversation_view.rs` and `thread_view.rs` field additions; the `code_span_resolver` repair above covers both.
+
+**Validation**:
+- `./stack build-zed dev`: green (one signature-drift fix).
+- E2E `zed-agent`: **PASSED** (all 17 phases).
+- E2E `claude`: **PASSED** (all 17 phases, including Phase 17 live-Claude-process-count gate).
+- Store validation: PASSED (28 interactions, 0 interrupted/cancelled).
+
 ## Merge 002029 (2026-05-21)
 
 **Divergence at start**:
