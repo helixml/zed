@@ -1438,6 +1438,7 @@ fn create_new_thread_sync(
                     let delegate = agent_servers::AgentServerDelegate::new(
                         agent_server_store,
                         None,
+                        None,
                     );
                     eprintln!("🔌 [THREAD_SERVICE] Requesting cached connection (attempt {}/{})...", attempt + 1, max_retries + 1);
                     agent_servers::AgentConnectionCache::request_connection(
@@ -1795,6 +1796,7 @@ async fn load_thread_from_agent(
         let delegate = agent_servers::AgentServerDelegate::new(
             agent_server_store,
             None,
+            None,
         );
         let shared = agent_servers::AgentConnectionCache::request_connection(
             cx,
@@ -2012,6 +2014,7 @@ fn open_existing_thread_sync(
     // Create delegate for connection
     let delegate = agent_servers::AgentServerDelegate::new(
         agent_server_store,
+        None,
         None,
     );
 

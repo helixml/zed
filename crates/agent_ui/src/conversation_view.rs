@@ -855,7 +855,6 @@ impl ConversationView {
         workspace: WeakEntity<Workspace>,
         project: Entity<Project>,
         thread_store: Option<Entity<ThreadStore>>,
-        prompt_store: Option<Entity<PromptStore>>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
@@ -922,7 +921,6 @@ impl ConversationView {
                 workspace.clone(),
                 project.downgrade(),
                 thread_store.clone(),
-                prompt_store.clone(),
                 session_capabilities.clone(),
                 agent_id.clone(),
             )
@@ -1015,12 +1013,9 @@ impl ConversationView {
         } else {
             config_options_view = None;
             model_selector = connection.model_selector(&session_id).map(|selector| {
-                let fs = project.read(cx).fs().clone();
                 cx.new(|cx| {
                     ModelSelectorPopover::new(
                         selector,
-                        agent.clone(),
-                        fs,
                         PopoverMenuHandle::default(),
                         cx.focus_handle(),
                         window,
@@ -1066,7 +1061,6 @@ impl ConversationView {
                 project.downgrade(),
                 code_span_resolver.clone(),
                 thread_store.clone(),
-                prompt_store.clone(),
                 None, // initial_content
                 thread_subscriptions,
                 window,
@@ -1094,7 +1088,6 @@ impl ConversationView {
             workspace,
             project,
             thread_store,
-            prompt_store,
             thread_id: root_thread_id,
             root_session_id: Some(id.clone()),
             server_state: ServerState::Connected(ConnectedServerState {
@@ -1108,6 +1101,7 @@ impl ConversationView {
             notifications: Vec::new(),
             notification_subscriptions: HashMap::default(),
             auth_task: None,
+            loading_status: None,
             _subscriptions: subscriptions,
             focus_handle: cx.focus_handle(),
             last_theme_id: Some(cx.theme().id.clone()),

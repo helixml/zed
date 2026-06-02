@@ -1544,7 +1544,6 @@ impl AgentPanel {
                                 this.workspace.clone(),
                                 this.project.clone(),
                                 Some(this.thread_store.clone()),
-                                this.prompt_store.clone(),
                                 window,
                                 cx,
                             )
@@ -4581,7 +4580,6 @@ impl AgentPanel {
                 let workspace = self.workspace.clone();
                 let project = self.project.clone();
                 let thread_store = self.thread_store.clone();
-                let prompt_store = self.prompt_store.clone();
                 let conversation_view = cx.new(|cx| {
                     ConversationView::from_existing_thread(
                         live,
@@ -4591,7 +4589,6 @@ impl AgentPanel {
                         workspace,
                         project,
                         Some(thread_store),
-                        prompt_store,
                         window,
                         cx,
                     )
