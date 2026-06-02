@@ -55,6 +55,12 @@ crates/docs_preprocessor/actions.json
 # Local documentation audit files
 /december-2025-releases.md
 /docs/december-2025-documentation-gaps.md
+<<<<<<< HEAD
 /target-ubuntu22
 /target-ubuntu25
 crates/external_websocket_sync/e2e-test/helix-ws-test-server/zed-ws-test-server
+=======
+
+# NixOS integration test state
+.nixos-test-history
+>>>>>>> upstream/main

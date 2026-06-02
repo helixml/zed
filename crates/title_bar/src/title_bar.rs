@@ -52,7 +52,8 @@ use ui::{
 use update_version::UpdateVersion;
 use util::ResultExt;
 use workspace::{
-    MultiWorkspace, ToggleWorktreeSecurity, Workspace, notifications::NotifyResultExt,
+    MultiWorkspace, ToggleWorktreeSecurity, Workspace,
+    notifications::{NotifyResultExt, NotifyTaskExt as _},
 };
 
 use zed_actions::OpenRemote;
@@ -184,7 +185,7 @@ impl Render for TitleBar {
 
         let show_menus = show_menus(cx);
 
-        let mut children = <ArrayVec<_, 4>>::new();
+        let mut children = <ArrayVec<_, 5>>::new();
 
         let mut project_name = None;
         let mut repository = None;
@@ -460,6 +461,8 @@ impl TitleBar {
             titlebar
         });
 
+        let banner = None;
+
         let mut this = Self {
             platform_titlebar,
             application_menu,
@@ -469,7 +472,7 @@ impl TitleBar {
             user_store,
             client,
             _subscriptions: subscriptions,
-            banner: None,
+            banner,
             update_version,
             screen_share_popover_handle: PopoverMenuHandle::default(),
             _diagnostics_subscription: None,
@@ -636,13 +639,8 @@ impl TitleBar {
             return None;
         }
 
-        let has_restricted_worktrees = TrustedWorktrees::try_get_global(cx)
-            .map(|trusted_worktrees| {
-                trusted_worktrees
-                    .read(cx)
-                    .has_restricted_worktrees(&self.project.read(cx).worktree_store(), cx)
-            })
-            .unwrap_or(false);
+        let has_restricted_worktrees =
+            TrustedWorktrees::has_restricted_worktrees(&self.project.read(cx).worktree_store(), cx);
         if !has_restricted_worktrees {
             return None;
         }
@@ -1311,6 +1309,7 @@ impl TitleBar {
         let show_update_button = self.update_version.read(cx).show_update_in_menu_bar();
 
         let user_store = self.user_store.clone();
+        let workspace = self.workspace.clone();
         let user_store_read = user_store.read(cx);
         let user = user_store_read.current_user();
 
@@ -1377,6 +1376,7 @@ impl TitleBar {
                 let current_organization = current_organization.clone();
                 let organizations = organizations.clone();
                 let user_store = user_store.clone();
+                let workspace = workspace.clone();
 
                 let ai_enabled = !project::DisableAiSettings::get_global(cx).disable_ai;
                 let current_layout = AgentSettings::get_layout(cx);
@@ -1468,11 +1468,13 @@ impl TitleBar {
                                 {
                                     let user_store = user_store.clone();
                                     let organization = organization.clone();
-                                    move |_window, cx| {
-                                        user_store.update(cx, |user_store, cx| {
+                                    let workspace = workspace.clone();
+                                    move |window, cx| {
+                                        let task = user_store.update(cx, |user_store, cx| {
                                             user_store
-                                                .set_current_organization(organization.clone(), cx);
+                                                .set_current_organization(organization.clone(), cx)
                                         });
+                                        task.detach_and_notify_err(workspace.clone(), window, cx);
                                     }
                                 },
                             );

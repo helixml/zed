@@ -214,8 +214,7 @@ These files contain Helix-specific changes that must be preserved during rebases
 - **`show_onboarding`**: Setting to control onboarding visibility
 - **`auto_open_panel`**: Setting to control agent panel auto-open
 
-### `crates/context_server/src/client.rs`
-- **`DEFAULT_REQUEST_TIMEOUT`**: Bumped from upstream's 60s to 180s for spec-task cold-start (see Critical Fix #10)
+### ~~`crates/context_server/src/client.rs`~~ (no longer modified — see retired Critical Fix #10)
 
 ### `.dockerignore`
 - Simplified for Helix build context
@@ -376,25 +375,11 @@ if !stopped_emitted_for_task.load(std::sync::atomic::Ordering::Acquire) {
 
 **Symptom:** After an interrupt, all subsequent messages return the response for the _previous_ message. The session appears permanently "off by one."
 
-### 10. Bump Context-Server Request Timeout to 180s
+### 10. ~~Bump Context-Server Request Timeout to 180s~~ (RETIRED 2026-05-21 — commit `e60a1b2789`)
 
-**File:** `crates/context_server/src/client.rs` — `DEFAULT_REQUEST_TIMEOUT` constant
+**Status:** **Reverted.** The 180s bump was based on a wrong diagnosis (npm cold-start headroom). The real failure was `npx -y <pkg>` finding `<pkg>` already on PATH — npm shells out and exits, breaking stdio for the MCP client tracking the spawned PID. The MCP child died in <1s in that case; 180s just delayed the failure surfacing by ~3 minutes and made it harder to notice. With MCP configs fixed to invoke installed binaries directly (the correct pattern already used by chrome-devtools and the frontend presets), upstream's 60s is ample headroom for genuine cold-starts and lets real failures surface fast.
 
-**Bug:** Upstream's 60s timeout on the JSON-RPC `initialize` request to a context_server is too short for our spec-task container cold-start scenario. When Zed boots, several stdio MCPs (`chrome-devtools`, `github`) spawn concurrently via `npx <pkg>@latest`, which triggers an npm download on first run. At the same time the local Helix API container (serving HTTP MCPs like `helixos`) is still warming up and the host is CPU-contended by Zed itself, settings-sync-daemon, language servers, etc. All three context_servers routinely exceed 60s and fire `Context server request timeout` simultaneously. The store marks them failed and their tools never appear — most visibly, `mcp__chrome-devtools__*` is missing for the entire session, so the model reports `Error: No such tool available: mcp__chrome-devtools__navigate_page`. Toggling the server off/on in settings appears to fix it because by then npm has cached the package, but that's a manual workaround the user shouldn't need.
-
-**Fix:** Bump the constant to 180s:
-
-```rust
-const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(180);
-```
-
-**Why 180s:** Cold-start `npx chrome-devtools-mcp@latest` is typically 60–90s on a contended container. 180s gives ~2x headroom without making genuine failures noticeably slower to surface in the UI.
-
-**Why not per-server `request_timeout` in settings:** Upstream's `ContextServerSettings` has no `request_timeout` field — this would be a much larger change touching settings schema, project store, and `ContextServer::new_with_timeout`. The constant bump is one line.
-
-**Symptom:** After starting a fresh spec-task, model reports `<tool_use_error>Error: No such tool available: mcp__chrome-devtools__*</tool_use_error>` for any chrome-devtools call. `Zed.log` shows three `cancelled csp request task for "initialize" id 0 which took over 60s` errors all firing at the same instant, exactly 60s after Zed startup.
-
-**History:** Triggered after the AgentConnection dedup fix landed (PR #46). Once the duplicate-spawn race was fixed and only one ACP wrapper started per session, the surviving wrapper's MCP set still depended on which context_servers had completed their `initialize` handshake before the timeout. Cold-start container = all of them failed.
+**Action for future merges:** none — the fix has been retired. Do NOT re-apply the 180s bump. `DEFAULT_REQUEST_TIMEOUT` should match upstream.
 
 ### 11. Entity-Identity Guard at the Top of `load_agent_thread`
 
@@ -675,6 +660,8 @@ Helix-specific commits on main (oldest first):
 | `bf544922aa` | Merge upstream Zed (`1da60a8518..8bdd78e023`, 127 commits, 3 days) into 001996 — 1 conflict resolved (`acp_thread.rs` cancel/Stopped path; folded upstream PR #55562 reorder with Helix Critical Fixes #6/#8/#9 dropped-tx Stopped emission) |
 | `1828cea13c` | Fix: handle `BaseView::Terminal` in Helix UI state query (upstream added the variant; the cfg-gated match in `agent_panel.rs:1270` was non-exhaustive — caught by build, not by silent-drift sweep) |
 | `a7ad11ec00` | Fix Phase 13 race: cancel handler now probes `thread.status()` and sends `turn_cancelled` BEFORE calling `cancel()` so Helix marks the interaction as Interrupted before message_completed (triggered by the synchronously-emitted Stopped) arrives and races it into Completed — discovered by E2E Phase 13 failing on the first run |
+| `6b39672e5f` | Merge upstream Zed (`8bdd78e023..1399540715`, 261 commits, 10 days) into 002029 — 6 conflicts resolved: workflows (theirs), title_bar Cargo.toml (kept Helix external_websocket_sync dep, dropped feature_flags), title_bar.rs `render_restricted_mode` (kept Helix early-return + adopted upstream's free-function API), agent_server_store.rs reregister_agents destructure (dropped `extension_agents`, kept `_subscriptions`/`registry_subscribed`, added `..`), agent_panel.rs load_panel restoration (kept Helix WS-wait + send_agent_ready, adopted upstream thread_to_restore + load_agent_thread + restore_new_draft), agent_panel.rs load_agent_thread (adapted Critical Fix #11 entity-identity guard to upstream's thread_id signature via ThreadMetadataStore session_id lookup), agent_panel.rs ensure_thread_initialized (Helix Fix 1b early-return as FIRST statement, before upstream 589dc95c87's new terminal-spawn branches) |
+| `edbc05cf99` | Build fixes for upstream signature drift: agent_servers/acp.rs PR #50 chain log-labels now use `directories.cwd` (upstream c3951af24f removed local `cwd` binding); agent_ui/conversation_view.rs from_existing_thread adapted to new ThreadView::new signature (root_thread_id first arg), 3-arg SessionCapabilities::new, and new ConversationView fields (draft_prompt_persist_task, last_theme_id); agent_ui/agent_panel.rs + zed/main.rs added ContextServerStatus::ClientSecretRequired arm |
 
 ## Merge 001996 (2026-05-11)
 
@@ -760,3 +747,146 @@ grep -n "AcpThreadEvent::Stopped\b\([^(]\|$\)" crates/acp_thread/src/acp_thread.
 
 (Pattern: any `AcpThreadEvent::Stopped` not followed by `(`.)
 
+## Merge 002029-extension round 2 (2026-06-02)
+
+A third upstream merge stacked onto the 002029 feature branch (still open PR). 242 upstream commits absorbed; four manual conflicts (all trivial "both sides added a struct field/var" merges); three signature-drift repairs.
+
+**Divergence at start (of round 2 extension)**:
+- Branch HEAD: `fb97e2cf95` (002029-extension first round)
+- Upstream HEAD: `9d50bab893` ("git_ui: Add total diff stats to git panel (#58018)")
+- Upstream commits to merge: **242** (8 days since `13e7c11768`)
+
+**Manual conflicts** (merge commit `1ebfaf5a39`):
+
+- `crates/zed/src/main.rs`: upstream extracted `build_application()` as a helper that always passes `false` for the platform-headless flag. Helix needs `args.headless` propagated so the `--headless` CLI flag selects the headless gpui_platform. **Resolution**: take `headless: bool` as a parameter on `build_application()`, and at both call sites pass either `args.headless` (the main entry) or `false` (the early-error path in `files_not_created_on_launch`).
+- `crates/agent_servers/src/acp.rs` (3 hunks): each is a "both sides added a struct field" merge — Helix's `session_creation_chain` field/initializer (PR #50) coexists with upstream's new `_settings_subscription`. Keep both, both initializers.
+- `crates/agent_settings/src/agent_settings.rs` and `crates/settings_content/src/agent.rs`: Helix's `show_onboarding` / `auto_open_panel` fields coexist with upstream's new `sandbox_permissions` field. Keep all.
+
+**Pre-existing Breakage Repaired** — three signature-drift repairs in commit `dcd8622f99`:
+
+- `agent_servers::AgentServerDelegate::new` now takes a third arg, `loading_status_tx: Option<watch::Sender<Option<String>>>`. Three Helix call sites in `external_websocket_sync/src/thread_service.rs` (lines ~1438, ~1795, ~2013) all pass `None` — these are internal session-creation paths with no UI status display.
+- `agent_ui/src/conversation_view.rs::from_existing_thread` (Helix-only constructor): upstream removed `prompt_store` entirely from `ConversationView`, `AgentPanel`, `EntryViewState::new`, `ModelSelectorPopover::new`, and `ThreadView::new` (now 24 args instead of 25). Mirror upstream by dropping `prompt_store` from `from_existing_thread`'s signature, dropping it from the three constructor calls, dropping the `prompt_store,` field from the trailing `Self { ... }`. Also add `loading_status: None` to the `Self` block (upstream `new()` now has it; we missed it earlier).
+- `agent_ui/src/agent_panel.rs` (2 callers of `from_existing_thread`): drop `this.prompt_store.clone()` / `let prompt_store = self.prompt_store.clone();` — these were the only readers of `AgentPanel::prompt_store` (already removed by upstream).
+
+**Ancillary upstream notes (no Helix action required)**:
+
+- `c413552859` "Update agent-client-protocol sdk to 0.13.1" — internal acp wire-protocol bump; the new `additional_directories` capability we already plumb through `SessionDirectories` from round 1 is unchanged.
+- `4d32f41ef6` "Remove audio denoiser crate" — workspace member removed cleanly; nothing in the Helix surface referenced it.
+- `201ae99dce` "Implement compaction (experimental)" — adds compaction code in upstream-only paths; cfg-gated under experimental flags, doesn't touch Helix surface.
+
+**Validation**:
+- `./stack build-zed dev`: green (after the three repairs).
+- E2E `zed-agent`: **PASSED** (all 17 phases).
+- E2E `claude`: **PASSED** (all 17 phases, including Phase 17 live-Claude-process-count gate that proves PR #56 Fix 1b draft-suppression survived).
+- Store validation: PASSED (28 interactions, 0 interrupted/cancelled).
+
+## Merge 002029-extension (2026-05-25)
+
+A second upstream merge stacked onto the 002029 feature branch before that PR landed (the original 002029 PR was still open; reviewer asked to roll a fresh upstream into the same branch rather than spin up a new task).
+
+**Divergence at start (of extension)**:
+- Branch HEAD: `8692f073b2` (002029 first-round merge, post `e60a1b2789` re-merge)
+- Upstream HEAD: `13e7c11768` ("ep: Fix bugs in the `split-commit` command (#57604)")
+- Upstream commits to merge: **287** (3 days since 002029's `1399540715`)
+
+**Merge result**: `git merge upstream/main` resolved entirely via the `ort` strategy — **no manual conflicts**. The Helix surface in `agent_panel.rs`, `conversation_view.rs`, `agent_servers/acp.rs`, `connection.rs`, `agent.rs`, `workspace.rs` all auto-merged cleanly. Critical Fix #11, Fix 1b, PR #50 `session_creation_chain`, the title_bar restricted-mode override, and the extensions_ui Helix bypass markers all survived intact (verified by grep).
+
+**Pre-existing Breakage Repaired** — one signature drift, applied in `f226fe7604`:
+
+- `crates/agent_ui/src/conversation_view.rs::from_existing_thread`: upstream `cfd0461b5a` ("Prefix `read_file` tool output with line numbers") added a `code_span_resolver: AgentCodeSpanResolver` field to `ConversationView` and a new positional argument to `ThreadView::new` (now 25 args). Mirror what upstream's `new()` does at line 725: build the resolver via `AgentCodeSpanResolver::new(&project.downgrade(), cx)`, pass it as a `.clone()` between `project.downgrade()` and `thread_store.clone()` in the `ThreadView::new` call, and add `code_span_resolver` to the trailing `Self { ... }`. The upstream `new()` also wires a `project::Event::Worktree*` subscription that calls `resolver.clear_cache()` — Helix's `from_existing_thread` does not currently bind a `Conversation`-level project subscription, so we don't add one (the resolver cache will simply persist for the lifetime of the headless wrapper; acceptable for the WebSocket-sync path where worktrees are not user-mutated mid-session).
+
+**Ancillary upstream notes (no Helix action required)**:
+
+- `91531fad6d` "ACP logout" — adds `supports_logout`/`logout` defaults to the `AgentConnection` trait. Helix's UI-state query loops in `agent_panel.rs` and `zed/main.rs` don't enumerate logout, so no exhaustiveness break.
+- `dee596fa96` "ACP additional directories" — extends the `additional_directories` capability already wired through `SessionDirectories`. Composes with PR #50 with no chain-wrapper changes needed.
+- `6753eb1736` "Update skill settings immediately after changes" — touches `agent.rs` but only inside upstream-only paths; no Helix surface affected.
+- `cfd0461b5a`, `f78f6da255` — `conversation_view.rs` and `thread_view.rs` field additions; the `code_span_resolver` repair above covers both.
+
+**Validation**:
+- `./stack build-zed dev`: green (one signature-drift fix).
+- E2E `zed-agent`: **PASSED** (all 17 phases).
+- E2E `claude`: **PASSED** (all 17 phases, including Phase 17 live-Claude-process-count gate).
+- Store validation: PASSED (28 interactions, 0 interrupted/cancelled).
+
+## Merge 002029 (2026-05-21)
+
+**Divergence at start**:
+- Fork HEAD: `fd26c1a113` (Dockerfile.ci helix-org fix)
+- Upstream HEAD: `1399540715` ("settings_ui: Display scope in the breadcrumb (#57437)")
+- Upstream commits to merge: **261** (10 days of activity since 001996's `8bdd78e023`)
+- Helix-only commits since 001996: 5 (PRs #50 `session_creation_chain`, #55 streaming-reveal `EntryUpdated`, #56 deferred-emit + Fix 1b draft suppression, #57 Phase 16 counter fix, direct `fd26c1a113` Dockerfile.ci)
+
+### Conflicts and Resolutions
+
+(Updated incrementally as each conflict is resolved.)
+
+#### 1. `.github/workflows/compare_perf.yml` and `release_nightly.yml`
+**Resolution**: `git checkout --theirs` for both — Helix doesn't use Zed's CI.
+
+#### 2. `crates/title_bar/Cargo.toml`
+**Upstream change**: removed `feature_flags.workspace = true` (Skills feature flag was the only consumer, removed by `2e70059cd9`).
+**HEAD change**: Helix added `external_websocket_sync = { workspace = true, optional = true }` (cfg-gated WS connection-status icon).
+**Resolution**: kept Helix `external_websocket_sync` line; dropped `feature_flags.workspace = true` (no remaining consumer in `title_bar.rs`).
+**Risk**: none.
+
+#### 3. `crates/title_bar/src/title_bar.rs` — `render_restricted_mode`
+**Upstream change**: `TrustedWorktrees::has_restricted_worktrees` became a free function taking the worktree_store directly (no `try_get_global`, no `read(cx)`).
+**HEAD change**: Helix added a cfg-gated `if cfg!(feature = "external_websocket_sync") { return None; }` at the top — Helix auto-trusts every worktree so the pill is meaningless.
+**Resolution**: kept Helix's early-return; adopted upstream's new API for the body underneath.
+**Risk**: none.
+
+#### 4. `crates/project/src/agent_server_store.rs` — `reregister_agents` destructure
+**Upstream change**: `c84c22dab5` "Deprecate ACP extensions" removed the `extension_agents` field from `AgentServerStoreState::Local`; switched to `..` in the destructure pattern.
+**HEAD change**: Helix HEAD destructured three named fields (`extension_agents`, `_subscriptions`, `registry_subscribed`).
+**Resolution**: dropped `extension_agents` (no longer a field anywhere); kept `_subscriptions` and `registry_subscribed` (still referenced in the body below); added trailing `..` for forward-compat.
+**Risk**: none — compile-driven; if any remaining body code references the removed field it will fail to build.
+
+#### 5. `crates/agent_ui/src/agent_panel.rs` — `load_panel` thread-restoration logic
+**Upstream change**: PR `589dc95c87` "Restore last active agent panel entry" (#57150) rewrote thread restoration: introduces `thread_to_restore` (with `has_open_project && terminal_to_restore.is_none()` guard, primary `thread_id` lookup with `session_id` fallback, archived filtering, await on the metadata-store reload task); calls `panel.load_agent_thread(...)` with `thread_id` instead of `session_id`; adds `panel.restore_new_draft(new_draft_thread_id, ...)` for restoring draft UI state.
+**HEAD change**: Helix HEAD had its own restoration path: WebSocket-wait at start; session-id-based `is_restorable` check; draft-prompt resurrection via `create_agent_thread(..., initial_content)` with `panel.draft_thread = Some(...)` and conditional `set_base_view`; `send_agent_ready` in the no-restore branch to unblock the server queue.
+**Resolution**: kept Helix's `wait_for_websocket_connected` at the top (must precede ANY thread restoration so the agent_ready→open_thread handshake can complete). Adopted upstream's `thread_to_restore` (strictly more robust — terminal/thread exclusivity, primary+fallback lookup, archived filter). Adopted upstream's `panel.load_agent_thread(thread_id, ...)` call site. Adopted upstream's `restore_new_draft` for `new_draft_thread_id` (subsumes Helix's `draft_prompt`/`was_draft_active` logic; under `external_websocket_sync` the draft path is suppressed by Fix 1b anyway). **Kept Helix's `send_agent_ready` in the new `else` branch (when neither terminal nor thread restored) — critical: without it, the WS server waits 60s for agent_ready and the user perceives a stuck session.**
+**Risk**: medium. The Helix WS-wait-then-restore flow is functionally preserved but now goes through upstream's new helper. Validation: E2E Phase 1 (basic creation), Phase 7 (open_thread), Phase 12 (reconnect) all exercise the panel-load + restore path.
+
+#### 6. `crates/agent_ui/src/agent_panel.rs` — `load_agent_thread` entity-identity guard (Critical Fix #11)
+**Upstream change**: PR `589dc95c87` changed `load_agent_thread` to take `thread_id: ThreadId` (not `session_id: SessionId`); rewrote the dedup to compare `conversation_view.read(cx).thread_id == thread_id`.
+**HEAD change**: Helix Critical Fix #11 had a `#[cfg(feature = "external_websocket_sync")]` entity-identity guard at the top that called `external_websocket_sync::get_thread(&session_id.to_string())` — but `session_id` is no longer a parameter.
+**Resolution**: prepended a `ThreadMetadataStore::try_global(cx).read(cx).entry(thread_id).and_then(|e| e.session_id.clone())` lookup. If the thread has an ACP session_id (i.e. it's been registered with the server), do the Helix entity-identity dance; otherwise fall through to upstream's thread_id-based dedup. Drafts that don't yet have a session_id naturally skip the guard.
+**Risk**: medium. The guard's behavior is preserved for the bug it was designed to catch (sidebar split-brain on click of the currently-open thread). Validation: regression-test by clicking the active thread in the sidebar after a fresh container start.
+
+#### 7. `crates/agent_ui/src/agent_panel.rs` — `ensure_thread_initialized` (Helix Fix 1b)
+**Upstream change**: PR `589dc95c87` rewrote `ensure_thread_initialized` body — was a single `self.activate_draft(...)` call, now branches on `self.pending_terminal_spawn`, `self.should_create_terminal_for_new_entry(cx)` (deferred terminal spawn via `cx.defer_in`), else falls through to `activate_draft`. Also added `create_initial_terminal` and `spawn_initial_terminal` helpers.
+**HEAD change**: Helix PR #56 Fix 1b had a `#[cfg(feature = "external_websocket_sync")] { return; }` guard inside the `BaseView::Uninitialized` branch to prevent speculative draft Claude spawn.
+**Resolution**: kept the Helix cfg-gated `return;` as the **first statement** inside `if matches!(BaseView::Uninitialized)`, BEFORE the new terminal-spawn branches. This is critical — upstream's new terminal-spawn path also calls `connection.new_session()` indirectly via `spawn_terminal`, which would re-introduce the duplicate-Claude bug Fix 1b was created to prevent. Adopted upstream's terminal-spawn branches and new helper functions verbatim for the non-WS-sync build. Also adopted upstream's signature change for `activate_draft` (string `"agent_panel"` → enum `AgentThreadSource::AgentPanel`).
+**Risk**: HIGH. This is the regression we explicitly planned for. Validation: **E2E Phase 17 (live Claude process count == real thread count) is the hard gate**. If Phase 17 fails for either `zed-agent` or `claude`, this resolution lost the suppression.
+
+### Pre-existing Breakage Repaired (002029)
+
+#### `crates/agent_servers/src/acp.rs` — `acquire_session_creation_slot` debug-label `cwd` binding
+**Upstream change**: PR `c3951af24f` "Support additional session directories" removed the local `cwd: PathBuf` binding from `open_or_create_session` and `new_session` (now uses `directories: SessionDirectories`).
+**HEAD change**: PR #50 `acquire_session_creation_slot` log-label format strings reference the removed `cwd` binding.
+**Resolution**: changed both format strings to use `directories.cwd.display()` instead.
+**Risk**: none — debug labels only.
+
+#### `crates/agent_ui/src/conversation_view.rs` — `from_existing_thread` signature drift
+**Upstream change**: PR `589dc95c87` "Restore last active agent panel entry" added `root_thread_id: ThreadId` as the first parameter of `ThreadView::new`; PR added `draft_prompt_persist_task: Option<Task<()>>` and `last_theme_id: Option<String>` to `ConversationView`. Independently, `SessionCapabilities::new` now takes three arguments (added `available_skills: Vec<AvailableSkill>`) — from the agent-skills work.
+**HEAD change**: Helix `from_existing_thread` constructor was bound to the older 2-arg `SessionCapabilities::new`, the 23-arg `ThreadView::new`, and didn't initialise the new struct fields.
+**Resolution**: added `vec![]` for `available_skills`; hoisted `let root_thread_id = ThreadId::new();` before the `ThreadView::new` call and passed it as the first arg; set `thread_id: root_thread_id` and added `last_theme_id: Some(cx.theme().id.clone())`, `draft_prompt_persist_task: None` to the `Self { ... }` literal.
+**Risk**: low — UI-only fields with safe defaults. `last_theme_id` may force a redundant first re-render on a theme reload, but that's an existing pattern across the codebase.
+
+#### `crates/agent_ui/src/agent_panel.rs` and `crates/zed/src/main.rs` — `ContextServerStatus` exhaustive match
+**Upstream change**: upstream MCP work added `ContextServerStatus::ClientSecretRequired { .. }` variant.
+**HEAD change**: two Helix UI-state-query loops (agent_panel.rs UI state callback; main.rs headless responder) matched the prior 6 variants exhaustively, no wildcard.
+**Resolution**: added a `ClientSecretRequired { .. } => "client_secret_required"` arm to both. Reports the active state as a known short string (consistent with the other variants).
+**Risk**: none. Helix server is forward-compatible — it doesn't enumerate the strings, just records them.
+**Lesson for future merges**: same lesson as 001996's `BaseView::Terminal` repair — when upstream adds a variant to an enum the Helix code matches exhaustively, the silent-drift sweep doesn't catch it. Build-driven discovery is the only safety net.
+
+### Notes on other upstream changes that did NOT require Helix action (002029)
+
+#### `c84c22dab5` "Deprecate ACP extensions" — Helix bypass markers retained
+The 80-line deletion in `extensions_ui.rs` reshaped the surrounding code but did NOT remove the lines Helix's `// HELIX: External agent ...` comments guard. Markers still present at lines 221, 243, 1513 — keep them as documentation of Helix's intent (no agent keywords / no upsells visible to corporate-LLM users).
+
+#### `f2df3f9e18` "ACP logout" — no Helix override needed
+Upstream's default impls (`supports_logout() -> false`, `logout() -> Err("Logout is not supported")`) are correct for Helix mode. No Helix-mode `AcpConnection` impl overrides them. UI gates the logout button on `supports_logout(cx)` so nothing surfaces in Helix builds. Confirm visually in the next user-facing change to the agent panel.
+
+#### `supports_delete(&self)` → `supports_delete(&self, &App)` signature change (`23231879cd`)
+Trait signature migration applied at 4 sites: trait default impl (`acp_thread/src/connection.rs:335`), upstream impl on NativeAgentConnection (`agent/src/agent.rs:2520`), upstream impl on AcpConnection (`agent_servers/src/acp.rs:558`), Helix UI wrapper on AcpThreadHistory (`agent_ui/src/acp/thread_history.rs:362`). Compile-driven; all call sites updated in a single sweep.
