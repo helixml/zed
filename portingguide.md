@@ -747,6 +747,39 @@ grep -n "AcpThreadEvent::Stopped\b\([^(]\|$\)" crates/acp_thread/src/acp_thread.
 
 (Pattern: any `AcpThreadEvent::Stopped` not followed by `(`.)
 
+## Merge 002029-extension round 2 (2026-06-02)
+
+A third upstream merge stacked onto the 002029 feature branch (still open PR). 242 upstream commits absorbed; four manual conflicts (all trivial "both sides added a struct field/var" merges); three signature-drift repairs.
+
+**Divergence at start (of round 2 extension)**:
+- Branch HEAD: `fb97e2cf95` (002029-extension first round)
+- Upstream HEAD: `9d50bab893` ("git_ui: Add total diff stats to git panel (#58018)")
+- Upstream commits to merge: **242** (8 days since `13e7c11768`)
+
+**Manual conflicts** (merge commit `1ebfaf5a39`):
+
+- `crates/zed/src/main.rs`: upstream extracted `build_application()` as a helper that always passes `false` for the platform-headless flag. Helix needs `args.headless` propagated so the `--headless` CLI flag selects the headless gpui_platform. **Resolution**: take `headless: bool` as a parameter on `build_application()`, and at both call sites pass either `args.headless` (the main entry) or `false` (the early-error path in `files_not_created_on_launch`).
+- `crates/agent_servers/src/acp.rs` (3 hunks): each is a "both sides added a struct field" merge — Helix's `session_creation_chain` field/initializer (PR #50) coexists with upstream's new `_settings_subscription`. Keep both, both initializers.
+- `crates/agent_settings/src/agent_settings.rs` and `crates/settings_content/src/agent.rs`: Helix's `show_onboarding` / `auto_open_panel` fields coexist with upstream's new `sandbox_permissions` field. Keep all.
+
+**Pre-existing Breakage Repaired** — three signature-drift repairs in commit `dcd8622f99`:
+
+- `agent_servers::AgentServerDelegate::new` now takes a third arg, `loading_status_tx: Option<watch::Sender<Option<String>>>`. Three Helix call sites in `external_websocket_sync/src/thread_service.rs` (lines ~1438, ~1795, ~2013) all pass `None` — these are internal session-creation paths with no UI status display.
+- `agent_ui/src/conversation_view.rs::from_existing_thread` (Helix-only constructor): upstream removed `prompt_store` entirely from `ConversationView`, `AgentPanel`, `EntryViewState::new`, `ModelSelectorPopover::new`, and `ThreadView::new` (now 24 args instead of 25). Mirror upstream by dropping `prompt_store` from `from_existing_thread`'s signature, dropping it from the three constructor calls, dropping the `prompt_store,` field from the trailing `Self { ... }`. Also add `loading_status: None` to the `Self` block (upstream `new()` now has it; we missed it earlier).
+- `agent_ui/src/agent_panel.rs` (2 callers of `from_existing_thread`): drop `this.prompt_store.clone()` / `let prompt_store = self.prompt_store.clone();` — these were the only readers of `AgentPanel::prompt_store` (already removed by upstream).
+
+**Ancillary upstream notes (no Helix action required)**:
+
+- `c413552859` "Update agent-client-protocol sdk to 0.13.1" — internal acp wire-protocol bump; the new `additional_directories` capability we already plumb through `SessionDirectories` from round 1 is unchanged.
+- `4d32f41ef6` "Remove audio denoiser crate" — workspace member removed cleanly; nothing in the Helix surface referenced it.
+- `201ae99dce` "Implement compaction (experimental)" — adds compaction code in upstream-only paths; cfg-gated under experimental flags, doesn't touch Helix surface.
+
+**Validation**:
+- `./stack build-zed dev`: green (after the three repairs).
+- E2E `zed-agent`: **PASSED** (all 17 phases).
+- E2E `claude`: **PASSED** (all 17 phases, including Phase 17 live-Claude-process-count gate that proves PR #56 Fix 1b draft-suppression survived).
+- Store validation: PASSED (28 interactions, 0 interrupted/cancelled).
+
 ## Merge 002029-extension (2026-05-25)
 
 A second upstream merge stacked onto the 002029 feature branch before that PR landed (the original 002029 PR was still open; reviewer asked to roll a fresh upstream into the same branch rather than spin up a new task).
