@@ -16,7 +16,9 @@ use gpui::{
 };
 use itertools::Itertools;
 use language::language_settings::FormatOnSave;
-use language::{Anchor, Buffer, BufferSnapshot, LanguageRegistry, Point, ToPoint, text_diff};
+use language::{
+    Anchor, Buffer, BufferEditSource, BufferSnapshot, LanguageRegistry, Point, ToPoint, text_diff,
+};
 use markdown::{Markdown, MarkdownOptions};
 pub use mention::*;
 use project::lsp_store::{FormatTrigger, LspFormatTarget};
@@ -74,6 +76,35 @@ pub fn meta_with_tool_name(tool_name: &str) -> acp::Meta {
 
 /// Key used in ACP ToolCall meta to store the session id and message indexes
 pub const SUBAGENT_SESSION_INFO_META_KEY: &str = "subagent_session_info";
+
+pub const SANDBOX_AUTHORIZATION_META_KEY: &str = "sandbox_authorization";
+
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
+pub struct SandboxAuthorizationDetails {
+    #[serde(default)]
+    pub network: bool,
+    #[serde(default)]
+    pub allow_fs_write_all: bool,
+    #[serde(default)]
+    pub unsandboxed: bool,
+    #[serde(default)]
+    pub write_paths: Vec<PathBuf>,
+}
+
+pub fn meta_with_sandbox_authorization(details: SandboxAuthorizationDetails) -> acp::Meta {
+    acp::Meta::from_iter([(
+        SANDBOX_AUTHORIZATION_META_KEY.into(),
+        serde_json::to_value(details).unwrap_or_default(),
+    )])
+}
+
+pub fn sandbox_authorization_details_from_meta(
+    meta: &Option<acp::Meta>,
+) -> Option<SandboxAuthorizationDetails> {
+    meta.as_ref()
+        .and_then(|m| m.get(SANDBOX_AUTHORIZATION_META_KEY))
+        .and_then(|v| serde_json::from_value(v.clone()).ok())
+}
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct SubagentSessionInfo {
@@ -189,6 +220,7 @@ pub enum AgentThreadEntry {
     AssistantMessage(AssistantMessage),
     ToolCall(ToolCall),
     CompletedPlan(Vec<PlanEntry>),
+    ContextCompaction,
 }
 
 impl AgentThreadEntry {
@@ -198,6 +230,7 @@ impl AgentThreadEntry {
             Self::AssistantMessage(message) => message.indented,
             Self::ToolCall(_) => false,
             Self::CompletedPlan(_) => false,
+            Self::ContextCompaction => false,
         }
     }
 
@@ -214,6 +247,7 @@ impl AgentThreadEntry {
                 }
                 md
             }
+            Self::ContextCompaction => "--- Context Compacted ---\n\n".to_string(),
         }
     }
 
@@ -272,6 +306,7 @@ pub struct ToolCall {
     pub raw_output: Option<serde_json::Value>,
     pub tool_name: Option<SharedString>,
     pub subagent_session_info: Option<SubagentSessionInfo>,
+    pub sandbox_authorization_details: Option<SandboxAuthorizationDetails>,
 }
 
 impl ToolCall {
@@ -313,6 +348,8 @@ impl ToolCall {
         let tool_name = tool_name_from_meta(&tool_call.meta);
 
         let subagent_session_info = subagent_session_info_from_meta(&tool_call.meta);
+        let sandbox_authorization_details =
+            sandbox_authorization_details_from_meta(&tool_call.meta);
 
         let label = if tool_call.kind == acp::ToolKind::Execute {
             cx.new(|cx| Markdown::new_text(title.into(), cx))
@@ -333,6 +370,7 @@ impl ToolCall {
             raw_output: tool_call.raw_output,
             tool_name,
             subagent_session_info,
+            sandbox_authorization_details,
         };
         Ok(result)
     }
@@ -367,6 +405,10 @@ impl ToolCall {
 
         if let Some(subagent_session_info) = subagent_session_info_from_meta(&meta) {
             self.subagent_session_info = Some(subagent_session_info);
+        }
+        if let Some(sandbox_authorization_details) = sandbox_authorization_details_from_meta(&meta)
+        {
+            self.sandbox_authorization_details = Some(sandbox_authorization_details);
         }
 
         if let Some(title) = title {
@@ -793,6 +835,7 @@ impl ContentBlock {
                     None,
                     MarkdownOptions {
                         render_mermaid_diagrams: true,
+                        render_metadata_blocks: true,
                         ..Default::default()
                     },
                     cx,
@@ -1485,7 +1528,8 @@ impl AcpThread {
                 }) => return true,
                 AgentThreadEntry::ToolCall(_)
                 | AgentThreadEntry::AssistantMessage(_)
-                | AgentThreadEntry::CompletedPlan(_) => {}
+                | AgentThreadEntry::CompletedPlan(_)
+                | AgentThreadEntry::ContextCompaction => {}
             }
         }
         false
@@ -1513,7 +1557,8 @@ impl AcpThread {
                 }
                 AgentThreadEntry::ToolCall(_)
                 | AgentThreadEntry::AssistantMessage(_)
-                | AgentThreadEntry::CompletedPlan(_) => {}
+                | AgentThreadEntry::CompletedPlan(_)
+                | AgentThreadEntry::ContextCompaction => {}
             }
         }
 
@@ -1532,7 +1577,8 @@ impl AcpThread {
                 }
                 AgentThreadEntry::ToolCall(_)
                 | AgentThreadEntry::AssistantMessage(_)
-                | AgentThreadEntry::CompletedPlan(_) => {}
+                | AgentThreadEntry::CompletedPlan(_)
+                | AgentThreadEntry::ContextCompaction => {}
             }
         }
 
@@ -1543,9 +1589,9 @@ impl AcpThread {
         for entry in self.entries.iter().rev() {
             match entry {
                 AgentThreadEntry::UserMessage(..) => return false,
-                AgentThreadEntry::AssistantMessage(..) | AgentThreadEntry::CompletedPlan(..) => {
-                    continue;
-                }
+                AgentThreadEntry::AssistantMessage(..)
+                | AgentThreadEntry::CompletedPlan(..)
+                | AgentThreadEntry::ContextCompaction => continue,
                 AgentThreadEntry::ToolCall(..) => return true,
             }
         }
@@ -1888,6 +1934,10 @@ impl AcpThread {
         cx.emit(AcpThreadEvent::NewEntry);
     }
 
+    pub fn push_context_compaction(&mut self, cx: &mut Context<Self>) {
+        self.push_entry(AgentThreadEntry::ContextCompaction, cx);
+    }
+
     pub fn can_set_title(&mut self, cx: &mut Context<Self>) -> bool {
         self.connection.set_title(&self.session_id, cx).is_some()
     }
@@ -1963,6 +2013,7 @@ impl AcpThread {
                     raw_output: None,
                     tool_name: None,
                     subagent_session_info: None,
+                    sandbox_authorization_details: None,
                 };
                 self.push_entry(AgentThreadEntry::ToolCall(failed_tool_call), cx);
                 return Ok(());
@@ -2975,7 +3026,9 @@ impl AcpThread {
                 });
 
                 let format_on_save = buffer.update(cx, |buffer, cx| {
+                    buffer.start_transaction();
                     buffer.edit(edits, None, cx);
+                    buffer.end_transaction_with_source(BufferEditSource::Agent, cx);
 
                     let settings =
                         language::language_settings::LanguageSettings::for_buffer(buffer, cx);
@@ -3018,6 +3071,7 @@ impl AcpThread {
         extra_env: Vec<acp::EnvVariable>,
         cwd: Option<PathBuf>,
         output_byte_limit: Option<u64>,
+        sandbox_wrap: Option<SandboxWrap>,
         cx: &mut Context<Self>,
     ) -> Task<Result<Entity<Terminal>>> {
         let env = match &cwd {
@@ -3058,6 +3112,8 @@ impl AcpThread {
                     ShellBuilder::new(&Shell::Program(shell), is_windows)
                         .redirect_stdin_to_dev_null()
                         .build(Some(command.clone()), &args);
+                let (task_command, task_args, sandbox_config) =
+                    apply_sandbox_wrap(task_command, task_args, sandbox_wrap)?;
                 let terminal = project
                     .update(cx, |project, cx| {
                         project.create_terminal_task(
@@ -3081,6 +3137,7 @@ impl AcpThread {
                         output_byte_limit.map(|l| l as usize),
                         terminal,
                         language_registry,
+                        sandbox_config,
                         cx,
                     )
                 }))
@@ -3160,6 +3217,9 @@ impl AcpThread {
                 output_byte_limit.map(|l| l as usize),
                 terminal,
                 language_registry,
+                // External terminal providers manage their own sandboxing
+                // (if any). We don't wrap their commands.
+                None,
                 cx,
             )
         });
@@ -3506,8 +3566,7 @@ mod tests {
                 0,
                 cx.background_executor(),
                 PathStyle::local(),
-            )
-            .unwrap();
+            );
             builder.subscribe(cx)
         });
 
@@ -3587,8 +3646,7 @@ mod tests {
                 0,
                 cx.background_executor(),
                 PathStyle::local(),
-            )
-            .unwrap();
+            );
             builder.subscribe(cx)
         });
 
@@ -5202,8 +5260,7 @@ mod tests {
                 0,
                 cx.background_executor(),
                 PathStyle::local(),
-            )
-            .unwrap();
+            );
             builder.subscribe(cx)
         });
 
@@ -5249,8 +5306,7 @@ mod tests {
                 0,
                 cx.background_executor(),
                 PathStyle::local(),
-            )
-            .unwrap();
+            );
             builder.subscribe(cx)
         });
 
@@ -5310,8 +5366,7 @@ mod tests {
                 0,
                 cx.background_executor(),
                 PathStyle::local(),
-            )
-            .unwrap();
+            );
             builder.subscribe(cx)
         });
 
