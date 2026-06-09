@@ -1728,23 +1728,54 @@ async fn handle_follow_up_message(
         }
     });
 
-    let send_task = cx.update(|cx| {
-        thread.update(cx, |thread: &mut AcpThread, cx| {
-            let message = vec![ContentBlock::Text(
-                TextContent::new(message.clone())
-            )];
-            thread.send(message, cx)
-        })
-    })?;
+    // The claude-agent-acp wrapper has a transient race after a cancelled turn:
+    // if a follow-up `prompt` arrives before the wrapper has finished finalizing
+    // the prior assistant turn, it returns
+    //   `Internal error: [ede_diagnostic] result_type=user last_content_type=n/a stop_reason=null`
+    // Retry with backoff while the wrapper drains. See claude-agent-acp#442/#423
+    // class of bugs already worked around in acp_thread::AcpThread::cancel.
+    //
+    // Sized empirically against Drone CI Phase 9 (rapid 3-turn cancel regression
+    // test): 4 attempts at 750ms gives ~2.25s of total patience, which clears
+    // the longest observed drain in practice. A previous 2-attempt / 500ms
+    // window was below the drain tail and produced deterministic CI failures.
+    let max_attempts = 4;
+    let retry_delay = Duration::from_millis(750);
+    for attempt in 1..=max_attempts {
+        let send_task = cx.update(|cx| {
+            thread.update(cx, |thread: &mut AcpThread, cx| {
+                let message = vec![ContentBlock::Text(
+                    TextContent::new(message.clone())
+                )];
+                thread.send(message, cx)
+            })
+        })?;
 
-    // Await the send task to completion (LLM response finishes)
-    match send_task.await {
-        Ok(_) => {
-            eprintln!("✅ [THREAD_SERVICE] Follow-up send completed successfully");
-        }
-        Err(e) => {
-            eprintln!("❌ [THREAD_SERVICE] Follow-up send failed: {}", e);
-            return Err(e);
+        match send_task.await {
+            Ok(_) => {
+                eprintln!("✅ [THREAD_SERVICE] Follow-up send completed successfully");
+                break;
+            }
+            Err(e) => {
+                let msg = e.to_string();
+                let is_acp_drain_race = msg.contains("ede_diagnostic")
+                    && msg.contains("result_type=user")
+                    && msg.contains("stop_reason=null");
+                if is_acp_drain_race && attempt < max_attempts {
+                    eprintln!(
+                        "⚠️ [THREAD_SERVICE] Follow-up hit claude-agent-acp drain race (attempt {}/{}), retrying after {:?}: {}",
+                        attempt, max_attempts, retry_delay, msg
+                    );
+                    log::warn!(
+                        "⚠️ [THREAD_SERVICE] Follow-up hit claude-agent-acp drain race (attempt {}/{}), retrying after {:?}: {}",
+                        attempt, max_attempts, retry_delay, msg
+                    );
+                    cx.background_executor().timer(retry_delay).await;
+                    continue;
+                }
+                eprintln!("❌ [THREAD_SERVICE] Follow-up send failed: {}", e);
+                return Err(e);
+            }
         }
     }
 
