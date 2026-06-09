@@ -1741,7 +1741,6 @@ async fn handle_follow_up_message(
     // window was below the drain tail and produced deterministic CI failures.
     let max_attempts = 4;
     let retry_delay = Duration::from_millis(750);
-    let mut last_err: Option<anyhow::Error> = None;
     for attempt in 1..=max_attempts {
         let send_task = cx.update(|cx| {
             thread.update(cx, |thread: &mut AcpThread, cx| {
@@ -1755,7 +1754,6 @@ async fn handle_follow_up_message(
         match send_task.await {
             Ok(_) => {
                 eprintln!("✅ [THREAD_SERVICE] Follow-up send completed successfully");
-                last_err = None;
                 break;
             }
             Err(e) => {
@@ -1773,16 +1771,12 @@ async fn handle_follow_up_message(
                         attempt, max_attempts, retry_delay, msg
                     );
                     cx.background_executor().timer(retry_delay).await;
-                    last_err = Some(e);
                     continue;
                 }
                 eprintln!("❌ [THREAD_SERVICE] Follow-up send failed: {}", e);
                 return Err(e);
             }
         }
-    }
-    if let Some(e) = last_err {
-        return Err(e);
     }
 
     // NOTE: MessageCompleted is now sent by the persistent subscription's
