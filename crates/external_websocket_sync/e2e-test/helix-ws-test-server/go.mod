@@ -70,8 +70,6 @@ require (
 	github.com/getkin/kin-openapi v0.133.0 // indirect
 	github.com/getsentry/sentry-go v0.25.0 // indirect
 	github.com/gfleury/go-bitbucket-v1 v0.0.0-20230825095122-9bc1711434ab // indirect
-	github.com/glebarez/go-sqlite v1.21.2 // indirect
-	github.com/glebarez/sqlite v1.11.0 // indirect
 	github.com/go-co-op/gocron/v2 v2.11.0 // indirect
 	github.com/go-errors/errors v1.5.1 // indirect
 	github.com/go-git/gcfg v1.5.1-0.20230307220236-3a3c6141e376 // indirect
@@ -114,6 +112,7 @@ require (
 	github.com/gomlx/onnx-gomlx v0.4.2-0.20260327164137-4e2832549fc1 // indirect
 	github.com/google/go-cmp v0.7.0 // indirect
 	github.com/google/go-github/v57 v57.0.0 // indirect
+	github.com/google/go-github/v61 v61.0.0 // indirect
 	github.com/google/go-github/v62 v62.0.0 // indirect
 	github.com/google/go-github/v75 v75.0.0 // indirect
 	github.com/google/go-querystring v1.1.0 // indirect
@@ -206,7 +205,6 @@ require (
 	github.com/pkoukk/tiktoken-go v0.1.6 // indirect
 	github.com/planetscale/vtprotobuf v0.6.1-0.20240319094008-0393e58bdf10 // indirect
 	github.com/redis/go-redis/v9 v9.18.0 // indirect
-	github.com/remyoudompheng/bigfft v0.0.0-20230129092748-24d4a6f8daec // indirect
 	github.com/robfig/cron/v3 v3.0.2-0.20210106135023-bc59245fe10e // indirect
 	github.com/rs/zerolog v1.35.0 // indirect
 	github.com/russross/blackfriday/v2 v2.1.0 // indirect
@@ -235,7 +233,6 @@ require (
 	github.com/tiktoken-go/tokenizer v0.6.2 // indirect
 	github.com/tmc/langchaingo v0.1.12 // indirect
 	github.com/tsawler/tabula v1.6.6 // indirect
-	github.com/tylermmorton/tmpl v1.1.0 // indirect
 	github.com/unknwon/com v1.0.1 // indirect
 	github.com/viant/afs v1.30.0 // indirect
 	github.com/woodsbury/decimal128 v1.3.0 // indirect
@@ -306,10 +303,6 @@ require (
 	gorm.io/driver/sqlite v1.6.0 // indirect
 	gorm.io/gorm v1.31.1 // indirect
 	k8s.io/klog/v2 v2.140.0 // indirect
-	modernc.org/libc v1.22.5 // indirect
-	modernc.org/mathutil v1.5.0 // indirect
-	modernc.org/memory v1.5.0 // indirect
-	modernc.org/sqlite v1.23.1 // indirect
 )
 
 // During development, use local helix source (assumes zed and helix are sibling directories).

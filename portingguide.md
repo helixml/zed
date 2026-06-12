@@ -662,6 +662,80 @@ Helix-specific commits on main (oldest first):
 | `a7ad11ec00` | Fix Phase 13 race: cancel handler now probes `thread.status()` and sends `turn_cancelled` BEFORE calling `cancel()` so Helix marks the interaction as Interrupted before message_completed (triggered by the synchronously-emitted Stopped) arrives and races it into Completed — discovered by E2E Phase 13 failing on the first run |
 | `6b39672e5f` | Merge upstream Zed (`8bdd78e023..1399540715`, 261 commits, 10 days) into 002029 — 6 conflicts resolved: workflows (theirs), title_bar Cargo.toml (kept Helix external_websocket_sync dep, dropped feature_flags), title_bar.rs `render_restricted_mode` (kept Helix early-return + adopted upstream's free-function API), agent_server_store.rs reregister_agents destructure (dropped `extension_agents`, kept `_subscriptions`/`registry_subscribed`, added `..`), agent_panel.rs load_panel restoration (kept Helix WS-wait + send_agent_ready, adopted upstream thread_to_restore + load_agent_thread + restore_new_draft), agent_panel.rs load_agent_thread (adapted Critical Fix #11 entity-identity guard to upstream's thread_id signature via ThreadMetadataStore session_id lookup), agent_panel.rs ensure_thread_initialized (Helix Fix 1b early-return as FIRST statement, before upstream 589dc95c87's new terminal-spawn branches) |
 | `edbc05cf99` | Build fixes for upstream signature drift: agent_servers/acp.rs PR #50 chain log-labels now use `directories.cwd` (upstream c3951af24f removed local `cwd` binding); agent_ui/conversation_view.rs from_existing_thread adapted to new ThreadView::new signature (root_thread_id first arg), 3-arg SessionCapabilities::new, and new ConversationView fields (draft_prompt_persist_task, last_theme_id); agent_ui/agent_panel.rs + zed/main.rs added ContextServerStatus::ClientSecretRequired arm |
+| `b2993c0b01` | Merge upstream Zed (`9d50bab893..992f395c3d`, 256 commits, 10 days) into 002077 — 6 conflicts resolved (2 workflows deleted `git rm`, 1 workflow `--theirs`, language_model/model/mod.rs accepted upstream deletion of entire `model/` directory, recent_projects/dev_container_suggest.rs kept Helix `Settings` import + upstream `std::path::Path` import, title_bar/title_bar.rs kept Helix Plan+external_websocket_sync imports + added upstream `CommandPaletteFilter`). Helix surface auto-merged cleanly across all critical fixes — no PR #55 emit relocation needed, no Fix 1b movement needed, no `Workspace::show_error` call sites in Helix surface to migrate. Build green on first try. |
+
+## Merge 002077 (2026-06-12)
+
+**Divergence at start**:
+- Fork HEAD: `ecdc2ea67d` (PR #60 — `claude-agent-acp` `ede_diagnostic` retry loop, landed 2026-06-09)
+- Upstream HEAD: `992f395c3d` ("editor: Fix columnar selection alignment on rows with multi-byte chars (#57097)")
+- Upstream commits to merge: **256** (10 days of activity since 002029-extension-round-2's `9d50bab893`)
+- Helix-only commits since 002029: 2 (PR #60: `27e8867c9e` ede_diagnostic retry, `e4c36d837c` cleanup)
+
+### Conflicts and Resolutions
+
+#### 1. `.github/workflows/{run_cron_unit_evals,run_unit_evals}.yml` — modify/delete
+**Upstream change**: deleted both files (Zed CI workflows retired).
+**HEAD change**: had small modifications.
+**Resolution**: `git rm` — Helix doesn't use Zed's CI.
+**Risk**: none.
+
+#### 2. `.github/workflows/slack_notify_first_responders.yml` — content
+**Resolution**: `git checkout --theirs`. Helix doesn't use Zed's CI.
+**Risk**: none.
+
+#### 3. `crates/language_model/src/model/mod.rs` — rename/delete
+**Upstream change**: PR `a98485809b` "Return typed completion errors from Cloud provider (#58997)" plus the `language_model_core` refactor — `crates/language_model/src/model.rs` (HEAD's `model/mod.rs`) deleted entirely; `CloudModel` code relocated to `crates/language_model_core/` and `crates/language_models/src/provider/cloud.rs`.
+**HEAD change**: had `model/mod.rs` with `pub mod cloud_model; pub use cloud_model::*;` — no Helix content.
+**Resolution**: accept upstream deletion (`git rm`). No Helix surface referenced `cloud_model` directly.
+**Risk**: none. Verified `git grep "cloud_model\|CloudModel" -- crates/external_websocket_sync/ crates/agent_ui/ crates/agent/` is clean.
+
+#### 4. `crates/recent_projects/src/dev_container_suggest.rs` — content
+**Upstream change**: added `use std::path::Path;` (new use of `Path` in `worktree_abs_path: &Path` parameter).
+**HEAD change**: had `use settings::Settings;` (Helix-only — required for `RemoteSettings::get_global(cx).suggest_dev_container` early-return guard).
+**Resolution**: keep both imports.
+**Risk**: none — both compile and are needed.
+
+#### 5. `crates/title_bar/src/title_bar.rs` — content
+**Upstream change**: added `use command_palette_hooks::CommandPaletteFilter;` import (new use in `CommandPaletteFilter::update_global(cx, ...)` call site).
+**HEAD change**: had Helix-only `use cloud_api_types::Plan;` and the cfg-gated `use external_websocket_sync::{WebSocketConnectionStatus, get_websocket_connection_status};` block.
+**Resolution**: keep all three import lines. Reordered to alphabetical-ish layout to match the surrounding import block style.
+**Risk**: none.
+
+### Helix Surface — Auto-Merge Survival Check
+
+All Helix critical fixes and load-bearing patches survived `git merge upstream/main` cleanly with no manual conflict in the Helix-touched source files (`agent.rs`, `acp_thread.rs`, `agent_panel.rs`, `conversation_view.rs`, `workspace.rs`, `agent_servers/src/acp.rs`, `zed/src/main.rs`, `extensions_ui.rs`, `feature_flags/src/flags.rs`):
+
+- **Critical Fix #1** (`load_session` keeps `Entity<NativeAgent>` alive): preserved via the `pending_sessions` shared-task pattern in `open_thread` (pre-existing relocation from 002029-era).
+- **Critical Fix #3** (`content_only()`): intact at `acp_thread.rs:262`.
+- **Critical Fix #6/#9** (`stopped_emitted_for_task`): intact at `acp_thread.rs:2793/2837/2929`.
+- **Critical Fix #8** (`drop(turn.send_task)`): intact at `acp_thread.rs:2980`.
+- **Critical Fix #11** (entity-identity guard via `ThreadMetadataStore` session_id lookup): intact at top of `load_agent_thread` in `agent_panel.rs`.
+- **PR #50** `session_creation_chain` + `_settings_subscription` coexistence: intact in `agent_servers/src/acp.rs`.
+- **PR #55** streaming-reveal `EntryUpdated` emit: intact at `acp_thread.rs:2147`.
+- **PR #56 Fix 1a** deferred `UserCreatedThread`: intact in `external_websocket_sync/src/thread_service.rs`.
+- **PR #56 Fix 1b** cfg-gated early return: intact and verified as the FIRST statement of `BaseView::Uninitialized` in `ensure_thread_initialized` at `agent_panel.rs:5420`.
+- **PR #60** `ede_diagnostic` retry loop: intact in `handle_follow_up_message` (no upstream churn in `thread_service.rs` this window).
+
+### Risks Specifically Worried About in Planning — All Cleanly Absorbed
+
+- **`d7ac5e6cf4` "Preserve waiting tool call status on updates (#58537)"** — +602 lines reworking `ToolCall::status`. Auto-merged with no manual conflict; PR #55's `EntryUpdated` emit site and Fix #6's `stopped_emitted_for_task` invariant both survived in place. Will validate at runtime via E2E Phases 15 (PR #55) and 8/9 (Stopped invariant).
+- **Compaction cluster** (`e5052961af`, `9baefe701e`, `e17e272d24`, `5c90b0664f`, `0bc6c76fcf`, `0e9e8d0e68`, `620ceaaaca`) — ~1700 net lines. Auto-merged with no manual conflict. No `compact`/`Compact`/`compaction`/`cumulative_token_usage` matches in `external_websocket_sync/` so WS payload schema is unchanged. The `auto_compact` settings field coexists with Helix's `show_onboarding` / `auto_open_panel` / `sandbox_permissions` without conflict.
+- **`215ca2fb0b` "Typed workspace errors (#57649)"** + follow-up `83aa943705` — auto-merged with no manual conflict. Grep across `crates/external_websocket_sync/` and `crates/agent_ui/src/` shows **zero Helix `Workspace::show_error` call sites** — the typed-error migration is not needed in the Helix surface. (Helix relies on log/`anyhow` propagation, not on `Workspace::show_error`.) No "Pre-existing Breakage Repaired" entry needed.
+- **`116e4bc184` "Inherit source agent without draft content"** — auto-merged with no manual conflict. Fix 1b remains the FIRST statement of `BaseView::Uninitialized`; the source-agent inheritance path falls inside the non-`external_websocket_sync` branch and is therefore suppressed in Helix builds.
+- **`27191913e9` "Cumulative token usage" + `0bc6c76fcf` "Hide token usage after /compact"** — auto-merged. No `cumulative_token_usage`/`TokenUsage` matches in `external_websocket_sync/`; WS payload schema unaffected.
+- **`620ceaaaca` "Flush thread content to database on app quit"** — auto-merged. The flush path is in `NativeAgent` (database-backed); Helix's WS sync layer is orthogonal. No interaction.
+- **`56b71271c4` "Enable ACP session usage and deletion features"** — auto-merged. Helix `NativeAgentConnection` impl already supports `close_session` (preserved upstream); no new override needed.
+
+### Pre-existing Breakage Repaired
+
+**None this round.** Build (`./stack build-zed dev`) succeeded on first try after the merge, with only three unused-import warnings (all in upstream code: `crates/title_bar`, `crates/agent_ui`, `crates/zed`). No Helix-side signature-drift repairs were needed — first time since 001980.
+
+### Validation
+
+- `./stack build-zed dev` (8m 14s, 0 errors, 3 unused-import warnings in upstream code): **PASSED**
+- Silent-drift sweep (`ActiveView`/`set_active_view`/`draft_threads`/`background_threads`/`selected_agent_type`/`smol::Timer`/non-tuple `Stopped`/`Workspace::show_error`/`cumulative_token_usage`/`compact`-in-WS): **all 0 hits or only expected matches**
+- E2E (zed-agent + claude personalities): **see commit history below for run results**
 
 ## Merge 001996 (2026-05-11)
 
