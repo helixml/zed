@@ -134,6 +134,33 @@ pub trait AgentConnection {
         Task::ready(Err(anyhow::Error::msg("Closing sessions is not supported")))
     }
 
+    /// Force-close a session at the wire level, bypassing any ref counting.
+    /// Sends `CloseSessionRequest` to the agent immediately and drops the
+    /// session from internal bookkeeping so a follow-up `load_session`
+    /// recreates it cleanly.
+    ///
+    /// Necessary for recovery from a wedged downstream session (e.g. the
+    /// Anthropic Claude Code SDK `Query` gets stuck after a mid-stream
+    /// cancellation; only the wrapper's `teardownSession` unwedges it,
+    /// and we cannot reach it through `close_session` because the
+    /// `AcpThread` entity still holds a reference). Callers must ensure
+    /// the consuming entity is dropped or replaced before re-using the
+    /// session id; otherwise events for the closed session will be
+    /// orphaned.
+    fn force_close_session(
+        self: Rc<Self>,
+        _session_id: &acp::SessionId,
+        _cx: &mut App,
+    ) -> Task<Result<()>> {
+        // Default implementation is intentionally an error — only ACP-style
+        // wrapper connections (e.g. AcpConnection) need force-close for
+        // wedged-Query recovery. Implementations that route via other agent
+        // backends should explicitly override if recovery applies.
+        Task::ready(Err(anyhow::Error::msg(
+            "Force-closing sessions is not supported by this agent backend",
+        )))
+    }
+
     /// Whether this agent supports resuming existing sessions without loading history.
     fn supports_resume_session(&self) -> bool {
         false

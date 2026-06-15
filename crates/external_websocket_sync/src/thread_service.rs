@@ -40,6 +40,20 @@ static THREAD_KEEP_ALIVE: parking_lot::Mutex<Option<Arc<RwLock<HashMap<String, E
 static THREAD_AGENT_SESSION_MAP: parking_lot::Mutex<Option<Arc<RwLock<HashMap<String, String>>>>> =
     parking_lot::Mutex::new(None);
 
+/// Global map of acp_thread_id -> agent_name (e.g. "claude", "qwen", "zed-agent").
+///
+/// Helix's `SendChatMessage` path used for follow-up messages on existing
+/// threads strips `agent_name` from the chat_message command (only the
+/// initial create-thread message carries it). When the wrapper-side wedge
+/// recovery fires on a follow-up, the request's `agent_name` is therefore
+/// missing, and routing to the wrong `ExternalAgent` variant (e.g.
+/// NativeAgent for a claude thread) makes `force_close_session` dispatch
+/// to the trait default instead of `AcpConnection`'s override. Recording
+/// the agent at thread-create / thread-load time lets the recovery path
+/// look up the correct agent independently of the incoming request.
+static THREAD_AGENT_NAME_MAP: parking_lot::Mutex<Option<Arc<RwLock<HashMap<String, String>>>>> =
+    parking_lot::Mutex::new(None);
+
 /// Global map of thread_id -> current_request_id
 /// Tracks the request_id for the CURRENT/LATEST message being processed by each thread
 /// This ensures message_completed events use the correct request_id (not the first one)
@@ -216,6 +230,11 @@ pub fn init_thread_registry() {
     let mut session_map = THREAD_AGENT_SESSION_MAP.lock();
     if session_map.is_none() {
         *session_map = Some(Arc::new(RwLock::new(HashMap::new())));
+    }
+
+    let mut agent_name_map = THREAD_AGENT_NAME_MAP.lock();
+    if agent_name_map.is_none() {
+        *agent_name_map = Some(Arc::new(RwLock::new(HashMap::new())));
     }
 
     let mut request_map = THREAD_REQUEST_MAP.lock();
@@ -557,6 +576,26 @@ pub fn set_agent_session_id(acp_thread_id: &str, agent_session_id: String) {
 /// Get the agent's session ID for a thread (for passing to load_session).
 pub fn get_agent_session_id(acp_thread_id: &str) -> Option<String> {
     let map = THREAD_AGENT_SESSION_MAP.lock();
+    map.as_ref().and_then(|m| m.read().get(acp_thread_id).cloned())
+}
+
+/// Record which agent backs a thread (e.g. "claude", "qwen", "zed-agent").
+/// Called at create/load time so the wrapper-side wedge recovery path can
+/// route back to the correct agent even when Helix's follow-up
+/// `SendChatMessage` strips `agent_name` from the chat_message command.
+pub fn set_thread_agent_name(acp_thread_id: &str, agent_name: String) {
+    init_thread_registry();
+    let map = THREAD_AGENT_NAME_MAP.lock();
+    if let Some(m) = map.as_ref() {
+        m.write().insert(acp_thread_id.to_string(), agent_name);
+    }
+}
+
+/// Look up the recorded agent_name for a thread. Returns None if no
+/// create/load event recorded it (e.g. legacy threads from before this
+/// map was introduced).
+pub fn get_thread_agent_name(acp_thread_id: &str) -> Option<String> {
+    let map = THREAD_AGENT_NAME_MAP.lock();
     map.as_ref().and_then(|m| m.read().get(acp_thread_id).cloned())
 }
 
@@ -1154,18 +1193,157 @@ pub fn setup_thread_handler(
                         }
                     }
 
-                    if let Err(e) = handle_follow_up_message(
+                    let initial_message = request.message.clone();
+                    let initial_err = handle_follow_up_message(
                         thread,
                         existing_thread_id.clone(),
                         request.request_id.clone(),
                         request.message,
                         request.simulate_input,
                         cx.clone()
-                    ).await {
+                    ).await;
+
+                    if let Err(e) = initial_err {
+                        let err_msg = e.to_string();
+                        if is_claude_acp_drain_race(&err_msg) {
+                            // The claude-agent-acp SDK Query is wedged — the
+                            // in-place retry inside handle_follow_up_message
+                            // has already exhausted; only a wrapper-side
+                            // teardown will unstick it. Force-close the
+                            // session, reload the thread from disk transcript,
+                            // and retry the send against the fresh entity.
+                            eprintln!(
+                                "🧹 [THREAD_SERVICE] claude-acp wedge detected on {} — attempting force-reset + reload (recovery)",
+                                existing_thread_id
+                            );
+                            log::warn!(
+                                "🧹 [THREAD_SERVICE] claude-acp wedge detected on {} — attempting force-reset + reload (recovery)",
+                                existing_thread_id
+                            );
+
+                            let reset_res = force_close_agent_session(
+                                project_for_create.clone(),
+                                acp_history_store_for_create.clone(),
+                                fs_for_create.clone(),
+                                existing_thread_id.clone(),
+                                request.agent_name.clone(),
+                                cx.clone(),
+                            ).await;
+
+                            match reset_res {
+                                Ok(()) => {
+                                    // Prefer the recorded agent_name for the
+                                    // reload too — same reason as force_close
+                                    // (Helix's SendChatMessage drops the
+                                    // request's agent_name on follow-ups).
+                                    let reload_agent_name = get_thread_agent_name(existing_thread_id)
+                                        .or_else(|| request.agent_name.clone());
+                                    let load_res = load_thread_from_agent(
+                                        project_for_create.clone(),
+                                        acp_history_store_for_create.clone(),
+                                        fs_for_create.clone(),
+                                        existing_thread_id.clone(),
+                                        reload_agent_name,
+                                        cx.clone(),
+                                    ).await;
+                                    match load_res {
+                                        Ok(fresh_thread) => {
+                                            eprintln!(
+                                                "✅ [THREAD_SERVICE] Reloaded thread {} after force-reset; retrying send",
+                                                existing_thread_id
+                                            );
+                                            if let Err(e2) = handle_follow_up_message(
+                                                fresh_thread,
+                                                existing_thread_id.clone(),
+                                                request.request_id.clone(),
+                                                initial_message,
+                                                request.simulate_input,
+                                                cx.clone(),
+                                            ).await {
+                                                eprintln!(
+                                                    "❌ [THREAD_SERVICE] Retry after force-reset still failed: {}",
+                                                    e2
+                                                );
+                                                log::error!(
+                                                    "❌ [THREAD_SERVICE] Retry after force-reset still failed: {}",
+                                                    e2
+                                                );
+                                                let error_event = SyncEvent::ThreadLoadError {
+                                                    acp_thread_id: existing_thread_id.clone(),
+                                                    request_id: request.request_id.clone(),
+                                                    error: format!(
+                                                        "Failed to send follow-up (after force-reset + reload): {}",
+                                                        e2
+                                                    ),
+                                                };
+                                                if let Err(send_err) = crate::send_websocket_event(error_event) {
+                                                    eprintln!("❌ [THREAD_SERVICE] Failed to send error event: {}", send_err);
+                                                }
+                                            }
+                                            continue;
+                                        }
+                                        Err(load_err) => {
+                                            // Force-close succeeded (wrapper teardown done) but
+                                            // we couldn't rehydrate the transcript. The load error
+                                            // is the actionable signal — surface it to Helix so
+                                            // operators see the actual failure cause, not the
+                                            // already-recovered drain-race error.
+                                            eprintln!(
+                                                "❌ [THREAD_SERVICE] Force-reset succeeded but reload failed: {} (orig drain-race: {})",
+                                                load_err, e
+                                            );
+                                            log::error!(
+                                                "❌ [THREAD_SERVICE] Force-reset succeeded but reload failed: {} (orig drain-race: {})",
+                                                load_err, e
+                                            );
+                                            let error_event = SyncEvent::ThreadLoadError {
+                                                acp_thread_id: existing_thread_id.clone(),
+                                                request_id: request.request_id.clone(),
+                                                error: format!(
+                                                    "Failed to reload thread after wrapper force-reset: {} (recovery was triggered by: {})",
+                                                    load_err, e
+                                                ),
+                                            };
+                                            if let Err(send_err) = crate::send_websocket_event(error_event) {
+                                                eprintln!("❌ [THREAD_SERVICE] Failed to send error event: {}", send_err);
+                                            }
+                                            continue;
+                                        }
+                                    }
+                                }
+                                Err(close_err) => {
+                                    // Force-close itself failed — wrapper is unreachable or
+                                    // doesn't support force_close. Surface both errors so
+                                    // operators can see the recovery attempt failed and why.
+                                    eprintln!(
+                                        "❌ [THREAD_SERVICE] Force-close failed: {} (orig drain-race: {})",
+                                        close_err, e
+                                    );
+                                    log::error!(
+                                        "❌ [THREAD_SERVICE] Force-close failed: {} (orig drain-race: {})",
+                                        close_err, e
+                                    );
+                                    let error_event = SyncEvent::ThreadLoadError {
+                                        acp_thread_id: existing_thread_id.clone(),
+                                        request_id: request.request_id.clone(),
+                                        error: format!(
+                                            "Force-close failed during drain-race recovery: {} (recovery was triggered by: {})",
+                                            close_err, e
+                                        ),
+                                    };
+                                    if let Err(send_err) = crate::send_websocket_event(error_event) {
+                                        eprintln!("❌ [THREAD_SERVICE] Failed to send error event: {}", send_err);
+                                    }
+                                    continue;
+                                }
+                            }
+                        }
+
                         eprintln!("❌ [THREAD_SERVICE] Failed to send follow-up message: {}", e);
                         log::error!("❌ [THREAD_SERVICE] Failed to send follow-up message: {}", e);
 
-                        // If follow-up failed (e.g., entity released), send error back to Helix
+                        // Non-drain-race follow-up failure (or recovery was attempted but
+                        // already sent its own error event above and continued past this).
                         let error_event = SyncEvent::ThreadLoadError {
                             acp_thread_id: existing_thread_id.clone(),
                             request_id: request.request_id.clone(),
@@ -1604,6 +1782,10 @@ fn create_new_thread_sync(
         // Send agent_ready event to Helix (signals that agent is ready to receive prompts)
         // This prevents race conditions where Helix sends continue prompts before agent is initialized
         let agent_name_for_ready = request_clone.agent_name.clone().unwrap_or_else(|| "zed-agent".to_string());
+        // Persist the agent backing this thread so wrapper-side wedge
+        // recovery can route to the correct AgentConnection later, even
+        // when Helix's follow-up SendChatMessage strips agent_name.
+        set_thread_agent_name(&acp_thread_id, agent_name_for_ready.clone());
         crate::send_agent_ready(agent_name_for_ready, Some(acp_thread_id.clone()));
 
         // Notify AgentPanel to display this thread (for auto-select in UI)
@@ -1728,19 +1910,17 @@ async fn handle_follow_up_message(
         }
     });
 
-    // The claude-agent-acp wrapper has a transient race after a cancelled turn:
-    // if a follow-up `prompt` arrives before the wrapper has finished finalizing
-    // the prior assistant turn, it returns
-    //   `Internal error: [ede_diagnostic] result_type=user last_content_type=n/a stop_reason=null`
-    // Retry with backoff while the wrapper drains. See claude-agent-acp#442/#423
-    // class of bugs already worked around in acp_thread::AcpThread::cancel.
-    //
-    // Sized empirically against Drone CI Phase 9 (rapid 3-turn cancel regression
-    // test): 4 attempts at 750ms gives ~2.25s of total patience, which clears
-    // the longest observed drain in practice. A previous 2-attempt / 500ms
-    // window was below the drain tail and produced deterministic CI failures.
-    let max_attempts = 4;
-    let retry_delay = Duration::from_millis(750);
+    // The claude-agent-acp wrapper exposes a wedge after a cancelled turn:
+    // a follow-up `prompt` arrives, the SDK Query is still finalizing the
+    // prior assistant turn, and the wrapper returns
+    //   `Internal error: [ede_diagnostic] result_type=user last_content_type=n/a stop_reason=null`.
+    // One quick in-place retry catches the genuine sub-second drain race.
+    // When the SDK Query is *permanently* wedged (the common case observed
+    // on Drone CI Phase 9), retrying the same handle never recovers - the
+    // caller of handle_follow_up_message is responsible for force-resetting
+    // the agent session and re-invoking us on a fresh thread entity.
+    let max_attempts = 2;
+    let retry_delay = Duration::from_millis(500);
     for attempt in 1..=max_attempts {
         let send_task = cx.update(|cx| {
             thread.update(cx, |thread: &mut AcpThread, cx| {
@@ -1758,9 +1938,7 @@ async fn handle_follow_up_message(
             }
             Err(e) => {
                 let msg = e.to_string();
-                let is_acp_drain_race = msg.contains("ede_diagnostic")
-                    && msg.contains("result_type=user")
-                    && msg.contains("stop_reason=null");
+                let is_acp_drain_race = is_claude_acp_drain_race(&msg);
                 if is_acp_drain_race && attempt < max_attempts {
                     eprintln!(
                         "⚠️ [THREAD_SERVICE] Follow-up hit claude-agent-acp drain race (attempt {}/{}), retrying after {:?}: {}",
@@ -1783,6 +1961,139 @@ async fn handle_follow_up_message(
     // Stopped event handler. See create_new_thread_sync for rationale.
 
     log::info!("✅ [THREAD_SERVICE] Follow-up message sent successfully");
+    Ok(())
+}
+
+/// Returns true if the given error string matches the wedged-Query signature
+/// from `@zed-industries/claude-agent-acp` (Anthropic Claude Code SDK
+/// re-raised through the wrapper). When this fires, the wrapper's
+/// session-side `Query` is permanently stuck until we drive it through
+/// `teardownSession` via a raw `session/close`.
+///
+/// Strict triple-match: keep the recovery path narrow so unrelated agent
+/// errors fall through to the normal error path unchanged.
+pub(crate) fn is_claude_acp_drain_race(msg: &str) -> bool {
+    msg.contains("ede_diagnostic")
+        && msg.contains("result_type=user")
+        && msg.contains("stop_reason=null")
+}
+
+/// Force-close an agent-side session at the wire level, bypassing Zed's
+/// ref-counted `close_session` path (which is a no-op while an
+/// `AcpThread` entity still holds a reference). After the wrapper
+/// teardown lands, the registry entry for `acp_thread_id` is dropped so
+/// a subsequent `load_thread_from_agent` recreates the session cleanly.
+///
+/// Used by the recovery path in `claude` follow-ups: when the SDK Query
+/// wedges after a mid-stream cancel, force-closing is the only way to
+/// unstick it; the next `loadSession` then hits the empty-map branch in
+/// the wrapper's `getOrCreateSession` and spawns a fresh Query that
+/// resumes from the on-disk transcript.
+async fn force_close_agent_session(
+    project: Entity<Project>,
+    acp_history_store: Entity<ThreadStore>,
+    fs: Arc<dyn Fs>,
+    acp_thread_id: String,
+    agent_name: Option<String>,
+    cx: gpui::AsyncApp,
+) -> Result<()> {
+    // The chat_message that triggered recovery may have lost its
+    // agent_name (Helix's follow-up SendChatMessage path strips it).
+    // The thread itself, however, was created with a specific agent —
+    // we recorded that at thread-create / thread-load time. Prefer the
+    // recorded value over the request's, otherwise we'd route to
+    // NativeAgent for a thread that's actually backed by claude (or
+    // qwen, gemini, etc.), and force_close_session would dispatch to
+    // the trait default and the recovery would fail.
+    let recorded_agent = get_thread_agent_name(&acp_thread_id);
+    let effective_agent_name = recorded_agent.clone().or(agent_name.clone());
+
+    log::info!(
+        "🧹 [THREAD_SERVICE] force_close_agent_session: thread={} (request agent={:?}, recorded={:?}, effective={:?})",
+        acp_thread_id, agent_name, recorded_agent, effective_agent_name
+    );
+
+    let agent = match effective_agent_name.as_deref() {
+        Some("zed-agent") | Some("") | None => ExternalAgent::NativeAgent,
+        Some(name) => {
+            let zed_name = match name {
+                "claude" => agent_servers::CLAUDE_AGENT_ID,
+                other => other,
+            };
+            ExternalAgent::Custom {
+                name: gpui::SharedString::from(zed_name.to_string()),
+                command: project::agent_server_store::AgentServerCommand {
+                    path: std::path::PathBuf::new(),
+                    args: vec![],
+                    env: None,
+                },
+            }
+        }
+    };
+
+    let server = agent.server(fs, acp_history_store.clone());
+
+    let shared = cx.update(|cx| {
+        let agent_id = server.agent_id();
+        let agent_server_store = project.read(cx).agent_server_store().clone();
+        let delegate = agent_servers::AgentServerDelegate::new(
+            agent_server_store,
+            None,
+            None,
+        );
+        agent_servers::AgentConnectionCache::request_connection(
+            cx,
+            project.clone(),
+            agent_id,
+            server.clone(),
+            delegate,
+        )
+    });
+
+    let connection: std::rc::Rc<dyn acp_thread::AgentConnection> = shared
+        .await
+        .map_err(|e| anyhow::anyhow!("agent connect for force-close failed: {:?}", e))?;
+
+    let agent_sid =
+        get_agent_session_id(&acp_thread_id).unwrap_or_else(|| acp_thread_id.clone());
+    let session_id = acp::SessionId::new(agent_sid.clone());
+
+    // Drop ALL Helix-side references to the wedged entity FIRST, so any
+    // in-flight handler (e.g. the cancel-task loop, a follow-up callback)
+    // that calls `get_thread` during the recovery window cannot resurrect
+    // the wedged entity from the keep-alive map and prompt-send into a
+    // session whose wrapper-side state is being torn down underneath us.
+    //
+    // We also clear EXTERNAL_ORIGINATED_ENTRIES — its indices are keyed
+    // on the OLD entity's entries vector, which the reloaded entity will
+    // not share. Leaving stale indices behind would suppress sync for
+    // matching-index entries on the fresh thread.
+    //
+    // We deliberately keep THREAD_AGENT_SESSION_MAP intact: the agent
+    // assigns its own session id at thread creation, and the wrapper's
+    // load_session-with-resume reuses that same id to rehydrate from
+    // the on-disk transcript. Clearing it would break the reload.
+    unregister_thread(&acp_thread_id);
+    {
+        let keep_alive = THREAD_KEEP_ALIVE.lock();
+        if let Some(ka) = keep_alive.as_ref() {
+            ka.write().remove(&acp_thread_id);
+        }
+    }
+    {
+        let map = EXTERNAL_ORIGINATED_ENTRIES.lock();
+        if let Some(m) = map.as_ref() {
+            m.write().remove(&acp_thread_id);
+        }
+    }
+
+    let close_task = cx.update(|cx| connection.clone().force_close_session(&session_id, cx));
+    close_task.await?;
+    log::info!(
+        "🧹 [THREAD_SERVICE] force_close_agent_session: wrapper teardown complete for {} (agent session {})",
+        acp_thread_id, agent_sid
+    );
+
     Ok(())
 }
 
@@ -1907,6 +2218,13 @@ async fn load_thread_from_agent(
 
     // Send agent_ready event to Helix (signals that agent is ready to receive prompts)
     let agent_name_for_ready = agent_name.clone().unwrap_or_else(|| "zed-agent".to_string());
+    // Persist the agent backing this thread (see set_thread_agent_name doc).
+    set_thread_agent_name(&loaded_thread_id, agent_name_for_ready.clone());
+    if loaded_thread_id != acp_thread_id {
+        // Helix-side IDs (request key) and agent-side session IDs (load key)
+        // can differ; record under both so lookups by either find it.
+        set_thread_agent_name(&acp_thread_id, agent_name_for_ready.clone());
+    }
     crate::send_agent_ready(agent_name_for_ready, Some(loaded_thread_id.clone()));
 
     // Notify AgentPanel to display this thread
@@ -2001,6 +2319,8 @@ fn open_existing_thread_sync(
                     }
                     let agent_name_for_ready = agent_name.unwrap_or_else(|| "zed-agent".to_string());
                     eprintln!("🚀 [THREAD_SERVICE] Sending agent_ready after lock-wait for '{}'", acp_thread_id);
+                    // Persist the agent backing this thread (see set_thread_agent_name doc).
+                    set_thread_agent_name(&acp_thread_id, agent_name_for_ready.clone());
                     crate::send_agent_ready(agent_name_for_ready, Some(acp_thread_id));
                 } else {
                     eprintln!("⚠️ [THREAD_SERVICE] Lock released but entity not in registry for '{}' — no action taken", acp_thread_id);
@@ -2194,6 +2514,12 @@ fn open_existing_thread_sync(
         // Send agent_ready event to Helix (signals that agent is ready to receive prompts)
         // (THREAD_LOAD_IN_PROGRESS is cleared by the ClearLoadingGuard drop guard)
         let agent_name_for_ready = request_clone.agent_name.clone().unwrap_or_else(|| "zed-agent".to_string());
+        // Persist the agent backing this thread (see set_thread_agent_name doc).
+        set_thread_agent_name(&acp_thread_id, agent_name_for_ready.clone());
+        if !request_clone.acp_thread_id.is_empty() && request_clone.acp_thread_id != acp_thread_id {
+            // Helix-side ID may differ from agent-side session ID; record under both.
+            set_thread_agent_name(&request_clone.acp_thread_id, agent_name_for_ready.clone());
+        }
         crate::send_agent_ready(agent_name_for_ready, Some(acp_thread_id.clone()));
 
         // Notify AgentPanel to display this thread (for auto-select in UI)
