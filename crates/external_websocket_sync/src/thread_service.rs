@@ -1238,26 +1238,58 @@ pub fn setup_thread_handler(
                                             continue;
                                         }
                                         Err(load_err) => {
+                                            // Force-close succeeded (wrapper teardown done) but
+                                            // we couldn't rehydrate the transcript. The load error
+                                            // is the actionable signal — surface it to Helix so
+                                            // operators see the actual failure cause, not the
+                                            // already-recovered drain-race error.
                                             eprintln!(
-                                                "❌ [THREAD_SERVICE] Force-reset succeeded but reload failed: {}",
-                                                load_err
+                                                "❌ [THREAD_SERVICE] Force-reset succeeded but reload failed: {} (orig drain-race: {})",
+                                                load_err, e
                                             );
                                             log::error!(
-                                                "❌ [THREAD_SERVICE] Force-reset succeeded but reload failed: {}",
-                                                load_err
+                                                "❌ [THREAD_SERVICE] Force-reset succeeded but reload failed: {} (orig drain-race: {})",
+                                                load_err, e
                                             );
+                                            let error_event = SyncEvent::ThreadLoadError {
+                                                acp_thread_id: existing_thread_id.clone(),
+                                                request_id: request.request_id.clone(),
+                                                error: format!(
+                                                    "Failed to reload thread after wrapper force-reset: {} (recovery was triggered by: {})",
+                                                    load_err, e
+                                                ),
+                                            };
+                                            if let Err(send_err) = crate::send_websocket_event(error_event) {
+                                                eprintln!("❌ [THREAD_SERVICE] Failed to send error event: {}", send_err);
+                                            }
+                                            continue;
                                         }
                                     }
                                 }
                                 Err(close_err) => {
+                                    // Force-close itself failed — wrapper is unreachable or
+                                    // doesn't support force_close. Surface both errors so
+                                    // operators can see the recovery attempt failed and why.
                                     eprintln!(
-                                        "❌ [THREAD_SERVICE] Force-close failed: {} — propagating original drain-race error",
-                                        close_err
+                                        "❌ [THREAD_SERVICE] Force-close failed: {} (orig drain-race: {})",
+                                        close_err, e
                                     );
                                     log::error!(
-                                        "❌ [THREAD_SERVICE] Force-close failed: {} — propagating original drain-race error",
-                                        close_err
+                                        "❌ [THREAD_SERVICE] Force-close failed: {} (orig drain-race: {})",
+                                        close_err, e
                                     );
+                                    let error_event = SyncEvent::ThreadLoadError {
+                                        acp_thread_id: existing_thread_id.clone(),
+                                        request_id: request.request_id.clone(),
+                                        error: format!(
+                                            "Force-close failed during drain-race recovery: {} (recovery was triggered by: {})",
+                                            close_err, e
+                                        ),
+                                    };
+                                    if let Err(send_err) = crate::send_websocket_event(error_event) {
+                                        eprintln!("❌ [THREAD_SERVICE] Failed to send error event: {}", send_err);
+                                    }
+                                    continue;
                                 }
                             }
                         }
@@ -1265,7 +1297,8 @@ pub fn setup_thread_handler(
                         eprintln!("❌ [THREAD_SERVICE] Failed to send follow-up message: {}", e);
                         log::error!("❌ [THREAD_SERVICE] Failed to send follow-up message: {}", e);
 
-                        // If follow-up failed (e.g., entity released), send error back to Helix
+                        // Non-drain-race follow-up failure (or recovery was attempted but
+                        // already sent its own error event above and continued past this).
                         let error_event = SyncEvent::ThreadLoadError {
                             acp_thread_id: existing_thread_id.clone(),
                             request_id: request.request_id.clone(),
@@ -1969,10 +2002,52 @@ async fn force_close_agent_session(
         get_agent_session_id(&acp_thread_id).unwrap_or_else(|| acp_thread_id.clone());
     let session_id = acp::SessionId::new(agent_sid.clone());
 
-    // Drop the registry entry FIRST so any in-flight handlers cannot pick
-    // up the entity once we've kicked off teardown. Subscription bookkeeping
-    // stays put — the new entity will get a fresh subscription on reload.
+    // Drop ALL Helix-side references to the wedged entity FIRST, so any
+    // in-flight handler (e.g. the cancel-task loop, a follow-up callback)
+    // that calls `get_thread` during the recovery window cannot resurrect
+    // the wedged entity from the keep-alive map and prompt-send into a
+    // session whose wrapper-side state is being torn down underneath us.
+    //
+    // We also clear EXTERNAL_ORIGINATED_ENTRIES — its indices are keyed
+    // on the OLD entity's entries vector, which the reloaded entity will
+    // not share. Leaving stale indices behind would suppress sync for
+    // matching-index entries on the fresh thread.
+    //
+    // We deliberately keep THREAD_AGENT_SESSION_MAP intact: the agent
+    // assigns its own session id at thread creation, and the wrapper's
+    // load_session-with-resume reuses that same id to rehydrate from
+    // the on-disk transcript. Clearing it would break the reload.
     unregister_thread(&acp_thread_id);
+    {
+        let keep_alive = THREAD_KEEP_ALIVE.lock();
+        if let Some(ka) = keep_alive.as_ref() {
+            if ka.write().remove(&acp_thread_id).is_some() {
+                eprintln!(
+                    "🗑️ [THREAD_SERVICE] force_close: cleared keep-alive entry for {}",
+                    acp_thread_id
+                );
+                log::info!(
+                    "🗑️ [THREAD_SERVICE] force_close: cleared keep-alive entry for {}",
+                    acp_thread_id
+                );
+            }
+        }
+    }
+    {
+        let map = EXTERNAL_ORIGINATED_ENTRIES.lock();
+        if let Some(m) = map.as_ref() {
+            if m.write().remove(&acp_thread_id).is_some() {
+                eprintln!(
+                    "🗑️ [THREAD_SERVICE] force_close: cleared external-originated entries for {}",
+                    acp_thread_id
+                );
+                log::info!(
+                    "🗑️ [THREAD_SERVICE] force_close: cleared external-originated entries for {}",
+                    acp_thread_id
+                );
+            }
+        }
+    }
 
     let close_task = cx.update(|cx| connection.clone().force_close_session(&session_id, cx));
     close_task.await?;
