@@ -1919,6 +1919,32 @@ impl AgentConnection for AcpConnection {
         })
     }
 
+    fn force_close_session(
+        self: Rc<Self>,
+        session_id: &acp::SessionId,
+        cx: &mut App,
+    ) -> Task<Result<()>> {
+        if !self.supports_close_session() {
+            return Task::ready(Err(anyhow!(LoadError::Other(
+                "Force-closing sessions is not supported by this agent.".into()
+            ))));
+        }
+
+        // Unconditionally drop our session bookkeeping so a follow-up
+        // `load_session` cannot accidentally return a stale handle while
+        // the wrapper finishes its teardown. Ignored if the entry is gone.
+        self.pending_sessions.borrow_mut().remove(session_id);
+        self.sessions.borrow_mut().remove(session_id);
+
+        let conn = self.connection.clone();
+        let session_id = session_id.clone();
+        cx.foreground_executor().spawn(async move {
+            into_foreground_future(conn.send_request(acp::CloseSessionRequest::new(session_id)))
+                .await?;
+            Ok(())
+        })
+    }
+
     fn auth_methods(&self) -> &[acp::AuthMethod] {
         &self.auth_methods
     }
@@ -2290,6 +2316,14 @@ pub mod test_support {
             cx: &mut App,
         ) -> Task<Result<()>> {
             self.inner.clone().close_session(session_id, cx)
+        }
+
+        fn force_close_session(
+            self: Rc<Self>,
+            session_id: &acp::SessionId,
+            cx: &mut App,
+        ) -> Task<Result<()>> {
+            self.inner.clone().force_close_session(session_id, cx)
         }
 
         fn supports_resume_session(&self) -> bool {

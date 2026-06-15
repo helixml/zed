@@ -1154,14 +1154,114 @@ pub fn setup_thread_handler(
                         }
                     }
 
-                    if let Err(e) = handle_follow_up_message(
+                    let initial_message = request.message.clone();
+                    let initial_err = handle_follow_up_message(
                         thread,
                         existing_thread_id.clone(),
                         request.request_id.clone(),
                         request.message,
                         request.simulate_input,
                         cx.clone()
-                    ).await {
+                    ).await;
+
+                    if let Err(e) = initial_err {
+                        let err_msg = e.to_string();
+                        if is_claude_acp_drain_race(&err_msg) {
+                            // The claude-agent-acp SDK Query is wedged — the
+                            // in-place retry inside handle_follow_up_message
+                            // has already exhausted; only a wrapper-side
+                            // teardown will unstick it. Force-close the
+                            // session, reload the thread from disk transcript,
+                            // and retry the send against the fresh entity.
+                            eprintln!(
+                                "🧹 [THREAD_SERVICE] Drain race signature on {} — attempting force-reset + reload",
+                                existing_thread_id
+                            );
+                            log::warn!(
+                                "🧹 [THREAD_SERVICE] Drain race signature on {} — attempting force-reset + reload",
+                                existing_thread_id
+                            );
+
+                            let reset_res = force_close_agent_session(
+                                project_for_create.clone(),
+                                acp_history_store_for_create.clone(),
+                                fs_for_create.clone(),
+                                existing_thread_id.clone(),
+                                request.agent_name.clone(),
+                                cx.clone(),
+                            ).await;
+
+                            match reset_res {
+                                Ok(()) => {
+                                    let load_res = load_thread_from_agent(
+                                        project_for_create.clone(),
+                                        acp_history_store_for_create.clone(),
+                                        fs_for_create.clone(),
+                                        existing_thread_id.clone(),
+                                        request.agent_name.clone(),
+                                        cx.clone(),
+                                    ).await;
+                                    match load_res {
+                                        Ok(fresh_thread) => {
+                                            eprintln!(
+                                                "✅ [THREAD_SERVICE] Reloaded thread {} after force-reset; retrying send",
+                                                existing_thread_id
+                                            );
+                                            if let Err(e2) = handle_follow_up_message(
+                                                fresh_thread,
+                                                existing_thread_id.clone(),
+                                                request.request_id.clone(),
+                                                initial_message,
+                                                request.simulate_input,
+                                                cx.clone(),
+                                            ).await {
+                                                eprintln!(
+                                                    "❌ [THREAD_SERVICE] Retry after force-reset still failed: {}",
+                                                    e2
+                                                );
+                                                log::error!(
+                                                    "❌ [THREAD_SERVICE] Retry after force-reset still failed: {}",
+                                                    e2
+                                                );
+                                                let error_event = SyncEvent::ThreadLoadError {
+                                                    acp_thread_id: existing_thread_id.clone(),
+                                                    request_id: request.request_id.clone(),
+                                                    error: format!(
+                                                        "Failed to send follow-up (after force-reset + reload): {}",
+                                                        e2
+                                                    ),
+                                                };
+                                                if let Err(send_err) = crate::send_websocket_event(error_event) {
+                                                    eprintln!("❌ [THREAD_SERVICE] Failed to send error event: {}", send_err);
+                                                }
+                                            }
+                                            continue;
+                                        }
+                                        Err(load_err) => {
+                                            eprintln!(
+                                                "❌ [THREAD_SERVICE] Force-reset succeeded but reload failed: {}",
+                                                load_err
+                                            );
+                                            log::error!(
+                                                "❌ [THREAD_SERVICE] Force-reset succeeded but reload failed: {}",
+                                                load_err
+                                            );
+                                        }
+                                    }
+                                }
+                                Err(close_err) => {
+                                    eprintln!(
+                                        "❌ [THREAD_SERVICE] Force-close failed: {} — propagating original drain-race error",
+                                        close_err
+                                    );
+                                    log::error!(
+                                        "❌ [THREAD_SERVICE] Force-close failed: {} — propagating original drain-race error",
+                                        close_err
+                                    );
+                                }
+                            }
+                        }
+
                         eprintln!("❌ [THREAD_SERVICE] Failed to send follow-up message: {}", e);
                         log::error!("❌ [THREAD_SERVICE] Failed to send follow-up message: {}", e);
 
@@ -1728,19 +1828,17 @@ async fn handle_follow_up_message(
         }
     });
 
-    // The claude-agent-acp wrapper has a transient race after a cancelled turn:
-    // if a follow-up `prompt` arrives before the wrapper has finished finalizing
-    // the prior assistant turn, it returns
-    //   `Internal error: [ede_diagnostic] result_type=user last_content_type=n/a stop_reason=null`
-    // Retry with backoff while the wrapper drains. See claude-agent-acp#442/#423
-    // class of bugs already worked around in acp_thread::AcpThread::cancel.
-    //
-    // Sized empirically against Drone CI Phase 9 (rapid 3-turn cancel regression
-    // test): 4 attempts at 750ms gives ~2.25s of total patience, which clears
-    // the longest observed drain in practice. A previous 2-attempt / 500ms
-    // window was below the drain tail and produced deterministic CI failures.
-    let max_attempts = 4;
-    let retry_delay = Duration::from_millis(750);
+    // The claude-agent-acp wrapper exposes a wedge after a cancelled turn:
+    // a follow-up `prompt` arrives, the SDK Query is still finalizing the
+    // prior assistant turn, and the wrapper returns
+    //   `Internal error: [ede_diagnostic] result_type=user last_content_type=n/a stop_reason=null`.
+    // One quick in-place retry catches the genuine sub-second drain race.
+    // When the SDK Query is *permanently* wedged (the common case observed
+    // on Drone CI Phase 9), retrying the same handle never recovers - the
+    // caller of handle_follow_up_message is responsible for force-resetting
+    // the agent session and re-invoking us on a fresh thread entity.
+    let max_attempts = 2;
+    let retry_delay = Duration::from_millis(500);
     for attempt in 1..=max_attempts {
         let send_task = cx.update(|cx| {
             thread.update(cx, |thread: &mut AcpThread, cx| {
@@ -1758,9 +1856,7 @@ async fn handle_follow_up_message(
             }
             Err(e) => {
                 let msg = e.to_string();
-                let is_acp_drain_race = msg.contains("ede_diagnostic")
-                    && msg.contains("result_type=user")
-                    && msg.contains("stop_reason=null");
+                let is_acp_drain_race = is_claude_acp_drain_race(&msg);
                 if is_acp_drain_race && attempt < max_attempts {
                     eprintln!(
                         "⚠️ [THREAD_SERVICE] Follow-up hit claude-agent-acp drain race (attempt {}/{}), retrying after {:?}: {}",
@@ -1783,6 +1879,112 @@ async fn handle_follow_up_message(
     // Stopped event handler. See create_new_thread_sync for rationale.
 
     log::info!("✅ [THREAD_SERVICE] Follow-up message sent successfully");
+    Ok(())
+}
+
+/// Returns true if the given error string matches the wedged-Query signature
+/// from `@zed-industries/claude-agent-acp` (Anthropic Claude Code SDK
+/// re-raised through the wrapper). When this fires, the wrapper's
+/// session-side `Query` is permanently stuck until we drive it through
+/// `teardownSession` via a raw `session/close`.
+///
+/// Strict triple-match: keep the recovery path narrow so unrelated agent
+/// errors fall through to the normal error path unchanged.
+pub(crate) fn is_claude_acp_drain_race(msg: &str) -> bool {
+    msg.contains("ede_diagnostic")
+        && msg.contains("result_type=user")
+        && msg.contains("stop_reason=null")
+}
+
+/// Force-close an agent-side session at the wire level, bypassing Zed's
+/// ref-counted `close_session` path (which is a no-op while an
+/// `AcpThread` entity still holds a reference). After the wrapper
+/// teardown lands, the registry entry for `acp_thread_id` is dropped so
+/// a subsequent `load_thread_from_agent` recreates the session cleanly.
+///
+/// Used by the recovery path in `claude` follow-ups: when the SDK Query
+/// wedges after a mid-stream cancel, force-closing is the only way to
+/// unstick it; the next `loadSession` then hits the empty-map branch in
+/// the wrapper's `getOrCreateSession` and spawns a fresh Query that
+/// resumes from the on-disk transcript.
+async fn force_close_agent_session(
+    project: Entity<Project>,
+    acp_history_store: Entity<ThreadStore>,
+    fs: Arc<dyn Fs>,
+    acp_thread_id: String,
+    agent_name: Option<String>,
+    cx: gpui::AsyncApp,
+) -> Result<()> {
+    eprintln!(
+        "🧹 [THREAD_SERVICE] force_close_agent_session: {} (agent: {:?})",
+        acp_thread_id, agent_name
+    );
+    log::info!(
+        "🧹 [THREAD_SERVICE] force_close_agent_session: {} (agent: {:?})",
+        acp_thread_id, agent_name
+    );
+
+    let agent = match agent_name.as_deref() {
+        Some("zed-agent") | Some("") | None => ExternalAgent::NativeAgent,
+        Some(name) => {
+            let zed_name = match name {
+                "claude" => agent_servers::CLAUDE_AGENT_ID,
+                other => other,
+            };
+            ExternalAgent::Custom {
+                name: gpui::SharedString::from(zed_name.to_string()),
+                command: project::agent_server_store::AgentServerCommand {
+                    path: std::path::PathBuf::new(),
+                    args: vec![],
+                    env: None,
+                },
+            }
+        }
+    };
+
+    let server = agent.server(fs, acp_history_store.clone());
+
+    let shared = cx.update(|cx| {
+        let agent_id = server.agent_id();
+        let agent_server_store = project.read(cx).agent_server_store().clone();
+        let delegate = agent_servers::AgentServerDelegate::new(
+            agent_server_store,
+            None,
+            None,
+        );
+        agent_servers::AgentConnectionCache::request_connection(
+            cx,
+            project.clone(),
+            agent_id,
+            server.clone(),
+            delegate,
+        )
+    });
+
+    let connection: std::rc::Rc<dyn acp_thread::AgentConnection> = shared
+        .await
+        .map_err(|e| anyhow::anyhow!("agent connect for force-close failed: {:?}", e))?;
+
+    let agent_sid =
+        get_agent_session_id(&acp_thread_id).unwrap_or_else(|| acp_thread_id.clone());
+    let session_id = acp::SessionId::new(agent_sid.clone());
+
+    // Drop the registry entry FIRST so any in-flight handlers cannot pick
+    // up the entity once we've kicked off teardown. Subscription bookkeeping
+    // stays put — the new entity will get a fresh subscription on reload.
+    unregister_thread(&acp_thread_id);
+
+    let close_task = cx.update(|cx| connection.clone().force_close_session(&session_id, cx));
+    close_task.await?;
+    eprintln!(
+        "🧹 [THREAD_SERVICE] force_close_agent_session: wrapper teardown complete for {} (agent session {})",
+        acp_thread_id, agent_sid
+    );
+    log::info!(
+        "🧹 [THREAD_SERVICE] force_close_agent_session: wrapper teardown complete for {} (agent session {})",
+        acp_thread_id, agent_sid
+    );
+
     Ok(())
 }
 
