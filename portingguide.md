@@ -714,13 +714,14 @@ All Helix critical fixes and load-bearing patches survived `git merge upstream/m
 
 ### Pre-existing Breakage Repaired
 
-**None this round.** Will be confirmed when `./stack build-zed dev` runs.
+**None this round.** Build green on first try; no Helix-side signature-drift repairs needed. Second consecutive merge with zero "Pre-existing Breakage Repaired" entries (after 002077).
 
 ### Validation
 
-- `./stack build-zed dev`: **pending** (run during implementation)
-- Silent-drift sweep: pending
-- E2E (zed-agent + claude personalities): pending
+- `./stack build-zed dev`: **PASSED** — cargo 16m 59s, total ~18m (cold cache), 0 errors, 1 unused-import warning in upstream code. Binary 220M at `helix/zed-build/zed`.
+- Silent-drift sweep: **all clean** — `smol::Timer` 0 hits, `ActiveView`/`set_active_view`/`draft_threads`/`background_threads`/`selected_agent_type` 0 hits, Fix 1b first-statement intact, three `// HELIX:` markers intact, all PR #50/#55/#56/#60 surface intact.
+- E2E `zed-agent` only: **PASSED** on retry (first run timed out at Phase 9 with ~73s API latency before first token + 17s of streaming = 90s budget exhausted; retry green with Phase 9 explicitly reporting "Received 2 completions — thread recovered from rapid cancel (correct)"). Lesson: Phase 9's 90s budget is tight when zed-agent's Anthropic API has a slow first-token latency for long-form prompts ("Write a detailed explanation of merge sort with code examples."). The flake is API-latency-bound, not a Helix regression.
+- E2E `zed-agent,claude`: **PASSED** on retry (first run: zed-agent ALL 15 phases green; claude Phase 1 timeout with 0 events — npx-install bootstrap flake, also documented from 001996). Second run: `[zed-agent] PASSED`, `[claude] PASSED`, `[store] PASSED`. 28 interactions, 0 interrupted/cancelled, response entries isolation across 8 sessions, thread title sync across 3 sessions. Phase 9 (PR #60 retry-loop gate), Phase 15 (PR #55 emit gate, 82 samples / 407ms longest gap / 22% in final 20%), Phase 16 (0 spontaneous user_created_thread emits — Fix 1a working) all explicitly green.
 
 
 
