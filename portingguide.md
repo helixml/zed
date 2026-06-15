@@ -663,8 +663,66 @@ Helix-specific commits on main (oldest first):
 | `6b39672e5f` | Merge upstream Zed (`8bdd78e023..1399540715`, 261 commits, 10 days) into 002029 — 6 conflicts resolved: workflows (theirs), title_bar Cargo.toml (kept Helix external_websocket_sync dep, dropped feature_flags), title_bar.rs `render_restricted_mode` (kept Helix early-return + adopted upstream's free-function API), agent_server_store.rs reregister_agents destructure (dropped `extension_agents`, kept `_subscriptions`/`registry_subscribed`, added `..`), agent_panel.rs load_panel restoration (kept Helix WS-wait + send_agent_ready, adopted upstream thread_to_restore + load_agent_thread + restore_new_draft), agent_panel.rs load_agent_thread (adapted Critical Fix #11 entity-identity guard to upstream's thread_id signature via ThreadMetadataStore session_id lookup), agent_panel.rs ensure_thread_initialized (Helix Fix 1b early-return as FIRST statement, before upstream 589dc95c87's new terminal-spawn branches) |
 | `edbc05cf99` | Build fixes for upstream signature drift: agent_servers/acp.rs PR #50 chain log-labels now use `directories.cwd` (upstream c3951af24f removed local `cwd` binding); agent_ui/conversation_view.rs from_existing_thread adapted to new ThreadView::new signature (root_thread_id first arg), 3-arg SessionCapabilities::new, and new ConversationView fields (draft_prompt_persist_task, last_theme_id); agent_ui/agent_panel.rs + zed/main.rs added ContextServerStatus::ClientSecretRequired arm |
 | `b2993c0b01` | Merge upstream Zed (`9d50bab893..992f395c3d`, 256 commits, 10 days) into 002077 — 6 conflicts resolved (2 workflows deleted `git rm`, 1 workflow `--theirs`, language_model/model/mod.rs accepted upstream deletion of entire `model/` directory, recent_projects/dev_container_suggest.rs kept Helix `Settings` import + upstream `std::path::Path` import, title_bar/title_bar.rs kept Helix Plan+external_websocket_sync imports + added upstream `CommandPaletteFilter`). Helix surface auto-merged cleanly across all critical fixes — no PR #55 emit relocation needed, no Fix 1b movement needed, no `Workspace::show_error` call sites in Helix surface to migrate. Build green on first try. |
+| `0098823efa` | Merge upstream Zed (`992f395c3d..a31d3505da`, 25 commits, 3 days) into 002100 — 1 conflict resolved (`settings_content/src/settings_content.rs` both-sides-added-a-field on `RemoteSettingsContent`: kept Helix `suggest_dev_container` + upstream `dev_container_use_buildkit`). Smallest catch-up window in the series. Zero upstream churn in `acp_thread/`, `agent/src/`, `workspace.rs`, `zed/src/main.rs`, `title_bar/`, `feature_flags/`, `agent_servers/`, `external_websocket_sync/`, `agent_settings/` — all critical fixes and PR #50/#55/#56/#60 surface intact by construction. |
 
-## Merge 002077 (2026-06-12)
+## Merge 002100 (2026-06-15)
+
+**Divergence at start**:
+- Fork HEAD: `f82e1c6760` (Merge PR #61 — 002077, landed 2026-06-12)
+- Upstream HEAD: `a31d3505da` ("git: Do not run `git stash list` on every file save (#59042)")
+- Upstream commits to merge: **25** (3 days of activity since 002077's `992f395c3d`)
+- Helix-only commits since 002077: **0** (fork main has not moved)
+
+Smallest catch-up window of any merge in this series.
+
+### Conflicts and Resolutions
+
+#### 1. `crates/settings_content/src/settings_content.rs` — both sides added a field
+**Upstream change**: `26fc42721a` "dev_container: Support the classic Docker builder via a setting (#59288)" added `pub dev_container_use_buildkit: Option<bool>` to `RemoteSettingsContent`.
+**HEAD change**: Helix's earlier `suggest_dev_container: Option<bool>` field on the same struct (drives the `dev_container_suggest.rs` early-return guard).
+**Resolution**: keep both fields. Standard "both sides added a field" merge — independent settings, no semantic overlap.
+**Risk**: none. Both fields are `Option<bool>` with defaulting handled at consumer sites.
+
+### Helix Surface — Auto-Merge Survival Check
+
+All Helix critical fixes and load-bearing patches survived `git merge upstream/main` cleanly. No upstream commits in this window touch `acp_thread/`, `agent/src/`, `workspace.rs`, `zed/src/main.rs`, `title_bar/`, `feature_flags/`, `agent_servers/`, `external_websocket_sync/`, or `agent_settings/`, so the "must survive" surface is by-construction untouched.
+
+- **Critical Fix #1** (`load_session` via `pending_sessions` shared-task pattern): intact in `agent/src/agent.rs:399/572/1612/1627/1637`.
+- **Critical Fix #3** (`content_only()`): intact at `acp_thread.rs:262`.
+- **Critical Fix #6/#9** (`stopped_emitted_for_task`): intact at `acp_thread.rs:2793/2837/2929`.
+- **Critical Fix #8** (`drop(turn.send_task)`): intact at `acp_thread.rs:2980`.
+- **Critical Fix #11** (entity-identity guard via `ThreadMetadataStore` / `external_websocket_sync::get_thread`): intact in `agent_panel.rs:4623+`.
+- **PR #50** `session_creation_chain` + `_settings_subscription` coexistence: intact at `agent_servers/src/acp.rs:438-439`.
+- **PR #55** streaming-reveal `EntryUpdated` emit: intact (16 occurrences in `acp_thread.rs`, no upstream churn).
+- **PR #56 Fix 1a** deferred `UserCreatedThread`: intact in `external_websocket_sync/src/thread_service.rs` (zero churn either way).
+- **PR #56 Fix 1b** cfg-gated `return;`: intact as the FIRST statement of `BaseView::Uninitialized` at `agent_panel.rs:5420-5425`. `1e017d04b9`'s `Rules Library` menu deletion landed in a different region of the same file (line ~5690) with no positional impact.
+- **PR #60** `ede_diagnostic` retry loop: intact at `thread_service.rs:1734/1761` (zero churn either way).
+
+### Risks Specifically Worried About in Planning — All Cleanly Absorbed
+
+- **`f39cf25c0b` "extension_ui: Hide agent servers from chips (#59231)"** — restructured the `ExtensionProvides::iter()` chip filter from `.filter_map` to `.filter().map()` at upstream line ~1738. Auto-merged with no manual conflict; the three `// HELIX: External agent …` bypass markers remain at lines 226, 248, 1518 (no line-number shift — the upstream restructure was confined to its own region).
+- **`1e017d04b9` "agent_ui: Remove dead link in agent menu (#59232)"** — single-hunk deletion of the `Rules Library` menu entry near line 5690. Auto-merged with no manual conflict; Fix 1b's first-statement position in `BaseView::Uninitialized` at line 5420 is untouched.
+- **`d4cc8d2409` "Patch async-process to allow reusing their reaper (#59156)"** — added `[patch.crates-io] async-process = …` entry in `Cargo.toml`. Helix had no prior `[patch.crates-io]` entry, so this landed as a clean upstream-only addition.
+- **`26fc42721a` "dev_container: Support the classic Docker builder via a setting (#59288)"** — the lone conflict (above). Trivial both-sides-added-a-field on `RemoteSettingsContent`.
+
+### Cargo.toml / Cargo.lock notes
+
+- `objc2-app-kit`: `0.3` → `0.3.2` with feature widening (`NSButton`, `NSControl`, `NSResponder`, `NSView`, `NSWindow`, `objc2-core-foundation`). `objc2 = "0.6"` added as a workspace dep.
+- New `[patch.crates-io] async-process = { git = "https://github.com/zed-industries/async-process.git", rev = "0b6d6713570af61806e1e5cb40e0f757cb93fd9d" }` (from `d4cc8d2409`).
+- `Cargo.lock` auto-merged.
+- Helix workspace members (`crates/cloud_api_types`, `crates/external_websocket_sync`) and the `rust-embed`'s `debug-embed` feature are intact and untouched.
+
+### Pre-existing Breakage Repaired
+
+**None this round.** Will be confirmed when `./stack build-zed dev` runs.
+
+### Validation
+
+- `./stack build-zed dev`: **pending** (run during implementation)
+- Silent-drift sweep: pending
+- E2E (zed-agent + claude personalities): pending
+
+
 
 **Divergence at start**:
 - Fork HEAD: `ecdc2ea67d` (PR #60 — `claude-agent-acp` `ede_diagnostic` retry loop, landed 2026-06-09)
