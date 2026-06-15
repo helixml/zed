@@ -152,14 +152,12 @@ pub trait AgentConnection {
         _session_id: &acp::SessionId,
         _cx: &mut App,
     ) -> Task<Result<()>> {
-        eprintln!(
-            "🚨 [DIAG-ERROR] TRAIT DEFAULT force_close_session DISPATCHED (override missing for this connection type — recovery will return error)"
-        );
-        log::error!(
-            "🚨 [DIAG-ERROR] TRAIT DEFAULT force_close_session DISPATCHED (override missing for this connection type — recovery will return error)"
-        );
+        // Default implementation is intentionally an error — only ACP-style
+        // wrapper connections (e.g. AcpConnection) need force-close for
+        // wedged-Query recovery. Implementations that route via other agent
+        // backends should explicitly override if recovery applies.
         Task::ready(Err(anyhow::Error::msg(
-            "Force-closing sessions is not supported",
+            "Force-closing sessions is not supported by this agent backend",
         )))
     }
 
