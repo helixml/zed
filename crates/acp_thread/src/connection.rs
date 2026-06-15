@@ -152,6 +152,12 @@ pub trait AgentConnection {
         _session_id: &acp::SessionId,
         _cx: &mut App,
     ) -> Task<Result<()>> {
+        eprintln!(
+            "🚨 [DIAG] TRAIT DEFAULT force_close_session DISPATCHED (override missing for this connection type)"
+        );
+        log::error!(
+            "🚨 [DIAG] TRAIT DEFAULT force_close_session DISPATCHED (override missing for this connection type)"
+        );
         Task::ready(Err(anyhow::Error::msg(
             "Force-closing sessions is not supported",
         )))

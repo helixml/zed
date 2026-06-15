@@ -1924,6 +1924,16 @@ impl AgentConnection for AcpConnection {
         session_id: &acp::SessionId,
         cx: &mut App,
     ) -> Task<Result<()>> {
+        eprintln!(
+            "🔎 [DIAG] AcpConnection::force_close_session ENTERED for session={:?} supports_close={}",
+            session_id,
+            self.supports_close_session()
+        );
+        log::warn!(
+            "🔎 [DIAG] AcpConnection::force_close_session ENTERED for session={:?} supports_close={}",
+            session_id,
+            self.supports_close_session()
+        );
         if !self.supports_close_session() {
             return Task::ready(Err(anyhow!(LoadError::Other(
                 "Force-closing sessions is not supported by this agent.".into()
