@@ -1174,11 +1174,11 @@ pub fn setup_thread_handler(
                             // session, reload the thread from disk transcript,
                             // and retry the send against the fresh entity.
                             eprintln!(
-                                "🧹 [THREAD_SERVICE] Drain race signature on {} — attempting force-reset + reload",
+                                "🧹 [THREAD_SERVICE] DIAG-ERROR Drain race signature on {} — attempting force-reset + reload",
                                 existing_thread_id
                             );
                             log::warn!(
-                                "🧹 [THREAD_SERVICE] Drain race signature on {} — attempting force-reset + reload",
+                                "🧹 [THREAD_SERVICE] DIAG-ERROR Drain race signature on {} — attempting force-reset + reload",
                                 existing_thread_id
                             );
 
@@ -1949,11 +1949,11 @@ async fn force_close_agent_session(
     cx: gpui::AsyncApp,
 ) -> Result<()> {
     eprintln!(
-        "🧹 [THREAD_SERVICE] force_close_agent_session: {} (agent: {:?})",
+        "🧹 [THREAD_SERVICE] DIAG-ERROR force_close_agent_session ENTERED: {} (agent: {:?})",
         acp_thread_id, agent_name
     );
     log::info!(
-        "🧹 [THREAD_SERVICE] force_close_agent_session: {} (agent: {:?})",
+        "🧹 [THREAD_SERVICE] DIAG-ERROR force_close_agent_session ENTERED: {} (agent: {:?})",
         acp_thread_id, agent_name
     );
 
@@ -2023,11 +2023,11 @@ async fn force_close_agent_session(
         if let Some(ka) = keep_alive.as_ref() {
             if ka.write().remove(&acp_thread_id).is_some() {
                 eprintln!(
-                    "🗑️ [THREAD_SERVICE] force_close: cleared keep-alive entry for {}",
+                    "🗑️ [THREAD_SERVICE] DIAG-ERROR force_close cleared keep-alive entry for {}",
                     acp_thread_id
                 );
                 log::info!(
-                    "🗑️ [THREAD_SERVICE] force_close: cleared keep-alive entry for {}",
+                    "🗑️ [THREAD_SERVICE] DIAG-ERROR force_close cleared keep-alive entry for {}",
                     acp_thread_id
                 );
             }
@@ -2038,11 +2038,11 @@ async fn force_close_agent_session(
         if let Some(m) = map.as_ref() {
             if m.write().remove(&acp_thread_id).is_some() {
                 eprintln!(
-                    "🗑️ [THREAD_SERVICE] force_close: cleared external-originated entries for {}",
+                    "🗑️ [THREAD_SERVICE] DIAG-ERROR force_close cleared external-originated entries for {}",
                     acp_thread_id
                 );
                 log::info!(
-                    "🗑️ [THREAD_SERVICE] force_close: cleared external-originated entries for {}",
+                    "🗑️ [THREAD_SERVICE] DIAG-ERROR force_close cleared external-originated entries for {}",
                     acp_thread_id
                 );
             }
@@ -2052,11 +2052,11 @@ async fn force_close_agent_session(
     let close_task = cx.update(|cx| connection.clone().force_close_session(&session_id, cx));
     close_task.await?;
     eprintln!(
-        "🧹 [THREAD_SERVICE] force_close_agent_session: wrapper teardown complete for {} (agent session {})",
+        "🧹 [THREAD_SERVICE] DIAG-ERROR force_close_agent_session wrapper teardown complete for {} (agent session {})",
         acp_thread_id, agent_sid
     );
     log::info!(
-        "🧹 [THREAD_SERVICE] force_close_agent_session: wrapper teardown complete for {} (agent session {})",
+        "🧹 [THREAD_SERVICE] DIAG-ERROR force_close_agent_session wrapper teardown complete for {} (agent session {})",
         acp_thread_id, agent_sid
     );
 

@@ -1925,12 +1925,12 @@ impl AgentConnection for AcpConnection {
         cx: &mut App,
     ) -> Task<Result<()>> {
         eprintln!(
-            "🔎 [DIAG] AcpConnection::force_close_session ENTERED for session={:?} supports_close={}",
+            "🔎 [DIAG-ERROR] AcpConnection::force_close_session OVERRIDE DISPATCHED for session={:?} supports_close={}",
             session_id,
             self.supports_close_session()
         );
         log::warn!(
-            "🔎 [DIAG] AcpConnection::force_close_session ENTERED for session={:?} supports_close={}",
+            "🔎 [DIAG-ERROR] AcpConnection::force_close_session OVERRIDE DISPATCHED for session={:?} supports_close={}",
             session_id,
             self.supports_close_session()
         );
