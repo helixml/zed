@@ -678,6 +678,14 @@ Helix-specific commits on main (oldest first):
 
 This extension absorbs 95 upstream commits in 3 days — the inverse shape of round 1 (which absorbed 25 commits in 3 days). Total round 1 + round 2 = 120 upstream commits over 6 days.
 
+### Post-merge CI fix: removed `.github/workflows/docs_suggestions.yml` (2026-06-18)
+
+After PR #62 (the 002100 + 002100-extension branch) merged to fork `main`, the GitHub Actions check `batch-suggestions` went **red on the fork**. Root cause: `docs_suggestions.yml` is the one upstream workflow with a `pull_request` trigger that is **not** owner-gated to `zed-industries` (every other heavy workflow — `run_tests`, `compliance_check`, `nix_build`, etc. — carries `if: github.repository_owner == 'zed-industries' …` and therefore shows "skipped" on the fork). Its `batch-suggestions` job fires on any merged-to-`main` PR from the same repo, then fails because it installs Factory's Droid CLI and runs `./script/docs-suggest` against `secrets.FACTORY_API_KEY`, which does not exist on the Helix fork. (Its sibling `cherry-pick-suggestions` job also uses the security-sensitive `pull_request_target` trigger with secrets.)
+
+**Resolution**: `git rm .github/workflows/docs_suggestions.yml` — this is upstream-only docs-bot CI that Helix does not use, consistent with the rebase principle "Helix doesn't use Zed's CI" and the 002077 precedent of `git rm`-ing `run_cron_unit_evals.yml` / `run_unit_evals.yml`. Pushed on branch `fix/remove-fork-docs-suggestions-ci`.
+
+**Rebase-checklist addition**: on every future upstream merge, if `docs_suggestions.yml` reappears (upstream regenerates it via `cargo xtask workflows`), re-delete it — otherwise the `batch-suggestions` check goes red on the next merge to fork `main`. The cleaner long-term option is to disable GitHub Actions entirely on the fork (repo setting), since none of upstream's owner-gated workflows do anything useful here anyway.
+
 ### Conflicts and Resolutions
 
 #### 1. `crates/agent/src/tools/grep_tool.rs` — content
