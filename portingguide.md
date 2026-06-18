@@ -664,8 +664,92 @@ Helix-specific commits on main (oldest first):
 | `edbc05cf99` | Build fixes for upstream signature drift: agent_servers/acp.rs PR #50 chain log-labels now use `directories.cwd` (upstream c3951af24f removed local `cwd` binding); agent_ui/conversation_view.rs from_existing_thread adapted to new ThreadView::new signature (root_thread_id first arg), 3-arg SessionCapabilities::new, and new ConversationView fields (draft_prompt_persist_task, last_theme_id); agent_ui/agent_panel.rs + zed/main.rs added ContextServerStatus::ClientSecretRequired arm |
 | `b2993c0b01` | Merge upstream Zed (`9d50bab893..992f395c3d`, 256 commits, 10 days) into 002077 — 6 conflicts resolved (2 workflows deleted `git rm`, 1 workflow `--theirs`, language_model/model/mod.rs accepted upstream deletion of entire `model/` directory, recent_projects/dev_container_suggest.rs kept Helix `Settings` import + upstream `std::path::Path` import, title_bar/title_bar.rs kept Helix Plan+external_websocket_sync imports + added upstream `CommandPaletteFilter`). Helix surface auto-merged cleanly across all critical fixes — no PR #55 emit relocation needed, no Fix 1b movement needed, no `Workspace::show_error` call sites in Helix surface to migrate. Build green on first try. |
 | `0098823efa` | Merge upstream Zed (`992f395c3d..a31d3505da`, 25 commits, 3 days) into 002100 — 1 conflict resolved (`settings_content/src/settings_content.rs` both-sides-added-a-field on `RemoteSettingsContent`: kept Helix `suggest_dev_container` + upstream `dev_container_use_buildkit`). Smallest catch-up window in the series. Zero upstream churn in `acp_thread/`, `agent/src/`, `workspace.rs`, `zed/src/main.rs`, `title_bar/`, `feature_flags/`, `agent_servers/`, `external_websocket_sync/`, `agent_settings/` — all critical fixes and PR #50/#55/#56/#60 surface intact by construction. |
+| `0e0149ade5` | Merge upstream Zed (`a31d3505da..e45e42af6e`, 95 commits, 3 days) into 002100-extension — 1 conflict resolved (`agent/src/tools/grep_tool.rs`: kept Helix 001410 `truncate_long_lines` semantic while reusing upstream's pre-computed `snippet` variable from `40211567b8` "Make grep tool results clickable in agent panel"). Heavy upstream churn in `acp_thread.rs` (+198), `agent.rs` (+223), `agent/src/thread.rs` (+511), `agent_panel.rs` (+203), `conversation_view.rs` (+1024), new `thread_search_bar.rs` (+962), `thread_view.rs` (+1094), `extensions_ui.rs` (+286), `title_bar.rs` (+36), `agent/src/sandboxing.rs` (+458), `agent/src/tools/terminal_tool.rs` (+957) — yet all auto-merged cleanly. Fix 1b shifted from line 5420 → 5468 (still FIRST statement of `BaseView::Uninitialized`). Three `// HELIX:` markers shifted from 226/248/1518 → 337/359/1629. Critical Fix #3 shifted from line 262 → 335. All shifts content-preserving. |
+| `2221360fc1` | Tidy ws-test-server `go.mod`/`go.sum` for current Helix deps (certmagic / libdns / acmez / miekg/dns). Same pattern as `9f8364e138` after round 1. |
 
-## Merge 002100 (2026-06-15)
+## Merge 002100-extension (2026-06-18)
+
+**Divergence at start**:
+- Branch HEAD: `4ae2094b54` (PR #64 — `agent_ready` re-emit on reopening already-loaded thread, landed on fork main between rounds) — built on top of round 1's `5ed995947e` plus PRs #63 (claude-agent-acp wedge recovery, 6 commits) and #64 (1 commit).
+- Last upstream merge fence: `a31d3505da` ("git: Do not run `git stash list` on every file save (#59042)") — absorbed in round 1.
+- Upstream HEAD: `e45e42af6e` ("agent_ui: Use the thread title for agent notifications (#59377)")
+- Upstream commits to merge: **95** (3 days of dense activity since round 1; sandbox cluster, in-thread search, compaction-threshold tuning).
+- Helix-only commits since round 1 (PR #63 + PR #64): **7** (`c295cbc697` force-reset on wedged Query, `f8e9d85d42` clear keep-alive + surface load_err on force-reset, `d78e1b4327` + `47104fbad0` diagnostic eprintlns, `9f8364e138` track agent_name per thread for wedge recovery, `be0dcd329e` strip dispatch diagnostics keep recovery signal, `4ae2094b54` emit agent_ready on reopening already-loaded thread)
+
+This extension absorbs 95 upstream commits in 3 days — the inverse shape of round 1 (which absorbed 25 commits in 3 days). Total round 1 + round 2 = 120 upstream commits over 6 days.
+
+### Conflicts and Resolutions
+
+#### 1. `crates/agent/src/tools/grep_tool.rs` — content
+**Upstream change**: PR `40211567b8` "Make grep tool results clickable in agent panel (#59230)" refactored the snippet handling — introduced `let snippet: String = snapshot.text_for_range(range.clone()).collect();` at line 325, reused `snippet` both for the markdown block and for the new `acp::ToolCallContent::Content(ContentBlock::Text(...))` clickable-resource emit downstream. Replaced the in-place `text` binding inside the markdown block with `snippet`.
+**HEAD change**: Helix task 001410 `f51c0d5dae` "Truncate long lines in grep tool output to prevent context window blowups" wraps the markdown-block content with `truncate_long_lines(&text, MAX_LINE_CHARS)`.
+**Resolution**: kept Helix's `truncate_long_lines` semantic, but rewrote the call to reuse upstream's pre-computed `snippet` variable: `output.push_str(&truncate_long_lines(&snippet, MAX_LINE_CHARS));`. Drops the duplicate `text` binding; the truncation behavior is unchanged.
+**Risk**: none — `truncate_long_lines` operates on `&str`, both `text` and `snippet` carry identical content. The downstream `ContentBlock::Text(...)` still uses the un-truncated `snippet` (full content for clickable resource).
+
+### Helix Surface — Auto-Merge Survival Check
+
+All Helix critical fixes and load-bearing patches survived `git merge upstream/main` cleanly. The 95-commit window touched every Helix-adjacent surface (notably `acp_thread.rs` +198 lines, `agent/src/agent.rs` +223 lines, `agent/src/thread.rs` +511 lines, `agent_ui/src/agent_panel.rs` +203 lines, `agent_ui/src/conversation_view.rs` +1024 lines, new `agent_ui/src/conversation_view/thread_search_bar.rs` +962 lines, `agent_ui/src/conversation_view/thread_view.rs` +1094 lines, `extensions_ui.rs` +286 lines, `feature_flags/src/flags.rs` +16 lines, `title_bar/src/title_bar.rs` +36 lines, `agent/src/sandboxing.rs` +458 lines, `agent/src/tools/terminal_tool.rs` +957 lines) — yet `git merge` produced only one trivial conflict (above).
+
+- **Critical Fix #1** (`load_session` via `pending_sessions` shared-task pattern): intact at `agent/src/agent.rs:399/572/1612`.
+- **Critical Fix #3** (`content_only()`): intact at `acp_thread.rs:335` (was 262 pre-merge; upstream shifted it downward).
+- **Critical Fix #6/#9** (`stopped_emitted_for_task`): intact at `acp_thread.rs:2887/2931/3026`.
+- **Critical Fix #8** (`drop(turn.send_task)`): intact at `acp_thread.rs:3079`.
+- **Critical Fix #11** (entity-identity guard): intact via `ThreadMetadataStore` session_id lookup at top of `load_agent_thread` in `agent_panel.rs`.
+- **PR #50** `session_creation_chain` + `_settings_subscription` coexistence: intact at `agent_servers/src/acp.rs:438-439`.
+- **PR #55** streaming-reveal `EntryUpdated` emit: intact (16 occurrences in `acp_thread.rs`).
+- **PR #56 Fix 1a** deferred `UserCreatedThread`: intact in `external_websocket_sync/src/thread_service.rs`.
+- **PR #56 Fix 1b** cfg-gated early return: intact and verified as the FIRST statement of `BaseView::Uninitialized` at `agent_panel.rs:5468-5473` (was 5420 pre-merge; upstream added +49 lines above).
+- **PR #60** `ede_diagnostic` retry loop: intact at `thread_service.rs:1916/1976`.
+- **PR #63** claude-agent-acp wedge recovery surface (`force_reset_session`, `clear_keep_alive`, `track agent_name per thread`, dispatch diagnostics stripped): intact in `thread_service.rs` (Helix-only, no upstream churn).
+- **PR #64** `agent_ready` re-emit on reopening already-loaded thread: intact (Helix-only, no upstream churn).
+- **AcpBetaFeatureFlag override**: intact in `feature_flags/src/flags.rs:30` (despite +16 line upstream churn around it).
+- **Three `// HELIX: External agent …` bypass markers** in `extensions_ui.rs`: intact at lines 337, 359, 1629 (shifted from 226/248/1518 pre-merge — upstream added new chips above them).
+- **`render_restricted_mode` cfg-gated early return** in `title_bar.rs`: intact at line 699 (was 678 pre-merge).
+- **`build_application(headless: bool)`** in `zed/src/main.rs`: intact at line 88; `--headless` arg threading at line 346.
+
+### Risks Considered in Round 2 Reconnaissance — Outcomes
+
+- **`agent_ui/src/conversation_view.rs` +1024 lines + new `thread_search_bar.rs` (+962 lines) + `thread_view.rs` +1094 lines** — the "in-thread search bar" cluster (`10628c3d2c` agent_ui: Add in-thread search bar (#57231)) was the predicted signature-drift magnet for `from_existing_thread()`. **Outcome**: auto-merged cleanly — field set on `ConversationView::new` did not change in a Helix-incompatible way. Build green confirms `from_existing_thread()` still type-checks.
+- **`acp_thread/src/acp_thread.rs` +198 lines** — `d8eb569cc5` "acp_thread: Fix compaction button stuck at loading state on error (#59161)" risked clashing with PR #55's emit site and Critical Fix #6's invariant. **Outcome**: auto-merged. `EntryUpdated` site survives; `stopped_emitted_for_task` guard sites all intact; E2E Phase 15 (PR #55) and Phase 9 (Stopped invariant) green.
+- **`agent/src/agent.rs` +223 lines + `agent/src/thread.rs` +511 lines** — `33a54ce423` "Support provider-side compaction in the language model clients (#59145)" + `ea035a7a46` "Account for max_output_tokens in compaction threshold (#59469)" + `8ad9d18b93` "Address review follow-ups for quit-time thread flush (#59079)" + `f16a46967b` "Don't pass back the diff on successful edits (#59335)". **Outcome**: auto-merged. Critical Fix #1's `pending_sessions` shared-task path intact; build green; E2E green.
+- **Sandboxing cluster** (`5ef7b14a7d` enable sandboxing for staff by default, `dd7e50e66b` add global setting, `dfd44a45dd` Windows WSL, `54cd092189` sandbox permissions settings page, `e52cc1abe9` better sandboxing UI, `6661273a41` linux sandboxing, `8117571de3` host allowlist, `bf746a7a26` NetworkAccess enum, `c8faadd9c8` allowlisting proxy server, `c52d06a8f3` upstream proxy configuration, `f73b9daf3b` hostname allowlist, `3c7ca5ec5d` in-process proxy, `2c0a044237` unrestricted network access explicit, `a3e15cefac` show command in permission prompts, `ce22d1ab28` show commands in prompts) — 458 lines added to `agent/src/sandboxing.rs`, 957 added to `agent/src/tools/terminal_tool.rs`. **Outcome**: auto-merged. No `external_websocket_sync` interaction; Helix mode does not interact with the new sandbox UI (which is opt-in via settings).
+- **`agent_panel.rs` +203 lines** — `e45e42af6e` "Use the thread title for agent notifications (#59377)" + `50b2f63cfe` "Fix click flicker on empty draft thread (#59342)" + `9622ae92e1` "Fix reporting of 401/403 errors (#59119)" + `02b62a3d1f` "Settings UI agent providers (#58876)" + `ea673ff233` "Fix copy shortcut in macOS notebook cells" risked Fix 1b position regression. **Outcome**: auto-merged. Fix 1b is still the FIRST statement of `BaseView::Uninitialized` (shifted from line 5420 → 5468 — content of comment block + `#[cfg(...)] return` block all preserved verbatim).
+- **`extensions_ui.rs` +286 lines** — `5e32405669` "Add `RebuildDevExtension` action (#55173)" + further chip-area refactors. **Outcome**: three `// HELIX: External agent …` markers intact at new lines 337, 359, 1629 (shifted from 226, 248, 1518 — file got new content above them).
+- **`feature_flags/src/flags.rs` +16 lines** — new feature flags added. **Outcome**: `AcpBetaFeatureFlag::enabled_for_all() -> true` override intact at line 30.
+- **`title_bar/src/title_bar.rs` +36 lines** — restructure around title bar. **Outcome**: Helix `Plan` import + cfg-gated `external_websocket_sync::{...}` imports + `render_restricted_mode` cfg-gated early return all intact.
+- **`zed/src/main.rs` +7 lines** + `zed/src/zed/open_listener.rs` +163 lines (from `adb8a1d80f` Respect `default_open_behavior` when opening from Finder). **Outcome**: `--allow-multiple-instances`, `--headless`, `build_application(headless: bool)` pattern all intact.
+- **`settings_content/src/settings_content.rs`** — `2c0a044237` and the sandbox cluster added several fields to top-level Settings. **Outcome**: Helix's `helix_mode`, `suggest_dev_container`, `auto_open_panel`/`show_onboarding`, `dev_container_use_buildkit` (added in round 1) all coexist cleanly.
+
+### Cargo.toml / Cargo.lock notes
+
+- `acp_thread/Cargo.toml`: +1 line (new dep for compaction UI). Auto-merged.
+- `agent/Cargo.toml`: +2 lines (sandbox deps). Auto-merged.
+- `agent_ui/Cargo.toml`: +1 line. Auto-merged.
+- `extensions_ui/Cargo.toml`: +2 lines. Auto-merged.
+- `zed/Cargo.toml`: +3 lines. Auto-merged.
+- `Cargo.toml` workspace: new deps + version bumps. Auto-merged.
+- `Cargo.lock`: auto-merged; rebuilt cleanly.
+
+### Pre-existing Breakage Repaired
+
+**None this round.** Build green on first try (3m 37s warm cache). Two unused-import warnings present, both incidental:
+- `crates/agent_ui/...` (upstream code)
+- `crates/zed/src/zed.rs:871` — `use settings::Settings;` (Helix-introduced wrapper at `external_websocket_sync` init site; the underlying `ExternalSyncSettings::get_global(cx)` no longer needs the trait import since upstream re-exported the relevant method on a concrete type). Innocuous; can be removed in a follow-up cleanup pass.
+
+This is the **third consecutive** merge with zero "Pre-existing Breakage Repaired" — 002077 → 002100 round 1 → 002100 round 2.
+
+### Validation
+
+- `./stack build-zed dev`: **PASSED** (3m 37s warm cache, 0 errors, 2 unused-import warnings).
+- Silent-drift sweep: **all clean** — every critical-fix grep returned the expected hit; Helix bypass markers all present at their new (shifted) line numbers.
+- E2E `zed-agent` only: **PASSED on first try** — all 15 phases green, store validation PASSED, 14 interactions / 0 interrupted/cancelled / response-entries isolation PASSED / thread-title sync PASSED.
+- E2E `zed-agent,claude`: **PASSED** on retry with full rebuild. First attempt was via `--no-build` (cached test server) and the store-validation step reported a `response_entries leaked across interactions` isolation violation — re-running with full rebuild produced green across the board (28 interactions / 0 interrupted-cancelled / response-entries isolation across 8 sessions / thread-title sync across 3 sessions). This matches the documented e2e-test CLAUDE.md guidance: "Never trust `--no-build` when investigating test failures."
+
+### Lesson learned (added to future-merge rebase checklist)
+
+- **`--no-build` is a footgun for the E2E test server.** When the Helix Go code (`api/`) has advanced relative to the cached test-server binary, the `--no-build` shortcut runs an out-of-date server against current Zed and can produce false positive store-validation failures (`response_entries leaked across interactions` was the symptom this round). Always do a full `./run_docker_e2e.sh` rebuild when investigating a failure. The cached binary is only safe when the Go code is provably unchanged since the last rebuild.
+
+
 
 **Divergence at start**:
 - Fork HEAD: `f82e1c6760` (Merge PR #61 — 002077, landed 2026-06-12)
