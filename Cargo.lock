@@ -4,9 +4,9 @@ version = 4
 
 [[package]]
 name = "accesskit"
-version = "0.24.0"
+version = "0.24.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5351dcebb14b579ccab05f288596b2ae097005be7ee50a7c3d4ca9d0d5a66f6a"
+checksum = "d3b7f7f85a7e5f68090000ed7622545829afd484d210358702ae4cb97dd0c320"
 dependencies = [
  "uuid",
 ]
@@ -18,7 +18,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "842fd8203e6dfcf531d24f5bac792088edfba7d6b35844fead191603fb32a260"
 dependencies = [
  "accesskit",
- "accesskit_consumer",
+ "accesskit_consumer 0.35.0",
  "atspi-common",
  "phf 0.13.1",
  "serde",
@@ -36,13 +36,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "accesskit_consumer"
+version = "0.37.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f950720ce064757a1b629caad3a408e8d2c63bb01f29b8a3ff8daa331053ffeb"
+dependencies = [
+ "accesskit",
+ "hashbrown 0.16.1",
+]
+
+[[package]]
 name = "accesskit_macos"
 version = "0.26.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "534bc3fdc89a64a1db3c46b33c198fde2b7c3c7d094e5809c8c8bf2970c18243"
 dependencies = [
  "accesskit",
- "accesskit_consumer",
+ "accesskit_consumer 0.35.0",
  "hashbrown 0.16.1",
  "objc2 0.5.2",
  "objc2-app-kit 0.2.2",
@@ -69,12 +79,12 @@ dependencies = [
 
 [[package]]
 name = "accesskit_windows"
-version = "0.32.1"
+version = "0.33.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "eff7009f1a532e917d66970a1e80c965140c6cfbbabbdde3d64e5431e6c78e21"
+checksum = "36e93ac7bf50b964f1cbb75f741629a4e950571baa1ef1274457ab5a80d9bcc2"
 dependencies = [
  "accesskit",
- "accesskit_consumer",
+ "accesskit_consumer 0.37.0",
  "hashbrown 0.16.1",
  "static_assertions",
  "windows 0.62.2",
@@ -98,6 +108,7 @@ dependencies = [
  "file_icons",
  "futures 0.3.32",
  "gpui",
+ "http_proxy",
  "image",
  "indoc",
  "itertools 0.14.0",
@@ -258,6 +269,7 @@ dependencies = [
  "heck 0.5.0",
  "html_to_markdown",
  "http_client",
+ "http_proxy",
  "indoc",
  "itertools 0.14.0",
  "language",
@@ -276,6 +288,7 @@ dependencies = [
  "regex",
  "reqwest_client",
  "rust-embed",
+ "sandbox",
  "schemars 1.0.4",
  "serde",
  "serde_json",
@@ -598,7 +611,7 @@ dependencies = [
 [[package]]
 name = "alacritty_terminal"
 version = "0.26.1-dev"
-source = "git+https://github.com/zed-industries/alacritty?rev=fcf32feacb367b75ec84dd40f041e4fd411d3cc1#fcf32feacb367b75ec84dd40f041e4fd411d3cc1"
+source = "git+https://github.com/zed-industries/alacritty?rev=4c129667ce56611becdc82de6e28218c80e2e88f#4c129667ce56611becdc82de6e28218c80e2e88f"
 dependencies = [
  "base64 0.22.1",
  "bitflags 2.10.0",
@@ -2199,6 +2212,7 @@ dependencies = [
  "language",
  "language_model",
  "lsp",
+ "markdown",
  "multi_buffer",
  "project",
  "prompt_store",
@@ -2245,7 +2259,7 @@ dependencies = [
  "bitflags 2.10.0",
  "cexpr",
  "clang-sys",
- "itertools 0.11.0",
+ "itertools 0.10.5",
  "log",
  "prettyplease",
  "proc-macro2",
@@ -2265,7 +2279,7 @@ dependencies = [
  "bitflags 2.10.0",
  "cexpr",
  "clang-sys",
- "itertools 0.11.0",
+ "itertools 0.10.5",
  "proc-macro2",
  "quote",
  "regex",
@@ -5474,7 +5488,7 @@ dependencies = [
 [[package]]
 name = "dugong"
 version = "0.6.2"
-source = "git+https://github.com/zed-industries/merman?tag=v0.6.2-with-patches#06094471f97acb10d0eebf8b92bac19ba2928eea"
+source = "git+https://github.com/zed-industries/merman?tag=v0.6.2-with-patches#9acc3960f04a7deeb08079d60fa8183f15e8bde1"
 dependencies = [
  "dugong-graphlib",
  "rustc-hash 2.1.1",
@@ -5485,7 +5499,7 @@ dependencies = [
 [[package]]
 name = "dugong-graphlib"
 version = "0.6.2"
-source = "git+https://github.com/zed-industries/merman?tag=v0.6.2-with-patches#06094471f97acb10d0eebf8b92bac19ba2928eea"
+source = "git+https://github.com/zed-industries/merman?tag=v0.6.2-with-patches#9acc3960f04a7deeb08079d60fa8183f15e8bde1"
 dependencies = [
  "hashbrown 0.16.1",
  "rustc-hash 2.1.1",
@@ -6440,6 +6454,7 @@ dependencies = [
  "anyhow",
  "cloud_api_types",
  "collections",
+ "command_palette_hooks",
  "db",
  "editor",
  "extension",
@@ -6453,6 +6468,7 @@ dependencies = [
  "picker",
  "project",
  "release_channel",
+ "schemars 1.0.4",
  "semver",
  "serde",
  "settings",
@@ -7475,7 +7491,6 @@ dependencies = [
  "itertools 0.14.0",
  "language",
  "language_model",
- "linkify",
  "log",
  "markdown",
  "menu",
@@ -7938,6 +7953,7 @@ dependencies = [
  "filedescriptor",
  "futures 0.3.32",
  "gpui",
+ "gpui_util",
  "gpui_wgpu",
  "http_client",
  "image",
@@ -7956,7 +7972,6 @@ dependencies = [
  "strum 0.27.2",
  "swash",
  "url",
- "util",
  "uuid",
  "wayland-backend",
  "wayland-client",
@@ -7995,6 +8010,7 @@ dependencies = [
  "foreign-types 0.5.0",
  "futures 0.3.32",
  "gpui",
+ "gpui_util",
  "image",
  "itertools 0.14.0",
  "libc",
@@ -8012,7 +8028,6 @@ dependencies = [
  "semver",
  "smallvec",
  "strum 0.27.2",
- "util",
  "uuid",
  "zed-font-kit",
 ]
@@ -8055,8 +8070,8 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "gpui",
+ "gpui_util",
  "tokio",
- "util",
 ]
 
 [[package]]
@@ -8065,6 +8080,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "log",
+ "which 6.0.3",
 ]
 
 [[package]]
@@ -8127,9 +8143,11 @@ dependencies = [
  "accesskit_windows",
  "anyhow",
  "collections",
+ "dunce",
  "etagere",
  "futures 0.3.32",
  "gpui",
+ "gpui_util",
  "image",
  "itertools 0.14.0",
  "log",
@@ -8137,7 +8155,6 @@ dependencies = [
  "rand 0.9.4",
  "raw-window-handle",
  "smallvec",
- "util",
  "uuid",
  "windows 0.61.3",
  "windows-core 0.61.2",
@@ -8666,6 +8683,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "http_proxy"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "base64 0.22.1",
+ "futures 0.3.32",
+ "httparse",
+ "idna",
+ "log",
+ "percent-encoding",
+ "proxyvars",
+ "thiserror 2.0.17",
+ "url",
+]
+
+[[package]]
 name = "httparse"
 version = "1.10.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -8830,7 +8863,7 @@ dependencies = [
  "js-sys",
  "log",
  "wasm-bindgen",
- "windows-core 0.62.2",
+ "windows-core 0.56.0",
 ]
 
 [[package]]
@@ -9084,7 +9117,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4b0f83760fb341a774ed326568e19f5a863af4a952def8c39f9ab92fd95b88e5"
 dependencies = [
  "equivalent",
- "hashbrown 0.16.1",
+ "hashbrown 0.15.5",
  "serde",
  "serde_core",
 ]
@@ -9774,6 +9807,7 @@ dependencies = [
  "toml 0.8.23",
  "tracing",
  "tree-sitter",
+ "tree-sitter-c",
  "tree-sitter-elixir",
  "tree-sitter-embedded-template",
  "tree-sitter-heex",
@@ -10711,7 +10745,7 @@ dependencies = [
 [[package]]
 name = "manatee"
 version = "0.6.2"
-source = "git+https://github.com/zed-industries/merman?tag=v0.6.2-with-patches#06094471f97acb10d0eebf8b92bac19ba2928eea"
+source = "git+https://github.com/zed-industries/merman?tag=v0.6.2-with-patches#9acc3960f04a7deeb08079d60fa8183f15e8bde1"
 dependencies = [
  "indexmap 2.11.4",
  "nalgebra",
@@ -10748,6 +10782,7 @@ dependencies = [
  "node_runtime",
  "pulldown-cmark 0.13.0",
  "settings",
+ "smallvec",
  "stacksafe",
  "sum_tree",
  "theme",
@@ -10761,6 +10796,8 @@ name = "markdown_preview"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "buffer_diff",
+ "db",
  "editor",
  "fs",
  "gpui",
@@ -11006,7 +11043,7 @@ dependencies = [
 [[package]]
 name = "merman"
 version = "0.6.2"
-source = "git+https://github.com/zed-industries/merman?tag=v0.6.2-with-patches#06094471f97acb10d0eebf8b92bac19ba2928eea"
+source = "git+https://github.com/zed-industries/merman?tag=v0.6.2-with-patches#9acc3960f04a7deeb08079d60fa8183f15e8bde1"
 dependencies = [
  "merman-core",
  "merman-render",
@@ -11016,7 +11053,7 @@ dependencies = [
 [[package]]
 name = "merman-core"
 version = "0.6.2"
-source = "git+https://github.com/zed-industries/merman?tag=v0.6.2-with-patches#06094471f97acb10d0eebf8b92bac19ba2928eea"
+source = "git+https://github.com/zed-industries/merman?tag=v0.6.2-with-patches#9acc3960f04a7deeb08079d60fa8183f15e8bde1"
 dependencies = [
  "chrono",
  "euclid",
@@ -11042,7 +11079,7 @@ dependencies = [
 [[package]]
 name = "merman-render"
 version = "0.6.2"
-source = "git+https://github.com/zed-industries/merman?tag=v0.6.2-with-patches#06094471f97acb10d0eebf8b92bac19ba2928eea"
+source = "git+https://github.com/zed-industries/merman?tag=v0.6.2-with-patches#9acc3960f04a7deeb08079d60fa8183f15e8bde1"
 dependencies = [
  "base64 0.22.1",
  "chrono",
@@ -14306,7 +14343,7 @@ checksum = "22505a5c94da8e3b7c2996394d1c933236c4d743e81a410bcca4e6989fc066a4"
 dependencies = [
  "bytes 1.11.1",
  "heck 0.5.0",
- "itertools 0.11.0",
+ "itertools 0.10.5",
  "log",
  "multimap",
  "once_cell",
@@ -14339,7 +14376,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "81bddcdb20abf9501610992b6759a4c888aef7d1a7247ef75e2404275ac24af1"
 dependencies = [
  "anyhow",
- "itertools 0.11.0",
+ "itertools 0.10.5",
  "proc-macro2",
  "quote",
  "syn 2.0.117",
@@ -14392,6 +14429,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3e36c2f31e0a47f9280fb347ef5e461ffcd2c52dd520d8e216b52f93b0b0d7d6"
 dependencies = [
  "thiserror 1.0.69",
+]
+
+[[package]]
+name = "proxyvars"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7285bf1ae9f4d28cd9b1100c9a3aab55263ec0aa44e4d439593e528fc1dc1e05"
+dependencies = [
+ "http 1.3.1",
+ "ipnet",
 ]
 
 [[package]]
@@ -15540,7 +15587,7 @@ dependencies = [
 [[package]]
 name = "roughr-merman"
 version = "0.12.0"
-source = "git+https://github.com/zed-industries/merman?tag=v0.6.2-with-patches#06094471f97acb10d0eebf8b92bac19ba2928eea"
+source = "git+https://github.com/zed-industries/merman?tag=v0.6.2-with-patches#9acc3960f04a7deeb08079d60fa8183f15e8bde1"
 dependencies = [
  "derive_builder",
  "euclid",
@@ -15986,6 +16033,9 @@ name = "sandbox"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "libc",
+ "log",
+ "smol",
  "tempfile",
 ]
 
@@ -16709,13 +16759,17 @@ dependencies = [
  "audio",
  "cloud_api_types",
  "codestral",
+ "collections",
  "component",
+ "context_server",
  "copilot",
  "copilot_ui",
  "cpal",
  "edit_prediction",
  "edit_prediction_ui",
  "editor",
+ "extension",
+ "extension_host",
  "feature_flags",
  "fs",
  "futures 0.3.32",
@@ -16723,8 +16777,10 @@ dependencies = [
  "gpui",
  "heck 0.5.0",
  "http_client",
+ "http_proxy",
  "itertools 0.14.0",
  "language",
+ "language_model",
  "log",
  "menu",
  "paths",
@@ -16749,6 +16805,7 @@ dependencies = [
  "title_bar",
  "ui",
  "ui_input",
+ "url",
  "util",
  "workspace",
  "zed_actions",
@@ -16868,6 +16925,7 @@ dependencies = [
  "feature_flags",
  "fs",
  "git",
+ "git_ui",
  "gpui",
  "http_client",
  "itertools 0.14.0",
@@ -20007,6 +20065,7 @@ dependencies = [
  "util_macros",
  "walkdir",
  "which 6.0.3",
+ "windows 0.61.3",
 ]
 
 [[package]]
@@ -23048,7 +23107,7 @@ dependencies = [
 
 [[package]]
 name = "zed"
-version = "1.8.0"
+version = "1.9.0"
 dependencies = [
  "acp_thread",
  "acp_tools",
@@ -23165,6 +23224,7 @@ dependencies = [
  "repl",
  "reqwest_client",
  "rope",
+ "sandbox",
  "search",
  "semver",
  "serde",
