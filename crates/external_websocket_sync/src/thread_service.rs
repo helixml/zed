@@ -2260,6 +2260,20 @@ fn open_existing_thread_sync(
         if let Some(thread_entity) = thread_weak.upgrade() {
             ensure_thread_subscription(&thread_entity, &request.acp_thread_id, cx);
         }
+        // Emit agent_ready, exactly like the other three load paths (fresh load,
+        // slow-path sync load, lock-wait recheck). On reconnect the external
+        // client sends open_thread, which suppresses the connection loop's 5s
+        // fallback agent_ready and delegates the ready signal to the thread
+        // service. Without this, a thread that is still in the registry never
+        // gets an agent_ready and the client's readiness wait times out on every
+        // reconnect.
+        let agent_name_for_ready = request
+            .agent_name
+            .clone()
+            .unwrap_or_else(|| "zed-agent".to_string());
+        // Persist the agent backing this thread (see set_thread_agent_name doc).
+        set_thread_agent_name(&request.acp_thread_id, agent_name_for_ready.clone());
+        crate::send_agent_ready(agent_name_for_ready, Some(request.acp_thread_id.clone()));
         // TODO: Still need to notify AgentPanel to display it
         return Ok(());
     }
@@ -2690,6 +2704,130 @@ mod pending_user_created_emit_tests {
             pending.get(&id).cloned().flatten(),
             Some("second".to_string()),
             "later defer must overwrite the earlier entry"
+        );
+    }
+}
+
+#[cfg(test)]
+mod agent_ready_on_reconnect_tests {
+    //! Regression test for the agent-readiness handshake on reconnect.
+    //!
+    //! When the external sync client reconnects it sends `open_thread`, which
+    //! suppresses the connection loop's 5s fallback `agent_ready`
+    //! (see `websocket_sync.rs`) and delegates emitting the ready signal to the
+    //! thread service. `open_existing_thread_sync` has four load paths: the fresh
+    //! load, the slow-path sync load, and the lock-wait recheck all emit
+    //! `agent_ready` after loading — but the "already loaded in registry"
+    //! fast-path returns `Ok(())` WITHOUT emitting it. So when a thread is still in
+    //! the in-process registry on reconnect, `agent_ready` is never sent and the
+    //! client's readiness wait times out.
+    //!
+    //! This test pins the fast-path to the same contract as the other three paths.
+    //! It is RED until the registry fast-path emits `agent_ready` before returning.
+
+    use super::*;
+    use crate::types::SyncEvent;
+    use crate::websocket_sync::{WebSocketSync, WEBSOCKET_SERVICE};
+    use acp_thread::{AgentConnection, StubAgentConnection};
+    use fs::FakeFs;
+    use gpui::{AppContext as _, TestAppContext};
+    use project::Project;
+    use settings::SettingsStore;
+    use std::rc::Rc;
+    use util::path_list::PathList;
+
+    fn init_test(cx: &mut TestAppContext) {
+        env_logger::try_init().ok();
+        cx.update(|cx| {
+            let settings_store = SettingsStore::test(cx);
+            cx.set_global(settings_store);
+        });
+    }
+
+    #[gpui::test]
+    async fn open_thread_on_already_registered_thread_emits_agent_ready(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        // Build a real AcpThread entity via the stub connection and register it —
+        // simulating a thread entity that survived in the in-process registry
+        // across a WebSocket reconnect (the precise fast-path trigger).
+        let fs = FakeFs::new(cx.executor());
+        let project = Project::test(fs, [], cx).await;
+        let connection = Rc::new(StubAgentConnection::new());
+        let thread = cx
+            .update(|cx| {
+                connection
+                    .clone()
+                    .new_session(project.clone(), PathList::default(), cx)
+            })
+            .await
+            .expect("stub new_session should succeed");
+
+        // The external thread id (the registry key) is distinct from the ACP
+        // session id. Unique per run so the process-global registry / subscription
+        // statics don't collide with other tests.
+        let acp_thread_id = format!(
+            "test-reconnect-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        register_thread(acp_thread_id.clone(), thread);
+        assert!(
+            get_thread(&acp_thread_id).is_some(),
+            "precondition: thread must be in the registry so open_existing_thread_sync \
+             takes the 'already loaded' fast-path"
+        );
+
+        // Install a recording WebSocket service so send_agent_ready is observable
+        // (without it, send_websocket_event errors on an uninitialised service).
+        let (service, mut events_rx) = WebSocketSync::new_test();
+        *WEBSOCKET_SERVICE.lock() = Some(service);
+
+        // Exercise the reconnect `open_thread` against the already-registered thread.
+        let request = ThreadOpenRequest {
+            acp_thread_id: acp_thread_id.clone(),
+            agent_name: Some("zed-agent".to_string()),
+        };
+        let history_store = cx.update(|cx| cx.new(|cx| ThreadStore::new(cx)));
+        let unused_fs: Arc<dyn Fs> = FakeFs::new(cx.executor());
+        cx.update(|cx| {
+            open_existing_thread_sync(project.clone(), history_store, unused_fs, request, cx)
+                .expect("open_existing_thread_sync should return Ok on the fast-path");
+        });
+        cx.run_until_parked();
+
+        // Drain emitted events and count AgentReady for this thread.
+        let mut agent_ready_count = 0;
+        while let Ok(event) = events_rx.try_recv() {
+            if let SyncEvent::AgentReady { thread_id, .. } = event {
+                if thread_id.as_deref() == Some(acp_thread_id.as_str()) {
+                    agent_ready_count += 1;
+                }
+            }
+        }
+
+        // Tear down all process-global state this test touched, BEFORE the
+        // assertion, so it runs on both the pass and fail paths:
+        //  - the recording WebSocket service (else it leaks into other tests);
+        //  - the registry + keep-alive strong refs to the AcpThread entity (else
+        //    the gpui test harness panics with "leaked handle" at App teardown,
+        //    since THREAD_KEEP_ALIVE intentionally holds a permanent strong ref).
+        *WEBSOCKET_SERVICE.lock() = None;
+        unregister_thread(&acp_thread_id);
+        if let Some(keep_alive) = THREAD_KEEP_ALIVE.lock().as_ref() {
+            keep_alive.write().remove(&acp_thread_id);
+        }
+        cx.run_until_parked();
+
+        assert_eq!(
+            agent_ready_count, 1,
+            "open_thread on an already-registered thread MUST emit exactly one \
+             agent_ready, like the other three load paths in \
+             open_existing_thread_sync. The registry fast-path currently omits it; \
+             because the 5s fallback agent_ready was suppressed when open_thread \
+             arrived, the readiness wait then times out."
         );
     }
 }

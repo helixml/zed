@@ -63,6 +63,7 @@ uuid.workspace = true
 watch.workspace = true
 
 [dev-dependencies]
+acp_thread = { workspace = true, features = ["test-support"] }
 env_logger.workspace = true
 fs.workspace = true
 gpui = { workspace = true, features = ["test-support"] }
