@@ -2260,6 +2260,20 @@ fn open_existing_thread_sync(
         if let Some(thread_entity) = thread_weak.upgrade() {
             ensure_thread_subscription(&thread_entity, &request.acp_thread_id, cx);
         }
+        // Emit agent_ready, exactly like the other three load paths (fresh load,
+        // slow-path sync load, lock-wait recheck). On reconnect the external
+        // client sends open_thread, which suppresses the connection loop's 5s
+        // fallback agent_ready and delegates the ready signal to the thread
+        // service. Without this, a thread that is still in the registry never
+        // gets an agent_ready and the client's readiness wait times out on every
+        // reconnect.
+        let agent_name_for_ready = request
+            .agent_name
+            .clone()
+            .unwrap_or_else(|| "zed-agent".to_string());
+        // Persist the agent backing this thread (see set_thread_agent_name doc).
+        set_thread_agent_name(&request.acp_thread_id, agent_name_for_ready.clone());
+        crate::send_agent_ready(agent_name_for_ready, Some(request.acp_thread_id.clone()));
         // TODO: Still need to notify AgentPanel to display it
         return Ok(());
     }
