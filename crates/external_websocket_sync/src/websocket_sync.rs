@@ -575,6 +575,21 @@ impl WebSocketSync {
     pub fn get_reconnect_delay_ms(&self) -> u64 {
         self.reconnect_delay_ms.load(Ordering::SeqCst)
     }
+
+    /// Test-only: build a service whose outgoing events can be observed via the
+    /// returned receiver, without opening a real WebSocket connection. Install it
+    /// into `WEBSOCKET_SERVICE` so `send_websocket_event` / `send_agent_ready`
+    /// deliver into the receiver instead of erroring on an uninitialised service.
+    #[cfg(test)]
+    pub(crate) fn new_test() -> (Arc<Self>, mpsc::UnboundedReceiver<SyncEvent>) {
+        let (outgoing_tx, outgoing_rx) = mpsc::unbounded_channel::<SyncEvent>();
+        let service = Arc::new(Self {
+            outgoing_tx,
+            is_connected: Arc::new(AtomicBool::new(true)),
+            reconnect_delay_ms: Arc::new(AtomicU64::new(INITIAL_RECONNECT_DELAY_MS)),
+        });
+        (service, outgoing_rx)
+    }
 }
 
 /// Global WebSocket service instance
