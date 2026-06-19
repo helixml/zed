@@ -223,6 +223,14 @@ pub enum SyncEvent {
         request_id: String,
         error: String,
     },
+    /// Sent when a turn aborts (ACP agent process exited mid-turn, or MaxTokens).
+    /// Helix's handleChatResponseError marks the interaction state=error with
+    /// this message and ends the activation, freeing the per-Worker lane.
+    #[serde(rename = "chat_response_error")]
+    ChatResponseError {
+        request_id: String,
+        error: String,
+    },
     /// Sent when the agent (e.g., qwen-code) has finished initialization and is ready to receive prompts
     /// This prevents race conditions where Helix sends prompts before the agent is ready
     #[serde(rename = "agent_ready")]
@@ -309,6 +317,13 @@ impl SyncEvent {
                 "thread_load_error".to_string(),
                 serde_json::json!({
                     "acp_thread_id": acp_thread_id,
+                    "request_id": request_id,
+                    "error": error,
+                })
+            ),
+            SyncEvent::ChatResponseError { request_id, error } => (
+                "chat_response_error".to_string(),
+                serde_json::json!({
                     "request_id": request_id,
                     "error": error,
                 })
