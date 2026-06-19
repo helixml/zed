@@ -739,10 +739,12 @@ pub fn get_thread(acp_thread_id: &str) -> Option<WeakEntity<AcpThread>> {
 /// that create or load threads must call this to set up the subscription. It is
 /// idempotent — if a persistent subscription already exists, it does nothing.
 ///
-/// Handles three events:
+/// Handles four events:
 /// - `NewEntry`: new user/assistant message → send `message_added`
 /// - `EntryUpdated`: streaming tokens / tool call updates → throttled `message_added`
 /// - `Stopped`: turn completed → flush throttle + send `message_completed`
+/// - `Error`: turn aborted (agent process exited mid-turn, or MaxTokens) →
+///   flush + send `chat_response_error` so Helix errors the interaction
 pub fn ensure_thread_subscription(
     thread_entity: &Entity<AcpThread>,
     thread_id: &str,
@@ -978,10 +980,16 @@ pub fn ensure_thread_subscription(
                     );
                 }
             }
-            AcpThreadEvent::Stopped(_) => {
+            // Stopped and Error are both turn-terminal and must send Helix a
+            // terminal frame to free the activation lane. Stopped → completed;
+            // Error (agent process exited mid-turn, or MaxTokens — run_turn's Err
+            // arm) → chat_response_error. Without the Error arm a crashed agent
+            // that streamed partial output wedges the worker forever.
+            AcpThreadEvent::Stopped(_) | AcpThreadEvent::Error => {
+                let is_error = matches!(event, AcpThreadEvent::Error);
                 flush_streaming_throttle(&thread_id_for_sub);
 
-                // AcpThread calls flush_streaming_text before emitting Stopped, so all
+                // AcpThread calls flush_streaming_text before emitting Stopped/Error, so all
                 // Markdown entities now have their complete buffered text. Send corrected
                 // content for ALL entries — EntryUpdated events during streaming carried
                 // incomplete content (text was still in the streaming buffer at that point),
@@ -1062,15 +1070,56 @@ pub fn ensure_thread_subscription(
                     captured_rid
                 };
                 *last_completed_request_id.borrow_mut() = completed_rid.clone();
-                eprintln!(
-                    "📤 [THREAD_SERVICE] Stopped event: sending message_completed for thread {} (request_id={})",
-                    thread_id_for_sub, completed_rid
-                );
-                let _ = crate::send_websocket_event(SyncEvent::MessageCompleted {
-                    acp_thread_id: thread_id_for_sub.clone(),
-                    message_id: "0".to_string(),
-                    request_id: completed_rid,
-                });
+                if is_error {
+                    // Turn aborted (agent process exited mid-turn, or MaxTokens).
+                    // Emit chat_response_error, NOT message_completed: Helix's
+                    // handleChatResponseError marks the interaction state=error
+                    // (vs masking a crash as a normal completion) and ends the
+                    // activation, freeing the per-Worker lane.
+                    //
+                    // AcpThreadEvent::Error carries no cause string, so the
+                    // payload is generic — the real exit reason (e.g. "process
+                    // exited with code 143") is logged by acp_thread::run_turn
+                    // just before this fires: grep Zed.log for "Error in run
+                    // turn" near this request_id. We also log the
+                    // streamed-then-died signal (partial entry count + bytes) so
+                    // a future wedge is identifiable from Zed.log alone, without
+                    // reconstructing it from Helix DB state.
+                    let turn_entries = entries.len().saturating_sub(turn_start);
+                    let partial_bytes: usize = entries
+                        .iter()
+                        .skip(turn_start)
+                        .map(|e| match e {
+                            acp_thread::AgentThreadEntry::AssistantMessage(m) => {
+                                m.content_only(cx).len()
+                            }
+                            acp_thread::AgentThreadEntry::ToolCall(tc) => tc.to_markdown(cx).len(),
+                            _ => 0,
+                        })
+                        .sum();
+                    log::warn!(
+                        "🛑 [THREAD_SERVICE] turn ABORTED (AcpThreadEvent::Error) thread={} request_id={} \
+                         streamed {} partial entries / {} bytes before dying — emitting chat_response_error \
+                         to mark the interaction errored and free the Helix activation lane",
+                        thread_id_for_sub, completed_rid, turn_entries, partial_bytes
+                    );
+                    let _ = crate::send_websocket_event(SyncEvent::ChatResponseError {
+                        request_id: completed_rid,
+                        error: "agent turn aborted: the ACP agent process exited mid-turn or hit \
+                                max tokens (see Zed.log 'Error in run turn' for the cause)"
+                            .to_string(),
+                    });
+                } else {
+                    eprintln!(
+                        "📤 [THREAD_SERVICE] Stopped event: sending message_completed for thread {} (request_id={})",
+                        thread_id_for_sub, completed_rid
+                    );
+                    let _ = crate::send_websocket_event(SyncEvent::MessageCompleted {
+                        acp_thread_id: thread_id_for_sub.clone(),
+                        message_id: "0".to_string(),
+                        request_id: completed_rid,
+                    });
+                }
             }
             _ => {}
         }
@@ -2558,6 +2607,12 @@ fn open_existing_thread_sync(
     Ok(())
 }
 
+/// Serializes tests that install a recording WebSocket service into the
+/// process-global `WEBSOCKET_SERVICE`. Without it, two such tests running on
+/// parallel cargo threads stomp each other's service and lose events.
+#[cfg(test)]
+static TEST_WEBSOCKET_SERVICE_GUARD: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
+
 #[cfg(test)]
 mod pending_user_created_emit_tests {
     //! Regression tests for the deferred-emission machinery that backs Fix 1a
@@ -2746,6 +2801,7 @@ mod agent_ready_on_reconnect_tests {
 
     #[gpui::test]
     async fn open_thread_on_already_registered_thread_emits_agent_ready(cx: &mut TestAppContext) {
+        let _ws_guard = super::TEST_WEBSOCKET_SERVICE_GUARD.lock();
         init_test(cx);
 
         // Build a real AcpThread entity via the stub connection and register it —
@@ -2828,6 +2884,120 @@ mod agent_ready_on_reconnect_tests {
              open_existing_thread_sync. The registry fast-path currently omits it; \
              because the 5s fallback agent_ready was suppressed when open_thread \
              arrived, the readiness wait then times out."
+        );
+    }
+}
+
+#[cfg(test)]
+mod agent_process_crash_tests {
+    //! Regression test for the "streamed-then-died" stuck-turn wedge.
+    //!
+    //! When the ACP agent process exits mid-turn, run_turn emits
+    //! `AcpThreadEvent::Error` (not `Stopped`). The subscription must emit a
+    //! terminal `chat_response_error` for the in-flight `request_id` so Helix's
+    //! handleChatResponseError marks the interaction errored and frees the
+    //! activation lane — otherwise the worker wedges forever.
+
+    use super::*;
+    use crate::types::SyncEvent;
+    use crate::websocket_sync::{WebSocketSync, WEBSOCKET_SERVICE};
+    use acp_thread::{AcpThread, AgentConnection, StubAgentConnection};
+    use fs::FakeFs;
+    use gpui::{AppContext as _, TestAppContext};
+    use project::Project;
+    use settings::SettingsStore;
+    use std::rc::Rc;
+    use util::path_list::PathList;
+
+    fn init_test(cx: &mut TestAppContext) {
+        env_logger::try_init().ok();
+        cx.update(|cx| {
+            let settings_store = SettingsStore::test(cx);
+            cx.set_global(settings_store);
+        });
+    }
+
+    #[gpui::test]
+    async fn agent_process_crash_mid_turn_emits_terminal_frame(cx: &mut TestAppContext) {
+        let _ws_guard = TEST_WEBSOCKET_SERVICE_GUARD.lock();
+        init_test(cx);
+
+        // Stub leaves the turn pending so we can crash it mid-flight below.
+        let fs = FakeFs::new(cx.executor());
+        let project = Project::test(fs, [], cx).await;
+        let connection = Rc::new(StubAgentConnection::new());
+        let thread: Entity<AcpThread> = cx
+            .update(|cx| {
+                connection
+                    .clone()
+                    .new_session(project.clone(), PathList::default(), cx)
+            })
+            .await
+            .expect("stub new_session should succeed");
+
+        let session_id = cx.read(|cx| thread.read(cx).session_id().clone());
+
+        // Unique ids so the process-global statics don't collide across tests.
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let acp_thread_id = format!("test-crash-{}", nonce);
+        let request_id = format!("req-crash-{}", nonce);
+
+        // request_id must be set before the subscription so the turn captures it.
+        set_thread_request_id(acp_thread_id.clone(), request_id.clone());
+        register_thread(acp_thread_id.clone(), thread.clone());
+        cx.update(|cx| ensure_thread_subscription(&thread, &acp_thread_id, cx));
+
+        let (service, mut events_rx) = WebSocketSync::new_test();
+        *WEBSOCKET_SERVICE.lock() = Some(service);
+
+        // Drive the turn future on the foreground executor — it only resolves
+        // once the turn ends, but its run_turn machinery emits the events.
+        let send_fut = cx.update(|cx| {
+            thread.update(cx, |thread, cx| {
+                thread.send(vec!["partial output then crash".into()], cx)
+            })
+        });
+        cx.foreground_executor()
+            .spawn(async move {
+                let _ = send_fut.await;
+            })
+            .detach();
+        cx.run_until_parked();
+
+        // Crash the agent mid-turn → run_turn emits AcpThreadEvent::Error.
+        connection.fail_turn(session_id);
+        cx.run_until_parked();
+
+        let mut terminal_for_turn = 0;
+        while let Ok(event) = events_rx.try_recv() {
+            if let SyncEvent::ChatResponseError { request_id: rid, error } = event {
+                if rid == request_id {
+                    assert!(!error.is_empty(), "chat_response_error must carry an error payload");
+                    terminal_for_turn += 1;
+                }
+            }
+        }
+
+        // Tear down process-global state before asserting (THREAD_KEEP_ALIVE
+        // holds a permanent strong ref → "leaked handle" panic otherwise).
+        *WEBSOCKET_SERVICE.lock() = None;
+        unregister_thread(&acp_thread_id);
+        if let Some(keep_alive) = THREAD_KEEP_ALIVE.lock().as_ref() {
+            keep_alive.write().remove(&acp_thread_id);
+        }
+        cx.run_until_parked();
+
+        assert_eq!(
+            terminal_for_turn, 1,
+            "when the ACP agent process exits mid-turn, AcpThread emits \
+             AcpThreadEvent::Error and the subscription MUST forward a terminal \
+             chat_response_error frame for the in-flight request_id so Helix's \
+             handleChatResponseError marks the interaction errored and frees the \
+             activation lane. Without an Error arm the crash is swallowed and the \
+             interaction stays waiting forever — the permanent worker wedge."
         );
     }
 }

@@ -911,6 +911,20 @@ mod test_support {
                 .send(stop_reason)
                 .unwrap();
         }
+
+        /// Simulate the agent process exiting mid-turn: drop the pending turn's
+        /// response sender without sending a `StopReason`, so the `prompt`
+        /// future's `rx.await?` resolves to `Err` — the same path run_turn takes
+        /// on a real ACP agent crash (emits `AcpThreadEvent::Error`, not `Stopped`).
+        pub fn fail_turn(&self, session_id: acp::SessionId) {
+            self.sessions
+                .lock()
+                .get_mut(&session_id)
+                .unwrap()
+                .response_tx
+                .take()
+                .expect("No pending turn");
+        }
     }
 
     impl AgentConnection for StubAgentConnection {
