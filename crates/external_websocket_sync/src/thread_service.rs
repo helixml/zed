@@ -1242,6 +1242,38 @@ pub fn setup_thread_handler(
                         }
                     }
 
+                    // Interrupt: cancel the pre-existing running turn INLINE here,
+                    // in order, immediately before dispatching this message. Doing
+                    // it on this task (rather than via the independent by-thread
+                    // cancel task) guarantees the cancel targets the OLD turn — the
+                    // global request_id map still points at the old turn at this
+                    // point (handle_follow_up_message rotates it to this turn), so
+                    // the cancelled turn's Stopped is attributed correctly, and this
+                    // message's own turn (started below) is never the cancel target.
+                    // No-op if no turn is running (e.g. Helix's server-side
+                    // cancel_current_turn already cancelled it). See E2E Phase 17.
+                    if request.interrupt {
+                        eprintln!(
+                            "⚡ [THREAD_SERVICE] Interrupt: cancelling pre-existing turn on {} before dispatch",
+                            existing_thread_id
+                        );
+                        log::info!(
+                            "⚡ [THREAD_SERVICE] Interrupt: cancelling pre-existing turn on {} before dispatch",
+                            existing_thread_id
+                        );
+                        // cancel() drops the running turn's send_task and emits
+                        // Stopped(Cancelled) synchronously, returning Task::ready(()),
+                        // so we don't need to await the returned task — mirrors the
+                        // dedicated cancel task's handling.
+                        match cx.update(|cx| thread.update(cx, |t, cx| t.cancel(cx))) {
+                            Ok(_) => {}
+                            Err(e) => log::warn!(
+                                "⚠️ [THREAD_SERVICE] Interrupt cancel failed for {}: {}",
+                                existing_thread_id, e
+                            ),
+                        }
+                    }
+
                     let initial_message = request.message.clone();
                     let initial_err = handle_follow_up_message(
                         thread,

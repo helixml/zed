@@ -429,23 +429,19 @@ impl WebSocketSync {
         log::info!("💬 [WEBSOCKET-IN] Processing chat_message: acp_thread_id={:?}, request_id={}, message_len={}, interrupt={}",
                    chat_msg.acp_thread_id, chat_msg.request_id, chat_msg.message.len(), chat_msg.interrupt);
 
-        // If this is an interrupt message and we have an existing thread, cancel its
-        // running turn immediately via the dedicated cancel task (which runs independently
-        // of the sequential callback_rx loop, so it can fire even while the loop is
-        // blocked awaiting the previous turn's response).
-        if chat_msg.interrupt {
-            if let Some(ref thread_id) = chat_msg.acp_thread_id {
-                if !thread_id.is_empty() {
-                    eprintln!("⚡ [WEBSOCKET-IN] Interrupt flag set — cancelling running turn on thread: {}", thread_id);
-                    log::info!("⚡ [WEBSOCKET-IN] Interrupt flag set — cancelling running turn on thread: {}", thread_id);
-                    if let Err(e) = crate::request_cancel_thread(thread_id.clone()) {
-                        eprintln!("⚠️ [WEBSOCKET-IN] Failed to request cancel for thread {}: {}", thread_id, e);
-                        log::warn!("⚠️ [WEBSOCKET-IN] Failed to request cancel for thread {}: {}", thread_id, e);
-                    }
-                }
-            }
-        }
-
+        // Interrupt handling: an interrupt message must cancel the thread's
+        // currently-running turn and then dispatch its own message. We do NOT
+        // cancel here via the independent by-thread cancel task, because that
+        // task races the sequential thread-creation loop below: for a slow
+        // agent (e.g. claude-agent-acp) the cancel can land AFTER this message's
+        // own turn has already started, killing the interrupt turn instead of
+        // the turn it was meant to replace (E2E Phase 17). Instead we thread the
+        // interrupt flag into the creation request so the handler cancels the
+        // pre-existing turn INLINE, in order, immediately before sending — which
+        // deterministically targets the old turn. (Helix's processInterruptPrompt
+        // also sends a targeted cancel_current_turn beforehand; the inline cancel
+        // is then a no-op, but it keeps interrupt cancellation correct even if
+        // that targeted cancel is absent or races.)
         // Request thread creation via callback
         let request = ThreadCreationRequest {
             acp_thread_id: chat_msg.acp_thread_id.clone(),
@@ -453,6 +449,7 @@ impl WebSocketSync {
             request_id: chat_msg.request_id.clone(),
             agent_name: chat_msg.agent_name.clone(),
             simulate_input: false,
+            interrupt: chat_msg.interrupt,
         };
 
         eprintln!("🎯 [WEBSOCKET-IN] Calling request_thread_creation()...");
@@ -486,6 +483,7 @@ impl WebSocketSync {
             request_id: chat_msg.request_id.clone(),
             agent_name: chat_msg.agent_name.clone(),
             simulate_input: true,
+            interrupt: false,
         };
 
         eprintln!("🎯 [WEBSOCKET-IN] Calling request_thread_creation() with simulate_input=true...");
