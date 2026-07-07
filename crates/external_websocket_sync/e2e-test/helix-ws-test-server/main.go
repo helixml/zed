@@ -122,6 +122,19 @@ type roundState struct {
 	// filters Phase 10's synthetic ID out of this counter explicitly.
 	spontaneousUserCreatedThreadCount int
 	spontaneousUserCreatedThreadIDs   []string
+
+	// Phases 16/17: PRODUCTION queue path (session-scoped prompt queue) against
+	// a live Zed. Unlike the other phases (which drive the low-level
+	// SendChatMessage primitive), these exercise EnqueueQueuedPrompt →
+	// processPendingPromptsForSession → processPromptQueue / processInterruptPrompt
+	// → sendQueuedPromptToSession — the path all production agent sends now use.
+	// Queue prompts get generated request_ids (not "req-phaseN-"), so these
+	// phases are driven by polling the store, not the completion switch.
+	queueThreadID      string // established thread the queue phases reuse
+	phase16Deferred    bool   // interrupt=false was HELD while busy (no concurrent interaction)
+	phase16Delivered   bool   // the deferred message was delivered as the next turn once idle
+	phase17Interrupted bool   // interrupt=true cancelled the running turn (interaction went interrupted)
+	phase17Delivered   bool   // the interrupt message was delivered
 }
 
 // phase15AddSample records a single message_added event tied to phase 15's
@@ -230,6 +243,11 @@ func (d *testDriver) syncEventCallback(sessionID string, syncMsg *types.SyncMess
 			if d.phase == 15 && d.round.phase15ThreadID == "" {
 				d.round.phase15ThreadID = acpThreadID
 				log.Printf("[%s] Phase 15: Captured thread ID: %s", d.round.agentName, truncate(acpThreadID, 16))
+			}
+			// Capture the thread created for phase 16 (production queue path).
+			if d.phase == 16 && d.round.queueThreadID == "" {
+				d.round.queueThreadID = acpThreadID
+				log.Printf("[%s] Phase 16: Captured thread ID: %s", d.round.agentName, truncate(acpThreadID, 16))
 			}
 		}
 
@@ -770,8 +788,16 @@ func (d *testDriver) advanceAfterCompletion(completedPhase int) {
 		d.mu.Unlock()
 		d.runPhase13()
 	case 15:
-		// Phase 15 completed normally — final phase of the round.
-		d.advanceToNextRound()
+		// Phase 15 done — advance to the production queue-path phases.
+		d.mu.Lock()
+		d.phase = 16
+		d.mu.Unlock()
+		d.runPhase16()
+	case 16:
+		// The phase-16 initial message (which established the queue thread) has
+		// completed. Now run the queue defer + interrupt sub-tests, which drive
+		// the production queue path and poll the store for outcomes.
+		go d.runQueuePhases()
 	}
 }
 
@@ -1275,6 +1301,191 @@ func (d *testDriver) runPhase15() {
 		d.round.reqID("phase15"),
 		agent,
 	)
+}
+
+// runPhase16 establishes a thread for the production queue-path phases by
+// sending an ordinary message. When it completes (case 16), runQueuePhases()
+// drives the queue itself. Establishing the thread up front keeps the queue
+// tests off the first-message boot-race path so they exercise the steady-state
+// busy-defer / interrupt behaviour cleanly.
+func (d *testDriver) runPhase16() {
+	agent := d.round.agentName
+	log.Printf("\n==================================================")
+	log.Printf("  [%s] PHASE 16: Production queue path — establish thread", agent)
+	log.Printf("==================================================")
+	d.startPhaseTimeout(16)
+	d.sendChatMessage("What is 6 + 6? Reply with just the number.", d.round.reqID("phase16"), agent)
+}
+
+// findInteractionByPromptID returns (interactionID, state) for the interaction
+// the queue created from the given prompt-history entry, or ("","") if none yet.
+func (d *testDriver) findInteractionByPromptID(promptID string) (string, string) {
+	for _, in := range d.store.GetAllInteractions() {
+		if in.PromptID == promptID {
+			return in.ID, string(in.State)
+		}
+	}
+	return "", ""
+}
+
+// waitInteractionStreaming polls until the interaction for promptID is actively
+// streaming (waiting state with some assistant content) — the same precondition
+// Phase 8 uses before interrupting, so the second message lands mid-turn rather
+// than before the turn has started (cancelling a not-yet-started turn leaves the
+// follow-up wedged). Returns true once streaming, false on timeout.
+func (d *testDriver) waitInteractionStreaming(promptID string, timeout time.Duration) bool {
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		for _, in := range d.store.GetAllInteractions() {
+			if in.PromptID == promptID && in.ResponseMessage != "" {
+				return true
+			}
+		}
+		time.Sleep(300 * time.Millisecond)
+	}
+	return false
+}
+
+// waitInteractionState polls until the interaction for promptID reaches one of
+// wantStates, returning true on success or false on timeout.
+func (d *testDriver) waitInteractionState(promptID string, wantStates map[string]bool, timeout time.Duration) bool {
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		if _, st := d.findInteractionByPromptID(promptID); st != "" && wantStates[st] {
+			return true
+		}
+		time.Sleep(500 * time.Millisecond)
+	}
+	return false
+}
+
+// runQueuePhases drives the production send path against live Zed:
+//
+//	Phase 16 (defer): enqueue interrupt=false while the agent is busy and assert
+//	  it is HELD (no concurrent interaction) then delivered as the next turn once
+//	  idle — the concurrent-mid-turn incident, now fixed.
+//	Phase 17 (interrupt): enqueue interrupt=true while busy and assert it cancels
+//	  the running turn (interaction → interrupted) and its own message is delivered.
+//
+// Driven by polling the store because queue prompts get generated request_ids
+// that don't flow through the phase-completion switch.
+func (d *testDriver) runQueuePhases() {
+	agent := d.round.agentName
+	d.mu.Lock()
+	threadID := d.round.queueThreadID
+	d.mu.Unlock()
+
+	// Resolve the child session that owns the established thread — that's what we
+	// enqueue onto (its ZedThreadID drives sendQueuedPromptToSession).
+	var sessID string
+	for _, s := range d.store.GetAllSessions() {
+		if s.Metadata.ZedThreadID == threadID {
+			sessID = s.ID
+			break
+		}
+	}
+	if sessID == "" {
+		log.Printf("[%s] Phase 16: ABORT — no session found for queue thread %s", agent, truncate(threadID, 12))
+		os.Exit(1)
+	}
+	waiting := map[string]bool{"waiting": true}
+	complete := map[string]bool{"complete": true}
+	interrupted := map[string]bool{"interrupted": true}
+
+	// ---- Phase 16: busy-defer + deliver-when-idle (interrupt=false) ----
+	log.Printf("\n==================================================")
+	log.Printf("  [%s] PHASE 16: Queue busy-defer (interrupt=false)", agent)
+	log.Printf("==================================================")
+	d.startPhaseTimeout(16)
+
+	promptA, err := d.srv.EnqueueQueuedPrompt(sessID, "Count slowly from 1 to 40, writing one number per line with a short fact about each.", false)
+	if err != nil {
+		log.Printf("[%s] Phase 16: ABORT — enqueue A failed: %v", agent, err)
+		os.Exit(1)
+	}
+	if !d.waitInteractionState(promptA, waiting, 15*time.Second) {
+		log.Printf("[%s] Phase 16: ABORT — turn A never became waiting", agent)
+		os.Exit(1)
+	}
+	// Wait until A is actively streaming so the session is genuinely busy when we
+	// enqueue B (avoids racing a fast turn that completes before B is queued).
+	if !d.waitInteractionStreaming(promptA, 30*time.Second) {
+		log.Printf("[%s] Phase 16: ABORT — turn A never started streaming", agent)
+		os.Exit(1)
+	}
+	// Agent is now busy on A. Enqueue B (interrupt=false): must be HELD.
+	promptB, err := d.srv.EnqueueQueuedPrompt(sessID, "Now also mention whales.", false)
+	if err != nil {
+		log.Printf("[%s] Phase 16: ABORT — enqueue B failed: %v", agent, err)
+		os.Exit(1)
+	}
+	if inID, _ := d.findInteractionByPromptID(promptB); inID != "" {
+		log.Printf("[%s] Phase 16: FAIL — B was dispatched concurrently (interaction %s) instead of deferred", agent, truncate(inID, 12))
+	} else {
+		d.mu.Lock()
+		d.round.phase16Deferred = true
+		d.mu.Unlock()
+		log.Printf("[%s] Phase 16: ✅ interrupt=false HELD while busy (no concurrent interaction)", agent)
+	}
+	// Once A completes, the production completion handler drains the queue and B
+	// is delivered as the next turn.
+	if d.waitInteractionState(promptB, complete, 75*time.Second) {
+		d.mu.Lock()
+		d.round.phase16Delivered = true
+		d.mu.Unlock()
+		log.Printf("[%s] Phase 16: ✅ deferred message delivered as next turn once idle", agent)
+	} else {
+		log.Printf("[%s] Phase 16: FAIL — deferred message never delivered", agent)
+	}
+
+	// ---- Phase 17: interrupt (interrupt=true cancels + delivers) ----
+	d.mu.Lock()
+	d.phase = 17
+	d.mu.Unlock()
+	log.Printf("\n==================================================")
+	log.Printf("  [%s] PHASE 17: Queue interrupt (interrupt=true)", agent)
+	log.Printf("==================================================")
+	d.startPhaseTimeout(17)
+
+	promptX, err := d.srv.EnqueueQueuedPrompt(sessID, "Count slowly from 1 to 60, one number per line, with a short sentence about each.", false)
+	if err != nil {
+		log.Printf("[%s] Phase 17: ABORT — enqueue X failed: %v", agent, err)
+		os.Exit(1)
+	}
+	if !d.waitInteractionState(promptX, waiting, 15*time.Second) {
+		log.Printf("[%s] Phase 17: ABORT — turn X never became waiting", agent)
+		os.Exit(1)
+	}
+	// Interrupt only once X is actively streaming (cancelling a not-yet-started
+	// turn leaves the follow-up wedged — same precondition Phase 8 relies on).
+	if !d.waitInteractionStreaming(promptX, 30*time.Second) {
+		log.Printf("[%s] Phase 17: ABORT — turn X never started streaming", agent)
+		os.Exit(1)
+	}
+	// Interrupt while X is streaming: cancel-then-send via processInterruptPrompt.
+	promptY, err := d.srv.EnqueueQueuedPrompt(sessID, "Stop counting — just say 'done'.", true)
+	if err != nil {
+		log.Printf("[%s] Phase 17: ABORT — enqueue Y (interrupt) failed: %v", agent, err)
+		os.Exit(1)
+	}
+	if d.waitInteractionState(promptX, interrupted, 30*time.Second) {
+		d.mu.Lock()
+		d.round.phase17Interrupted = true
+		d.mu.Unlock()
+		log.Printf("[%s] Phase 17: ✅ interrupt cancelled the running turn (X → interrupted)", agent)
+	} else {
+		log.Printf("[%s] Phase 17: FAIL — running turn X was not interrupted", agent)
+	}
+	if d.waitInteractionState(promptY, complete, 60*time.Second) {
+		d.mu.Lock()
+		d.round.phase17Delivered = true
+		d.mu.Unlock()
+		log.Printf("[%s] Phase 17: ✅ interrupt message delivered", agent)
+	} else {
+		log.Printf("[%s] Phase 17: FAIL — interrupt message never delivered", agent)
+	}
+
+	d.advanceToNextRound()
 }
 
 // --- Per-round validation ---
@@ -1812,6 +2023,21 @@ func (d *testDriver) validateRound() roundResult {
 		}
 	}
 
+	// Phase 16: production queue path — busy-defer + deliver-when-idle.
+	if !d.round.phase16Deferred {
+		errors = append(errors, "Phase 16: interrupt=false was NOT held while busy (concurrent dispatch)")
+	}
+	if !d.round.phase16Delivered {
+		errors = append(errors, "Phase 16: deferred queue message was never delivered once idle")
+	}
+	// Phase 17: production queue path — interrupt cancels + delivers.
+	if !d.round.phase17Interrupted {
+		errors = append(errors, "Phase 17: interrupt=true did NOT cancel the running turn")
+	}
+	if !d.round.phase17Delivered {
+		errors = append(errors, "Phase 17: interrupt queue message was never delivered")
+	}
+
 	// --- SUMMARY ---
 	passed := len(errors) == 0
 	if !passed {
@@ -1836,6 +2062,8 @@ func (d *testDriver) validateRound() roundResult {
 		log.Printf("[%s] Phase 13: Helix-initiated cancel - PASSED", agent)
 		log.Printf("[%s] Phase 14: Cancel no-op - PASSED", agent)
 		log.Printf("[%s] Phase 15: Streaming patches arrive incrementally - PASSED", agent)
+		log.Printf("[%s] Phase 16: Queue busy-defer (production path) - PASSED", agent)
+		log.Printf("[%s] Phase 17: Queue interrupt (production path) - PASSED", agent)
 	}
 
 	totalCompletions := 0
