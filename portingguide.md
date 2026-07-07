@@ -679,6 +679,8 @@ Helix-specific commits on main (oldest first):
 
 Merge strategy: `git merge upstream/main` (no rebase), per every prior merge. Merge commit `70bf514b87`.
 
+**Out-of-band fork-main re-merge**: while this branch was open, PR #66 (`6799c947a0`, task 002228 "unify all agent message" + `548da160ce` e2e prompt-queue phases) landed on fork `main`. Re-fetched and merged `origin/main` into the branch — clean (only the Go e2e test-server changed: `go.mod`/`go.sum`/`main.go` added busy-defer + interrupt phases; no Rust conflict, zed binary unaffected). This is the recurring out-of-band-push pattern every merge in this series hits.
+
 ### Conflicts and Resolutions
 
 `git merge` produced **5 content conflicts + 2 workflow modify/deletes**. Despite enormous churn in the touched files (`acp_thread.rs` +3707, `agent_servers/src/acp.rs` +1232, `agent_panel.rs` 824 changed, `connection.rs` 89, `zed.rs` 142), the Helix surface collided in only five spots.
