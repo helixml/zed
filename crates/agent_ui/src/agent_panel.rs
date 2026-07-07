@@ -57,10 +57,6 @@ use crate::{
     },
     ui::{AgentNotification, AgentNotificationEvent, EndTrialUpsell},
 };
-use crate::{
-    Agent, AgentInitialContent, AgentThreadSource, ExternalSourcePrompt, NewExternalAgentThread,
-    NewNativeAgentThreadFromSummary,
-};
 #[cfg(feature = "external_websocket_sync")]
 use external_websocket_sync_dep as external_websocket_sync;
 #[cfg(feature = "external_websocket_sync")]
@@ -4658,7 +4654,9 @@ impl AgentPanel {
 
                 if let BaseView::AgentThread { conversation_view } = &self.base_view {
                     if observes_live(conversation_view, cx) {
-                        self.clear_overlay_state();
+                        // Upstream removed the overlay/configuration panel system
+                        // (previously cleared here via clear_overlay_state); the
+                        // live thread is already displayed, so just notify.
                         cx.emit(AgentPanelEvent::ActiveViewChanged);
                         return;
                     }

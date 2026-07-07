@@ -1164,6 +1164,7 @@ impl ConversationView {
                 threads: HashMap::from_iter([(id, current)]),
                 conversation: conversation_entity,
                 _connection_entry_subscription: Subscription::new(|| {}),
+                _request_elicitation_subscription: None,
             }),
             notifications: Vec::new(),
             notification_subscriptions: HashMap::default(),
@@ -1174,6 +1175,7 @@ impl ConversationView {
             last_theme_id: Some(cx.theme().id.clone()),
             draft_prompt_persist_task: None,
             code_span_resolver,
+            request_elicitation_form_states: HashMap::default(),
         }
     }
 
