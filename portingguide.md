@@ -538,7 +538,9 @@ When rebasing/merging against upstream Zed:
 41a. **Check `acp_thread.rs` test code for unit-variant `AcpThreadEvent::Stopped` patterns** — `Stopped` is a tuple variant `Stopped(StopReason)` and `matches!(event, AcpThreadEvent::Stopped)` no longer compiles. Production builds skip `#[cfg(test)]` so this fails silently in `cargo build` but breaks `cargo test -p acp_thread test_second_send`. Grep: `grep -n "AcpThreadEvent::Stopped[^(]" crates/acp_thread/src/`. Fixed in 001980; patterns must be `Stopped(_)`.
 42. **Run `cargo check --package zed --features external_websocket_sync`** — must compile
 43. **Run `cargo test -p external_websocket_sync`** — unit tests
-44. **Run E2E test** after merge to verify all phases pass (currently 12 phases, run for both `zed-agent` and `claude` rounds)
+44. **Run E2E test** after merge to verify all phases pass (currently **17 phases** as of 002224, run for both `zed-agent` and `claude` rounds)
+45. **On an ACP `agent-client-protocol` MAJOR bump (e.g. 0.14 → 1.0, seen in 002224)** — the schema types move under a versioned submodule. Grep Helix code for `use agent_client_protocol::schema as acp;` and change to `schema::v1 as acp` (match how upstream crates alias it). Also: `into_foreground_future(conn.send_request(...))` → `conn.send_request(...).block_task()` (the helper is removed); check `ErrorCode` variants and any `non_exhaustive` struct literals for builder-pattern requirements. The feature build is the gate — these compile in upstream crates but not in the Helix-only crates that auto-merged unchanged.
+46. **`from_existing_thread` field drift (Rebase-Checklist item 11 recurring)** — each ACP/UI bump tends to add fields to `ConnectedServerState` / `ConversationView`. 002224 added `_request_elicitation_subscription: Option<Subscription>` and `request_elicitation_form_states: HashMap<…>`. Fix by mirroring the defaults from `ConversationView::new` and the sibling `ConnectedServerState` initializers (usually `None` / `HashMap::default()`). Build error E0063 is the signal.
 
 ## Building
 
