@@ -667,7 +667,80 @@ Helix-specific commits on main (oldest first):
 | `0e0149ade5` | Merge upstream Zed (`a31d3505da..e45e42af6e`, 95 commits, 3 days) into 002100-extension — 1 conflict resolved (`agent/src/tools/grep_tool.rs`: kept Helix 001410 `truncate_long_lines` semantic while reusing upstream's pre-computed `snippet` variable from `40211567b8` "Make grep tool results clickable in agent panel"). Heavy upstream churn in `acp_thread.rs` (+198), `agent.rs` (+223), `agent/src/thread.rs` (+511), `agent_panel.rs` (+203), `conversation_view.rs` (+1024), new `thread_search_bar.rs` (+962), `thread_view.rs` (+1094), `extensions_ui.rs` (+286), `title_bar.rs` (+36), `agent/src/sandboxing.rs` (+458), `agent/src/tools/terminal_tool.rs` (+957) — yet all auto-merged cleanly. Fix 1b shifted from line 5420 → 5468 (still FIRST statement of `BaseView::Uninitialized`). Three `// HELIX:` markers shifted from 226/248/1518 → 337/359/1629. Critical Fix #3 shifted from line 262 → 335. All shifts content-preserving. |
 | `2221360fc1` | Tidy ws-test-server `go.mod`/`go.sum` for current Helix deps (certmagic / libdns / acmez / miekg/dns). Same pattern as `9f8364e138` after round 1. |
 
-## Merge 002100-extension (2026-06-18)
+## Merge 002224 (2026-07-06)
+
+**Divergence at start**:
+- Branch HEAD (fork main): `9546054e68` (PR #65 — emit terminal frame when ACP agent crashes mid-turn).
+- Last upstream merge fence: `e45e42af6e` ("agent_ui: Use the thread title for agent notifications (#59377)") — absorbed in 002100-extension; confirmed as the `git merge-base main upstream/main`.
+- Upstream HEAD: `872ca8fef5` ("Add license symlinks to lint test fixture crates (#60505)").
+- **Upstream commits to merge: 289** (18-day window, 2026-06-18 → 2026-07-06). Largest single window since 002029.
+- Helix-only commits since 002100-extension: **0** (fork main was exactly at PR #65).
+- **Major dependency bump**: `agent-client-protocol` **0.14.0 → 1.0.1** (and `-schema` 0.13.6 → 1.x). This is the dominant risk of the window — the ACP builder API and `send_request` execution changed.
+
+Merge strategy: `git merge upstream/main` (no rebase), per every prior merge. Merge commit `70bf514b87`.
+
+### Conflicts and Resolutions
+
+`git merge` produced **5 content conflicts + 2 workflow modify/deletes**. Despite enormous churn in the touched files (`acp_thread.rs` +3707, `agent_servers/src/acp.rs` +1232, `agent_panel.rs` 824 changed, `connection.rs` 89, `zed.rs` 142), the Helix surface collided in only five spots.
+
+#### 1. `.github/workflows/{hotfix-review-monitor,stale-pr-reminder}.yml` — modify/delete
+**Resolution**: `git rm` both. Helix deleted these Zed-CI workflows; upstream modified them. Helix doesn't run Zed's GitHub CI. (Standard resolution, same as prior merges.)
+
+#### 2. `crates/reqwest_client/src/reqwest_client.rs` — content
+**Upstream change**: added HTTP/2 keep-alive + pool tuning to `builder()` (`tcp_keepalive`, `pool_idle_timeout`, `http2_keep_alive_*`) to drop silently-dead connections (BadRecordMac mitigation).
+**HEAD change**: Helix insecure-TLS branch (`ZED_HTTP_INSECURE_TLS` → `use_preconfigured_tls(insecure_tls_config())` else `use_rustls_tls()`).
+**Resolution**: kept both — apply upstream's keep-alive tuning to the base `builder`, then branch on `is_insecure_tls_enabled()` for the TLS backend. No behavior lost on either side.
+
+#### 3. `crates/agent_ui/src/config_options.rs` — content
+**Upstream change**: renamed `first_config_option_id(category)` → `first_config_option_id_matching(category, predicate)`.
+**HEAD change**: Helix `current_model_value()` accessor (used by the model-id fallback in `thread_view`) called the old `first_config_option_id`.
+**Resolution**: kept `current_model_value()`, rewrote its call to `first_config_option_id_matching(Model, |_| true)`. Took upstream's renamed helper.
+
+#### 4. `crates/agent_ui/src/agent_panel.rs` — content (imports)
+**Resolution**: pure both-added import block. Kept HEAD's Helix imports (`Agent`, `AgentInitialContent`, `AgentThreadSource`, `ExternalSourcePrompt`, `NewExternalAgentThread`, `NewNativeAgentThreadFromSummary`, the `external_websocket_sync_dep as external_websocket_sync` alias, and `tokio::sync::mpsc`), followed by upstream's `agent_settings::AgentSettings`.
+
+#### 5. `crates/agent_servers/src/acp.rs` — content (×2)
+**5a (both-added items)**: HEAD added PR #50's `SessionCreationGuard` struct + `Drop` impl; upstream added a new `client_capabilities_for_agent()` fn at the same spot. Kept both (they collided only by adjacency).
+**5b (`new_session` send path)**: upstream replaced `into_foreground_future(connection.send_request(...))` with `connection.send_request(...).block_task()`. HEAD wrapped this in PR #50's session-creation slot (`let _slot_guard = slot_guard; prev_chain.await;`). **Resolution**: kept PR #50's slot-guard + `prev_chain.await`, switched the send to upstream's `.block_task()`. `load_session` (open_or_create_session) auto-merged and already uses `.block_task()` + the slot guard consistently. `into_foreground_future` remains used by the close-session path (line ~2004), so the import is not orphaned.
+
+#### 6. `crates/acp_thread/src/acp_thread.rs` — content (×2)
+Both hunks are the `run_turn` terminal path where upstream added `if is_same_turn { cx.emit(StatusChanged) }` and Helix has the Critical Fix #6/#9 `stopped_emitted_for_task` guard around `Stopped` emission.
+**Resolution (tx-dropped branch, ~3800)**: kept Helix's guarded `Stopped(Cancelled)` emission, then added upstream's `is_same_turn → StatusChanged`.
+**Resolution (normal-completion branch, ~3902)**: emit upstream's `StatusChanged` on same-turn first, then Helix's guarded `Stopped(r.stop_reason)` (guard preserved — Critical Fix #9).
+
+### PR #65 Survival Check
+- `StubAgentConnection::fail_turn()` intact — `acp_thread/src/connection.rs:936`.
+- `SyncEvent::ChatResponseError` intact — `types.rs:230`; emit at `thread_service.rs:1106`.
+- `TEST_WEBSOCKET_SERVICE_GUARD` present (3 refs in `thread_service.rs`, shared by crash + reconnect tests).
+
+### Helix Surface — Auto-Merge Survival Check
+All critical fixes intact post-merge (line numbers shifted by upstream churn):
+- **Fix #1** `pending_sessions`/`load_session`: `agent/src/agent.rs:407/580/1616/2586`.
+- **Fix #3** `content_only()`: `acp_thread.rs:339`.
+- **Fix #6/#9** `stopped_emitted_for_task`: `acp_thread.rs:3762/3807/3911`.
+- **Fix #8** `drop(turn.send_task)`: `acp_thread.rs:3969`.
+- **Fix #11** entity-identity guard via `ThreadMetadataStore`: `agent_panel.rs:1911` (in `load_agent_thread`).
+- **PR #50** `session_creation_chain` + `_settings_subscription`: `acp.rs:410/411`; slot held in both `new_session` and `load_session`.
+- **PR #55** streaming `EntryUpdated` emit: 21 occurrences in `acp_thread.rs` (was ~16; upstream added sites, Helix's retained).
+- **PR #56 Fix 1b** cfg-gated `return;` is the FIRST statement of the `BaseView::Uninitialized` branch in `ensure_thread_initialized`: `agent_panel.rs:5419-5424`.
+- **PR #60** `ede_diagnostic` retry: `thread_service.rs:2025`.
+- **PR #63/#64** wedge recovery + `agent_ready` re-emit: intact (Helix-only file, no upstream churn) — `thread_service.rs:1838/2277/2325`.
+- **AcpBetaFeatureFlag::enabled_for_all()** override: `feature_flags/src/flags.rs:30`.
+- **3× `// HELIX: External agent` markers**: `extensions_ui.rs:337/359/1629` (unshifted).
+- **`render_restricted_mode`** cfg-gated early return: `title_bar.rs:699` (`cfg!(feature="external_websocket_sync") → None`).
+- **`--allow-multiple-instances` / `--headless` / `initialize_headless` / `build_application(headless)`**: `zed/src/main.rs:86/343/361/362/886/1416`.
+- **`rust-embed` `debug-embed` feature**: `Cargo.toml:741`.
+- **No `smol::Timer` in `agent.rs`**: 0 hits.
+- **No non-tuple `AcpThreadEvent::Stopped` patterns** in non-test code (only a comment at `acp_thread.rs:9542`).
+
+### Finding — branding/trust settings are code-enforced, not in `default.json`
+Task constraints listed `trust_all_worktrees: true` and `show_sign_in: false` as `assets/settings/default.json` invariants. **In this fork they are NOT set in `default.json`** — fork `main`, the merge base, and upstream all carry `show_sign_in: true` / `trust_all_worktrees: false`. Trust is enforced in code (`can_trust` auto-trusts every worktree; `render_restricted_mode` is cfg-gated to `None`); branding/sign-in is injected by the Helix platform at deploy time. No regression from this merge (values are byte-identical to fork `main`); no change made to `default.json`. Flag for the maintainer if the intent was to bake these into `default.json`.
+
+### Cargo.toml / Cargo.lock notes
+- `Cargo.lock` taken from upstream (`--theirs`); to be regenerated by the build. ACP `agent-client-protocol` now `1.0.1`.
+- ACP 0.14→1.0 is a major bump; any Helix code using ACP struct literals / `ErrorCode` / `send_request` execution is compile-checked in the build stage (see below).
+
+
 
 **Divergence at start**:
 - Branch HEAD: `4ae2094b54` (PR #64 — `agent_ready` re-emit on reopening already-loaded thread, landed on fork main between rounds) — built on top of round 1's `5ed995947e` plus PRs #63 (claude-agent-acp wedge recovery, 6 commits) and #64 (1 commit).
