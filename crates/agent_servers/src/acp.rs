@@ -2001,7 +2001,8 @@ impl AgentConnection for AcpConnection {
         let conn = self.connection.clone();
         let session_id = session_id.clone();
         cx.foreground_executor().spawn(async move {
-            into_foreground_future(conn.send_request(acp::CloseSessionRequest::new(session_id)))
+            conn.send_request(acp::CloseSessionRequest::new(session_id))
+                .block_task()
                 .await?;
             Ok(())
         })
