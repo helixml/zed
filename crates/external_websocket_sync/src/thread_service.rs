@@ -20,6 +20,26 @@ use tokio::sync::mpsc;
 use util::ResultExt;
 use crate::{ExternalAgent, ThreadCreationRequest, ThreadOpenRequest, SyncEvent};
 
+fn zed_agent_server_id(agent_name: &str) -> &str {
+    match agent_name {
+        "claude" => agent_servers::CLAUDE_AGENT_ID,
+        "codex" => agent_servers::CODEX_ID,
+        other => other,
+    }
+}
+
+#[cfg(test)]
+mod agent_server_id_tests {
+    use super::zed_agent_server_id;
+
+    #[test]
+    fn maps_helix_agent_names_to_registry_ids() {
+        assert_eq!(zed_agent_server_id("claude"), "claude-acp");
+        assert_eq!(zed_agent_server_id("codex"), "codex-acp");
+        assert_eq!(zed_agent_server_id("qwen"), "qwen");
+    }
+}
+
 /// Global registry of active ACP threads (service layer)
 /// Stores STRONG references to keep threads alive for follow-up messages
 static THREAD_REGISTRY: parking_lot::Mutex<Option<Arc<RwLock<HashMap<String, Entity<AcpThread>>>>>> =
@@ -1628,12 +1648,7 @@ fn create_new_thread_sync(
     let agent = match request.agent_name.as_deref() {
         Some("zed-agent") | None => ExternalAgent::NativeAgent,
         Some(name) => {
-            // Map Helix agent names to Zed registry agent IDs.
-            // Helix sends "claude" but the Zed registry uses "claude-acp".
-            let zed_name = match name {
-                "claude" => agent_servers::CLAUDE_AGENT_ID,
-                other => other,
-            };
+            let zed_name = zed_agent_server_id(name);
             ExternalAgent::Custom {
                 name: gpui::SharedString::from(zed_name.to_string()),
                 command: project::agent_server_store::AgentServerCommand {
@@ -2065,10 +2080,7 @@ async fn force_close_agent_session(
     let agent = match effective_agent_name.as_deref() {
         Some("zed-agent") | Some("") | None => ExternalAgent::NativeAgent,
         Some(name) => {
-            let zed_name = match name {
-                "claude" => agent_servers::CLAUDE_AGENT_ID,
-                other => other,
-            };
+            let zed_name = zed_agent_server_id(name);
             ExternalAgent::Custom {
                 name: gpui::SharedString::from(zed_name.to_string()),
                 command: project::agent_server_store::AgentServerCommand {
@@ -2163,10 +2175,7 @@ async fn load_thread_from_agent(
     let agent = match agent_name.as_deref() {
         Some("zed-agent") | Some("") | None => ExternalAgent::NativeAgent,
         Some(name) => {
-            let zed_name = match name {
-                "claude" => agent_servers::CLAUDE_AGENT_ID,
-                other => other,
-            };
+            let zed_name = zed_agent_server_id(name);
             ExternalAgent::Custom {
                 name: gpui::SharedString::from(zed_name.to_string()),
                 command: project::agent_server_store::AgentServerCommand {
@@ -2402,10 +2411,7 @@ fn open_existing_thread_sync(
     let agent = match request.agent_name.as_deref() {
         Some("zed-agent") | Some("") | None => ExternalAgent::NativeAgent,
         Some(name) => {
-            let zed_name = match name {
-                "claude" => agent_servers::CLAUDE_AGENT_ID,
-                other => other,
-            };
+            let zed_name = zed_agent_server_id(name);
             ExternalAgent::Custom {
                 name: gpui::SharedString::from(zed_name.to_string()),
                 command: project::agent_server_store::AgentServerCommand {
