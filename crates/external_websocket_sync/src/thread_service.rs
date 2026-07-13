@@ -18,7 +18,7 @@ use fs::Fs;
 use project::Project;
 use tokio::sync::mpsc;
 use util::ResultExt;
-use crate::{ExternalAgent, ThreadCreationRequest, ThreadOpenRequest, SyncEvent};
+use crate::{ExternalAgent, SyncEvent, ThreadCreationRequest, ThreadOpenRequest, TurnUsage};
 
 fn zed_agent_server_id(agent_name: &str) -> &str {
     match agent_name {
@@ -1138,6 +1138,17 @@ pub fn ensure_thread_subscription(
                         acp_thread_id: thread_id_for_sub.clone(),
                         message_id: "0".to_string(),
                         request_id: completed_rid,
+                        agent_name: thread.agent_telemetry_id().to_string(),
+                        usage: thread.turn_token_usage().map(|usage| {
+                            TurnUsage {
+                                total_tokens: usage.total_tokens,
+                                input_tokens: usage.input_tokens,
+                                output_tokens: usage.output_tokens,
+                                thought_tokens: usage.thought_tokens,
+                                cached_read_tokens: usage.cached_read_tokens,
+                                cached_write_tokens: usage.cached_write_tokens,
+                            }
+                        }),
                     });
                 }
             }

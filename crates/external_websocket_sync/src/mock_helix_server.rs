@@ -688,7 +688,7 @@ impl MockHelixServer {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::{IncomingChatMessage, OutgoingMessage, SyncEvent};
+    use crate::types::{IncomingChatMessage, OutgoingMessage, SyncEvent, TurnUsage};
 
     // -----------------------------------------------------------------------
     // Protocol serialization tests
@@ -742,6 +742,15 @@ mod tests {
             acp_thread_id: "thread-123".to_string(),
             message_id: "msg-456".to_string(),
             request_id: "req-001".to_string(),
+            agent_name: "codex-acp".to_string(),
+            usage: Some(TurnUsage {
+                total_tokens: 175,
+                input_tokens: 100,
+                output_tokens: 75,
+                thought_tokens: 25,
+                cached_read_tokens: 40,
+                cached_write_tokens: 10,
+            }),
         };
 
         let outgoing = event.to_outgoing_message().unwrap();
@@ -749,6 +758,9 @@ mod tests {
         assert_eq!(outgoing.data["acp_thread_id"], "thread-123");
         assert_eq!(outgoing.data["message_id"], "msg-456");
         assert_eq!(outgoing.data["request_id"], "req-001");
+        assert_eq!(outgoing.data["agent_name"], "codex-acp");
+        assert_eq!(outgoing.data["usage"]["total_tokens"], 175);
+        assert_eq!(outgoing.data["usage"]["cached_read_tokens"], 40);
     }
 
     #[test]
@@ -947,6 +959,8 @@ mod tests {
                     acp_thread_id: "t5".to_string(),
                     message_id: "m2".to_string(),
                     request_id: "r2".to_string(),
+                    agent_name: "test-agent".to_string(),
+                    usage: None,
                 },
                 "message_completed",
             ),

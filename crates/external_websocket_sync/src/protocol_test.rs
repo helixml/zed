@@ -122,6 +122,8 @@ mod tests {
                     acp_thread_id: acp_thread_id.clone(),
                     message_id: "msg-123".to_string(),
                     request_id: request.request_id.clone(),
+                    agent_name: "test-agent".to_string(),
+                    usage: None,
                 };
                 zed_to_ext_tx_clone.send(serde_json::to_string(&message_completed).unwrap()).unwrap();
                 println!("📤 Sent message_completed");
@@ -319,6 +321,8 @@ mod tests {
                     acp_thread_id: acp_thread_id.clone(),
                     message_id: format!("msg-{}", request.request_id),
                     request_id: request.request_id.clone(),
+                    agent_name: "test-agent".to_string(),
+                    usage: None,
                 };
                 zed_to_ext_tx_clone.send(serde_json::to_string(&message_completed).unwrap()).unwrap();
                 println!("📤 Sent message_completed");
