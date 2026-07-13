@@ -1411,6 +1411,16 @@ pub struct TokenUsage {
     pub max_output_tokens: Option<u64>,
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TurnTokenUsage {
+    pub total_tokens: u64,
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub thought_tokens: u64,
+    pub cached_read_tokens: u64,
+    pub cached_write_tokens: u64,
+}
+
 #[derive(Debug, Clone)]
 pub struct SessionCost {
     pub amount: f64,
@@ -1499,6 +1509,7 @@ pub struct AcpThread {
     running_turn: Option<RunningTurn>,
     connection: Rc<dyn AgentConnection>,
     token_usage: Option<TokenUsage>,
+    turn_token_usage: Option<TurnTokenUsage>,
     cost: Option<SessionCost>,
     prompt_capabilities: acp::PromptCapabilities,
     available_commands: Vec<acp::AvailableCommand>,
@@ -1705,6 +1716,7 @@ impl AcpThread {
             connection,
             session_id,
             token_usage: None,
+            turn_token_usage: None,
             cost: None,
             prompt_capabilities,
             available_commands: Vec::new(),
@@ -1859,6 +1871,14 @@ impl AcpThread {
 
     pub fn token_usage(&self) -> Option<&TokenUsage> {
         self.token_usage.as_ref()
+    }
+
+    pub fn turn_token_usage(&self) -> Option<&TurnTokenUsage> {
+        self.turn_token_usage.as_ref()
+    }
+
+    pub fn agent_telemetry_id(&self) -> SharedString {
+        self.connection.telemetry_id()
     }
 
     pub fn cost(&self) -> Option<&SessionCost> {
@@ -2878,6 +2898,8 @@ impl AcpThread {
         self.clear_completed_plan_entries(cx);
         self.had_error = false;
 
+        self.turn_token_usage = None;
+
         let (tx, rx) = oneshot::channel();
         let cancel_task = self.cancel(cx);
 
@@ -3014,6 +3036,18 @@ impl AcpThread {
                             let usage = this.token_usage.get_or_insert_with(Default::default);
                             usage.input_tokens = response_usage.input_tokens;
                             usage.output_tokens = response_usage.output_tokens;
+                            this.turn_token_usage = Some(TurnTokenUsage {
+                                total_tokens: response_usage.total_tokens,
+                                input_tokens: response_usage.input_tokens,
+                                output_tokens: response_usage.output_tokens,
+                                thought_tokens: response_usage.thought_tokens.unwrap_or_default(),
+                                cached_read_tokens: response_usage
+                                    .cached_read_tokens
+                                    .unwrap_or_default(),
+                                cached_write_tokens: response_usage
+                                    .cached_write_tokens
+                                    .unwrap_or_default(),
+                            });
                             cx.emit(AcpThreadEvent::TokenUsageUpdated);
                         }
 
@@ -6738,7 +6772,9 @@ mod tests {
         }));
 
         let thread = cx
-            .update(|cx| connection.new_session(project, Path::new(path!("/test")), cx))
+            .update(|cx| {
+                connection.new_session(project, PathList::new(&[Path::new(path!("/test"))]), cx)
+            })
             .await
             .unwrap();
 
@@ -6812,7 +6848,9 @@ mod tests {
         }));
 
         let thread = cx
-            .update(|cx| connection.new_session(project, Path::new(path!("/test")), cx))
+            .update(|cx| {
+                connection.new_session(project, PathList::new(&[Path::new(path!("/test"))]), cx)
+            })
             .await
             .unwrap();
 
@@ -7389,6 +7427,15 @@ mod tests {
             assert_eq!(
                 usage.output_tokens, 300,
                 "output_tokens from response usage"
+            );
+            assert_eq!(
+                thread.turn_token_usage(),
+                Some(&TurnTokenUsage {
+                    total_tokens: 500,
+                    input_tokens: 200,
+                    output_tokens: 300,
+                    ..Default::default()
+                })
             );
 
             let cost = thread.cost().expect("cost should be set");

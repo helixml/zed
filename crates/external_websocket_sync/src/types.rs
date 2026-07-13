@@ -163,6 +163,16 @@ pub struct OutgoingMessage {
     pub data: serde_json::Value,
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct TurnUsage {
+    pub total_tokens: u64,
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub thought_tokens: u64,
+    pub cached_read_tokens: u64,
+    pub cached_write_tokens: u64,
+}
+
 /// Events that Zed sends to external system via WebSocket
 /// Per WEBSOCKET_PROTOCOL_SPEC.md - Zed is stateless and only knows about acp_thread_id
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -215,6 +225,9 @@ pub enum SyncEvent {
         acp_thread_id: String,
         message_id: String,
         request_id: String,
+        agent_name: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        usage: Option<TurnUsage>,
     },
     /// Sent when thread loading fails (e.g., session already active via UI)
     #[serde(rename = "thread_load_error")]
@@ -305,12 +318,14 @@ impl SyncEvent {
                     "tool_status": tool_status,
                 })
             ),
-            SyncEvent::MessageCompleted { acp_thread_id, message_id, request_id } => (
+            SyncEvent::MessageCompleted { acp_thread_id, message_id, request_id, agent_name, usage } => (
                 "message_completed".to_string(),
                 serde_json::json!({
                     "acp_thread_id": acp_thread_id,
                     "message_id": message_id,
                     "request_id": request_id,
+                    "agent_name": agent_name,
+                    "usage": usage,
                 })
             ),
             SyncEvent::ThreadLoadError { acp_thread_id, request_id, error } => (
