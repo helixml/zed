@@ -280,6 +280,10 @@ fn supports_selectable_thinking_effort(model: &open_ai::Model) -> bool {
             .any(|effort| *effort != open_ai::ReasoningEffort::None)
 }
 
+fn chat_completions_reasoning_effort(model: &open_ai::Model) -> Option<open_ai::ReasoningEffort> {
+    model.reasoning_effort()
+}
+
 fn supported_thinking_effort_levels(model: &open_ai::Model) -> Vec<LanguageModelEffortLevel> {
     if !supports_selectable_thinking_effort(model) {
         return Vec::new();
@@ -350,6 +354,10 @@ mod tests {
             model
                 .supported_reasoning_efforts()
                 .contains(&open_ai::ReasoningEffort::None)
+        );
+        assert_eq!(
+            chat_completions_reasoning_effort(&model),
+            Some(open_ai::ReasoningEffort::None)
         );
     }
 }
@@ -567,7 +575,7 @@ impl LanguageModel for OpenAiLanguageModel {
                 self.model.supports_parallel_tool_calls(),
                 self.model.supports_prompt_cache_key(),
                 self.max_output_tokens(),
-                None,
+                chat_completions_reasoning_effort(&self.model),
                 false,
             );
             let completions = self.stream_completion(request, cx);
