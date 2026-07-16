@@ -28,6 +28,20 @@ fn zed_agent_server_id(agent_name: &str) -> &str {
     }
 }
 
+fn report_thread_open_failure(request: &ThreadOpenRequest, error: &anyhow::Error) {
+    let Some(request_id) = request.request_id.clone().filter(|id| !id.is_empty()) else {
+        return;
+    };
+    let event = SyncEvent::ThreadLoadError {
+        acp_thread_id: request.acp_thread_id.clone(),
+        request_id,
+        error: format!("Failed to load thread: {}", error),
+    };
+    if let Err(send_err) = crate::send_websocket_event(event) {
+        log::error!("❌ [THREAD_SERVICE] Failed to send thread open error: {}", send_err);
+    }
+}
+
 #[cfg(test)]
 mod agent_server_id_tests {
     use super::zed_agent_server_id;
@@ -2367,47 +2381,27 @@ fn open_existing_thread_sync(
                        in_progress, request.acp_thread_id);
             drop(loading); // release parking_lot lock before spawning
 
-            let acp_thread_id = request.acp_thread_id.clone();
-            let agent_name = request.agent_name.clone();
             cx.spawn(async move |cx| {
                 // Poll until the load lock is released (max 30 s).
                 let deadline = Instant::now() + Duration::from_secs(30);
                 loop {
-                    smol::Timer::after(Duration::from_millis(50)).await;
+                    cx.background_executor().timer(Duration::from_millis(50)).await;
                     if THREAD_LOAD_IN_PROGRESS.lock().is_none() {
-                        eprintln!("🔓 [THREAD_SERVICE] Load lock released, rechecking fast path for '{}'", acp_thread_id);
+                        eprintln!("🔓 [THREAD_SERVICE] Load lock released, retrying open for '{}'", request.acp_thread_id);
                         break;
                     }
                     if Instant::now() > deadline {
-                        eprintln!("⚠️ [THREAD_SERVICE] Timed out waiting for load lock for '{}', proceeding anyway", acp_thread_id);
-                        break;
+                        let error = anyhow::anyhow!("timed out waiting for thread load lock");
+                        eprintln!("⚠️ [THREAD_SERVICE] Timed out waiting for load lock for '{}'", request.acp_thread_id);
+                        report_thread_open_failure(&request, &error);
+                        return;
                     }
                 }
 
-                // Recheck registry — whoever held the lock should have registered the entity.
-                if let Some(thread_weak) = get_thread(&acp_thread_id) {
-                    if let Some(thread_entity) = thread_weak.upgrade() {
-                        let flag_was_set = {
-                            let subs = PERSISTENT_SUBSCRIPTIONS.lock();
-                            subs.as_ref().map(|s| s.read().contains(&acp_thread_id)).unwrap_or(false)
-                        };
-                        let entity_id = thread_entity.entity_id();
-                        eprintln!(
-                            "🔍 [THREAD_SERVICE] After lock wait: fast-path entity={:?}, subscription flag was_set={} for '{}'",
-                            entity_id, flag_was_set, acp_thread_id
-                        );
-                        cx.update(|cx| {
-                            ensure_thread_subscription(&thread_entity, &acp_thread_id, cx);
-                        });
-                    }
-                    let agent_name_for_ready = agent_name.unwrap_or_else(|| "zed-agent".to_string());
-                    eprintln!("🚀 [THREAD_SERVICE] Sending agent_ready after lock-wait for '{}'", acp_thread_id);
-                    // Persist the agent backing this thread (see set_thread_agent_name doc).
-                    set_thread_agent_name(&acp_thread_id, agent_name_for_ready.clone());
-                    crate::send_agent_ready(agent_name_for_ready, Some(acp_thread_id));
-                } else {
-                    eprintln!("⚠️ [THREAD_SERVICE] Lock released but entity not in registry for '{}' — no action taken", acp_thread_id);
-                    log::warn!("⚠️ [THREAD_SERVICE] Lock released but entity not in registry for '{}'", acp_thread_id);
+                if let Err(error) = cx.update(|cx| {
+                    open_existing_thread_sync(project, acp_history_store, fs, request.clone(), cx)
+                }) {
+                    report_thread_open_failure(&request, &error);
                 }
             }).detach();
             return Ok(());
@@ -2490,7 +2484,9 @@ fn open_existing_thread_sync(
             Err(e) => {
                 eprintln!("❌ [THREAD_SERVICE] Failed to connect to agent: {:?}", e);
                 log::error!("❌ [THREAD_SERVICE] Failed to connect to agent: {:?}", e);
-                return Err(anyhow::anyhow!("agent connect failed: {:?}", e));
+                let error = anyhow::anyhow!("agent connect failed: {:?}", e);
+                report_thread_open_failure(&request_clone, &error);
+                return Err(error);
             }
         };
 
@@ -2503,7 +2499,9 @@ fn open_existing_thread_sync(
             if !cx.update(|_cx| connection.supports_load_session()) {
                 eprintln!("⚠️ [THREAD_SERVICE] Agent does not support session loading");
                 log::warn!("⚠️ [THREAD_SERVICE] Agent does not support session loading");
-                return Err(anyhow::anyhow!("Agent does not support session loading"));
+                let error = anyhow::anyhow!("Agent does not support session loading");
+                report_thread_open_failure(&request_clone, &error);
+                return Err(error);
             }
         }
 
@@ -2529,6 +2527,7 @@ fn open_existing_thread_sync(
             Err(e) => {
                 eprintln!("❌ [THREAD_SERVICE] connection.load_session() failed: {}", e);
                 log::error!("❌ [THREAD_SERVICE] connection.load_session() failed: {}", e);
+                report_thread_open_failure(&request_clone, &e);
                 return Err(e);
             }
         };
@@ -2629,6 +2628,109 @@ fn open_existing_thread_sync(
 /// parallel cargo threads stomp each other's service and lose events.
 #[cfg(test)]
 static TEST_WEBSOCKET_SERVICE_GUARD: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
+
+#[cfg(test)]
+mod thread_open_failure_tests {
+    use super::*;
+    use crate::websocket_sync::{WebSocketSync, WEBSOCKET_SERVICE};
+    use fs::FakeFs;
+    use gpui::{AppContext as _, TestAppContext};
+    use project::Project;
+    use settings::SettingsStore;
+
+    #[test]
+    fn thread_open_failure_preserves_request_correlation() {
+        let _guard = super::TEST_WEBSOCKET_SERVICE_GUARD.lock();
+        let (service, mut events) = WebSocketSync::new_test();
+        *WEBSOCKET_SERVICE.lock() = Some(service);
+        let request = ThreadOpenRequest {
+            acp_thread_id: "stale-thread".to_string(),
+            request_id: Some("req-exact".to_string()),
+            agent_name: Some("claude".to_string()),
+        };
+
+        report_thread_open_failure(&request, &anyhow::anyhow!("no thread found"));
+
+        match events.try_recv().expect("thread_load_error event") {
+            SyncEvent::ThreadLoadError {
+                acp_thread_id,
+                request_id,
+                error,
+            } => {
+                assert_eq!(acp_thread_id, "stale-thread");
+                assert_eq!(request_id, "req-exact");
+                assert!(error.contains("no thread found"));
+            }
+            event => panic!("unexpected event: {event:?}"),
+        }
+
+        *WEBSOCKET_SERVICE.lock() = None;
+    }
+
+    #[test]
+    fn uncorrelated_thread_open_failure_emits_no_event() {
+        let _guard = super::TEST_WEBSOCKET_SERVICE_GUARD.lock();
+        let (service, mut events) = WebSocketSync::new_test();
+        *WEBSOCKET_SERVICE.lock() = Some(service);
+
+        report_thread_open_failure(
+            &ThreadOpenRequest {
+                acp_thread_id: "uncorrelated-thread".to_string(),
+                request_id: None,
+                agent_name: None,
+            },
+            &anyhow::anyhow!("no thread found"),
+        );
+
+        assert!(events.try_recv().is_err());
+        *WEBSOCKET_SERVICE.lock() = None;
+    }
+
+    #[gpui::test]
+    async fn lock_waiter_retries_missing_thread_and_reports_failure(cx: &mut TestAppContext) {
+        let _guard = super::TEST_WEBSOCKET_SERVICE_GUARD.lock();
+        cx.update(|cx| {
+            let settings_store = SettingsStore::test(cx);
+            cx.set_global(settings_store);
+            language_model::init(cx);
+        });
+        let fs = FakeFs::new(cx.executor());
+        let project = Project::test(fs.clone(), [], cx).await;
+        let history_store = cx.update(|cx| cx.new(|cx| ThreadStore::new(cx)));
+        let (service, mut events) = WebSocketSync::new_test();
+        *WEBSOCKET_SERVICE.lock() = Some(service);
+        *THREAD_LOAD_IN_PROGRESS.lock() = Some("restoring-thread".to_string());
+
+        let request = ThreadOpenRequest {
+            acp_thread_id: "missing-thread".to_string(),
+            request_id: Some("req-waiter".to_string()),
+            agent_name: Some("zed-agent".to_string()),
+        };
+        cx.update(|cx| {
+            open_existing_thread_sync(project, history_store, fs, request, cx)
+                .expect("waiter should be scheduled");
+        });
+
+        cx.run_until_parked();
+        release_thread_load_lock();
+        cx.executor().advance_clock(Duration::from_millis(51));
+        cx.run_until_parked();
+
+        let event = events.try_recv();
+        *WEBSOCKET_SERVICE.lock() = None;
+        release_thread_load_lock();
+
+        let event = event.expect("missing thread should emit a correlated failure");
+        assert!(matches!(
+            event,
+            SyncEvent::ThreadLoadError {
+                request_id,
+                acp_thread_id,
+                ..
+            } if request_id == "req-waiter" && acp_thread_id == "missing-thread"
+        ));
+    }
+}
 
 #[cfg(test)]
 mod pending_user_created_emit_tests {
@@ -2861,6 +2963,7 @@ mod agent_ready_on_reconnect_tests {
         // Exercise the reconnect `open_thread` against the already-registered thread.
         let request = ThreadOpenRequest {
             acp_thread_id: acp_thread_id.clone(),
+            request_id: None,
             agent_name: Some("zed-agent".to_string()),
         };
         let history_store = cx.update(|cx| cx.new(|cx| ThreadStore::new(cx)));
