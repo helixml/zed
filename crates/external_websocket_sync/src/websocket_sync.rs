@@ -502,6 +502,7 @@ impl WebSocketSync {
         #[derive(Deserialize)]
         struct OpenThreadData {
             acp_thread_id: String,
+            request_id: Option<String>,
             /// Which ACP agent to use (e.g., "qwen", "claude", "gemini", "codex").
             /// None or empty means use NativeAgent (Zed's built-in agent).
             agent_name: Option<String>,
@@ -518,6 +519,7 @@ impl WebSocketSync {
         // Request thread opening via callback (will load from database and display)
         let request = crate::ThreadOpenRequest {
             acp_thread_id: open_data.acp_thread_id.clone(),
+            request_id: open_data.request_id.clone(),
             agent_name: open_data.agent_name.clone(),
         };
 

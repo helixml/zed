@@ -28,6 +28,20 @@ fn zed_agent_server_id(agent_name: &str) -> &str {
     }
 }
 
+fn report_thread_open_failure(request: &ThreadOpenRequest, error: &anyhow::Error) {
+    let Some(request_id) = request.request_id.clone().filter(|id| !id.is_empty()) else {
+        return;
+    };
+    let event = SyncEvent::ThreadLoadError {
+        acp_thread_id: request.acp_thread_id.clone(),
+        request_id,
+        error: format!("Failed to load thread: {}", error),
+    };
+    if let Err(send_err) = crate::send_websocket_event(event) {
+        log::error!("❌ [THREAD_SERVICE] Failed to send thread open error: {}", send_err);
+    }
+}
+
 #[cfg(test)]
 mod agent_server_id_tests {
     use super::zed_agent_server_id;
@@ -2490,7 +2504,9 @@ fn open_existing_thread_sync(
             Err(e) => {
                 eprintln!("❌ [THREAD_SERVICE] Failed to connect to agent: {:?}", e);
                 log::error!("❌ [THREAD_SERVICE] Failed to connect to agent: {:?}", e);
-                return Err(anyhow::anyhow!("agent connect failed: {:?}", e));
+                let error = anyhow::anyhow!("agent connect failed: {:?}", e);
+                report_thread_open_failure(&request_clone, &error);
+                return Err(error);
             }
         };
 
@@ -2503,7 +2519,9 @@ fn open_existing_thread_sync(
             if !cx.update(|_cx| connection.supports_load_session()) {
                 eprintln!("⚠️ [THREAD_SERVICE] Agent does not support session loading");
                 log::warn!("⚠️ [THREAD_SERVICE] Agent does not support session loading");
-                return Err(anyhow::anyhow!("Agent does not support session loading"));
+                let error = anyhow::anyhow!("Agent does not support session loading");
+                report_thread_open_failure(&request_clone, &error);
+                return Err(error);
             }
         }
 
@@ -2529,6 +2547,7 @@ fn open_existing_thread_sync(
             Err(e) => {
                 eprintln!("❌ [THREAD_SERVICE] connection.load_session() failed: {}", e);
                 log::error!("❌ [THREAD_SERVICE] connection.load_session() failed: {}", e);
+                report_thread_open_failure(&request_clone, &e);
                 return Err(e);
             }
         };
@@ -2629,6 +2648,60 @@ fn open_existing_thread_sync(
 /// parallel cargo threads stomp each other's service and lose events.
 #[cfg(test)]
 static TEST_WEBSOCKET_SERVICE_GUARD: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
+
+#[cfg(test)]
+mod thread_open_failure_tests {
+    use super::*;
+    use crate::websocket_sync::{WebSocketSync, WEBSOCKET_SERVICE};
+
+    #[test]
+    fn thread_open_failure_preserves_request_correlation() {
+        let _guard = super::TEST_WEBSOCKET_SERVICE_GUARD.lock();
+        let (service, mut events) = WebSocketSync::new_test();
+        *WEBSOCKET_SERVICE.lock() = Some(service);
+        let request = ThreadOpenRequest {
+            acp_thread_id: "stale-thread".to_string(),
+            request_id: Some("req-exact".to_string()),
+            agent_name: Some("claude".to_string()),
+        };
+
+        report_thread_open_failure(&request, &anyhow::anyhow!("no thread found"));
+
+        match events.try_recv().expect("thread_load_error event") {
+            SyncEvent::ThreadLoadError {
+                acp_thread_id,
+                request_id,
+                error,
+            } => {
+                assert_eq!(acp_thread_id, "stale-thread");
+                assert_eq!(request_id, "req-exact");
+                assert!(error.contains("no thread found"));
+            }
+            event => panic!("unexpected event: {event:?}"),
+        }
+
+        *WEBSOCKET_SERVICE.lock() = None;
+    }
+
+    #[test]
+    fn uncorrelated_thread_open_failure_emits_no_event() {
+        let _guard = super::TEST_WEBSOCKET_SERVICE_GUARD.lock();
+        let (service, mut events) = WebSocketSync::new_test();
+        *WEBSOCKET_SERVICE.lock() = Some(service);
+
+        report_thread_open_failure(
+            &ThreadOpenRequest {
+                acp_thread_id: "uncorrelated-thread".to_string(),
+                request_id: None,
+                agent_name: None,
+            },
+            &anyhow::anyhow!("no thread found"),
+        );
+
+        assert!(events.try_recv().is_err());
+        *WEBSOCKET_SERVICE.lock() = None;
+    }
+}
 
 #[cfg(test)]
 mod pending_user_created_emit_tests {
@@ -2861,6 +2934,7 @@ mod agent_ready_on_reconnect_tests {
         // Exercise the reconnect `open_thread` against the already-registered thread.
         let request = ThreadOpenRequest {
             acp_thread_id: acp_thread_id.clone(),
+            request_id: None,
             agent_name: Some("zed-agent".to_string()),
         };
         let history_store = cx.update(|cx| cx.new(|cx| ThreadStore::new(cx)));
