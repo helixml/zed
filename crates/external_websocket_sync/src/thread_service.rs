@@ -28,6 +28,38 @@ fn zed_agent_server_id(agent_name: &str) -> &str {
     }
 }
 
+fn report_thread_creation_failure(request_id: &str, error: &str) {
+    if let Err(send_err) = crate::send_websocket_event(SyncEvent::ChatResponseError {
+        request_id: request_id.to_string(),
+        error: error.to_string(),
+    }) {
+        log::error!("[THREAD_SERVICE] Failed to send thread creation error: {}", send_err);
+    }
+}
+
+async fn create_native_session_when_ready(
+    connection: std::rc::Rc<agent::NativeAgentConnection>,
+    project: Entity<Project>,
+    request_id: String,
+    cx: gpui::AsyncApp,
+) -> Result<Entity<AcpThread>> {
+    let executor = cx.background_executor().clone();
+    let deadline = executor.now() + Duration::from_secs(15);
+    loop {
+        if let Some(entity) = cx.update(|cx| {
+            connection.new_session_with_configured_model(project.clone(), cx)
+        }) {
+            return Ok(entity);
+        }
+        if executor.now() >= deadline {
+            let error = "configured NativeAgent model did not become available within 15s";
+            report_thread_creation_failure(&request_id, error);
+            return Err(anyhow::anyhow!(error));
+        }
+        executor.timer(Duration::from_millis(100)).await;
+    }
+}
+
 fn report_thread_open_failure(request: &ThreadOpenRequest, error: &anyhow::Error) {
     let Some(request_id) = request.request_id.clone().filter(|id| !id.is_empty()) else {
         return;
@@ -1684,6 +1716,7 @@ fn create_new_thread_sync(
             }
         }
     };
+    let is_native_agent = matches!(&agent, ExternalAgent::NativeAgent);
 
     // Spawn async task to complete the connection and create the thread
     let request_clone = request.clone();
@@ -1771,16 +1804,36 @@ fn create_new_thread_sync(
         let connection_for_model = connection.clone();
         let work_dirs = PathList::new(&[cwd.clone()]);
         eprintln!("🧵 [THREAD_SERVICE] Calling new_session() with cwd={:?}", cwd);
-        let thread_entity: Entity<AcpThread> = match cx.update(|cx| {
-            connection.new_session(project_clone.clone(), work_dirs, cx)
-        }).await {
-            Ok(entity) => {
-                eprintln!("✅ [THREAD_SERVICE] new_session() succeeded");
-                entity
-            }
-            Err(e) => {
-                eprintln!("❌ [THREAD_SERVICE] new_session() failed: {}", e);
-                return Err(e);
+        let thread_entity: Entity<AcpThread> = if is_native_agent {
+            let Some(native_connection) = connection
+                .clone()
+                .downcast::<agent::NativeAgentConnection>()
+            else {
+                let error = "NativeAgent connection had unexpected type";
+                report_thread_creation_failure(&request_clone.request_id, error);
+                return Err(anyhow::anyhow!(error));
+            };
+            let entity = create_native_session_when_ready(
+                native_connection,
+                project_clone.clone(),
+                request_clone.request_id.clone(),
+                cx.clone(),
+            )
+            .await?;
+            eprintln!("✅ [THREAD_SERVICE] new_session() succeeded");
+            entity
+        } else {
+            match cx.update(|cx| {
+                connection.new_session(project_clone.clone(), work_dirs, cx)
+            }).await {
+                Ok(entity) => {
+                    eprintln!("✅ [THREAD_SERVICE] new_session() succeeded");
+                    entity
+                }
+                Err(e) => {
+                    eprintln!("❌ [THREAD_SERVICE] new_session() failed: {}", e);
+                    return Err(e);
+                }
             }
         };
 
@@ -2637,6 +2690,7 @@ mod thread_open_failure_tests {
     use gpui::{AppContext as _, TestAppContext};
     use project::Project;
     use settings::SettingsStore;
+    use std::rc::Rc;
 
     #[test]
     fn thread_open_failure_preserves_request_correlation() {
@@ -2665,6 +2719,59 @@ mod thread_open_failure_tests {
         }
 
         *WEBSOCKET_SERVICE.lock() = None;
+    }
+
+    #[gpui::test]
+    async fn native_creation_timeout_emits_only_correlated_error(cx: &mut TestAppContext) {
+        let _guard = super::TEST_WEBSOCKET_SERVICE_GUARD.lock();
+        cx.update(|cx| {
+            let settings_store = SettingsStore::test(cx);
+            cx.set_global(settings_store);
+            language_model::init(cx);
+        });
+        let fs = FakeFs::new(cx.executor());
+        let project = Project::test(fs.clone(), [], cx).await;
+        let thread_store = cx.new(|cx| ThreadStore::new(cx));
+        let agent = cx.update(|cx| {
+            agent::NativeAgent::new(thread_store, agent::Templates::new(), fs, cx)
+        });
+        let connection = Rc::new(agent::NativeAgentConnection(agent));
+        let (service, mut events) = WebSocketSync::new_test();
+        *WEBSOCKET_SERVICE.lock() = Some(service);
+
+        let task = cx.update(|cx| {
+            cx.spawn(async move |cx| {
+                create_native_session_when_ready(
+                    connection,
+                    project,
+                    "req-timeout".to_string(),
+                    cx.clone(),
+                )
+                .await
+            })
+        });
+        cx.run_until_parked();
+        cx.executor().advance_clock(Duration::from_secs(16));
+        cx.run_until_parked();
+        assert!(task.await.is_err());
+
+        let mut correlated_errors = 0;
+        while let Ok(event) = events.try_recv() {
+            match event {
+                SyncEvent::ChatResponseError { request_id, .. }
+                    if request_id == "req-timeout" =>
+                {
+                    correlated_errors += 1;
+                }
+                SyncEvent::ThreadCreated { .. } | SyncEvent::AgentReady { .. } => {
+                    panic!("timeout must not create or ready a thread")
+                }
+                _ => {}
+            }
+        }
+        *WEBSOCKET_SERVICE.lock() = None;
+
+        assert_eq!(correlated_errors, 1);
     }
 
     #[test]
