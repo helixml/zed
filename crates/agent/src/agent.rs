@@ -35,6 +35,7 @@ use agent_skills::{
     SkillSource, SkillSummary, builtin_skills, global_skills_dir, load_skills_from_directory,
     parse_skill_frontmatter, project_skills_relative_path, read_skill_body_from_content,
 };
+use agent_settings::AgentSettings;
 use anyhow::{Context as _, Result, anyhow};
 use chrono::{DateTime, Utc};
 use collections::{HashMap, HashSet, IndexMap};
@@ -2074,6 +2075,26 @@ impl NativeAgentConnection {
             .map(|session| session.thread.clone())
     }
 
+    pub fn new_session_with_configured_model(
+        &self,
+        project: Entity<Project>,
+        cx: &mut App,
+    ) -> Option<Entity<AcpThread>> {
+        self.0.update(cx, |agent, cx| {
+            let configured = AgentSettings::get_global(cx).default_model.as_ref()?;
+            let registry_default = LanguageModelRegistry::read_global(cx).default_model()?;
+            if configured.provider.0.as_str() != registry_default.provider.id().0.as_ref()
+                || configured.model != registry_default.model.id().0.as_ref()
+            {
+                return None;
+            }
+            agent
+                .models
+                .model_from_id(&LanguageModels::model_id(&registry_default.model))?;
+            Some(agent.new_session(project, cx))
+        })
+    }
+
     /// Forwards to [`NativeAgent::ensure_skills_scan_started`]. The
     /// agent panel calls this from its three user-interaction trigger
     /// points (input box focus, slash-autocomplete invocation, and
@@ -3714,7 +3735,7 @@ mod internal_tests {
     use acp_thread::{AgentConnection, AgentModelGroupName, AgentModelInfo, MentionUri};
     use agent_settings::COMPACTION_PROMPT;
     use fs::FakeFs;
-    use gpui::TestAppContext;
+    use gpui::{TestAppContext, UpdateGlobal as _};
     use indoc::formatdoc;
     use language_model::fake_provider::{FakeLanguageModel, FakeLanguageModelProvider};
     use language_model::{
@@ -6648,6 +6669,68 @@ mod internal_tests {
 
             LanguageModelRegistry::test(cx);
         });
+    }
+
+    #[gpui::test]
+    async fn configured_session_uses_exact_cached_model(cx: &mut TestAppContext) {
+        init_test(cx);
+        cx.update(|cx| {
+            SettingsStore::update_global(cx, |store, cx| {
+                store.update_user_settings(cx, |settings| {
+                    settings.agent.get_or_insert_default().default_model =
+                        Some(LanguageModelSelection {
+                            provider: "fake".into(),
+                            model: "fake".to_string(),
+                            enable_thinking: false,
+                            effort: None,
+                            speed: None,
+                        });
+                });
+            });
+        });
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree("/", json!({ "a": {} })).await;
+        let project = Project::test(fs.clone(), [], cx).await;
+        let thread_store = cx.new(|cx| ThreadStore::new(cx));
+        let agent = cx.update(|cx| NativeAgent::new(thread_store, Templates::new(), fs, cx));
+        let connection = NativeAgentConnection(agent.clone());
+
+        cx.update(|cx| {
+            let configured = AgentSettings::get_global(cx).default_model.as_ref().unwrap();
+            let registry_default = LanguageModelRegistry::read_global(cx).default_model().unwrap();
+            assert_eq!(configured.provider.0.as_str(), registry_default.provider.id().0.as_ref());
+            assert_eq!(configured.model, registry_default.model.id().0.as_ref());
+            let model_id = LanguageModels::model_id(&registry_default.model);
+            assert!(agent.read(cx).models.model_from_id(&model_id).is_some());
+        });
+        let settings_before =
+            cx.update(|cx| AgentSettings::get_global(cx).default_model.clone());
+        let session = cx
+            .update(|cx| {
+                connection.new_session_with_configured_model(project.clone(), cx)
+            })
+            .expect("matching settings, registry, and cache should create a session");
+        let session_id = session.read_with(cx, |thread, _cx| thread.session_id().clone());
+        agent.read_with(cx, |agent, cx| {
+            agent.sessions[&session_id]
+                .thread
+                .read_with(cx, |thread, _cx| {
+                    let model = thread.model().unwrap();
+                    assert_eq!(model.provider_id().0.as_ref(), "fake");
+                    assert_eq!(model.id().0.as_ref(), "fake");
+                });
+        });
+        let settings_after =
+            cx.update(|cx| AgentSettings::get_global(cx).default_model.clone());
+        assert_eq!(settings_after, settings_before);
+
+        let session_count = agent.read_with(cx, |agent, _cx| agent.sessions.len());
+        agent.update(cx, |agent, _cx| agent.models.models.clear());
+        let missing =
+            cx.update(|cx| connection.new_session_with_configured_model(project, cx));
+
+        assert!(missing.is_none());
+        agent.read_with(cx, |agent, _cx| assert_eq!(agent.sessions.len(), session_count));
     }
 
     #[test]
