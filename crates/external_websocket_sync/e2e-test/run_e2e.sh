@@ -229,7 +229,7 @@ ${AGENT_SERVERS_JSON}
   "agent": {
     "default_model": {
       "provider": "anthropic",
-      "model": "claude-sonnet-4-5-latest"
+      "model": "claude-sonnet-4-6"
     },
     "always_allow_tool_actions": true,
     "show_onboarding": false,
