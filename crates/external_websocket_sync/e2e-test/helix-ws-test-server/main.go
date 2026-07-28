@@ -1414,7 +1414,7 @@ func (d *testDriver) runQueuePhases() {
 		os.Exit(1)
 	}
 	// Agent is now busy on A. Enqueue B (interrupt=false): must be HELD.
-	promptB, err := d.srv.EnqueueQueuedPrompt(sessID, "Now also mention whales.", false)
+	promptB, err := d.srv.EnqueueQueuedPrompt(sessID, "Reply with exactly this one sentence: Whales are mammals.", false)
 	if err != nil {
 		log.Printf("[%s] Phase 16: ABORT — enqueue B failed: %v", agent, err)
 		os.Exit(1)
