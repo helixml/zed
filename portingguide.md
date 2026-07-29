@@ -208,7 +208,27 @@ These files contain Helix-specific changes that must be preserved during rebases
 - For enterprise deployments with internal CAs / self-signed certs
 
 ### `crates/reqwest_client/src/reqwest_client.rs`
-- **Insecure TLS support**: Reads `ZED_HTTP_INSECURE_TLS=1` to disable cert verification
+- **Insecure TLS support**: Reads `ZED_HTTP_INSECURE_TLS=1` to disable cert verification.
+  The Helix change is the `if is_insecure_tls_enabled() { use_preconfigured_tls(...) } else
+  { use_rustls_tls() }` branch. Upstream keeps appending builder options (tcp_keepalive /
+  pool_idle_timeout / http2 keep-alive, added 2026-07) to a single fluent chain ending in
+  `.use_rustls_tls()`. On merge, append upstream's new options to the `builder` binding and
+  keep the branch as the tail — do NOT let the chain re-fix `use_rustls_tls()` unconditionally
+  or insecure-TLS silently stops working in enterprise/self-signed deployments.
+
+### `crates/language_models/src/provider/open_ai.rs`
+- **`chat_completions_reasoning_effort(&self.model)`** passed to `into_open_ai(...)` on the
+  chat-completions branch, instead of upstream's unconditional `None`. Preserves an
+  explicitly-disabled ("none") reasoning effort for chat-tool models — Helix commit
+  `135f5b4421` "fix(agent): preserve disabled reasoning for chat tools"
+  (see `design/2026-07-14-zed-agent-reasoning-none.md`).
+- **Merge hazard:** upstream keeps adding positional parameters to `into_open_ai`. As of
+  2026-07 the order is `(request, model_id, supports_parallel_tool_calls,
+  supports_prompt_cache_key, max_output_tokens, max_tokens_parameter, reasoning_effort,
+  interleaved_reasoning)`. A conflict here looks like a one-line arg swap and is very easy to
+  resolve *toward upstream*, silently dropping the Helix fix. Always keep
+  `chat_completions_reasoning_effort(&self.model)` in the `reasoning_effort` slot and adopt
+  upstream's new params around it. This surface was undocumented until the 2026-07-29 merge.
 
 ### `crates/agent_settings/src/agent_settings.rs`
 - **`show_onboarding`**: Setting to control onboarding visibility
@@ -536,8 +556,23 @@ When rebasing/merging against upstream Zed:
 40. **Check `Cargo.toml` workspace `rust-embed` features** — must include both `include-exclude` AND `debug-embed`. The `debug-embed` feature was originally added by Helix in commit `9ca797706f` (Oct 2025), lost in a subsequent merge, re-added in 001909. Without it, dev builds panic on startup with `settings/default.json` because RustEmbed tries to read assets from `CARGO_MANIFEST_DIR` at runtime, and that path doesn't exist outside the build directory (e.g. inside the e2e-test container or any deployed binary). Release builds always embed assets so they're unaffected — but debug builds (used by the e2e test, ARM aside) need this feature.
 41. **Check `crates/agent/src/agent.rs` for `smol::Timer::after` references** — must use `cx.background_executor().timer(d).await` instead. Upstream PR #53603 (Apr 2026) removed `smol` from the agent crate's deps. Helix's `wait_for_tools_ready()` previously used `smol::Timer::after` and broke after the merge; fixed in 001909 by switching to the canonical GPUI pattern.
 41a. **Check `acp_thread.rs` test code for unit-variant `AcpThreadEvent::Stopped` patterns** — `Stopped` is a tuple variant `Stopped(StopReason)` and `matches!(event, AcpThreadEvent::Stopped)` no longer compiles. Production builds skip `#[cfg(test)]` so this fails silently in `cargo build` but breaks `cargo test -p acp_thread test_second_send`. Grep: `grep -n "AcpThreadEvent::Stopped[^(]" crates/acp_thread/src/`. Fixed in 001980; patterns must be `Stopped(_)`.
+45. **Check `language_models/src/provider/open_ai.rs`** — the chat-completions `into_open_ai(...)`
+    call must pass `chat_completions_reasoning_effort(&self.model)` in the `reasoning_effort`
+    slot, NOT upstream's `None` (Helix `135f5b4421`). Upstream adds positional params to this
+    call regularly, so the conflict presents as a trivial-looking arg swap.
+46. **Check `reqwest_client.rs` builder** — Helix's `is_insecure_tls_enabled()` branch must remain
+    the TAIL of the builder chain; upstream's newly-appended options (keepalive/pool timeouts)
+    go on the `builder` binding above it.
+47. **Run the drift sweep** — `script/helix-drift-sweep.sh` mechanises checks 1–46. Run it before
+    AND after each merge round; a check that passes before and fails after is a dropped fix.
 42. **Run `cargo check --package zed --features external_websocket_sync`** — must compile
 43. **Run `cargo test -p external_websocket_sync`** — unit tests
+48. **Run the FULL crate suites, not a single filtered test** — `cargo test -p acp_thread` AND
+    `cargo test -p external_websocket_sync`. Item #7's filtered `test_second_send` run let a
+    whole-suite failure hide for six weeks (see Merge 2026-07-29 → Pre-existing Breakage).
+    Expected baseline as of 2026-07-29: `acp_thread` 127 passed / 1 ignored,
+    `external_websocket_sync` 50 passed / 4 ignored. A NEW ignore or failure needs triage —
+    check whether it is an upstream test encoding an invariant a Helix Critical Fix breaks.
 44. **Run E2E test** after merge to verify all phases pass (currently 12 phases, run for both `zed-agent` and `claude` rounds)
 
 ## Building
@@ -666,6 +701,155 @@ Helix-specific commits on main (oldest first):
 | `0098823efa` | Merge upstream Zed (`992f395c3d..a31d3505da`, 25 commits, 3 days) into 002100 — 1 conflict resolved (`settings_content/src/settings_content.rs` both-sides-added-a-field on `RemoteSettingsContent`: kept Helix `suggest_dev_container` + upstream `dev_container_use_buildkit`). Smallest catch-up window in the series. Zero upstream churn in `acp_thread/`, `agent/src/`, `workspace.rs`, `zed/src/main.rs`, `title_bar/`, `feature_flags/`, `agent_servers/`, `external_websocket_sync/`, `agent_settings/` — all critical fixes and PR #50/#55/#56/#60 surface intact by construction. |
 | `0e0149ade5` | Merge upstream Zed (`a31d3505da..e45e42af6e`, 95 commits, 3 days) into 002100-extension — 1 conflict resolved (`agent/src/tools/grep_tool.rs`: kept Helix 001410 `truncate_long_lines` semantic while reusing upstream's pre-computed `snippet` variable from `40211567b8` "Make grep tool results clickable in agent panel"). Heavy upstream churn in `acp_thread.rs` (+198), `agent.rs` (+223), `agent/src/thread.rs` (+511), `agent_panel.rs` (+203), `conversation_view.rs` (+1024), new `thread_search_bar.rs` (+962), `thread_view.rs` (+1094), `extensions_ui.rs` (+286), `title_bar.rs` (+36), `agent/src/sandboxing.rs` (+458), `agent/src/tools/terminal_tool.rs` (+957) — yet all auto-merged cleanly. Fix 1b shifted from line 5420 → 5468 (still FIRST statement of `BaseView::Uninitialized`). Three `// HELIX:` markers shifted from 226/248/1518 → 337/359/1629. Critical Fix #3 shifted from line 262 → 335. All shifts content-preserving. |
 | `2221360fc1` | Tidy ws-test-server `go.mod`/`go.sum` for current Helix deps (certmagic / libdns / acmez / miekg/dns). Same pattern as `9f8364e138` after round 1. |
+| `de79c75c16` | **Add `script/helix-drift-sweep.sh` (28 mechanised checklist checks) + document the previously-undocumented `open_ai.rs` and `reqwest_client.rs` Helix surfaces** |
+| `1298e61d48` | Merge upstream Zed (`e45e42af6e..4b7369481d`, 254 commits) — 2026-07-29 round 1 |
+| `d79806cc57` | Build fixes for round-1 signature drift (`into_foreground_future` removal, ACP `schema::v1`, elicitation fields, `clear_overlay_state` removal, `agent::ThreadStore`) |
+| `65fb0b37d6` | Merge upstream Zed (`4b7369481d..4a3e0af532`, 212 commits) — round 2 |
+| `08ec6919f0` | Merge upstream Zed (`4a3e0af532..d23aaeebea`, 226 commits) — round 3 (also repairs a committed conflict block in `.gitignore`) |
+| `b5036a9331` | Merge upstream Zed (`d23aaeebea..b9256fa8f0`, 72 commits) — round 4, to upstream HEAD |
+| `7fa02c2b4a` | Round-4 drift fixes + `#[ignore]` on the upstream compaction test that is mutually exclusive with Critical Fix #8 |
+
+## Merge 2026-07-29 (upstream catch-up, 764 commits)
+
+**Divergence at start**:
+- Fork HEAD: `06e9ce8059` (Merge PR #72 — e2e phase-16 deferred-queue bound)
+- Last upstream merge fence: `e45e42af6e` (absorbed by 002100-extension, 2026-06-18)
+- Upstream HEAD: `b9256fa8f0` ("Stop the npm cache from growing without bound (#61750)")
+- Upstream commits to merge: **764** (41 days — by far the largest window in this series;
+  previous max was 261)
+
+Merged in **four dated rounds** rather than one 764-commit jump, per the established
+pattern, so each conflict is attributable to a bounded upstream window:
+
+| Round | Range | Commits | Conflicts |
+|---|---|---|---|
+| 1 | `e45e42af6e..4b7369481d` (→07-03) | 254 | 6 |
+| 2 | `4b7369481d..4a3e0af532` (→07-14) | 212 | 3 |
+| 3 | `4a3e0af532..d23aaeebea` (→07-24) | 226 | 1 |
+| 4 | `d23aaeebea..b9256fa8f0` (→HEAD)  | 72  | 2 |
+
+### Conflicts and Resolutions
+
+1. **`acp_thread.rs`** (round 1, 2 hunks) — upstream added an `is_same_turn` guard emitting
+   `AcpThreadEvent::StatusChanged` on both the dropped-tx and normal-completion paths.
+   **Resolution**: kept Helix's `stopped_emitted_for_task` guard (Critical Fixes #6/#9) and
+   adopted upstream's `StatusChanged` emit, ordered StatusChanged-then-Stopped to match
+   upstream's own ordering in the sibling `Err` arm.
+2. **`agent_servers/acp.rs`** (rounds 1+2, 3 hunks) — (a) both sides added a top-level item at
+   the same offset (Helix `SessionCreationGuard`, upstream `client_capabilities_for_agent`):
+   kept both. (b) upstream replaced `into_foreground_future(..)` with `.block_task()`: kept
+   Helix's PR #50 slot-guard + `prev_chain.await`, adopted the new call form. (c) upstream
+   dropped `client_capabilities_for_agent`'s `supports_beta_features` param.
+3. **`agent_ui/agent_panel.rs`** (rounds 1+4) — upstream hoisted the `use crate::{Agent, …}`
+   block, making Helix's copy a duplicate (kept only the cfg-gated imports); and both sides
+   added a `Panel` method (kept Helix `starts_open` + upstream `activation_focus_handle`).
+4. **`agent_ui/config_options.rs`** (round 1) — upstream renamed `first_config_option_id` →
+   `first_config_option_id_matching` **and added a `predicate` param**. Helix's
+   `current_model_value()` now passes `|_| true`, preserving the old first-in-category
+   semantic.
+5. **`language_models/provider/open_ai.rs`** (round 1) — see the new "Modified Upstream Files"
+   entry. Upstream inserted `ChatCompletionMaxTokensParameter::MaxCompletionTokens` and passed
+   `None` for reasoning effort; Helix's `chat_completions_reasoning_effort(&self.model)` was
+   reinstated in the `reasoning_effort` slot.
+6. **`reqwest_client.rs`** (rounds 1+4) — upstream appended keepalive/pool options and later a
+   `read_timeout` param. Helix's insecure-TLS branch kept as the tail of the chain.
+7. **`.gitignore`** (round 3) — **pre-existing breakage**: a raw, unresolved conflict block
+   (`<<<<<<<` / `=======` / `>>>>>>> upstream/main`) had been *committed* to fork main by an
+   earlier merge. Repaired by keeping every real entry from all sides.
+8. **Workflows** (round 2) — `hotfix-review-monitor.yml`, `stale-pr-reminder.yml`
+   modify/delete: kept HEAD's deletion (`git rm`), matching prior rounds.
+
+### Pre-existing Breakage Repaired
+
+Two items, both invisible to the previous checklist:
+
+- **`.gitignore` committed conflict markers** (above).
+- **`cargo test -p acp_thread` had been RED since 2026-06-18.**
+  `test_stale_cancelled_response_does_not_cancel_current_compaction` (upstream `5c90b0664f`,
+  PR #59014, absorbed by 002100-extension) asserts a displaced turn still delivers its
+  `PromptResponse`. That is mutually exclusive with **Critical Fix #8** — `cancel()` does
+  `drop(turn.send_task)`, so `rx.await` returns `Err` and the displaced turn resolves to
+  `Ok(None)`. Confirmed failing identically on pre-merge `06e9ce8059`, so **not** a regression
+  from this merge. Marked `#[ignore]` with the full rationale inline; the suite is green again
+  and usable as a gate. Helix keeps Fix #8: a permanently wedged thread is far worse than a
+  lost stale response, and the compaction invariant the test guards still holds (the stale
+  turn returns `None`, so it cannot cancel the live compaction).
+
+  **Process lesson:** checklist item #7 only ever ran `cargo test -p acp_thread test_second_send`,
+  so a whole-suite failure hid for six weeks. Run the FULL crate suites (item #48 below).
+
+### Signature Drift Repaired (build fixes)
+
+- `into_foreground_future()` removed upstream → Helix's PR #63 `force_close_session` converted
+  to `.block_task()`.
+- ACP schema is now **versioned**: `agent_client_protocol::schema` → `::schema::v1`
+  (`ContentBlock`, `TextContent`, `SessionId`) in `thread_service.rs`.
+- `from_existing_thread()` gained two upstream fields:
+  `ConnectedServerState::_request_elicitation_subscription` (`None` — headless/external threads
+  have no elicitation UI) and `ConversationView::request_elicitation_form_states`.
+- `clear_overlay_state()` and its three backing fields (`overlay_view`,
+  `configuration_subscription`, `configuration`) were removed by upstream `40d20036af`
+  (PR #59860, in-panel AI-config overlay retired). The call is dropped from the Critical Fix #11
+  guard; guard semantics unchanged.
+- `initialize_headless()` now fully qualifies `agent::ThreadStore`.
+
+### Helix Surface — Auto-Merge Survival Check
+
+Drift sweep **28/28** after every round (`script/helix-drift-sweep.sh`). Critical Fixes #1, #3,
+#6/#9, #8, #11 and PR #50/#55/#56/#60 surface all intact.
+
+Two build warnings, both expected/not ours:
+- `agent_panel.rs` "unreachable statement" — this is **PR #56 Fix 1b working as designed**: the
+  cfg-gated `return` correctly shadows upstream's terminal-spawn branches. Its presence is
+  positive evidence Fix 1b is still the FIRST statement of the `BaseView::Uninitialized` branch.
+- `title_bar.rs:1330` "unused `Task` that must be used" — pure upstream code (`327ad43ebd`,
+  PR #49763 organization selector). Left alone; patching upstream here would only add future
+  conflict surface.
+
+### Validation
+
+- `cargo check --package zed --features external_websocket_sync`: **PASSED**, 0 errors.
+  Two warnings, both expected/not ours (see above).
+- `cargo test -p acp_thread`: **127 passed, 1 ignored** (the documented Critical Fix #8
+  divergence).
+- `cargo test -p external_websocket_sync`: **55 passed, 4 ignored**.
+- Drift sweep (`script/helix-drift-sweep.sh`): **28/28**, run after every round.
+- `./stack build-zed dev`: **PASSED**, binary 606MB.
+- E2E `E2E_AGENTS="zed-agent,claude" ./run_docker_e2e.sh`: **PASSED** on the final tree —
+  `[zed-agent]` all 17 phases, `[claude]` all 17 phases, `[store] PASSED`
+  (40 interactions / 15 sessions; response-entries isolation checked across 34
+  interactions in 10 sessions; accumulation 36 with content, interrupted/cancelled 0).
+
+**First E2E run flaked in the claude round** and is worth recording, because the
+signature differs from the previously-documented flake. Prior rounds (001996, 002077)
+saw claude Phase 1 time out with **0 events** (npx bootstrap). This time Phase 1
+received **3 events** — `agent_ready`, `thread_created`, and an assistant
+`message_added` with the correct answer — and then no `message_completed` at all: the
+agent produced output and never closed the turn. It did **not** reproduce on the
+re-run (Phase 1 completed in ~48s), and the most likely regression candidate was ruled
+out by inspection (`stopped_emitted` is constructed per turn at `acp_thread.rs:3789`
+and set only in `cancel()`, so the Critical Fix #6/#9 guard cannot leak across turns
+and suppress a legitimate `Stopped`).
+
+Two harness gaps this exposed, both worth fixing:
+- `e2e-test/run_e2e.sh:204` reports the agent version via
+  `npm view @anthropic-ai/claude-agent-acp version`, but Zed installs
+  **`@agentclientprotocol/claude-agent-acp`** (see `crates/agent_servers/`). Wrong scope
+  ⇒ always `unknown`, so the one line that would attribute a claude-round failure to an
+  agent-package change rather than to our code is useless.
+- The npm path is unpinned, so the claude round is not reproducible across time.
+
+### The message-queue rework (upstream PR #59310)
+
+Round 1 absorbed `5c58d5c49a` "agent_ui: Refactor the queue feature and add steering ability",
+which **removes `user_interrupted_generation` / `skip_queue_processing_count`** and replaces
+them with a `MessageQueue` state machine (`AutoProcess` / `Paused` / `AbsorbingCancel`) in the
+new `conversation_view/message_queue.rs`. The old booleans suppressed a queue flush on interrupt
+and had no path that ever flushed it afterwards; the new `AbsorbingCancel` state swallows exactly
+one self-initiated cancel's `Stopped` and then **returns to `AutoProcess`**, and both `enqueue()`
+and `resume()` restore `AutoProcess`. This closes a real message-stranding seam. (It was
+*not* the cause of the 2026-07-29 production hang — see
+`design/2026-07-29-acp-agent-silent-prompt-wedge.md`.)
 
 ## Merge 002100-extension (2026-06-18)
 
