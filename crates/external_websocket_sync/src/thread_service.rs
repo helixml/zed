@@ -1234,6 +1234,98 @@ pub fn ensure_thread_subscription(
             _ => {}
         }
     }).detach();
+
+    spawn_silent_turn_watchdog(thread_entity, thread_id, cx);
+}
+
+/// Origin-agnostic companion to the watchdog in [`handle_follow_up_message`].
+///
+/// The send-path watchdog only wraps turns that Helix dispatched. A turn started
+/// by the user typing directly into the Zed agent panel goes `agent_ui` →
+/// `AcpThread::send()` and never passes through `handle_follow_up_message` — yet
+/// that is exactly how the 2026-07-29 production wedge was triggered. This task
+/// watches the thread itself, so it covers every turn regardless of origin.
+///
+/// It observes `ThreadStatus::Generating` (i.e. `running_turn.is_some()`) and the
+/// [`THREAD_ACTIVITY`] counter. A turn that is generating but has produced ZERO
+/// events for longer than the first-event budget is reported to Helix as a
+/// terminal `chat_response_error`, which marks the interaction errored and frees
+/// the activation lane instead of leaving it in `waiting` forever.
+///
+/// Deliberately does NOT call `thread.cancel()`: the Stopped handler would then
+/// emit `message_completed` on top of this error and Helix would see the turn as
+/// both failed and completed. Leaving the turn alone is safe — the next
+/// `send()` displaces it (which cancels it via Critical Fix #8), so Zed
+/// self-heals on the user's next message while Helix has already been told the
+/// truth.
+fn spawn_silent_turn_watchdog(thread_entity: &Entity<AcpThread>, thread_id: &str, cx: &mut App) {
+    let Some(budget) = first_event_timeout() else {
+        return;
+    };
+    const POLL: Duration = Duration::from_secs(5);
+
+    let weak = thread_entity.downgrade();
+    let thread_id = thread_id.to_string();
+
+    cx.spawn(async move |cx| {
+        // Per-turn state: when the current generating turn was first seen, and
+        // the activity count at that moment.
+        let mut turn_started_at: Option<Instant> = None;
+        let mut baseline: u64 = 0;
+        let mut reported = false;
+
+        loop {
+            cx.background_executor().timer(POLL).await;
+
+            let Some(thread) = weak.upgrade() else {
+                return; // thread gone — stop watching
+            };
+            let status = cx.update(|cx| thread.read(cx).status());
+
+            match status {
+                acp_thread::ThreadStatus::Idle => {
+                    // Turn boundary: re-arm for the next one.
+                    turn_started_at = None;
+                    reported = false;
+                }
+                acp_thread::ThreadStatus::Generating => {
+                    let started = *turn_started_at.get_or_insert_with(|| {
+                        baseline = activity_count(&thread_id);
+                        Instant::now()
+                    });
+
+                    if activity_count(&thread_id) > baseline {
+                        // Proof of life — disarm for the rest of this turn.
+                        reported = true;
+                        continue;
+                    }
+
+                    if !reported && started.elapsed() >= budget {
+                        reported = true;
+                        let request_id = crate::get_thread_request_id(&thread_id)
+                            .unwrap_or_default();
+                        let msg = format!(
+                            "{}: agent has been generating for {:?} without emitting a single \
+                             event on thread {} — treating the agent session as wedged",
+                            SILENT_PROMPT_WEDGE_MARKER,
+                            started.elapsed(),
+                            thread_id
+                        );
+                        eprintln!("🛑 [THREAD_SERVICE] {}", msg);
+                        log::warn!("🛑 [THREAD_SERVICE] {}", msg);
+
+                        if !request_id.is_empty() {
+                            let _ = crate::send_websocket_event(SyncEvent::ChatResponseError {
+                                request_id,
+                                error: msg,
+                            });
+                        }
+                    }
+                }
+            }
+        }
+    })
+    .detach();
 }
 
 /// Setup WebSocket thread handler for a workspace
