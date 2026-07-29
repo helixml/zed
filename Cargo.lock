@@ -2761,6 +2761,7 @@ dependencies = [
  "postage",
  "project",
  "serde",
+ "serde_json",
  "settings",
  "telemetry",
  "util",
@@ -3546,6 +3547,7 @@ dependencies = [
  "theme",
  "theme_settings",
  "time",
+ "title_bar",
  "tokio",
  "toml 0.8.23",
  "tower 0.4.13",
@@ -3586,6 +3588,7 @@ dependencies = [
  "serde_json",
  "settings",
  "smallvec",
+ "smol",
  "telemetry",
  "theme",
  "theme_settings",
@@ -4640,8 +4643,10 @@ dependencies = [
  "anyhow",
  "editor",
  "feature_flags",
+ "fuzzy",
  "gpui",
  "log",
+ "picker",
  "text",
  "ui",
  "workspace",
@@ -6676,6 +6681,7 @@ dependencies = [
  "fs",
  "gpui",
  "inventory",
+ "release_channel",
  "schemars 1.0.4",
  "serde_json",
  "settings",
@@ -7027,6 +7033,7 @@ dependencies = [
  "paths",
  "proto",
  "rope",
+ "rustix 1.1.2",
  "serde",
  "serde_json",
  "slotmap",
@@ -8141,7 +8148,6 @@ dependencies = [
  "log",
  "parking_lot",
  "raw-window-handle",
- "smallvec",
  "uuid",
  "wasm-bindgen",
  "wasm-bindgen-futures",
@@ -8171,6 +8177,7 @@ dependencies = [
  "raw-window-handle",
  "smallvec",
  "swash",
+ "unicode-bidi",
  "unicode-segmentation",
  "wasm-bindgen",
  "wasm-bindgen-futures",
@@ -10003,10 +10010,10 @@ dependencies = [
  "log",
  "menu",
  "mistral",
- "oauth_callback_server",
  "ollama",
  "open_ai",
  "open_router",
+ "openai_subscribed",
  "opencode",
  "parking_lot",
  "pretty_assertions",
@@ -10016,13 +10023,10 @@ dependencies = [
  "serde",
  "serde_json",
  "settings",
- "sha2",
- "smol",
  "strum 0.27.2",
  "tokio",
  "ui",
  "ui_input",
- "url",
  "util",
  "x_ai",
 ]
@@ -12581,6 +12585,30 @@ dependencies = [
 ]
 
 [[package]]
+name = "openai_subscribed"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "base64 0.22.1",
+ "credentials_provider",
+ "futures 0.3.32",
+ "gpui",
+ "http_client",
+ "language_model",
+ "log",
+ "oauth_callback_server",
+ "open_ai",
+ "parking_lot",
+ "rand 0.9.4",
+ "serde",
+ "serde_json",
+ "sha2",
+ "smol",
+ "url",
+ "util",
+]
+
+[[package]]
 name = "opencode"
 version = "0.1.0"
 dependencies = [
@@ -14343,6 +14371,7 @@ dependencies = [
  "itertools 0.14.0",
  "language",
  "log",
+ "markdown",
  "markdown_preview",
  "menu",
  "notifications",
@@ -16241,6 +16270,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "futures 0.3.32",
+ "gpui",
  "http_proxy",
  "libc",
  "log",
@@ -19603,7 +19633,7 @@ dependencies = [
 [[package]]
 name = "trash"
 version = "5.2.5"
-source = "git+https://github.com/zed-industries/trash-rs?rev=47761739192828a66b11a94ba5420b82d63c03c5#47761739192828a66b11a94ba5420b82d63c03c5"
+source = "git+https://github.com/zed-industries/trash-rs?rev=41c6c800d884a89351f3b8856d12894cccee261d#41c6c800d884a89351f3b8856d12894cccee261d"
 dependencies = [
  "chrono",
  "libc",
@@ -20050,6 +20080,7 @@ dependencies = [
  "theme",
  "theme_settings",
  "ui_macros",
+ "web-time",
  "windows 0.61.3",
 ]
 
@@ -20797,8 +20828,7 @@ dependencies = [
 [[package]]
 name = "wasm_thread"
 version = "0.3.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b7516db7f32decdadb1c3b8deb1b7d78b9df7606c5cc2f6241737c2ab3a0258e"
+source = "git+https://github.com/zed-industries/wasm_thread?rev=0cf96c7708dfb97ccf3da50347e25edcf75d6937#0cf96c7708dfb97ccf3da50347e25edcf75d6937"
 dependencies = [
  "futures 0.3.32",
  "js-sys",
@@ -23392,7 +23422,7 @@ dependencies = [
 
 [[package]]
 name = "zed"
-version = "1.14.0"
+version = "1.15.0"
 dependencies = [
  "acp_thread",
  "acp_tools",

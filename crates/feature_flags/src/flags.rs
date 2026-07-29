@@ -93,6 +93,13 @@ impl FeatureFlag for ProjectPanelUndoRedoFeatureFlag {
     fn enabled_for_staff() -> bool {
         true
     }
+
+    fn enabled_for_all() -> bool {
+        !matches!(
+            *release_channel::RELEASE_CHANNEL,
+            release_channel::ReleaseChannel::Stable
+        )
+    }
 }
 register_feature_flag!(ProjectPanelUndoRedoFeatureFlag);
 
@@ -135,6 +142,10 @@ pub struct SandboxingFeatureFlag;
 impl FeatureFlag for SandboxingFeatureFlag {
     const NAME: &'static str = "sandboxing";
     type Value = PresenceFlag;
+
+    fn enabled_for_all() -> bool {
+        true
+    }
 
     fn enabled_for_staff() -> bool {
         false
