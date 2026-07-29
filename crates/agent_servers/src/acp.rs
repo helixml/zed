@@ -21,6 +21,7 @@ use project::agent_server_store::{
 use project::{AgentId, Project};
 use remote::remote_client::Interactive;
 use serde::Deserialize;
+use settings::Settings as _;
 use settings::SettingsStore;
 use std::path::PathBuf;
 use std::process::{ExitStatus, Stdio};
@@ -2628,7 +2629,64 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use super::*;
-    use settings::Settings as _;
+
+    fn permission_option(
+        id: &str,
+        kind: acp::PermissionOptionKind,
+    ) -> acp::PermissionOption {
+        acp::PermissionOption::new(acp::PermissionOptionId::new(id.to_string()), id, kind)
+    }
+
+    #[test]
+    fn auto_selected_permission_option_prefers_allow_always() {
+        let options = acp_thread::PermissionOptions::Flat(vec![
+            permission_option("allow_once", acp::PermissionOptionKind::AllowOnce),
+            permission_option("allow_always", acp::PermissionOptionKind::AllowAlways),
+            permission_option("reject", acp::PermissionOptionKind::RejectOnce),
+        ]);
+
+        let outcome = auto_selected_permission_option(&options, true).unwrap();
+        assert_eq!(outcome.option_kind, acp::PermissionOptionKind::AllowAlways);
+        assert_eq!(outcome.option_id.0.as_ref(), "allow_always");
+    }
+
+    #[test]
+    fn auto_selected_permission_option_falls_back_to_allow_once() {
+        let options = acp_thread::PermissionOptions::Flat(vec![
+            permission_option("allow_once", acp::PermissionOptionKind::AllowOnce),
+            permission_option("reject", acp::PermissionOptionKind::RejectOnce),
+        ]);
+
+        let outcome = auto_selected_permission_option(&options, true).unwrap();
+        assert_eq!(outcome.option_kind, acp::PermissionOptionKind::AllowOnce);
+        assert_eq!(outcome.option_id.0.as_ref(), "allow_once");
+    }
+
+    #[test]
+    fn auto_selected_permission_option_prefers_reject_once_when_denying() {
+        let options = acp_thread::PermissionOptions::Flat(vec![
+            permission_option("allow_once", acp::PermissionOptionKind::AllowOnce),
+            permission_option("reject_always", acp::PermissionOptionKind::RejectAlways),
+            permission_option("reject_once", acp::PermissionOptionKind::RejectOnce),
+        ]);
+
+        let outcome = auto_selected_permission_option(&options, false).unwrap();
+        assert_eq!(outcome.option_kind, acp::PermissionOptionKind::RejectOnce);
+        assert_eq!(outcome.option_id.0.as_ref(), "reject_once");
+    }
+
+    #[test]
+    fn auto_selected_permission_option_returns_none_without_matching_kind() {
+        // An agent that only offers reject options can't be auto-allowed; the
+        // caller must fall through to the interactive prompt rather than
+        // guessing.
+        let options = acp_thread::PermissionOptions::Flat(vec![permission_option(
+            "reject_once",
+            acp::PermissionOptionKind::RejectOnce,
+        )]);
+
+        assert!(auto_selected_permission_option(&options, true).is_none());
+    }
 
     #[test]
     fn terminal_auth_task_builds_spawn_from_prebuilt_command() {
@@ -4024,6 +4082,41 @@ fn respond_err<T: JsonRpcResponse>(responder: Responder<T>, err: acp::Error) {
     responder.respond_with_error(err).log_err();
 }
 
+/// Picks the permission option to auto-select for a settings-driven decision.
+///
+/// Matches on [`acp::PermissionOptionKind`] rather than the option id, because
+/// option ids are agent-specific strings (Qwen Code, Gemini and Claude Code all
+/// use different ones) while the kind is part of the ACP schema.
+///
+/// For an allow decision we prefer `AllowAlways` so the agent can also stop
+/// asking on its side; for a deny decision we prefer `RejectOnce` so a single
+/// blocked call doesn't poison the rest of the session.
+fn auto_selected_permission_option(
+    options: &acp_thread::PermissionOptions,
+    allow: bool,
+) -> Option<acp_thread::SelectedPermissionOutcome> {
+    let (preferred, fallback) = if allow {
+        (
+            acp::PermissionOptionKind::AllowAlways,
+            acp::PermissionOptionKind::AllowOnce,
+        )
+    } else {
+        (
+            acp::PermissionOptionKind::RejectOnce,
+            acp::PermissionOptionKind::RejectAlways,
+        )
+    };
+
+    let option = options
+        .first_option_of_kind(preferred)
+        .or_else(|| options.first_option_of_kind(fallback))?;
+
+    Some(acp_thread::SelectedPermissionOutcome::new(
+        option.option_id.clone(),
+        option.kind,
+    ))
+}
+
 fn handle_request_permission(
     args: acp::RequestPermissionRequest,
     responder: Responder<acp::RequestPermissionResponse>,
@@ -4037,14 +4130,51 @@ fn handle_request_permission(
 
     cx.spawn(async move |cx| {
         let result: Result<_, acp::Error> = async {
+            // External ACP agents (Qwen Code, Gemini, custom agent servers) get
+            // their permission requests routed straight to the interactive
+            // prompt, unlike Zed's native agent which short-circuits on
+            // `tool_permissions` first. Honour the same setting here so that a
+            // configured `allow`/`deny` doesn't silently stall a headless
+            // session that has nobody to click the dialog.
+            //
+            // Only the *global* default is consulted: per-tool rules are keyed
+            // by Zed's native tool names, and an external `tool_call` carries no
+            // equivalent name to match against.
+            let options = acp_thread::PermissionOptions::Flat(args.options);
+            let auto_outcome = cx.update(|cx| {
+                match agent_settings::AgentSettings::get_global(cx)
+                    .tool_permissions
+                    .default
+                {
+                    settings::ToolPermissionMode::Allow => {
+                        auto_selected_permission_option(&options, true)
+                    }
+                    settings::ToolPermissionMode::Deny => {
+                        auto_selected_permission_option(&options, false)
+                    }
+                    settings::ToolPermissionMode::Confirm => None,
+                }
+            });
+
             let task = thread
                 .update(cx, |thread, cx| {
-                    thread.request_tool_call_authorization(
+                    let tool_call_id = args.tool_call.tool_call_id.clone();
+                    let task = thread.request_tool_call_authorization(
                         args.tool_call,
-                        acp_thread::PermissionOptions::Flat(args.options),
+                        options,
                         acp_thread::AuthorizationKind::PermissionGrant,
                         cx,
-                    )
+                    );
+
+                    // Answer in the same update as the request so no frame is
+                    // ever rendered showing the prompt. The tool call still
+                    // lands in the thread view, and reusing `authorize_tool_call`
+                    // keeps the existing status transitions intact.
+                    if let Some(outcome) = auto_outcome {
+                        thread.authorize_tool_call(tool_call_id, outcome, cx);
+                    }
+
+                    task
                 })
                 .flatten_acp()?;
             Ok(task.await)
