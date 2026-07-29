@@ -25,7 +25,6 @@ use editor::scroll::Autoscroll;
 use editor::{
     Editor, EditorEvent, EditorMode, MultiBuffer, PathKey, SelectionEffects, SizingBehavior,
 };
-use feature_flags::{AcpBetaFeatureFlag, FeatureFlagAppExt as _};
 use file_icons::FileIcons;
 use fs::Fs;
 use futures::FutureExt as _;
@@ -281,7 +280,7 @@ impl Conversation {
         let session_id = thread.read(cx).session_id().clone();
         let subscription = cx.subscribe(&thread, {
             let session_id = session_id.clone();
-            move |this, _thread, event, cx| {
+            move |this, _thread, event, _cx| {
                 this.updated_at = Some(Instant::now());
                 match event {
                     AcpThreadEvent::ToolAuthorizationRequested(id) => {
@@ -298,15 +297,12 @@ impl Conversation {
                             }
                         }
                     }
-                    AcpThreadEvent::ElicitationRequested(id)
-                        if cx.has_flag::<AcpBetaFeatureFlag>() =>
-                    {
+                    AcpThreadEvent::ElicitationRequested(id) => {
                         this.elicitation_requests
                             .entry(session_id.clone())
                             .or_default()
                             .push(id.clone());
                     }
-                    AcpThreadEvent::ElicitationRequested(_) => {}
                     AcpThreadEvent::ElicitationResponded(id) => {
                         if let Some(elicitations) = this.elicitation_requests.get_mut(&session_id) {
                             elicitations.retain(|elicitation_id| elicitation_id != id);
@@ -426,10 +422,6 @@ impl Conversation {
         response: acp::CreateElicitationResponse,
         cx: &mut Context<Self>,
     ) -> Option<()> {
-        if !cx.has_flag::<AcpBetaFeatureFlag>() {
-            return None;
-        }
-
         let thread = self.threads.get(&session_id)?.clone();
         thread.update(cx, |thread, cx| {
             thread.respond_to_elicitation(&elicitation_id, response, cx);
@@ -1997,7 +1989,7 @@ impl ConversationView {
                     });
                     active.update(cx, |active, cx| {
                         active.sync_elicitation_state_for_entry(index, window, cx);
-                        active.sync_editor_mode_for_empty_state(cx);
+                        active.sync_editor_mode(cx);
                         active.sync_generating_indicator(cx);
                     });
                 }
@@ -2029,7 +2021,7 @@ impl ConversationView {
                     entry_view_state.update(cx, |view_state, _cx| view_state.remove(range.clone()));
                     list_state.splice(range.clone(), 0);
                     active.update(cx, |active, cx| {
-                        active.sync_editor_mode_for_empty_state(cx);
+                        active.sync_editor_mode(cx);
                     });
                 }
             }
@@ -2040,10 +2032,9 @@ impl ConversationView {
                 self.notify_with_sound("Waiting for tool confirmation", IconName::Info, window, cx);
             }
             AcpThreadEvent::ToolAuthorizationReceived(_) => {}
-            AcpThreadEvent::ElicitationRequested(_) if cx.has_flag::<AcpBetaFeatureFlag>() => {
+            AcpThreadEvent::ElicitationRequested(_) => {
                 self.notify_with_sound("Waiting for input", IconName::Info, window, cx);
             }
-            AcpThreadEvent::ElicitationRequested(_) => {}
             AcpThreadEvent::ElicitationResponded(_) => {}
             AcpThreadEvent::Retry(retry) => {
                 if let Some(active) = self.thread_view(&session_id) {
@@ -2755,11 +2746,6 @@ impl ConversationView {
     }
 
     fn sync_request_elicitation_states(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if !cx.has_flag::<AcpBetaFeatureFlag>() {
-            self.request_elicitation_form_states.clear();
-            return;
-        }
-
         let Some(store) = self.request_elicitation_store() else {
             self.request_elicitation_form_states.clear();
             return;
@@ -2805,10 +2791,6 @@ impl ConversationView {
         view: WeakEntity<Self>,
         cx: &App,
     ) -> Vec<AnyElement> {
-        if !cx.has_flag::<AcpBetaFeatureFlag>() {
-            return Vec::new();
-        }
-
         let Some(store) = connection.request_elicitations() else {
             return Vec::new();
         };
@@ -2937,10 +2919,6 @@ impl ConversationView {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if !cx.has_flag::<AcpBetaFeatureFlag>() {
-            return;
-        }
-
         let Some(store) = self.request_elicitation_store() else {
             return;
         };
@@ -2989,10 +2967,6 @@ impl ConversationView {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if !cx.has_flag::<AcpBetaFeatureFlag>() {
-            return;
-        }
-
         self.respond_to_request_elicitation(
             elicitation_id,
             acp::CreateElicitationResponse::new(acp::ElicitationAction::Decline),
@@ -3006,10 +2980,6 @@ impl ConversationView {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if !cx.has_flag::<AcpBetaFeatureFlag>() {
-            return;
-        }
-
         self.respond_to_request_elicitation(
             elicitation_id,
             acp::CreateElicitationResponse::new(acp::ElicitationAction::Cancel),
@@ -3298,6 +3268,7 @@ impl ConversationView {
 
         match settings.notify_when_agent_waiting {
             NotifyWhenAgentWaiting::PrimaryScreen => {
+                window.request_attention();
                 if let Some(primary) = cx.primary_display() {
                     self.pop_up(
                         icon,
@@ -3313,6 +3284,7 @@ impl ConversationView {
                 }
             }
             NotifyWhenAgentWaiting::AllScreens => {
+                window.request_attention();
                 let caption = caption.into();
                 for screen in cx.displays() {
                     self.pop_up(
@@ -4042,7 +4014,7 @@ pub(crate) mod tests {
     use agent_servers::FakeAcpAgentServer;
     use editor::MultiBufferOffset;
     use editor::actions::Paste;
-    use feature_flags::{FeatureFlag as _, FeatureFlagAppExt as _};
+    use feature_flags::{AcpBetaFeatureFlag, FeatureFlag as _, FeatureFlagAppExt as _};
     use fs::FakeFs;
     use gpui::{ClipboardItem, EventEmitter, TestAppContext, VisualTestContext, point, size};
     use parking_lot::Mutex;
