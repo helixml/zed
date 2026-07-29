@@ -1440,7 +1440,7 @@ fn initialize_headless(app_state: Arc<AppState>, cx: &mut App) {
             cx,
         );
 
-        let thread_store = ThreadStore::global(cx);
+        let thread_store = agent::ThreadStore::global(cx);
 
         external_websocket_sync::setup_thread_handler(
             project.clone(),

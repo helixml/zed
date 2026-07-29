@@ -4620,7 +4620,10 @@ impl AgentPanel {
 
                 if let BaseView::AgentThread { conversation_view } = &self.base_view {
                     if observes_live(conversation_view, cx) {
-                        self.clear_overlay_state();
+                        // No-op: the panel already observes the live entity.
+                        // (Upstream 40d20036af / PR #59860 removed the in-panel
+                        // AI-config overlay and with it `clear_overlay_state()`
+                        // — there is no overlay state left to dismiss here.)
                         cx.emit(AgentPanelEvent::ActiveViewChanged);
                         return;
                     }
