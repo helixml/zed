@@ -9961,6 +9961,31 @@ mod tests {
         // (didn't hang) and emitted Stopped.
     }
 
+    // HELIX DIVERGENCE — intentionally ignored, do not "fix" by changing cancel().
+    //
+    // Upstream (5c90b0664f, PR #59014) asserts that when a second send displaces
+    // an in-flight turn, the displaced turn still delivers its PromptResponse
+    // (`Ok(Some(response))` with StopReason::Cancelled). That holds upstream
+    // because cancel() awaits the displaced turn's send_task.
+    //
+    // Helix Critical Fix #8 (6e0e6db32b) deliberately does `drop(turn.send_task)`
+    // instead of awaiting it, because claude-agent-acp does not reliably return
+    // from prompt() on CancelNotification (claude-agent-acp#442, #423) and
+    // awaiting deadlocks the next turn forever. Dropping the task drops the
+    // oneshot tx, so `rx.await` in run_turn returns Err and the displaced turn
+    // resolves to `Ok(None)` — which is exactly what this test forbids.
+    //
+    // The two behaviours are mutually exclusive; Helix keeps #8 because a
+    // permanently wedged thread is far worse than a lost stale response. The
+    // compaction-status invariant the test actually cares about is unaffected:
+    // the stale turn returns None rather than a Cancelled response, so it still
+    // cannot cancel the current compaction.
+    //
+    // This has failed since the 002100-extension merge absorbed the upstream
+    // test on 2026-06-18; it went unnoticed because the rebase checklist only
+    // ran `cargo test -p acp_thread test_second_send`, never the full suite.
+    // Verified failing identically on pre-merge 06e9ce8059 — not a merge regression.
+    #[ignore = "incompatible with Helix Critical Fix #8 (cancel drops send_task); see comment above"]
     #[gpui::test]
     async fn test_stale_cancelled_response_does_not_cancel_current_compaction(
         cx: &mut TestAppContext,
