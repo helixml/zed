@@ -99,6 +99,36 @@ static THREAD_REGISTRY: parking_lot::Mutex<Option<Arc<RwLock<HashMap<String, Ent
 static THREAD_KEEP_ALIVE: parking_lot::Mutex<Option<Arc<RwLock<HashMap<String, Entity<AcpThread>>>>>> =
     parking_lot::Mutex::new(None);
 
+/// Monotonically increasing per-thread counter of observed `AcpThreadEvent`s.
+///
+/// Bumped by the persistent subscription on EVERY event, so it advances for any
+/// sign of life from the agent — thinking, text chunks, tool calls, entry
+/// updates, Stopped. Used by the silent-prompt watchdog (see
+/// [`wait_for_first_agent_activity`]) to distinguish "the agent is working" from
+/// "the agent accepted the prompt and died silently".
+static THREAD_ACTIVITY: parking_lot::Mutex<Option<Arc<RwLock<HashMap<String, u64>>>>> =
+    parking_lot::Mutex::new(None);
+
+/// Snapshot the current activity counter for a thread (0 if never seen).
+pub(crate) fn activity_count(thread_id: &str) -> u64 {
+    let guard = THREAD_ACTIVITY.lock();
+    guard
+        .as_ref()
+        .and_then(|m| m.read().get(thread_id).copied())
+        .unwrap_or(0)
+}
+
+/// Record one observed agent event for a thread.
+pub(crate) fn touch_activity(thread_id: &str) {
+    let mut guard = THREAD_ACTIVITY.lock();
+    if guard.is_none() {
+        *guard = Some(Arc::new(RwLock::new(HashMap::new())));
+    }
+    if let Some(map) = guard.as_ref() {
+        *map.write().entry(thread_id.to_string()).or_insert(0) += 1;
+    }
+}
+
 /// Global map of acp_thread_id -> agent_session_id
 /// The agent (e.g. Claude Code) uses its own session IDs that differ from Zed's thread UUIDs.
 /// We store this mapping when a thread is created so we can pass the correct session ID
@@ -861,6 +891,9 @@ pub fn ensure_thread_subscription(
             "🔔 [THREAD_SERVICE] Subscription FIRED for thread {} on entity {:?} (subscribed to {:?}), event: {:?}",
             thread_id_for_sub, current_entity_id, sub_entity_id, std::mem::discriminant(event)
         );
+        // Any event at all is proof of life from the agent. Recorded before the
+        // match so it counts even for event kinds this handler ignores.
+        touch_activity(&thread_id_for_sub);
         match event {
             AcpThreadEvent::NewEntry => {
                 let thread = thread_entity.read(cx);
@@ -1331,7 +1364,12 @@ pub fn setup_thread_handler(
 
                     if let Err(e) = initial_err {
                         let err_msg = e.to_string();
-                        if is_claude_acp_drain_race(&err_msg) {
+                        // Both signatures mean the same thing — the agent-side
+                        // session is wedged and only a wrapper teardown clears
+                        // it. The drain race announces itself with an
+                        // ede_diagnostic error; the silent wedge announces
+                        // nothing and is inferred by the first-event watchdog.
+                        if is_claude_acp_drain_race(&err_msg) || is_silent_prompt_wedge(&err_msg) {
                             // The claude-agent-acp SDK Query is wedged — the
                             // in-place retry inside handle_follow_up_message
                             // has already exhausted; only a wrapper-side
@@ -2064,6 +2102,10 @@ async fn handle_follow_up_message(
     let max_attempts = 2;
     let retry_delay = Duration::from_millis(500);
     for attempt in 1..=max_attempts {
+        // Snapshot BEFORE dispatch so the watchdog only credits activity that
+        // this prompt produced.
+        let activity_baseline = activity_count(&thread_id);
+
         let send_task = cx.update(|cx| {
             thread.update(cx, |thread: &mut AcpThread, cx| {
                 let message = vec![ContentBlock::Text(
@@ -2073,7 +2115,51 @@ async fn handle_follow_up_message(
             })
         })?;
 
-        match send_task.await {
+        // Silent-prompt watchdog. Race the turn against a time-to-first-event
+        // budget: if the agent produces literally nothing, `send_task` would
+        // otherwise never resolve and this await would hang forever (the
+        // 2026-07-29 production wedge). Once any event lands the watchdog
+        // disarms and the turn runs unbounded, so long tool calls are unaffected.
+        let send_result = if let Some(budget) = first_event_timeout() {
+            let send_task = Box::pin(send_task);
+            let watchdog = Box::pin(wait_for_first_agent_activity(
+                &thread_id,
+                activity_baseline,
+                budget,
+                &cx,
+            ));
+            match futures::future::select(send_task, watchdog).await {
+                // Turn finished before the budget elapsed — normal path.
+                futures::future::Either::Left((result, _)) => result,
+                futures::future::Either::Right((saw_activity, pending_send)) => {
+                    if saw_activity {
+                        // Agent is alive; let the turn run to completion unbounded.
+                        pending_send.await
+                    } else {
+                        // Zero events within the budget: the agent took the
+                        // prompt and went silent. Drop the send task (same
+                        // rationale as Critical Fix #8 — never block on a
+                        // non-responding agent) and report a wedge so the
+                        // caller runs the force-reset + reload recovery.
+                        drop(pending_send);
+                        let err = anyhow::anyhow!(
+                            "{}: agent produced no events within {:?} of session/prompt on thread {} — \
+                             treating the agent session as wedged",
+                            SILENT_PROMPT_WEDGE_MARKER,
+                            budget,
+                            thread_id
+                        );
+                        eprintln!("🛑 [THREAD_SERVICE] {}", err);
+                        log::warn!("🛑 [THREAD_SERVICE] {}", err);
+                        return Err(err);
+                    }
+                }
+            }
+        } else {
+            send_task.await
+        };
+
+        match send_result {
             Ok(_) => {
                 eprintln!("✅ [THREAD_SERVICE] Follow-up send completed successfully");
                 break;
@@ -2118,6 +2204,70 @@ pub(crate) fn is_claude_acp_drain_race(msg: &str) -> bool {
     msg.contains("ede_diagnostic")
         && msg.contains("result_type=user")
         && msg.contains("stop_reason=null")
+}
+
+/// Marker embedded in the error returned when the silent-prompt watchdog fires.
+pub(crate) const SILENT_PROMPT_WEDGE_MARKER: &str = "helix_silent_prompt_wedge";
+
+/// Returns true for the error raised by the silent-prompt watchdog.
+///
+/// Treated by the follow-up recovery path exactly like
+/// [`is_claude_acp_drain_race`]: both mean "the agent-side session is wedged and
+/// only a wrapper teardown will unstick it". The difference is only in how the
+/// wedge announces itself — the drain race raises an `ede_diagnostic` error,
+/// whereas this one raises nothing at all and has to be inferred from silence.
+pub(crate) fn is_silent_prompt_wedge(msg: &str) -> bool {
+    msg.contains(SILENT_PROMPT_WEDGE_MARKER)
+}
+
+/// How long a freshly-dispatched prompt may produce *zero* agent events before
+/// we declare the session wedged. Override with
+/// `HELIX_ACP_FIRST_EVENT_TIMEOUT_SECS`; set to `0` to disable the watchdog.
+///
+/// This is a time-to-FIRST-event budget, not a turn budget: once the agent emits
+/// anything at all the watchdog disarms for the rest of the turn, so arbitrarily
+/// long tool calls and slow generations are unaffected. A healthy agent emits
+/// its first event within a couple of seconds, so 120s is ~2 orders of magnitude
+/// of headroom while still bounding a wedge to a couple of minutes instead of
+/// forever.
+fn first_event_timeout() -> Option<Duration> {
+    let secs = std::env::var("HELIX_ACP_FIRST_EVENT_TIMEOUT_SECS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(120);
+    (secs > 0).then(|| Duration::from_secs(secs))
+}
+
+/// Watchdog for the "agent accepted the prompt and went silent" wedge.
+///
+/// Observed in production 2026-07-29 (see
+/// `helix/design/2026-07-29-acp-agent-silent-prompt-wedge.md`): after an earlier
+/// `model_not_found` + `Session not found` sequence, `claude-agent-acp` stayed
+/// alive but stopped answering `session/prompt` entirely. `connection.prompt()`
+/// never resolved, so no `Stopped`, no error, and no `message_completed` were
+/// ever emitted — the Helix interaction sat in `waiting` forever with no UI
+/// signal, and the pre-existing recovery could not fire because it keys on an
+/// error string that a silent wedge never produces.
+///
+/// Resolves as soon as [`THREAD_ACTIVITY`] advances past `baseline`, or after
+/// the first-event budget expires.
+async fn wait_for_first_agent_activity(
+    thread_id: &str,
+    baseline: u64,
+    timeout: Duration,
+    cx: &gpui::AsyncApp,
+) -> bool {
+    const POLL: Duration = Duration::from_millis(250);
+    let deadline = Instant::now() + timeout;
+    loop {
+        if activity_count(thread_id) > baseline {
+            return true;
+        }
+        if Instant::now() >= deadline {
+            return false;
+        }
+        cx.background_executor().timer(POLL).await;
+    }
 }
 
 /// Force-close an agent-side session at the wire level, bypassing Zed's
@@ -3112,6 +3262,140 @@ mod agent_ready_on_reconnect_tests {
              because the 5s fallback agent_ready was suppressed when open_thread \
              arrived, the readiness wait then times out."
         );
+    }
+}
+
+#[cfg(test)]
+#[cfg(test)]
+mod silent_prompt_wedge_tests {
+    //! Regression tests for the "agent accepted the prompt then went silent"
+    //! wedge observed in production on 2026-07-29.
+    //!
+    //! `claude-agent-acp` stayed alive but stopped answering `session/prompt`:
+    //! `connection.prompt()` never resolved, so no `Stopped`, no error and no
+    //! `message_completed` were ever emitted and the Helix interaction sat in
+    //! `waiting` indefinitely. The pre-existing recovery could not fire because
+    //! it keys on an `ede_diagnostic` error string that a silent wedge never
+    //! produces.
+
+    use super::*;
+    use gpui::TestAppContext;
+
+    fn unique_thread_id(tag: &str) -> String {
+        format!(
+            "test-watchdog-{}-{}",
+            tag,
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        )
+    }
+
+    #[test]
+    fn silent_wedge_error_is_recognised_and_routes_to_recovery() {
+        let err = format!(
+            "{}: agent produced no events within 120s of session/prompt",
+            SILENT_PROMPT_WEDGE_MARKER
+        );
+        assert!(is_silent_prompt_wedge(&err));
+        // Must NOT be misread as the drain race — they are separate signatures
+        // that happen to share one recovery path.
+        assert!(!is_claude_acp_drain_race(&err));
+        // And an unrelated agent error must not trip the wedge path.
+        assert!(!is_silent_prompt_wedge("Internal error: model_not_found"));
+    }
+
+    #[test]
+    fn activity_counter_is_per_thread_and_monotonic() {
+        let a = unique_thread_id("counter-a");
+        let b = unique_thread_id("counter-b");
+
+        let a0 = activity_count(&a);
+        touch_activity(&a);
+        touch_activity(&a);
+        assert_eq!(activity_count(&a), a0 + 2);
+
+        // Bumping one thread must not credit another — otherwise a busy thread
+        // would mask a wedge on a quiet one.
+        assert_eq!(activity_count(&b), 0);
+    }
+
+    #[gpui::test]
+    async fn watchdog_fires_when_agent_emits_nothing(cx: &mut TestAppContext) {
+        let thread_id = unique_thread_id("silent");
+        let baseline = activity_count(&thread_id);
+
+        let saw_activity = cx
+            .update(|cx| {
+                let cx = cx.to_async();
+                let thread_id = thread_id.clone();
+                async move {
+                    wait_for_first_agent_activity(
+                        &thread_id,
+                        baseline,
+                        Duration::from_millis(150),
+                        &cx,
+                    )
+                    .await
+                }
+            })
+            .await;
+
+        assert!(
+            !saw_activity,
+            "a prompt that produces zero agent events must be reported as wedged, \
+             not awaited forever"
+        );
+    }
+
+    #[gpui::test]
+    async fn watchdog_disarms_as_soon_as_the_agent_shows_life(cx: &mut TestAppContext) {
+        let thread_id = unique_thread_id("alive");
+        let baseline = activity_count(&thread_id);
+
+        // Simulate the agent emitting its first event before the budget expires.
+        touch_activity(&thread_id);
+
+        let saw_activity = cx
+            .update(|cx| {
+                let cx = cx.to_async();
+                let thread_id = thread_id.clone();
+                async move {
+                    // Deliberately generous budget: this must return promptly on
+                    // activity rather than waiting it out.
+                    wait_for_first_agent_activity(
+                        &thread_id,
+                        baseline,
+                        Duration::from_secs(30),
+                        &cx,
+                    )
+                    .await
+                }
+            })
+            .await;
+
+        assert!(
+            saw_activity,
+            "once the agent emits any event the watchdog must disarm so long \
+             tool calls and slow generations are never interrupted"
+        );
+    }
+
+    #[test]
+    fn first_event_timeout_is_configurable_and_disablable() {
+        // Default budget applies when unset.
+        unsafe { std::env::remove_var("HELIX_ACP_FIRST_EVENT_TIMEOUT_SECS") };
+        assert_eq!(first_event_timeout(), Some(Duration::from_secs(120)));
+
+        unsafe { std::env::set_var("HELIX_ACP_FIRST_EVENT_TIMEOUT_SECS", "5") };
+        assert_eq!(first_event_timeout(), Some(Duration::from_secs(5)));
+
+        // 0 disables the watchdog entirely (escape hatch for debugging).
+        unsafe { std::env::set_var("HELIX_ACP_FIRST_EVENT_TIMEOUT_SECS", "0") };
+        assert_eq!(first_event_timeout(), None);
+
+        unsafe { std::env::remove_var("HELIX_ACP_FIRST_EVENT_TIMEOUT_SECS") };
     }
 }
 
