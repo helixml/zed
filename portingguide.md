@@ -806,6 +806,39 @@ Two build warnings, both expected/not ours:
   PR #49763 organization selector). Left alone; patching upstream here would only add future
   conflict surface.
 
+### Validation
+
+- `cargo check --package zed --features external_websocket_sync`: **PASSED**, 0 errors.
+  Two warnings, both expected/not ours (see above).
+- `cargo test -p acp_thread`: **127 passed, 1 ignored** (the documented Critical Fix #8
+  divergence).
+- `cargo test -p external_websocket_sync`: **55 passed, 4 ignored**.
+- Drift sweep (`script/helix-drift-sweep.sh`): **28/28**, run after every round.
+- `./stack build-zed dev`: **PASSED**, binary 606MB.
+- E2E `E2E_AGENTS="zed-agent,claude" ./run_docker_e2e.sh`: **PASSED** on the final tree —
+  `[zed-agent]` all 17 phases, `[claude]` all 17 phases, `[store] PASSED`
+  (40 interactions / 15 sessions; response-entries isolation checked across 34
+  interactions in 10 sessions; accumulation 36 with content, interrupted/cancelled 0).
+
+**First E2E run flaked in the claude round** and is worth recording, because the
+signature differs from the previously-documented flake. Prior rounds (001996, 002077)
+saw claude Phase 1 time out with **0 events** (npx bootstrap). This time Phase 1
+received **3 events** — `agent_ready`, `thread_created`, and an assistant
+`message_added` with the correct answer — and then no `message_completed` at all: the
+agent produced output and never closed the turn. It did **not** reproduce on the
+re-run (Phase 1 completed in ~48s), and the most likely regression candidate was ruled
+out by inspection (`stopped_emitted` is constructed per turn at `acp_thread.rs:3789`
+and set only in `cancel()`, so the Critical Fix #6/#9 guard cannot leak across turns
+and suppress a legitimate `Stopped`).
+
+Two harness gaps this exposed, both worth fixing:
+- `e2e-test/run_e2e.sh:204` reports the agent version via
+  `npm view @anthropic-ai/claude-agent-acp version`, but Zed installs
+  **`@agentclientprotocol/claude-agent-acp`** (see `crates/agent_servers/`). Wrong scope
+  ⇒ always `unknown`, so the one line that would attribute a claude-round failure to an
+  agent-package change rather than to our code is useless.
+- The npm path is unpinned, so the claude round is not reproducible across time.
+
 ### The message-queue rework (upstream PR #59310)
 
 Round 1 absorbed `5c58d5c49a` "agent_ui: Refactor the queue feature and add steering ability",
