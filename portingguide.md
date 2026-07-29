@@ -208,7 +208,27 @@ These files contain Helix-specific changes that must be preserved during rebases
 - For enterprise deployments with internal CAs / self-signed certs
 
 ### `crates/reqwest_client/src/reqwest_client.rs`
-- **Insecure TLS support**: Reads `ZED_HTTP_INSECURE_TLS=1` to disable cert verification
+- **Insecure TLS support**: Reads `ZED_HTTP_INSECURE_TLS=1` to disable cert verification.
+  The Helix change is the `if is_insecure_tls_enabled() { use_preconfigured_tls(...) } else
+  { use_rustls_tls() }` branch. Upstream keeps appending builder options (tcp_keepalive /
+  pool_idle_timeout / http2 keep-alive, added 2026-07) to a single fluent chain ending in
+  `.use_rustls_tls()`. On merge, append upstream's new options to the `builder` binding and
+  keep the branch as the tail — do NOT let the chain re-fix `use_rustls_tls()` unconditionally
+  or insecure-TLS silently stops working in enterprise/self-signed deployments.
+
+### `crates/language_models/src/provider/open_ai.rs`
+- **`chat_completions_reasoning_effort(&self.model)`** passed to `into_open_ai(...)` on the
+  chat-completions branch, instead of upstream's unconditional `None`. Preserves an
+  explicitly-disabled ("none") reasoning effort for chat-tool models — Helix commit
+  `135f5b4421` "fix(agent): preserve disabled reasoning for chat tools"
+  (see `design/2026-07-14-zed-agent-reasoning-none.md`).
+- **Merge hazard:** upstream keeps adding positional parameters to `into_open_ai`. As of
+  2026-07 the order is `(request, model_id, supports_parallel_tool_calls,
+  supports_prompt_cache_key, max_output_tokens, max_tokens_parameter, reasoning_effort,
+  interleaved_reasoning)`. A conflict here looks like a one-line arg swap and is very easy to
+  resolve *toward upstream*, silently dropping the Helix fix. Always keep
+  `chat_completions_reasoning_effort(&self.model)` in the `reasoning_effort` slot and adopt
+  upstream's new params around it. This surface was undocumented until the 2026-07-29 merge.
 
 ### `crates/agent_settings/src/agent_settings.rs`
 - **`show_onboarding`**: Setting to control onboarding visibility
@@ -536,6 +556,15 @@ When rebasing/merging against upstream Zed:
 40. **Check `Cargo.toml` workspace `rust-embed` features** — must include both `include-exclude` AND `debug-embed`. The `debug-embed` feature was originally added by Helix in commit `9ca797706f` (Oct 2025), lost in a subsequent merge, re-added in 001909. Without it, dev builds panic on startup with `settings/default.json` because RustEmbed tries to read assets from `CARGO_MANIFEST_DIR` at runtime, and that path doesn't exist outside the build directory (e.g. inside the e2e-test container or any deployed binary). Release builds always embed assets so they're unaffected — but debug builds (used by the e2e test, ARM aside) need this feature.
 41. **Check `crates/agent/src/agent.rs` for `smol::Timer::after` references** — must use `cx.background_executor().timer(d).await` instead. Upstream PR #53603 (Apr 2026) removed `smol` from the agent crate's deps. Helix's `wait_for_tools_ready()` previously used `smol::Timer::after` and broke after the merge; fixed in 001909 by switching to the canonical GPUI pattern.
 41a. **Check `acp_thread.rs` test code for unit-variant `AcpThreadEvent::Stopped` patterns** — `Stopped` is a tuple variant `Stopped(StopReason)` and `matches!(event, AcpThreadEvent::Stopped)` no longer compiles. Production builds skip `#[cfg(test)]` so this fails silently in `cargo build` but breaks `cargo test -p acp_thread test_second_send`. Grep: `grep -n "AcpThreadEvent::Stopped[^(]" crates/acp_thread/src/`. Fixed in 001980; patterns must be `Stopped(_)`.
+45. **Check `language_models/src/provider/open_ai.rs`** — the chat-completions `into_open_ai(...)`
+    call must pass `chat_completions_reasoning_effort(&self.model)` in the `reasoning_effort`
+    slot, NOT upstream's `None` (Helix `135f5b4421`). Upstream adds positional params to this
+    call regularly, so the conflict presents as a trivial-looking arg swap.
+46. **Check `reqwest_client.rs` builder** — Helix's `is_insecure_tls_enabled()` branch must remain
+    the TAIL of the builder chain; upstream's newly-appended options (keepalive/pool timeouts)
+    go on the `builder` binding above it.
+47. **Run the drift sweep** — `script/helix-drift-sweep.sh` mechanises checks 1–46. Run it before
+    AND after each merge round; a check that passes before and fails after is a dropped fix.
 42. **Run `cargo check --package zed --features external_websocket_sync`** — must compile
 43. **Run `cargo test -p external_websocket_sync`** — unit tests
 44. **Run E2E test** after merge to verify all phases pass (currently 12 phases, run for both `zed-agent` and `claude` rounds)
