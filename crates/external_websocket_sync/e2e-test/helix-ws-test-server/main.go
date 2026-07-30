@@ -225,6 +225,19 @@ type testDriver struct {
 	// Per-phase timeout tracking
 	phaseStarted time.Time
 	phaseTimedOut map[int]bool // phases that timed out (skip in validation)
+
+	// Phases whose success condition has been met but which have not yet
+	// bumped d.phase, because the advance path deliberately settles first
+	// (500ms in the completion handler, plus 2s inside advanceAfterCompletion).
+	//
+	// The phase-timeout watcher aborts solely on `d.phase != phase`, so without
+	// this it can declare an ALREADY-SUCCESSFUL phase timed out whenever the
+	// completion lands within ~2.5s of the deadline. That is routine for the
+	// claude round, which is slower than zed-agent, and more likely under load.
+	// Observed directly:
+	//   11:43:57 Phase 9: Received enough completions -- thread did not hang
+	//   11:43:58 PHASE 9 TIMED OUT after 1m30s
+	phaseSucceeded map[int]bool
 }
 
 type roundResult struct {
@@ -494,6 +507,7 @@ func (d *testDriver) syncEventCallback(sessionID string, syncMsg *types.SyncMess
 				agentName, completions, truncate(acpThreadID, 12), requestID)
 			if completions >= 2 {
 				log.Printf("[%s] Phase 8: Both turns completed (cancelled + interrupt)", agentName)
+				d.markPhaseSucceeded(8)
 				time.Sleep(500 * time.Millisecond)
 				go d.advanceAfterCompletion(8)
 			}
@@ -510,11 +524,27 @@ func (d *testDriver) syncEventCallback(sessionID string, syncMsg *types.SyncMess
 				agentName, completions, truncate(acpThreadID, 12), requestID)
 			if completions >= 2 {
 				log.Printf("[%s] Phase 9: Received enough completions -- thread did not hang", agentName)
-				time.Sleep(500 * time.Millisecond)
+				// Record the advance IMMEDIATELY. The phase has succeeded at this
+				// point; the pause below is only pacing before phase 10 sends its
+				// first message.
+				//
+				// Previously d.phase stayed at 9 across a 500ms sleep plus
+				// goroutine scheduling, and the phase-timeout watcher aborts
+				// solely on `d.phase != phase`. When completions land near the end
+				// of the 90s window — routine for claude, which is slower than
+				// zed-agent — the watcher fired on an ALREADY-SUCCESSFUL phase:
+				//
+				//   11:43:57 Phase 9: Received enough completions -- thread did not hang
+				//   11:43:58 PHASE 9 TIMED OUT after 1m30s
+				//
+				// Advancing under the lock first closes that window entirely,
+				// rather than papering over it by enlarging the timeout.
+				d.markPhaseSucceeded(9)
+				d.mu.Lock()
+				d.phase = 10
+				d.mu.Unlock()
 				go func() {
-					d.mu.Lock()
-					d.phase = 10
-					d.mu.Unlock()
+					time.Sleep(500 * time.Millisecond)
 					d.runPhase10()
 				}()
 			}
@@ -707,6 +737,10 @@ func (d *testDriver) startPhaseTimeout(phase int) {
 			d.mu.Unlock()
 			return // phase already advanced
 		}
+		if d.phaseSucceeded[phase] {
+			d.mu.Unlock()
+			return // succeeded already; still settling before it bumps d.phase
+		}
 		// Phase timed out — dump state
 		if d.phaseTimedOut == nil {
 			d.phaseTimedOut = make(map[int]bool)
@@ -754,7 +788,22 @@ func (d *testDriver) startPhaseTimeout(phase int) {
 
 // --- Phase execution ---
 
+// markPhaseSucceeded records that a phase has met its success condition, so the
+// phase-timeout watcher will not fire while the advance path settles. Safe to
+// call without holding d.mu.
+func (d *testDriver) markPhaseSucceeded(phase int) {
+	d.mu.Lock()
+	if d.phaseSucceeded == nil {
+		d.phaseSucceeded = make(map[int]bool)
+	}
+	d.phaseSucceeded[phase] = true
+	d.mu.Unlock()
+}
+
 func (d *testDriver) advanceAfterCompletion(completedPhase int) {
+	// The caller has already decided this phase passed; record it before the
+	// settle sleeps below so the timeout watcher cannot race them.
+	d.markPhaseSucceeded(completedPhase)
 	d.mu.Lock()
 	agentName := d.round.agentName
 	actualPhase := d.phase
