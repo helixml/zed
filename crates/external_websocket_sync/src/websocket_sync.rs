@@ -436,9 +436,16 @@ impl WebSocketSync {
         if chat_msg.interrupt {
             if let Some(ref thread_id) = chat_msg.acp_thread_id {
                 if !thread_id.is_empty() {
-                    eprintln!("⚡ [WEBSOCKET-IN] Interrupt flag set — cancelling running turn on thread: {}", thread_id);
-                    log::info!("⚡ [WEBSOCKET-IN] Interrupt flag set — cancelling running turn on thread: {}", thread_id);
-                    if let Err(e) = crate::request_cancel_thread(thread_id.clone()) {
+                    // Name the turn we mean to interrupt. The cancel is delivered
+                    // out-of-band (so it can fire while the creation loop is blocked
+                    // awaiting this very turn), which means it races that loop: if
+                    // the turn finishes on its own first and the next one starts,
+                    // an untargeted cancel would kill the NEW turn instead. Passing
+                    // the current request_id makes a stale cancel a no-op.
+                    let target = crate::get_thread_request_id(thread_id);
+                    eprintln!("⚡ [WEBSOCKET-IN] Interrupt flag set — cancelling turn {:?} on thread: {}", target, thread_id);
+                    log::info!("⚡ [WEBSOCKET-IN] Interrupt flag set — cancelling turn {:?} on thread: {}", target, thread_id);
+                    if let Err(e) = crate::request_cancel_thread(thread_id.clone(), target) {
                         eprintln!("⚠️ [WEBSOCKET-IN] Failed to request cancel for thread {}: {}", thread_id, e);
                         log::warn!("⚠️ [WEBSOCKET-IN] Failed to request cancel for thread {}: {}", thread_id, e);
                     }

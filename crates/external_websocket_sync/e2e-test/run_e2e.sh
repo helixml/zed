@@ -44,7 +44,11 @@ cleanup() {
 
     # Dump Zed errors/panics (full log available at ZED_LOG_FILE)
     if [ -f "${ZED_LOG_FILE:-}" ]; then
-        ZED_ERRORS=$(grep -ciE "panic|error|fatal" "$ZED_LOG_FILE" 2>/dev/null || echo "0")
+        # NB: `grep -c` PRINTS the count and EXITS NON-ZERO when the count is 0, so
+        # `$(grep -c ... || echo 0)` yields the two-line string "0\n0" and every
+        # subsequent `[ "$X" -gt 0 ]` dies with "integer expression expected".
+        # Put the fallback on the assignment, not inside the substitution.
+        ZED_ERRORS=$(grep -ciE "panic|error|fatal" "$ZED_LOG_FILE" 2>/dev/null) || ZED_ERRORS=0
         if [ "$ZED_ERRORS" -gt 0 ]; then
             echo ""
             echo "=================================================="
@@ -54,13 +58,33 @@ cleanup() {
             echo "  (full log: $ZED_LOG_FILE)"
         fi
         # ACP_SPAWN/ACP_DEDUP are at log::info level — surface them explicitly
-        ACP_LINES=$(grep -cE "ACP_SPAWN|ACP_DEDUP" "$ZED_LOG_FILE" 2>/dev/null || echo "0")
+        ACP_LINES=$(grep -cE "ACP_SPAWN|ACP_DEDUP" "$ZED_LOG_FILE" 2>/dev/null) || ACP_LINES=0
         if [ "$ACP_LINES" -gt 0 ]; then
             echo ""
             echo "=================================================="
             echo "  ACP_SPAWN / ACP_DEDUP ($ACP_LINES lines)"
             echo "=================================================="
             grep -E "ACP_SPAWN|ACP_DEDUP" "$ZED_LOG_FILE" || true
+        fi
+
+        # Turn lifecycle: cancel / interrupt / silence-watchdog decisions.
+        #
+        # These are the events needed to tell the three failure shapes apart when
+        # a round fails, and reading them from the Helix side alone is impossible
+        # (Helix sees completions, not the ordering that produced them):
+        #   - cancel landing on the wrong turn  -> CANCEL_TASK vs THREAD_SERVICE order
+        #   - a stale cancel correctly dropped  -> "Stale cancel ignored"
+        #   - agent accepted a prompt then died -> helix_silent_prompt_wedge
+        # Without this block the harness reported only "phase N timed out", which
+        # is not enough to attribute a failure.
+        LIFECYCLE_RE="CANCEL_TASK|Interrupt flag set|Stale cancel ignored|helix_silent_prompt_wedge|THREAD_SERVICE\] (Sending follow-up|Updated request_id|Sending to existing)"
+        LIFECYCLE_LINES=$(grep -cE "$LIFECYCLE_RE" "$ZED_LOG_FILE" 2>/dev/null) || LIFECYCLE_LINES=0
+        if [ "$LIFECYCLE_LINES" -gt 0 ]; then
+            echo ""
+            echo "=================================================="
+            echo "  TURN LIFECYCLE / CANCEL ORDERING ($LIFECYCLE_LINES lines)"
+            echo "=================================================="
+            grep -E "$LIFECYCLE_RE" "$ZED_LOG_FILE" | tail -60 || true
         fi
         # Persist the full zed log into the mounted screenshots dir for offline inspection
         if [ -d "$SCREENSHOT_DIR" ]; then
@@ -199,10 +223,23 @@ if echo "$E2E_AGENTS" | grep -q "claude"; then
         LOCAL_VERSION=$(node -e "console.log(require('/opt/claude-agent-acp/package.json').version)" 2>/dev/null || echo "unknown")
         echo "[setup] Using LOCAL claude-agent-acp v$LOCAL_VERSION from /opt/claude-agent-acp"
     else
-        # Log which version npx will install so we can correlate failures
-        # with claude-agent-acp upgrades. This is a quick check, not an install.
-        CLAUDE_ACP_VERSION=$(npm view @anthropic-ai/claude-agent-acp version 2>/dev/null || echo "unknown")
-        echo "[setup] Using npm-installed claude-agent-acp (auto-install, latest=$CLAUDE_ACP_VERSION)"
+        # Log which version npx will install so we can correlate failures with
+        # claude-agent-acp upgrades. This is a quick check, not an install.
+        #
+        # The scope matters and has been wrong before: Zed installs
+        # @agentclientprotocol/claude-agent-acp (see crates/agent_servers/), NOT
+        # @anthropic-ai/... . Querying the wrong scope silently yields "unknown",
+        # which quietly disables the one signal that distinguishes "we regressed"
+        # from "the agent package changed under us" when the claude round fails.
+        CLAUDE_ACP_PKG="@agentclientprotocol/claude-agent-acp"
+        CLAUDE_ACP_VERSION=$(npm view "$CLAUDE_ACP_PKG" version 2>/dev/null || echo "")
+        if [ -z "$CLAUDE_ACP_VERSION" ]; then
+            echo "[setup] WARNING: could not resolve a version for $CLAUDE_ACP_PKG."
+            echo "[setup]          A claude-round failure will NOT be attributable to an agent-package change."
+            CLAUDE_ACP_VERSION="unknown"
+        fi
+        echo "[setup] Using npm-installed claude-agent-acp $CLAUDE_ACP_PKG (auto-install, latest=$CLAUDE_ACP_VERSION)"
+        echo "[setup] NOTE: this install is UNPINNED — the claude round is not reproducible across time."
     fi
     AGENT_SERVERS_JSON=$(cat << AGENTEOF
   "agent_servers": {

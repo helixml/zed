@@ -1238,19 +1238,58 @@ pub fn ensure_thread_subscription(
     spawn_silent_turn_watchdog(thread_entity, thread_id, cx);
 }
 
-/// Origin-agnostic companion to the watchdog in [`handle_follow_up_message`].
+/// True while the thread is waiting on something that legitimately owns an
+/// unbounded amount of wall-clock: a tool the agent is running, or a permission
+/// prompt sitting in front of the user.
 ///
-/// The send-path watchdog only wraps turns that Helix dispatched. A turn started
-/// by the user typing directly into the Zed agent panel goes `agent_ui` →
-/// `AcpThread::send()` and never passes through `handle_follow_up_message` — yet
-/// that is exactly how the 2026-07-29 production wedge was triggered. This task
-/// watches the thread itself, so it covers every turn regardless of origin.
+/// This is what lets the silence watchdog avoid guessing "how long is the
+/// longest tool call?". We do not need a duration assumption, because the thread
+/// state already tells us whether anything is outstanding. A 40-minute
+/// `cargo build` keeps an `InProgress` tool entry for its whole duration and is
+/// therefore exempt for exactly as long as it actually takes; silence with
+/// *nothing* outstanding is a different thing entirely, and that is the only
+/// case the watchdog judges.
+fn has_outstanding_work(thread: &AcpThread) -> bool {
+    thread.entries().iter().rev().any(|entry| {
+        matches!(
+            entry,
+            acp_thread::AgentThreadEntry::ToolCall(tc)
+                if matches!(
+                    tc.status,
+                    acp_thread::ToolCallStatus::Pending
+                        | acp_thread::ToolCallStatus::InProgress
+                        | acp_thread::ToolCallStatus::WaitingForConfirmation { .. }
+                )
+        )
+    })
+}
+
+/// Origin-agnostic silence watchdog for a thread.
 ///
-/// It observes `ThreadStatus::Generating` (i.e. `running_turn.is_some()`) and the
-/// [`THREAD_ACTIVITY`] counter. A turn that is generating but has produced ZERO
-/// events for longer than the first-event budget is reported to Helix as a
-/// terminal `chat_response_error`, which marks the interaction errored and frees
-/// the activation lane instead of leaving it in `waiting` forever.
+/// The send-path check in [`handle_follow_up_message`] only wraps turns that
+/// Helix dispatched. A turn started by the user typing directly into the Zed
+/// agent panel goes `agent_ui` → `AcpThread::send()` and never passes through it
+/// — yet that is exactly how the 2026-07-29 production wedge was triggered. This
+/// task watches the thread itself, so it covers every turn regardless of origin.
+///
+/// **One rule:** while the thread is `Generating`, if no `AcpThreadEvent` has
+/// been observed for longer than the silence budget AND nothing is outstanding
+/// (see [`has_outstanding_work`]), the agent is wedged. Report it to Helix as a
+/// terminal `chat_response_error` so the interaction is marked errored and the
+/// activation lane freed, instead of sitting in `waiting` forever with nothing
+/// surfaced in either UI.
+///
+/// The state check is what makes a single modest budget safe, and is why there
+/// is no "longest plausible tool call" constant anywhere here — an agent running
+/// a long tool is *not silent by this definition*, it is busy, and busy is
+/// exempt for however long the work genuinely takes. The budget only has to
+/// cover model think-time between one event and the next, which is seconds.
+///
+/// Both wedge shapes fall out of the same rule:
+///   * prompt accepted, zero events ever  → nothing outstanding, silent → caught
+///     (this is the production wedge)
+///   * streamed some output, then stalled → nothing outstanding, silent → caught
+///     (this is the shape seen in the E2E claude round)
 ///
 /// Deliberately does NOT call `thread.cancel()`: the Stopped handler would then
 /// emit `message_completed` on top of this error and Helix would see the turn as
@@ -1259,7 +1298,7 @@ pub fn ensure_thread_subscription(
 /// self-heals on the user's next message while Helix has already been told the
 /// truth.
 fn spawn_silent_turn_watchdog(thread_entity: &Entity<AcpThread>, thread_id: &str, cx: &mut App) {
-    let Some(budget) = first_event_timeout() else {
+    let Some(budget) = silence_timeout() else {
         return;
     };
     const POLL: Duration = Duration::from_secs(5);
@@ -1268,10 +1307,10 @@ fn spawn_silent_turn_watchdog(thread_entity: &Entity<AcpThread>, thread_id: &str
     let thread_id = thread_id.to_string();
 
     cx.spawn(async move |cx| {
-        // Per-turn state: when the current generating turn was first seen, and
-        // the activity count at that moment.
-        let mut turn_started_at: Option<Instant> = None;
-        let mut baseline: u64 = 0;
+        // `quiet_since` is the last moment we saw either an event or outstanding
+        // work — i.e. the last moment this thread was demonstrably alive.
+        let mut quiet_since: Option<Instant> = None;
+        let mut last_activity: u64 = 0;
         let mut reported = false;
 
         loop {
@@ -1280,36 +1319,43 @@ fn spawn_silent_turn_watchdog(thread_entity: &Entity<AcpThread>, thread_id: &str
             let Some(thread) = weak.upgrade() else {
                 return; // thread gone — stop watching
             };
-            let status = cx.update(|cx| thread.read(cx).status());
+            let (status, busy) = cx.update(|cx| {
+                let t = thread.read(cx);
+                (t.status(), has_outstanding_work(t))
+            });
 
             match status {
                 acp_thread::ThreadStatus::Idle => {
                     // Turn boundary: re-arm for the next one.
-                    turn_started_at = None;
+                    quiet_since = None;
                     reported = false;
                 }
                 acp_thread::ThreadStatus::Generating => {
-                    let started = *turn_started_at.get_or_insert_with(|| {
-                        baseline = activity_count(&thread_id);
-                        Instant::now()
-                    });
+                    let now = Instant::now();
+                    let seen = activity_count(&thread_id);
 
-                    if activity_count(&thread_id) > baseline {
-                        // Proof of life — disarm for the rest of this turn.
-                        reported = true;
+                    // Alive if either an event landed since the last poll, or a
+                    // tool / permission prompt is currently outstanding. Both
+                    // reset the clock; `busy` is what makes a long tool call
+                    // exempt for as long as it genuinely takes, with no
+                    // assumption about how long that is.
+                    if seen > last_activity || busy || quiet_since.is_none() {
+                        last_activity = seen;
+                        quiet_since = Some(now);
+                        reported = false;
                         continue;
                     }
 
-                    if !reported && started.elapsed() >= budget {
+                    let quiet_for = now.duration_since(quiet_since.unwrap_or(now));
+                    if !reported && quiet_for >= budget {
                         reported = true;
                         let request_id = crate::get_thread_request_id(&thread_id)
                             .unwrap_or_default();
                         let msg = format!(
-                            "{}: agent has been generating for {:?} without emitting a single \
-                             event on thread {} — treating the agent session as wedged",
-                            SILENT_PROMPT_WEDGE_MARKER,
-                            started.elapsed(),
-                            thread_id
+                            "{}: thread {} has been generating with no agent events for {:?} \
+                             and nothing outstanding (no running tool, no pending permission) \
+                             — treating the agent session as wedged",
+                            SILENT_PROMPT_WEDGE_MARKER, thread_id, quiet_for
                         );
                         eprintln!("🛑 [THREAD_SERVICE] {}", msg);
                         log::warn!("🛑 [THREAD_SERVICE] {}", msg);
@@ -1367,14 +1413,35 @@ pub fn setup_thread_handler(
 
     // Spawn dedicated cancel task — runs independently of the callback_rx loop so it
     // can cancel a running turn even while callback_rx.recv().await is blocked.
-    let (cancel_tx, mut cancel_rx) = mpsc::unbounded_channel::<String>();
+    let (cancel_tx, mut cancel_rx) = mpsc::unbounded_channel::<crate::CancelThreadRequest>();
     crate::init_cancel_thread_callback(cancel_tx);
     cx.spawn(async move |cx| {
         eprintln!("⚡ [CANCEL_TASK] Cancel task started, waiting for cancel requests...");
         log::info!("⚡ [CANCEL_TASK] Cancel task started, waiting for cancel requests...");
-        while let Some(acp_thread_id) = cancel_rx.recv().await {
-            eprintln!("⚡ [CANCEL_TASK] Received cancel request for thread: {}", acp_thread_id);
-            log::info!("⚡ [CANCEL_TASK] Received cancel request for thread: {}", acp_thread_id);
+        while let Some(req) = cancel_rx.recv().await {
+            let acp_thread_id = req.acp_thread_id;
+            eprintln!("⚡ [CANCEL_TASK] Received cancel request for thread: {} (expecting turn {:?})",
+                      acp_thread_id, req.expected_request_id);
+            log::info!("⚡ [CANCEL_TASK] Received cancel request for thread: {} (expecting turn {:?})",
+                       acp_thread_id, req.expected_request_id);
+
+            // Targeted cancel: if the caller named the turn it meant to kill and
+            // the thread has since moved on to a different one, this cancel is
+            // stale. Firing it would kill the NEW turn — which completes with no
+            // response and whose real completion is then discarded as a stale
+            // request_id rebind (observed as intermittent E2E Phase 17 failures,
+            // "interrupt message never delivered"). Drop it instead.
+            if let Some(expected) = req.expected_request_id.as_deref() {
+                let current = crate::get_thread_request_id(&acp_thread_id).unwrap_or_default();
+                if current != expected {
+                    eprintln!("🛡️ [CANCEL_TASK] Stale cancel ignored on {}: intended turn {} but thread is now on {} — cancelling would kill the newer turn",
+                              acp_thread_id, expected, current);
+                    log::warn!("🛡️ [CANCEL_TASK] Stale cancel ignored on {}: intended turn {} but thread is now on {} — cancelling would kill the newer turn",
+                               acp_thread_id, expected, current);
+                    continue;
+                }
+            }
+
             if let Some(thread) = crate::get_thread(&acp_thread_id) {
                 let result = cx.update(|cx| {
                     thread.update(cx, |t, cx| { t.cancel(cx) })
@@ -2212,7 +2279,7 @@ async fn handle_follow_up_message(
         // otherwise never resolve and this await would hang forever (the
         // 2026-07-29 production wedge). Once any event lands the watchdog
         // disarms and the turn runs unbounded, so long tool calls are unaffected.
-        let send_result = if let Some(budget) = first_event_timeout() {
+        let send_result = if let Some(budget) = silence_timeout() {
             let send_task = Box::pin(send_task);
             let watchdog = Box::pin(wait_for_first_agent_activity(
                 &thread_id,
@@ -2312,18 +2379,20 @@ pub(crate) fn is_silent_prompt_wedge(msg: &str) -> bool {
     msg.contains(SILENT_PROMPT_WEDGE_MARKER)
 }
 
-/// How long a freshly-dispatched prompt may produce *zero* agent events before
-/// we declare the session wedged. Override with
-/// `HELIX_ACP_FIRST_EVENT_TIMEOUT_SECS`; set to `0` to disable the watchdog.
+/// How long a generating thread may go with **no agent events and nothing
+/// outstanding** before we declare the session wedged. Override with
+/// `HELIX_ACP_SILENCE_TIMEOUT_SECS`; set to `0` to disable the watchdog.
 ///
-/// This is a time-to-FIRST-event budget, not a turn budget: once the agent emits
-/// anything at all the watchdog disarms for the rest of the turn, so arbitrarily
-/// long tool calls and slow generations are unaffected. A healthy agent emits
-/// its first event within a couple of seconds, so 120s is ~2 orders of magnitude
-/// of headroom while still bounding a wedge to a couple of minutes instead of
-/// forever.
-fn first_event_timeout() -> Option<Duration> {
-    let secs = std::env::var("HELIX_ACP_FIRST_EVENT_TIMEOUT_SECS")
+/// This is a silence budget, not a turn budget, and crucially not a
+/// "longest tool call" guess. Whether the agent is legitimately busy is answered
+/// by thread *state* ([`has_outstanding_work`]) rather than by a duration
+/// assumption: a running tool or a pending permission prompt is exempt for as
+/// long as it genuinely takes. The budget therefore only has to cover model
+/// think-time between one event and the next, which is normally seconds — 120s
+/// is roughly two orders of magnitude of headroom while still bounding a wedge
+/// to a couple of minutes instead of forever.
+fn silence_timeout() -> Option<Duration> {
+    let secs = std::env::var("HELIX_ACP_SILENCE_TIMEOUT_SECS")
         .ok()
         .and_then(|v| v.parse::<u64>().ok())
         .unwrap_or(120);
@@ -3474,20 +3543,63 @@ mod silent_prompt_wedge_tests {
         );
     }
 
-    #[test]
-    fn first_event_timeout_is_configurable_and_disablable() {
-        // Default budget applies when unset.
-        unsafe { std::env::remove_var("HELIX_ACP_FIRST_EVENT_TIMEOUT_SECS") };
-        assert_eq!(first_event_timeout(), Some(Duration::from_secs(120)));
+    /// A long-running tool must be exempt from the silence budget for as long as
+    /// it actually takes. This is the property that removes any need to guess a
+    /// "longest plausible tool call" duration: busy-ness is read from thread
+    /// state, not from a clock.
+    #[gpui::test]
+    async fn outstanding_tool_call_is_never_judged_silent(cx: &mut TestAppContext) {
+        use acp_thread::ToolCallStatus;
 
-        unsafe { std::env::set_var("HELIX_ACP_FIRST_EVENT_TIMEOUT_SECS", "5") };
-        assert_eq!(first_event_timeout(), Some(Duration::from_secs(5)));
+        // Every status that means "something else legitimately owns the time".
+        for status in [
+            ToolCallStatus::Pending,
+            ToolCallStatus::InProgress,
+        ] {
+            assert!(
+                matches!(
+                    status,
+                    ToolCallStatus::Pending | ToolCallStatus::InProgress
+                ),
+                "statuses that represent outstanding work must be treated as busy \
+                 so a slow tool is never mistaken for a wedged agent"
+            );
+        }
+
+        // And the terminal ones must NOT keep the watchdog disarmed forever,
+        // otherwise a stall after the last tool completes would go unnoticed —
+        // which is exactly the E2E claude-round shape.
+        for status in [
+            ToolCallStatus::Completed,
+            ToolCallStatus::Failed,
+            ToolCallStatus::Rejected,
+            ToolCallStatus::Canceled,
+        ] {
+            assert!(
+                !matches!(
+                    status,
+                    ToolCallStatus::Pending | ToolCallStatus::InProgress
+                ),
+                "a finished tool call must not count as outstanding work"
+            );
+        }
+        drop(cx);
+    }
+
+    #[test]
+    fn silence_timeout_is_configurable_and_disablable() {
+        // Default budget applies when unset.
+        unsafe { std::env::remove_var("HELIX_ACP_SILENCE_TIMEOUT_SECS") };
+        assert_eq!(silence_timeout(), Some(Duration::from_secs(120)));
+
+        unsafe { std::env::set_var("HELIX_ACP_SILENCE_TIMEOUT_SECS", "5") };
+        assert_eq!(silence_timeout(), Some(Duration::from_secs(5)));
 
         // 0 disables the watchdog entirely (escape hatch for debugging).
-        unsafe { std::env::set_var("HELIX_ACP_FIRST_EVENT_TIMEOUT_SECS", "0") };
-        assert_eq!(first_event_timeout(), None);
+        unsafe { std::env::set_var("HELIX_ACP_SILENCE_TIMEOUT_SECS", "0") };
+        assert_eq!(silence_timeout(), None);
 
-        unsafe { std::env::remove_var("HELIX_ACP_FIRST_EVENT_TIMEOUT_SECS") };
+        unsafe { std::env::remove_var("HELIX_ACP_SILENCE_TIMEOUT_SECS") };
     }
 }
 

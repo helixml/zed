@@ -387,7 +387,20 @@ func (d *testDriver) syncEventCallback(sessionID string, syncMsg *types.SyncMess
 		// Ignore completions from previous rounds. Two checks:
 		// 1. Request ID must contain the current agent name
 		// 2. Thread ID must belong to the current round
-		if !strings.Contains(requestID, agentName) {
+		//
+		// Check 1 is a heuristic that only holds for the synthetic ids this
+		// harness mints itself (req-phaseN-<agent>). The production-queue phases
+		// (16/17) drive real Helix interactions, whose ids are ULIDs like
+		// int_01kyry6ejk... and contain no agent name — so the heuristic rejects
+		// LIVE completions for the current round and logs them as "wrong agent".
+		// That is worse than useless during triage: it asserts the opposite of
+		// what happened, and cost real time chasing a phantom routing bug when
+		// Phase 17 was actually hitting a cancel race.
+		//
+		// Helix-minted ids are round-safe anyway (each round gets fresh sessions
+		// and threads), so defer to the precise thread check below for them.
+		isHelixInteractionID := strings.HasPrefix(requestID, "int_")
+		if !isHelixInteractionID && !strings.Contains(requestID, agentName) {
 			d.mu.Unlock()
 			log.Printf("[%s] FILTERED completion (wrong agent): req=%s thread=%s",
 				agentName, requestID, truncate(acpThreadID, 12))
