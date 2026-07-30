@@ -44,7 +44,11 @@ cleanup() {
 
     # Dump Zed errors/panics (full log available at ZED_LOG_FILE)
     if [ -f "${ZED_LOG_FILE:-}" ]; then
-        ZED_ERRORS=$(grep -ciE "panic|error|fatal" "$ZED_LOG_FILE" 2>/dev/null || echo "0")
+        # NB: `grep -c` PRINTS the count and EXITS NON-ZERO when the count is 0, so
+        # `$(grep -c ... || echo 0)` yields the two-line string "0\n0" and every
+        # subsequent `[ "$X" -gt 0 ]` dies with "integer expression expected".
+        # Put the fallback on the assignment, not inside the substitution.
+        ZED_ERRORS=$(grep -ciE "panic|error|fatal" "$ZED_LOG_FILE" 2>/dev/null) || ZED_ERRORS=0
         if [ "$ZED_ERRORS" -gt 0 ]; then
             echo ""
             echo "=================================================="
