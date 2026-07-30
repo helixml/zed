@@ -152,6 +152,48 @@ func newRoundState(agentName string) *roundState {
 	}
 }
 
+// stampRoundAgentOnSeedSession makes the seed session declare which agent the
+// current round is exercising.
+//
+// Why this is needed: for a thread already in contextMappings, sendChatMessage
+// deliberately uses the PRODUCTION send path (srv.SendChatMessage), which
+// ignores the agentName the harness passes and instead derives it via
+// getAgentNameForSession(). That reads session.Metadata.ZedAgentName and
+// otherwise falls back to "zed-agent" — and websocket_external_agent_sync.go
+// then PERSISTS that fallback back onto the session. In production the fallback
+// never fires, because the value resolves from the spec task's app
+// code_agent_runtime; the E2E has no such app, so every session was being
+// stamped "zed-agent" regardless of round.
+//
+// The visible symptom was claude-round traffic on the wire carrying
+// mismatched identity:
+//
+//	{"agent_name":"zed-agent", "request_id":"req-phase9-queue-claude"}
+//
+// Sessions created during a round inherit ZedAgentName from the originating
+// session, so stamping the seed session at round start propagates the correct
+// value to the whole round and makes the harness faithful to production.
+func (d *testDriver) stampRoundAgentOnSeedSession(agentName string) {
+	sessionID := os.Getenv("HELIX_SESSION_ID")
+	if sessionID == "" {
+		sessionID = "ses_e2e-test-session-001"
+	}
+	ctx := context.Background()
+	sess, err := d.store.GetSession(ctx, sessionID)
+	if err != nil {
+		log.Printf("[%s] WARNING: could not stamp round agent on seed session %s: %v",
+			agentName, sessionID, err)
+		return
+	}
+	sess.Metadata.ZedAgentName = agentName
+	if _, err := d.store.UpdateSession(ctx, *sess); err != nil {
+		log.Printf("[%s] WARNING: could not persist ZedAgentName=%s on %s: %v",
+			agentName, agentName, sessionID, err)
+		return
+	}
+	log.Printf("[%s] Seed session %s stamped ZedAgentName=%s", agentName, sessionID, agentName)
+}
+
 // reqID returns a round-namespaced request ID for validation uniqueness.
 func (r *roundState) reqID(phase string) string {
 	return fmt.Sprintf("req-%s-%s", phase, r.agentName)
@@ -214,6 +256,7 @@ func (d *testDriver) syncEventCallback(sessionID string, syncMsg *types.SyncMess
 			log.Printf("\n##################################################")
 			log.Printf("  ROUND %d/%d: Agent = %s", d.currentRoundIdx+1, len(d.agentRounds), d.round.agentName)
 			log.Printf("##################################################")
+			d.stampRoundAgentOnSeedSession(d.round.agentName)
 			d.runPhase1()
 			return
 		}
@@ -858,6 +901,7 @@ func (d *testDriver) advanceToNextRound() {
 	log.Printf("\n##################################################")
 	log.Printf("  ROUND %d/%d: Agent = %s (after %s)", d.currentRoundIdx+1, len(d.agentRounds), nextAgent, agentName)
 	log.Printf("##################################################")
+	d.stampRoundAgentOnSeedSession(nextAgent)
 
 	// Wait for stale events from the previous round to drain before starting.
 	// Phase 11 sends a message via SendChatMessage whose completion may arrive
