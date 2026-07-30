@@ -108,6 +108,16 @@ pub struct ThreadCreationRequest {
     /// This allows the NewEntry subscription to fire and sync the user message back to Helix,
     /// simulating a user typing directly in Zed's agent panel.
     pub simulate_input: bool,
+    /// When true, cancel the thread's running turn before sending this message.
+    ///
+    /// The cancel is carried ON the creation request, rather than dispatched
+    /// separately via [`request_cancel_thread`], so that cancel-then-send is
+    /// performed by a single task in a guaranteed order. Dispatching both
+    /// independently races: the send can start before the cancel is processed,
+    /// and the cancel then kills the *new* turn instead of the old one, leaving
+    /// the new interaction completed-with-nothing and its real response
+    /// discarded as a stale request_id rebind.
+    pub interrupt: bool,
 }
 
 /// Request to open existing ACP thread from database and display in UI

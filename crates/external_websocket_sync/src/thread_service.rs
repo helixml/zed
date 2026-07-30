@@ -1459,6 +1459,30 @@ pub fn setup_thread_handler(
                 request.request_id
             );
 
+            // Interrupt = cancel-then-send, performed HERE so the two steps
+            // cannot be reordered. Doing the cancel on the separate cancel task
+            // races the send and can cancel the new turn instead of the old one
+            // (see ThreadCreationRequest::interrupt).
+            if request.interrupt
+                && let Some(thread_id) = request.acp_thread_id.as_ref().filter(|id| !id.is_empty())
+            {
+                if let Some(thread) = crate::get_thread(thread_id) {
+                    match cx.update(|cx| thread.update(cx, |t, cx| t.cancel(cx))) {
+                        Ok(_) => {
+                            eprintln!("⚡ [THREAD_SERVICE] Interrupt: cancelled running turn inline before send on {}", thread_id);
+                            log::info!("⚡ [THREAD_SERVICE] Interrupt: cancelled running turn inline before send on {}", thread_id);
+                        }
+                        Err(e) => {
+                            eprintln!("⚠️ [THREAD_SERVICE] Interrupt: failed to cancel {}: {}", thread_id, e);
+                            log::warn!("⚠️ [THREAD_SERVICE] Interrupt: failed to cancel {}: {}", thread_id, e);
+                        }
+                    }
+                } else {
+                    eprintln!("⚠️ [THREAD_SERVICE] Interrupt: thread {} not in registry, nothing to cancel", thread_id);
+                    log::warn!("⚠️ [THREAD_SERVICE] Interrupt: thread {} not in registry, nothing to cancel", thread_id);
+                }
+            }
+
             // Check if this is a follow-up message to existing thread
             if let Some(existing_thread_id) = &request.acp_thread_id {
                 eprintln!("🔍 [THREAD_SERVICE] Checking for existing thread: '{}'", existing_thread_id);
