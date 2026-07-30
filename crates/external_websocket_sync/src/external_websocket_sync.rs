@@ -87,10 +87,29 @@ static GLOBAL_UI_STATE_QUERY_CALLBACK: parking_lot::Mutex<Option<mpsc::Unbounded
 static GLOBAL_CANCELLATION_CALLBACK: parking_lot::Mutex<Option<mpsc::UnboundedSender<CancellationRequest>>> =
     parking_lot::Mutex::new(None);
 
+/// Request to cancel a thread's running turn out-of-band.
+#[derive(Clone, Debug)]
+pub struct CancelThreadRequest {
+    pub acp_thread_id: String,
+    /// The turn this cancel is *intended* for, if the caller knows it.
+    ///
+    /// Cancelling is asynchronous and races the sequential creation loop: by the
+    /// time the cancel task runs, the turn the caller meant to kill may already
+    /// have finished and a NEW turn may have started on the same thread. Firing
+    /// blind then cancels the wrong turn — the new interaction completes
+    /// immediately with no response, and its real completion is later discarded
+    /// as a stale request_id rebind.
+    ///
+    /// When set, the cancel task only cancels if the thread's current request_id
+    /// still matches, so a stale cancel becomes a no-op instead of collateral
+    /// damage. `None` means "cancel whatever is running" (explicit user stop).
+    pub expected_request_id: Option<String>,
+}
+
 /// Static global for cancel-thread callback.
-/// Receives an acp_thread_id and immediately cancels that thread's running turn,
+/// Receives a [`CancelThreadRequest`] and cancels that thread's running turn,
 /// bypassing the sequential callback_rx loop (which would be blocked awaiting the turn).
-static GLOBAL_CANCEL_THREAD_CALLBACK: parking_lot::Mutex<Option<mpsc::UnboundedSender<String>>> =
+static GLOBAL_CANCEL_THREAD_CALLBACK: parking_lot::Mutex<Option<mpsc::UnboundedSender<CancelThreadRequest>>> =
     parking_lot::Mutex::new(None);
 
 /// Pending UI state queries that arrived before AgentPanel was ready
@@ -108,16 +127,6 @@ pub struct ThreadCreationRequest {
     /// This allows the NewEntry subscription to fire and sync the user message back to Helix,
     /// simulating a user typing directly in Zed's agent panel.
     pub simulate_input: bool,
-    /// When true, cancel the thread's running turn before sending this message.
-    ///
-    /// The cancel is carried ON the creation request, rather than dispatched
-    /// separately via [`request_cancel_thread`], so that cancel-then-send is
-    /// performed by a single task in a guaranteed order. Dispatching both
-    /// independently races: the send can start before the cancel is processed,
-    /// and the cancel then kills the *new* turn instead of the old one, leaving
-    /// the new interaction completed-with-nothing and its real response
-    /// discarded as a stale request_id rebind.
-    pub interrupt: bool,
 }
 
 /// Request to open existing ACP thread from database and display in UI
@@ -562,13 +571,19 @@ mod protocol_test;
 /// This bypasses the sequential callback_rx loop (which blocks waiting for turn
 /// completion) by routing through a dedicated cancel GPUI task.
 /// Called when Helix sends a chat_message with interrupt=true.
-pub fn request_cancel_thread(acp_thread_id: String) -> Result<()> {
-    eprintln!("⚡ [CANCEL] request_cancel_thread() called for thread: {}", acp_thread_id);
-    log::info!("⚡ [CANCEL] request_cancel_thread() called for thread: {}", acp_thread_id);
+pub fn request_cancel_thread(
+    acp_thread_id: String,
+    expected_request_id: Option<String>,
+) -> Result<()> {
+    eprintln!("⚡ [CANCEL] request_cancel_thread() called for thread: {} (expecting turn {:?})",
+              acp_thread_id, expected_request_id);
+    log::info!("⚡ [CANCEL] request_cancel_thread() called for thread: {} (expecting turn {:?})",
+               acp_thread_id, expected_request_id);
 
     let sender = GLOBAL_CANCEL_THREAD_CALLBACK.lock().clone();
     if let Some(sender) = sender {
-        sender.send(acp_thread_id)
+        sender
+            .send(CancelThreadRequest { acp_thread_id, expected_request_id })
             .map_err(|_| anyhow::anyhow!("Failed to send cancel request"))?;
         Ok(())
     } else {
@@ -581,7 +596,7 @@ pub fn request_cancel_thread(acp_thread_id: String) -> Result<()> {
 }
 
 /// Initialize the global cancel-thread callback (called from thread_service).
-pub fn init_cancel_thread_callback(sender: mpsc::UnboundedSender<String>) {
+pub fn init_cancel_thread_callback(sender: mpsc::UnboundedSender<CancelThreadRequest>) {
     eprintln!("🔧 [CANCEL] init_cancel_thread_callback() called - registering global callback");
     log::info!("🔧 [CANCEL] init_cancel_thread_callback() called - registering global callback");
     *GLOBAL_CANCEL_THREAD_CALLBACK.lock() = Some(sender);

@@ -1413,14 +1413,35 @@ pub fn setup_thread_handler(
 
     // Spawn dedicated cancel task — runs independently of the callback_rx loop so it
     // can cancel a running turn even while callback_rx.recv().await is blocked.
-    let (cancel_tx, mut cancel_rx) = mpsc::unbounded_channel::<String>();
+    let (cancel_tx, mut cancel_rx) = mpsc::unbounded_channel::<crate::CancelThreadRequest>();
     crate::init_cancel_thread_callback(cancel_tx);
     cx.spawn(async move |cx| {
         eprintln!("⚡ [CANCEL_TASK] Cancel task started, waiting for cancel requests...");
         log::info!("⚡ [CANCEL_TASK] Cancel task started, waiting for cancel requests...");
-        while let Some(acp_thread_id) = cancel_rx.recv().await {
-            eprintln!("⚡ [CANCEL_TASK] Received cancel request for thread: {}", acp_thread_id);
-            log::info!("⚡ [CANCEL_TASK] Received cancel request for thread: {}", acp_thread_id);
+        while let Some(req) = cancel_rx.recv().await {
+            let acp_thread_id = req.acp_thread_id;
+            eprintln!("⚡ [CANCEL_TASK] Received cancel request for thread: {} (expecting turn {:?})",
+                      acp_thread_id, req.expected_request_id);
+            log::info!("⚡ [CANCEL_TASK] Received cancel request for thread: {} (expecting turn {:?})",
+                       acp_thread_id, req.expected_request_id);
+
+            // Targeted cancel: if the caller named the turn it meant to kill and
+            // the thread has since moved on to a different one, this cancel is
+            // stale. Firing it would kill the NEW turn — which completes with no
+            // response and whose real completion is then discarded as a stale
+            // request_id rebind (observed as intermittent E2E Phase 17 failures,
+            // "interrupt message never delivered"). Drop it instead.
+            if let Some(expected) = req.expected_request_id.as_deref() {
+                let current = crate::get_thread_request_id(&acp_thread_id).unwrap_or_default();
+                if current != expected {
+                    eprintln!("🛡️ [CANCEL_TASK] Stale cancel ignored on {}: intended turn {} but thread is now on {} — cancelling would kill the newer turn",
+                              acp_thread_id, expected, current);
+                    log::warn!("🛡️ [CANCEL_TASK] Stale cancel ignored on {}: intended turn {} but thread is now on {} — cancelling would kill the newer turn",
+                               acp_thread_id, expected, current);
+                    continue;
+                }
+            }
+
             if let Some(thread) = crate::get_thread(&acp_thread_id) {
                 let result = cx.update(|cx| {
                     thread.update(cx, |t, cx| { t.cancel(cx) })
@@ -1458,30 +1479,6 @@ pub fn setup_thread_handler(
                 request.acp_thread_id,
                 request.request_id
             );
-
-            // Interrupt = cancel-then-send, performed HERE so the two steps
-            // cannot be reordered. Doing the cancel on the separate cancel task
-            // races the send and can cancel the new turn instead of the old one
-            // (see ThreadCreationRequest::interrupt).
-            if request.interrupt
-                && let Some(thread_id) = request.acp_thread_id.as_ref().filter(|id| !id.is_empty())
-            {
-                if let Some(thread) = crate::get_thread(thread_id) {
-                    match cx.update(|cx| thread.update(cx, |t, cx| t.cancel(cx))) {
-                        Ok(_) => {
-                            eprintln!("⚡ [THREAD_SERVICE] Interrupt: cancelled running turn inline before send on {}", thread_id);
-                            log::info!("⚡ [THREAD_SERVICE] Interrupt: cancelled running turn inline before send on {}", thread_id);
-                        }
-                        Err(e) => {
-                            eprintln!("⚠️ [THREAD_SERVICE] Interrupt: failed to cancel {}: {}", thread_id, e);
-                            log::warn!("⚠️ [THREAD_SERVICE] Interrupt: failed to cancel {}: {}", thread_id, e);
-                        }
-                    }
-                } else {
-                    eprintln!("⚠️ [THREAD_SERVICE] Interrupt: thread {} not in registry, nothing to cancel", thread_id);
-                    log::warn!("⚠️ [THREAD_SERVICE] Interrupt: thread {} not in registry, nothing to cancel", thread_id);
-                }
-            }
 
             // Check if this is a follow-up message to existing thread
             if let Some(existing_thread_id) = &request.acp_thread_id {

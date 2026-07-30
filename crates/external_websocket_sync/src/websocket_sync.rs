@@ -429,36 +429,28 @@ impl WebSocketSync {
         log::info!("💬 [WEBSOCKET-IN] Processing chat_message: acp_thread_id={:?}, request_id={}, message_len={}, interrupt={}",
                    chat_msg.acp_thread_id, chat_msg.request_id, chat_msg.message.len(), chat_msg.interrupt);
 
-        // An interrupt is ONE atomic operation: cancel the running turn, then send
-        // the new message. It is therefore carried on the creation request and
-        // performed by the creation task itself.
-        //
-        // It used to be dispatched separately via request_cancel_thread(), which
-        // races: the cancel task and the creation task are independent, so the
-        // send could start before the cancel was processed and the cancel would
-        // then kill the NEW turn. The new interaction was completed immediately
-        // with usage=null and no response, and its real completion was later
-        // rejected as a stale request_id rebind — the interaction never left
-        // `waiting`. Reproduced as an intermittent E2E Phase 17 failure
-        // ("interrupt message never delivered").
-        //
-        // The standalone cancel path (cancel_current_turn) still uses the
-        // dedicated cancel task, which is what that task exists for: cancelling
-        // while the creation loop is blocked awaiting a previous turn.
-        let interrupt = chat_msg.interrupt
-            && chat_msg
-                .acp_thread_id
-                .as_ref()
-                .is_some_and(|id| !id.is_empty());
-        if interrupt {
-            eprintln!(
-                "⚡ [WEBSOCKET-IN] Interrupt flag set — cancel will run inline, before the send, on thread: {:?}",
-                chat_msg.acp_thread_id
-            );
-            log::info!(
-                "⚡ [WEBSOCKET-IN] Interrupt flag set — cancel will run inline, before the send, on thread: {:?}",
-                chat_msg.acp_thread_id
-            );
+        // If this is an interrupt message and we have an existing thread, cancel its
+        // running turn immediately via the dedicated cancel task (which runs independently
+        // of the sequential callback_rx loop, so it can fire even while the loop is
+        // blocked awaiting the previous turn's response).
+        if chat_msg.interrupt {
+            if let Some(ref thread_id) = chat_msg.acp_thread_id {
+                if !thread_id.is_empty() {
+                    // Name the turn we mean to interrupt. The cancel is delivered
+                    // out-of-band (so it can fire while the creation loop is blocked
+                    // awaiting this very turn), which means it races that loop: if
+                    // the turn finishes on its own first and the next one starts,
+                    // an untargeted cancel would kill the NEW turn instead. Passing
+                    // the current request_id makes a stale cancel a no-op.
+                    let target = crate::get_thread_request_id(thread_id);
+                    eprintln!("⚡ [WEBSOCKET-IN] Interrupt flag set — cancelling turn {:?} on thread: {}", target, thread_id);
+                    log::info!("⚡ [WEBSOCKET-IN] Interrupt flag set — cancelling turn {:?} on thread: {}", target, thread_id);
+                    if let Err(e) = crate::request_cancel_thread(thread_id.clone(), target) {
+                        eprintln!("⚠️ [WEBSOCKET-IN] Failed to request cancel for thread {}: {}", thread_id, e);
+                        log::warn!("⚠️ [WEBSOCKET-IN] Failed to request cancel for thread {}: {}", thread_id, e);
+                    }
+                }
+            }
         }
 
         // Request thread creation via callback
@@ -468,7 +460,6 @@ impl WebSocketSync {
             request_id: chat_msg.request_id.clone(),
             agent_name: chat_msg.agent_name.clone(),
             simulate_input: false,
-            interrupt,
         };
 
         eprintln!("🎯 [WEBSOCKET-IN] Calling request_thread_creation()...");
@@ -502,9 +493,6 @@ impl WebSocketSync {
             request_id: chat_msg.request_id.clone(),
             agent_name: chat_msg.agent_name.clone(),
             simulate_input: true,
-            // simulate_user_input models the user typing in Zed; AcpThread::send()
-            // displaces any running turn on its own, so no explicit cancel.
-            interrupt: false,
         };
 
         eprintln!("🎯 [WEBSOCKET-IN] Calling request_thread_creation() with simulate_input=true...");
