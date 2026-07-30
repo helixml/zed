@@ -58,13 +58,33 @@ cleanup() {
             echo "  (full log: $ZED_LOG_FILE)"
         fi
         # ACP_SPAWN/ACP_DEDUP are at log::info level — surface them explicitly
-        ACP_LINES=$(grep -cE "ACP_SPAWN|ACP_DEDUP" "$ZED_LOG_FILE" 2>/dev/null || echo "0")
+        ACP_LINES=$(grep -cE "ACP_SPAWN|ACP_DEDUP" "$ZED_LOG_FILE" 2>/dev/null) || ACP_LINES=0
         if [ "$ACP_LINES" -gt 0 ]; then
             echo ""
             echo "=================================================="
             echo "  ACP_SPAWN / ACP_DEDUP ($ACP_LINES lines)"
             echo "=================================================="
             grep -E "ACP_SPAWN|ACP_DEDUP" "$ZED_LOG_FILE" || true
+        fi
+
+        # Turn lifecycle: cancel / interrupt / silence-watchdog decisions.
+        #
+        # These are the events needed to tell the three failure shapes apart when
+        # a round fails, and reading them from the Helix side alone is impossible
+        # (Helix sees completions, not the ordering that produced them):
+        #   - cancel landing on the wrong turn  -> CANCEL_TASK vs THREAD_SERVICE order
+        #   - a stale cancel correctly dropped  -> "Stale cancel ignored"
+        #   - agent accepted a prompt then died -> helix_silent_prompt_wedge
+        # Without this block the harness reported only "phase N timed out", which
+        # is not enough to attribute a failure.
+        LIFECYCLE_RE="CANCEL_TASK|Interrupt flag set|Stale cancel ignored|helix_silent_prompt_wedge|THREAD_SERVICE\] (Sending follow-up|Updated request_id|Sending to existing)"
+        LIFECYCLE_LINES=$(grep -cE "$LIFECYCLE_RE" "$ZED_LOG_FILE" 2>/dev/null) || LIFECYCLE_LINES=0
+        if [ "$LIFECYCLE_LINES" -gt 0 ]; then
+            echo ""
+            echo "=================================================="
+            echo "  TURN LIFECYCLE / CANCEL ORDERING ($LIFECYCLE_LINES lines)"
+            echo "=================================================="
+            grep -E "$LIFECYCLE_RE" "$ZED_LOG_FILE" | tail -60 || true
         fi
         # Persist the full zed log into the mounted screenshots dir for offline inspection
         if [ -d "$SCREENSHOT_DIR" ]; then
