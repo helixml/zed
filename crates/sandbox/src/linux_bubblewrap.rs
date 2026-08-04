@@ -145,21 +145,20 @@ fn locate_bwrap() -> BwrapLocation {
 }
 
 fn candidate_bwrap_paths() -> Vec<PathBuf> {
-    let mut candidates = Vec::new();
-    if let Some(system) = system_bwrap_path() {
-        candidates.push(system);
-    }
+    let mut candidates = system_bwrap_paths(std::env::var_os("PATH"));
     if let Some(bundled) = bundled_bwrap_path() {
         candidates.push(bundled);
     }
     candidates
 }
 
-fn system_bwrap_path() -> Option<PathBuf> {
-    let path = std::env::var_os("PATH")?;
+fn system_bwrap_paths(path: Option<OsString>) -> Vec<PathBuf> {
+    let Some(path) = path else {
+        return Vec::new();
+    };
     std::env::split_paths(&path)
         .map(|directory| directory.join("bwrap"))
-        .find(|candidate| candidate.is_file())
+        .collect()
 }
 
 fn bundled_bwrap_path() -> Option<PathBuf> {
@@ -1497,6 +1496,19 @@ fn copy_one_way(mut from: impl Read, mut to: impl BridgeStream) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_system_bwrap_paths_include_every_path_entry() {
+        let path = std::env::join_paths(["/setuid", "/usable"]).expect("join PATH entries");
+
+        assert_eq!(
+            system_bwrap_paths(Some(path)),
+            [
+                PathBuf::from("/setuid/bwrap"),
+                PathBuf::from("/usable/bwrap")
+            ]
+        );
+    }
 
     fn launcher_argv(program: &str, args: Vec<&str>) -> Vec<OsString> {
         std::iter::once(program)
