@@ -1264,7 +1264,7 @@ fn has_outstanding_work(thread: &AcpThread) -> bool {
     })
 }
 
-/// Origin-agnostic silence watchdog for a thread.
+/// Origin-agnostic silence watchdog for a Claude ACP thread.
 ///
 /// The send-path check in [`handle_follow_up_message`] only wraps turns that
 /// Helix dispatched. A turn started by the user typing directly into the Zed
@@ -1272,12 +1272,15 @@ fn has_outstanding_work(thread: &AcpThread) -> bool {
 /// — yet that is exactly how the 2026-07-29 production wedge was triggered. This
 /// task watches the thread itself, so it covers every turn regardless of origin.
 ///
-/// **One rule:** while the thread is `Generating`, if no `AcpThreadEvent` has
+/// This recovery is intentionally limited to `claude-agent-acp`, whose silent
+/// query failure mode was confirmed in production. ACP has no inference
+/// heartbeat, so applying the same rule to other agents would mistake a long
+/// reasoning interval for a wedge.
+///
+/// For Claude ACP, while the thread is `Generating`, if no `AcpThreadEvent` has
 /// been observed for longer than the silence budget AND nothing is outstanding
-/// (see [`has_outstanding_work`]), the agent is wedged. Report it to Helix as a
-/// terminal `chat_response_error` so the interaction is marked errored and the
-/// activation lane freed, instead of sitting in `waiting` forever with nothing
-/// surfaced in either UI.
+/// (see [`has_outstanding_work`]), report a terminal `chat_response_error` so
+/// the interaction is marked errored and the activation lane freed.
 ///
 /// The state check is what makes a single modest budget safe, and is why there
 /// is no "longest plausible tool call" constant anywhere here — an agent running
@@ -1295,10 +1298,10 @@ fn has_outstanding_work(thread: &AcpThread) -> bool {
 /// emit `message_completed` on top of this error and Helix would see the turn as
 /// both failed and completed. Leaving the turn alone is safe — the next
 /// `send()` displaces it (which cancels it via Critical Fix #8), so Zed
-/// self-heals on the user's next message while Helix has already been told the
-/// truth.
+/// self-heals on the user's next message after Helix has recorded the failure.
 fn spawn_silent_turn_watchdog(thread_entity: &Entity<AcpThread>, thread_id: &str, cx: &mut App) {
-    let Some(budget) = silence_timeout() else {
+    let agent_telemetry_id = thread_entity.read(cx).agent_telemetry_id();
+    let Some(budget) = silent_prompt_wedge_timeout(agent_telemetry_id.as_ref()) else {
         return;
     };
     const POLL: Duration = Duration::from_secs(5);
@@ -2260,6 +2263,10 @@ async fn handle_follow_up_message(
     // the agent session and re-invoking us on a fresh thread entity.
     let max_attempts = 2;
     let retry_delay = Duration::from_millis(500);
+    let agent_telemetry_id = cx.update(|cx| {
+        thread.update(cx, |thread, _| thread.agent_telemetry_id())
+    })?;
+    let silence_budget = silent_prompt_wedge_timeout(agent_telemetry_id.as_ref());
     for attempt in 1..=max_attempts {
         // Snapshot BEFORE dispatch so the watchdog only credits activity that
         // this prompt produced.
@@ -2279,7 +2286,7 @@ async fn handle_follow_up_message(
         // otherwise never resolve and this await would hang forever (the
         // 2026-07-29 production wedge). Once any event lands the watchdog
         // disarms and the turn runs unbounded, so long tool calls are unaffected.
-        let send_result = if let Some(budget) = silence_timeout() {
+        let send_result = if let Some(budget) = silence_budget {
             let send_task = Box::pin(send_task);
             let watchdog = Box::pin(wait_for_first_agent_activity(
                 &thread_id,
@@ -2379,8 +2386,8 @@ pub(crate) fn is_silent_prompt_wedge(msg: &str) -> bool {
     msg.contains(SILENT_PROMPT_WEDGE_MARKER)
 }
 
-/// How long a generating thread may go with **no agent events and nothing
-/// outstanding** before we declare the session wedged. Override with
+/// How long a generating Claude ACP thread may go with **no agent events and
+/// nothing outstanding** before we declare the session wedged. Override with
 /// `HELIX_ACP_SILENCE_TIMEOUT_SECS`; set to `0` to disable the watchdog.
 ///
 /// This is a silence budget, not a turn budget, and crucially not a
@@ -2388,15 +2395,27 @@ pub(crate) fn is_silent_prompt_wedge(msg: &str) -> bool {
 /// by thread *state* ([`has_outstanding_work`]) rather than by a duration
 /// assumption: a running tool or a pending permission prompt is exempt for as
 /// long as it genuinely takes. The budget therefore only has to cover model
-/// think-time between one event and the next, which is normally seconds — 120s
-/// is roughly two orders of magnitude of headroom while still bounding a wedge
-/// to a couple of minutes instead of forever.
+/// think-time between one event and the next. The 120s default still bounds the
+/// confirmed Claude wrapper failure to a couple of minutes instead of forever.
 fn silence_timeout() -> Option<Duration> {
     let secs = std::env::var("HELIX_ACP_SILENCE_TIMEOUT_SECS")
         .ok()
         .and_then(|v| v.parse::<u64>().ok())
         .unwrap_or(120);
     (secs > 0).then(|| Duration::from_secs(secs))
+}
+
+/// Return the silence budget only for the agent with the confirmed silent-query
+/// failure mode. ACP does not expose a model-inference heartbeat, so a pending
+/// prompt with no events is not generic proof of a wedge: Codex can legitimately
+/// spend longer than the budget reasoning after a tool completes. Applying this
+/// recovery to every ACP agent therefore reports healthy turns as terminal
+/// errors while they continue running.
+fn silent_prompt_wedge_timeout(agent_telemetry_id: &str) -> Option<Duration> {
+    if agent_telemetry_id != agent_servers::CLAUDE_AGENT_ID {
+        return None;
+    }
+    silence_timeout()
 }
 
 /// Watchdog for the "agent accepted the prompt and went silent" wedge.
@@ -3480,6 +3499,21 @@ mod silent_prompt_wedge_tests {
         // Bumping one thread must not credit another — otherwise a busy thread
         // would mask a wedge on a quiet one.
         assert_eq!(activity_count(&b), 0);
+    }
+
+    #[test]
+    fn silent_wedge_watchdog_only_targets_confirmed_affected_agent() {
+        assert_eq!(
+            silent_prompt_wedge_timeout(agent_servers::CODEX_ID),
+            None,
+            "Codex model inference has no ACP heartbeat and must not be judged by silence"
+        );
+        assert_eq!(
+            silent_prompt_wedge_timeout("qwen"),
+            None,
+            "agents without the confirmed claude-agent-acp failure mode must be excluded"
+        );
+        assert!(silent_prompt_wedge_timeout(agent_servers::CLAUDE_AGENT_ID).is_some());
     }
 
     #[gpui::test]
