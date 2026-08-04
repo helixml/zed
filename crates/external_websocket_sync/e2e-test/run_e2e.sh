@@ -196,10 +196,8 @@ export HELIX_SESSION_ID="ses_e2e-test-session-001"
 
 # ---- Determine which agents to test ----
 # E2E_AGENTS controls which agent rounds to run. Default: zed-agent only (fastest).
-# Set E2E_AGENTS="zed-agent,claude" to also test Claude Code (adds an LLM round).
-# Recommended CI matrix: zed-agent in headful mode + claude in E2E_HEADLESS=1 mode,
-# parallel jobs, each ~3-4 min — covers both agents and both display modes without
-# adding wall-clock time over the previous single-mode default.
+# Add `claude` or `codex` for live ACP-backed rounds. Recommended CI matrix:
+# zed-agent in headful mode and each external agent in E2E_HEADLESS=1 mode.
 export E2E_AGENTS="${E2E_AGENTS:-zed-agent}"
 echo "[setup] E2E_AGENTS=$E2E_AGENTS"
 
@@ -207,8 +205,9 @@ echo "[setup] E2E_AGENTS=$E2E_AGENTS"
 ZED_CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/zed"
 mkdir -p "$ZED_CONFIG_DIR"
 
-# Build the agent_servers config for Claude Code if it's in E2E_AGENTS
+# Build agent-server settings for the selected external agents.
 AGENT_SERVERS_JSON=""
+AGENT_SERVER_ENTRIES=""
 if echo "$E2E_AGENTS" | grep -q "claude"; then
     # Claude Code needs ANTHROPIC_API_KEY passed through settings (Zed clears env vars)
     CLAUDE_KEY="${ANTHROPIC_API_KEY:-}"
@@ -241,18 +240,49 @@ if echo "$E2E_AGENTS" | grep -q "claude"; then
         echo "[setup] Using npm-installed claude-agent-acp $CLAUDE_ACP_PKG (auto-install, latest=$CLAUDE_ACP_VERSION)"
         echo "[setup] NOTE: this install is UNPINNED — the claude round is not reproducible across time."
     fi
-    AGENT_SERVERS_JSON=$(cat << AGENTEOF
-  "agent_servers": {
+    AGENT_SERVER_ENTRIES=$(cat << AGENTEOF
     "claude": {
       ${CLAUDE_PATH_JSON}
       "env": {
         "ANTHROPIC_API_KEY": "${CLAUDE_KEY}"
       }
     }
-  },
 AGENTEOF
 )
     echo "[setup] Claude Code agent configured with API key"
+fi
+
+if echo "$E2E_AGENTS" | grep -q "codex"; then
+    CODEX_KEY="${OPENAI_API_KEY:-}"
+    if [ -z "$CODEX_KEY" ]; then
+        echo "[error] OPENAI_API_KEY is required when testing codex agent"
+        exit 1
+    fi
+    if [ -n "$AGENT_SERVER_ENTRIES" ]; then
+        AGENT_SERVER_ENTRIES="${AGENT_SERVER_ENTRIES},"
+    fi
+    CODEX_ACP_PKG="@agentclientprotocol/codex-acp"
+    CODEX_ACP_VERSION=$(npm view "$CODEX_ACP_PKG" version 2>/dev/null || echo "unknown")
+    echo "[setup] Using npm-installed codex-acp $CODEX_ACP_PKG (auto-install, latest=$CODEX_ACP_VERSION)"
+    AGENT_SERVER_ENTRIES="${AGENT_SERVER_ENTRIES}
+    \"codex-acp\": {
+      \"type\": \"registry\",
+      \"default_mode\": \"agent-full-access\",
+      \"default_model\": \"gpt-5.6-terra\",
+      \"env\": {
+        \"OPENAI_API_KEY\": \"${CODEX_KEY}\"
+      }
+    }"
+    echo "[setup] Codex agent configured with API key"
+fi
+
+if [ -n "$AGENT_SERVER_ENTRIES" ]; then
+    AGENT_SERVERS_JSON=$(cat << AGENTEOF
+  "agent_servers": {
+${AGENT_SERVER_ENTRIES}
+  },
+AGENTEOF
+)
 fi
 
 cat > "$ZED_CONFIG_DIR/settings.json" << JSONEOF
@@ -288,6 +318,8 @@ echo "[zed]   ZED_HELIX_URL=$ZED_HELIX_URL"
 echo "[zed]   ZED_EXTERNAL_SYNC_ENABLED=$ZED_EXTERNAL_SYNC_ENABLED"
 echo "[zed]   ZED_STATELESS=${ZED_STATELESS:-not set}"
 echo "[zed]   ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY:+set (${#ANTHROPIC_API_KEY} chars)}"
+echo "[zed]   OPENAI_API_KEY=${OPENAI_API_KEY:+set (${#OPENAI_API_KEY} chars)}"
+echo "[zed]   HELIX_ACP_SILENCE_TIMEOUT_SECS=${HELIX_ACP_SILENCE_TIMEOUT_SECS:-default}"
 echo "[zed]   E2E_AGENTS=$E2E_AGENTS"
 echo "[zed]   E2E_HEADLESS=${E2E_HEADLESS:-0}"
 echo ""

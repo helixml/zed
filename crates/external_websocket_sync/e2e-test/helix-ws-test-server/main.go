@@ -74,18 +74,18 @@ type roundState struct {
 	phase8Completions   int    // number of message_completed events received for phase 8 thread
 
 	// Phase 9: rapid 3-turn cancel state
-	phase9ThreadID  string // thread ID (reuses phase 8's thread)
-	phase9RapidSent bool   // whether the rapid sequence has been sent
-	phase9Completions int  // number of message_completed events for phase 9
+	phase9ThreadID    string // thread ID (reuses phase 8's thread)
+	phase9RapidSent   bool   // whether the rapid sequence has been sent
+	phase9Completions int    // number of message_completed events for phase 9
 
 	// Phase 10: user-created thread (multi-thread sync)
-	phase10NewThreadID       string // synthetic thread ID injected via ProcessSyncEvent
-	phase10WorkSessionFound  bool   // whether the work session was created
-	phase10ChatCompleted     bool   // whether chat on the new thread completed
+	phase10NewThreadID      string // synthetic thread ID injected via ProcessSyncEvent
+	phase10WorkSessionFound bool   // whether the work session was created
+	phase10ChatCompleted    bool   // whether chat on the new thread completed
 
 	// Phase 11: spectask routing (verifies findConnectedSessionForSpecTask
 	// picks the most recently active session)
-	phase11RoutedSessionID string // which session the routing picked
+	phase11RoutedSessionID  string // which session the routing picked
 	phase11ExpectedThreadID string // which thread we expect the message to land on
 	phase11Completed        bool   // whether the routed message completed
 
@@ -93,10 +93,10 @@ type roundState struct {
 	phase12Completed bool // whether the reconnected message completed
 
 	// Phase 13: Helix-initiated cancel via cancel_current_turn
-	phase13ThreadID     string // thread ID for the long-running turn
-	phase13CancelSent   bool   // whether cancel_current_turn has been sent
-	phase13TurnCancelled bool  // whether turn_cancelled event was received
-	phase13CancelStatus string // status from turn_cancelled ("cancelled" or "noop")
+	phase13ThreadID      string // thread ID for the long-running turn
+	phase13CancelSent    bool   // whether cancel_current_turn has been sent
+	phase13TurnCancelled bool   // whether turn_cancelled event was received
+	phase13CancelStatus  string // status from turn_cancelled ("cancelled" or "noop")
 
 	// Phase 14: cancel no-op (request_id not found)
 	phase14TurnCancelled bool   // whether turn_cancelled event was received
@@ -104,7 +104,6 @@ type roundState struct {
 
 	// Phase 15: streaming-cadence regression test
 	phase15ThreadID    string             // thread ID created in phase 15
-	phase15ChatSentAt  time.Time          // when we sent the chat_message
 	phase15CompletedAt time.Time          // when message_completed arrived
 	phase15Adds        []phase15AddSample // per message_added: timestamp + content length
 	phase15FinalLen    int                // length of the final assistant content
@@ -168,9 +167,9 @@ type testDriver struct {
 	agentID string // agent connection ID (discovered at runtime)
 
 	// Multi-agent round management
-	agentRounds    []string     // agent names to test (e.g., ["zed-agent", "claude"])
+	agentRounds     []string // agent names to test (e.g., ["zed-agent", "claude"])
 	currentRoundIdx int
-	round          *roundState  // current round state
+	round           *roundState // current round state
 
 	// Collected round results for final summary
 	roundResults []roundResult
@@ -181,7 +180,7 @@ type testDriver struct {
 	roundGeneration int
 
 	// Per-phase timeout tracking
-	phaseStarted time.Time
+	phaseStarted  time.Time
 	phaseTimedOut map[int]bool // phases that timed out (skip in validation)
 }
 
@@ -1300,7 +1299,6 @@ func (d *testDriver) runPhase15() {
 	log.Println("  external_websocket_sync sees fresh content as it grows).")
 
 	d.mu.Lock()
-	d.round.phase15ChatSentAt = time.Now()
 	d.mu.Unlock()
 
 	// Long-form, plain-prose prompt with NO tool calls. ~400 words gives ~30+
@@ -1586,8 +1584,10 @@ func (d *testDriver) validateRound() roundResult {
 				agent, activeView, truncate(threadID, 12), entryCount)
 		}
 
-		// Validate MCP server status (only for first round -- MCP servers are agent-independent)
-		if d.currentRoundIdx == 0 {
+		// Validate the Native Agent's MCP server status. External ACP agents own
+		// their MCP surface and do not necessarily expose Zed context servers in
+		// ui_state_response.
+		if agent == "zed-agent" {
 			mcpServers, _ := resp.Data["mcp_servers"].(map[string]interface{})
 			if len(mcpServers) == 0 {
 				errors = append(errors, "Phase 6: ui_state_response mcp_servers is empty (expected at least slow-mcp-test)")
@@ -1850,8 +1850,12 @@ func (d *testDriver) validateRound() roundResult {
 			// for long responses), which makes the midpoint metric agent-specific.
 			// The "did everything land in the final burst?" question is the actual
 			// regression signal we care about and works uniformly across agents.
-			if !d.round.phase15ChatSentAt.IsZero() && !d.round.phase15CompletedAt.IsZero() && d.round.phase15FinalLen > 0 {
-				totalElapsed := d.round.phase15CompletedAt.Sub(d.round.phase15ChatSentAt)
+			// Measure from the first assistant text sample, not from prompt dispatch.
+			// ACP agents may emit no user-visible text while the model reasons; that
+			// inference gap is not evidence that Zed's streaming-reveal drain stalled.
+			if len(d.round.phase15Adds) > 0 && !d.round.phase15CompletedAt.IsZero() && d.round.phase15FinalLen > 0 {
+				streamStartedAt := d.round.phase15Adds[0].ts
+				totalElapsed := d.round.phase15CompletedAt.Sub(streamStartedAt)
 				finalWindowStart := d.round.phase15CompletedAt.Add(-totalElapsed / 5) // last 20%
 
 				lenBeforeFinalWindow := 0
@@ -1874,6 +1878,19 @@ func (d *testDriver) validateRound() roundResult {
 						pctInFinalWindow, bytesInFinalWindow, d.round.phase15FinalLen, maxPctInFinalWindow))
 				}
 			}
+		}
+	}
+
+	// A healthy round must never emit the terminal error used by the silent
+	// watchdog. Codex runs set HELIX_ACP_SILENCE_TIMEOUT_SECS=1 so any accidental
+	// global watchdog would fire during normal model reasoning.
+	for _, event := range d.round.events {
+		if event.EventType != "chat_response_error" {
+			continue
+		}
+		errMsg, _ := event.Data["error"].(string)
+		if strings.Contains(errMsg, "helix_silent_prompt_wedge") {
+			errors = append(errors, "Silent-prompt watchdog fired during a healthy round: "+errMsg)
 		}
 	}
 
