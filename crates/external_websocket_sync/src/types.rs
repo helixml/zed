@@ -260,6 +260,18 @@ pub enum SyncEvent {
         /// "cancelled" if a turn was stopped, "noop" if no active turn for that request_id
         status: String,
     },
+    /// Response to a turn_status query from Helix. Read-only: answering this
+    /// never affects a running turn. Helix uses it to tell "this completion is
+    /// genuine but carried a stale request_id" apart from "a turn is still
+    /// live, don't settle anything".
+    #[serde(rename = "turn_status_response")]
+    TurnStatusResponse {
+        /// Echoed back from the query to correlate request/response
+        probe_id: String,
+        acp_thread_id: String,
+        /// true if a turn is currently generating on that thread
+        running: bool,
+    },
     /// Response to query_ui_state command — reports current agent panel UI state
     /// Used by E2E tests to verify that threads are correctly displayed
     #[serde(rename = "ui_state_response")]
@@ -355,6 +367,14 @@ impl SyncEvent {
                 serde_json::json!({
                     "request_id": request_id,
                     "status": status,
+                })
+            ),
+            SyncEvent::TurnStatusResponse { probe_id, acp_thread_id, running } => (
+                "turn_status_response".to_string(),
+                serde_json::json!({
+                    "probe_id": probe_id,
+                    "acp_thread_id": acp_thread_id,
+                    "running": running,
                 })
             ),
             SyncEvent::UiStateResponse { query_id, active_view, thread_id, entry_count, mcp_servers, active_model } => (

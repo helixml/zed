@@ -1168,6 +1168,24 @@ pub fn ensure_thread_subscription(
                 } else {
                     captured_rid
                 };
+                // Keep turn_request_id in lockstep with the id we just reported.
+                //
+                // Without this the fallback above poisons the thread PERMANENTLY.
+                // The assistant-side rotation only fires when
+                // turn_request_id == last_completed_request_id ("the turn I'm
+                // holding has already been reported, move on"). When the fallback
+                // reports a DIFFERENT id from the one held in turn_request_id, the
+                // two diverge and that equality can never hold again — so every
+                // later turn on this thread keeps emitting the first turn's id.
+                //
+                // That is the 2026-08-04 wedge: three turns created in 42s by
+                // rapid interrupt→resend cycles. Turn 2 produced no assistant
+                // entries, so its Stopped took the fallback and set
+                // last_completed=turn2 while turn_request_id stayed at turn1.
+                // Turn 3 then streamed and completed entirely under turn1's id,
+                // 23 minutes stale, and Helix dropped the completion as a
+                // duplicate — stranding a finished answer in state=waiting.
+                *turn_request_id.borrow_mut() = completed_rid.clone();
                 *last_completed_request_id.borrow_mut() = completed_rid.clone();
                 if is_error {
                     // Turn aborted (agent process exited mid-turn, or MaxTokens).
@@ -1805,6 +1823,48 @@ pub fn setup_thread_handler(
         }
 
         log::warn!("⚠️ [THREAD_SERVICE] Open thread handler task exiting - callback channel closed");
+        anyhow::Ok(())
+    })
+    .detach();
+
+    // Create callback channel for turn-status queries. This is the read-only
+    // twin of the cancellation channel below: Helix asks "is a turn running on
+    // this thread?" and we answer without touching the turn. Helix needs the
+    // answer to decide whether a message_completed carrying a stale request_id
+    // is a genuine completion it must apply, or a replay it must ignore.
+    let (turn_status_tx, mut turn_status_rx) = mpsc::unbounded_channel::<crate::TurnStatusRequest>();
+    crate::init_turn_status_callback(turn_status_tx);
+
+    cx.spawn(async move |cx| {
+        while let Some(request) = turn_status_rx.recv().await {
+            // Same liveness check the cancel path uses to decide cancelled-vs-noop,
+            // just without the cancel.
+            let running = match get_thread(&request.acp_thread_id) {
+                Some(weak_thread) => cx.update(|cx| {
+                    if let Some(thread_entity) = weak_thread.upgrade() {
+                        thread_entity.update(cx, |thread, _cx| {
+                            matches!(thread.status(), acp_thread::ThreadStatus::Generating)
+                        })
+                    } else {
+                        false
+                    }
+                }),
+                None => false,
+            };
+
+            log::info!(
+                "[THREAD_SERVICE] turn_status probe_id={} thread={} running={}",
+                request.probe_id, request.acp_thread_id, running
+            );
+
+            if let Err(e) = crate::send_websocket_event(SyncEvent::TurnStatusResponse {
+                probe_id: request.probe_id,
+                acp_thread_id: request.acp_thread_id,
+                running,
+            }) {
+                log::error!("[THREAD_SERVICE] Failed to send turn_status_response: {}", e);
+            }
+        }
         anyhow::Ok(())
     })
     .detach();

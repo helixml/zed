@@ -84,6 +84,9 @@ static GLOBAL_UI_STATE_QUERY_CALLBACK: parking_lot::Mutex<Option<mpsc::Unbounded
     parking_lot::Mutex::new(None);
 
 /// Static global for cancellation callback (cancels active ACP thread turn by request_id)
+static GLOBAL_TURN_STATUS_CALLBACK: parking_lot::Mutex<Option<mpsc::UnboundedSender<TurnStatusRequest>>> =
+    parking_lot::Mutex::new(None);
+
 static GLOBAL_CANCELLATION_CALLBACK: parking_lot::Mutex<Option<mpsc::UnboundedSender<CancellationRequest>>> =
     parking_lot::Mutex::new(None);
 
@@ -149,6 +152,15 @@ pub struct UiStateQueryRequest {
 #[derive(Clone, Debug)]
 pub struct CancellationRequest {
     pub request_id: String,
+}
+
+/// Read-only query from Helix: "do you currently have a turn running on this
+/// thread?". Deliberately separate from CancellationRequest — Helix needs to ask
+/// this during ordinary operation, and answering must never stop a live turn.
+#[derive(Clone, Debug)]
+pub struct TurnStatusRequest {
+    pub probe_id: String,
+    pub acp_thread_id: String,
 }
 
 /// Notification to display a thread in AgentPanel (for auto-select)
@@ -370,6 +382,36 @@ pub fn request_thread_cancellation(request: CancellationRequest) -> Result<()> {
         send_websocket_event(SyncEvent::TurnCancelled {
             request_id: request.request_id,
             status: "noop".to_string(),
+        })?;
+        Ok(())
+    }
+}
+
+/// Initialize the global turn-status callback (called from thread_service)
+pub fn init_turn_status_callback(sender: mpsc::UnboundedSender<TurnStatusRequest>) {
+    log::info!("[CALLBACK] init_turn_status_callback() called - registering global callback");
+    *GLOBAL_TURN_STATUS_CALLBACK.lock() = Some(sender);
+}
+
+/// Answer Helix's turn_status query. If the handler isn't ready we answer
+/// running=false: no handler means no thread service, which means no turn.
+pub fn request_turn_status(request: TurnStatusRequest) -> Result<()> {
+    log::info!(
+        "[CALLBACK] request_turn_status() called: probe_id={} thread={}",
+        request.probe_id, request.acp_thread_id
+    );
+
+    let sender = GLOBAL_TURN_STATUS_CALLBACK.lock().clone();
+    if let Some(sender) = sender {
+        sender.send(request)
+            .map_err(|_| anyhow::anyhow!("Failed to send turn status request"))?;
+        Ok(())
+    } else {
+        log::warn!("[CALLBACK] Turn status callback not initialized - answering running=false");
+        send_websocket_event(SyncEvent::TurnStatusResponse {
+            probe_id: request.probe_id,
+            acp_thread_id: request.acp_thread_id,
+            running: false,
         })?;
         Ok(())
     }

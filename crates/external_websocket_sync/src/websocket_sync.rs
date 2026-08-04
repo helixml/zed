@@ -403,6 +403,7 @@ impl WebSocketSync {
             "open_thread" => Self::handle_open_thread(command.data).await,
             "query_ui_state" => Self::handle_query_ui_state(command.data).await,
             "cancel_current_turn" => Self::handle_cancel_current_turn(command.data).await,
+            "turn_status" => Self::handle_turn_status(command.data).await,
             _ => {
                 eprintln!("⚠️  [WEBSOCKET-IN] Ignoring unknown command: {}", command.command_type);
                 log::warn!("⚠️  [WEBSOCKET-IN] Ignoring unknown command: {}", command.command_type);
@@ -565,6 +566,27 @@ impl WebSocketSync {
         log::info!("[WEBSOCKET-IN] Processing cancel_current_turn: request_id={}", request_id);
 
         crate::request_thread_cancellation(crate::CancellationRequest { request_id })?;
+
+        Ok(())
+    }
+
+    /// Handle turn_status command (read-only liveness query from Helix)
+    async fn handle_turn_status(data: serde_json::Value) -> Result<()> {
+        let probe_id = data.get("probe_id")
+            .and_then(|v| v.as_str())
+            .unwrap_or("unknown")
+            .to_string();
+        let acp_thread_id = data.get("acp_thread_id")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+            .to_string();
+
+        log::info!(
+            "[WEBSOCKET-IN] Processing turn_status: probe_id={} thread={}",
+            probe_id, acp_thread_id
+        );
+
+        crate::request_turn_status(crate::TurnStatusRequest { probe_id, acp_thread_id })?;
 
         Ok(())
     }
