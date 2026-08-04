@@ -132,6 +132,10 @@ type roundState struct {
 	queueThreadID      string // established thread the queue phases reuse
 	phase16Deferred    bool   // interrupt=false was HELD while busy (no concurrent interaction)
 	phase16Delivered   bool   // the deferred message was delivered as the next turn once idle
+	// Phase 18: turn_status read-only liveness probe (2026-08-04 wedge fix).
+	phase18IdleAnswered bool // turn_status_response arrived for the idle-thread probe
+	phase18IdleRunning  bool // running flag from that response (expected false)
+
 	phase17Interrupted bool   // interrupt=true cancelled the running turn (interaction went interrupted)
 	phase17Delivered   bool   // the interrupt message was delivered
 }
@@ -514,6 +518,25 @@ func (d *testDriver) syncEventCallback(sessionID string, syncMsg *types.SyncMess
 		}
 		return
 
+	case "turn_status_response":
+		probeID, _ := syncMsg.Data["probe_id"].(string)
+		running, _ := syncMsg.Data["running"].(bool)
+		// NOTE: syncEventCallback already holds d.mu on entry (see the
+		// Unlock calls in the sibling cases) — locking here deadlocks.
+		currentPhase := d.phase
+		agentName := d.round.agentName
+		if currentPhase == 18 {
+			d.round.phase18IdleAnswered = true
+			d.round.phase18IdleRunning = running
+			d.mu.Unlock()
+			log.Printf("[%s] Phase 18: turn_status_response received: probe_id=%s running=%v", agentName, probeID, running)
+			go d.advanceAfterPhase18()
+			return
+		}
+		d.mu.Unlock()
+		log.Printf("[%s] turn_status_response (unexpected phase %d): probe_id=%s running=%v", agentName, currentPhase, probeID, running)
+		return
+
 	case "turn_cancelled":
 		requestID, _ := syncMsg.Data["request_id"].(string)
 		status, _ := syncMsg.Data["status"].(string)
@@ -625,6 +648,19 @@ func (d *testDriver) sendCancelCurrentTurn(requestID string) {
 	}
 	if !d.srv.QueueCommand(d.agentID, cmd) {
 		log.Printf("[test-server] WARNING: Failed to send cancel_current_turn to agent %s", d.agentID)
+	}
+}
+
+func (d *testDriver) sendTurnStatus(probeID, acpThreadID string) {
+	cmd := types.ExternalAgentCommand{
+		Type: "turn_status",
+		Data: map[string]interface{}{
+			"probe_id":      probeID,
+			"acp_thread_id": acpThreadID,
+		},
+	}
+	if !d.srv.QueueCommand(d.agentID, cmd) {
+		log.Printf("[test-server] WARNING: Failed to send turn_status to agent %s", d.agentID)
 	}
 }
 
@@ -1496,6 +1532,34 @@ func (d *testDriver) runQueuePhases() {
 		log.Printf("[%s] Phase 17: FAIL — interrupt message never delivered", agent)
 	}
 
+	d.runPhase18()
+}
+
+// runPhase18 exercises the read-only turn_status probe added for the 2026-08-04
+// stale-request_id wedge. Helix relies on this answer to decide whether a
+// message_completed carrying a stale id is a genuine completion it must apply or
+// a replay it must ignore — so a wrong or missing answer silently reintroduces
+// either the wedge or the premature-completion bug.
+//
+// By this point phase 17's turns have all settled, so the thread is idle and the
+// agent must answer running=false.
+func (d *testDriver) runPhase18() {
+	agent := d.round.agentName
+	log.Printf("\n==================================================")
+	log.Printf("  [%s] PHASE 18: turn_status probe on an idle thread", agent)
+	log.Printf("==================================================")
+	d.startPhaseTimeout(18)
+
+	d.mu.Lock()
+	d.phase = 18
+	threadID := d.round.queueThreadID
+	d.mu.Unlock()
+
+	d.sendTurnStatus("probe-idle-"+agent, threadID)
+}
+
+func (d *testDriver) advanceAfterPhase18() {
+	time.Sleep(500 * time.Millisecond)
 	d.advanceToNextRound()
 }
 
@@ -2061,6 +2125,17 @@ func (d *testDriver) validateRound() roundResult {
 		errors = append(errors, "Phase 16: deferred queue message was never delivered once idle")
 	}
 	// Phase 17: production queue path — interrupt cancels + delivers.
+	// Phase 18: turn_status probe. Helix fails CLOSED on a missing answer, so a
+	// silent regression here degrades the wedge fix to "no recovery" rather than
+	// failing loudly in production — which is exactly why it is asserted.
+	if !d.round.phase18IdleAnswered {
+		errors = append(errors, "Phase 18: No turn_status_response received (turn_status command not handled by agent?)")
+	} else if d.round.phase18IdleRunning {
+		errors = append(errors, "Phase 18: turn_status reported running=true on an idle thread")
+	} else {
+		log.Printf("[%s] Phase 18: ✅ turn_status answered running=false on idle thread", agent)
+	}
+
 	if !d.round.phase17Interrupted {
 		errors = append(errors, "Phase 17: interrupt=true did NOT cancel the running turn")
 	}
