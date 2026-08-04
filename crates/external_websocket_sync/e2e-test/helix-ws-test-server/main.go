@@ -1009,10 +1009,10 @@ func (d *testDriver) runPhase9() {
 	d.round.phase9ThreadID = d.round.phase8ThreadID
 	d.mu.Unlock()
 
-	// Turn 1: start a long-running response. The syncEventCallback will
+	// Turn 1: start a bounded streaming response. The syncEventCallback will
 	// fire the rapid sequence as soon as the first assistant token arrives.
 	d.sendChatMessage(
-		"Write a detailed explanation of merge sort with code examples.",
+		"Output the numbers 1 through 100, one per line, and nothing else.",
 		d.round.reqID("phase9-initial"),
 		agent,
 		d.round.phase8ThreadID,
