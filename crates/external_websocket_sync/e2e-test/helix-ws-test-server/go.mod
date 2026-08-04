@@ -164,6 +164,7 @@ require (
 	github.com/klippa-app/go-pdfium v1.18.0 // indirect
 	github.com/knights-analytics/hugot v0.7.0 // indirect
 	github.com/knights-analytics/ortgenai v0.2.0 // indirect
+	github.com/kr/fs v0.1.0 // indirect
 	github.com/ktrysmt/go-bitbucket v0.9.80 // indirect
 	github.com/lestrrat-go/backoff/v2 v2.0.7 // indirect
 	github.com/lestrrat-go/blackmagic v1.0.0 // indirect
@@ -210,6 +211,7 @@ require (
 	github.com/perimeterx/marshmallow v1.1.5 // indirect
 	github.com/pjbgf/sha1cd v0.5.0 // indirect
 	github.com/pkg/errors v0.9.1 // indirect
+	github.com/pkg/sftp v1.13.7 // indirect
 	github.com/pkoukk/tiktoken-go v0.1.6 // indirect
 	github.com/planetscale/vtprotobuf v0.6.1-0.20240319094008-0393e58bdf10 // indirect
 	github.com/prometheus/client_golang v1.23.0 // indirect
