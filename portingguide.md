@@ -438,11 +438,19 @@ if !stopped_emitted_for_task.load(std::sync::atomic::Ordering::Acquire) {
 It still:
 - Initializes `external_websocket_sync` and connects to Helix (when settings enable it).
 - Wires up the thread service handler over a windowless `Project::local`.
+- Opens each path argument as a worktree, so agent file tools work.
 - Runs the GPUI event loop until interrupted, so MCP/agent turns can stream as normal.
 
 What it deliberately skips:
 - `restore_or_create_workspace` — no `MultiWorkspace`/`Workspace`/`Window` is ever opened.
 - `OpenListener` second-instance handling (`--headless` implies `--allow-multiple-instances`).
+
+**Worktrees are not free in headless mode.** It is `restore_or_create_workspace` that
+normally turns `zed <path>` into a worktree, and headless skips it — so
+`initialize_headless()` calls `find_or_create_worktree()` for each path argument itself.
+Without that the project is empty and every agent file tool fails with
+`Path ... is not in the project`, while chat-only turns still look perfectly healthy.
+That is why the CI gate below asserts a **tool call**, not just a reply.
 
 Use cases: running Zed as a Helix agent backend on a server with no GUI; running inside a
 container that doesn't have Sway/Hyprland/X11; smoke-testing the WebSocket protocol without
@@ -473,17 +481,41 @@ UI-state responder that returns `active_view: "headless"` plus the real
 `thread_id`, `entry_count`, and `active_model` are reported as null/0 (the
 panel is the source of those in headful mode and we don't track them here).
 
-**Recommended CI matrix** — covers both agents and both display modes without
-spending more wall-clock than the original single-mode default:
+### Smoke mode (`E2E_SMOKE=1`) — the CI gate
 
-| Job | Command | Runs | Time |
-|-----|---------|------|------|
-| `e2e-headful` | `./run_docker_e2e.sh` | zed-agent (headful, full 12 phases) | ~3–4 min |
-| `e2e-headless` | `E2E_HEADLESS=1 E2E_AGENTS=claude ./run_docker_e2e.sh` | claude (headless, full 12 phases) | ~3–4 min |
+The full suite costs a lot of tokens, which is why it was gated to main + tags
+and headless was never gated at all. `E2E_SMOKE=1` replaces the phase chain with
+a single phase: the agent reads `magic-number.txt` and replies with the value.
+One short turn covers WebSocket sync, worktree setup, an agent tool call,
+streaming and interaction completion. The value never appears in the prompt, so
+only a real tool call can produce it.
 
-Run them as parallel CI jobs and total wall clock stays at ~3–4 min. If you
-want to test both agents in both modes, expand to a 4-cell matrix. The
-`E2E_AGENTS` and `E2E_HEADLESS` env vars compose freely.
+```bash
+E2E_HEADLESS=1 E2E_SMOKE=1 E2E_AGENTS=zed-agent \
+  E2E_MODEL_PROVIDER=openai E2E_MODEL=gpt-5.6-luna ./run_docker_e2e.sh
+```
+
+Knobs (all optional, all default to today's behaviour):
+
+| Env | Default | Purpose |
+|-----|---------|---------|
+| `E2E_SMOKE` | `0` | Single tool-call phase instead of the full suite |
+| `E2E_SMOKE_FILE` | `<project>/magic-number.txt` | Absolute path the agent is told to read |
+| `E2E_MODEL_PROVIDER` | `anthropic` | Native-agent provider (`openai` emits an `available_models` entry) |
+| `E2E_MODEL` | `claude-sonnet-4-6` | Native-agent model id |
+| `E2E_REASONING_EFFORT` | `none` | OpenAI only. Must stay `none`: `/v1/chat/completions` rejects any other effort when the request carries function tools |
+| `E2E_CODEX_MODEL` | `gpt-5.6-terra` | codex-acp model id, `model[effort]` form |
+
+Helix CI (`.drone.yml`) runs `zed-e2e-headless-smoke` on **every push including
+PRs**, and the full `zed-e2e-test` on main + tags. Both share the image built by
+`zed-e2e-image`.
+
+**Note on codex in containers.** `E2E_AGENTS=codex` cannot do tool calls inside
+the E2E image: codex sandboxes commands with bubblewrap, which fails with
+`bwrap: No permissions to create new namespace` in an unprivileged container.
+The turn then hangs waiting for an approval nobody answers. Chat-only phases are
+unaffected — which is why the full codex round passes while a tool-call phase
+does not. Use `zed-agent` for the tool-call gate.
 
 ## Callback Architecture
 
