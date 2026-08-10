@@ -111,6 +111,7 @@ if [ -n "${ANTHROPIC_BASE_URL:-}" ]; then
     ANTHROPIC_BASE_URL_ARG="-e ANTHROPIC_BASE_URL=$ANTHROPIC_BASE_URL"
 fi
 
+E2E_RC=0
 docker run --rm \
     --add-host=host.docker.internal:host-gateway \
     -e ANTHROPIC_API_KEY="${ANTHROPIC_API_KEY:-}" \
@@ -118,13 +119,24 @@ docker run --rm \
     ${ANTHROPIC_BASE_URL_ARG} \
     -e E2E_AGENTS="$E2E_AGENTS" \
     -e E2E_HEADLESS="${E2E_HEADLESS:-0}" \
+    -e E2E_SMOKE="${E2E_SMOKE:-0}" \
+    -e E2E_SMOKE_FILE="${E2E_SMOKE_FILE:-}" \
+    -e E2E_CODEX_MODEL="${E2E_CODEX_MODEL:-}" \
+    -e E2E_MODEL_PROVIDER="${E2E_MODEL_PROVIDER:-}" \
+    -e E2E_MODEL="${E2E_MODEL:-}" \
+    -e E2E_REASONING_EFFORT="${E2E_REASONING_EFFORT:-}" \
     -e HELIX_ACP_SILENCE_TIMEOUT_SECS="${HELIX_ACP_SILENCE_TIMEOUT_SECS:-}" \
     -v "$SCREENSHOTS_DIR:/test/screenshots" \
     $CLAUDE_ACP_MOUNT \
-    zed-ws-e2e
+    zed-ws-e2e || E2E_RC=$?
 
-# Report screenshots
-SHOT_COUNT=$(ls -1 "$SCREENSHOTS_DIR"/*.png 2>/dev/null | wc -l || echo 0)
+# Report screenshots.
+# The fallback belongs on the ASSIGNMENT, not inside the substitution: `ls` exits
+# non-zero when the glob matches nothing (a headless run captures no
+# screenshots), `set -o pipefail` propagates that through `| wc -l`, and `set -e`
+# then kills the script. Putting `|| echo 0` inside the substitution instead
+# yields the two-line string "0\n0", which breaks the `-gt` test below.
+SHOT_COUNT=$(ls -1 "$SCREENSHOTS_DIR"/*.png 2>/dev/null | wc -l) || SHOT_COUNT=0
 if [ "$SHOT_COUNT" -gt 0 ]; then
     echo ""
     echo "=== Screenshots ==="
@@ -132,3 +144,9 @@ if [ "$SHOT_COUNT" -gt 0 ]; then
     ls -lh "$SCREENSHOTS_DIR"/*.png | tail -5
     echo "(showing last 5)"
 fi
+
+# Exit with the test's status, not whatever the reporting above happened to
+# return. A headless run captures no screenshots, so the trailing `[ -gt ]` was
+# the script's last command and its status became the script's — reporting a
+# failure for a test that passed.
+exit "$E2E_RC"

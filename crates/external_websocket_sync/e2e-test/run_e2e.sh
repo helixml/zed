@@ -94,9 +94,20 @@ cleanup() {
 
     # Report screenshots
     if [ -d "$SCREENSHOT_DIR" ]; then
-        SHOT_COUNT=$(ls -1 "$SCREENSHOT_DIR"/*.png 2>/dev/null | wc -l)
+        # `ls` exits non-zero when the glob matches nothing, and `set -o pipefail`
+        # propagates that through `| wc -l` to the ASSIGNMENT — which `set -e`
+        # then treats as fatal, aborting this trap mid-way. Put the fallback on
+        # the assignment (same shape as the grep -c cases above).
+        SHOT_COUNT=$(ls -1 "$SCREENSHOT_DIR"/*.png 2>/dev/null | wc -l) || SHOT_COUNT=0
         echo "[screenshots] Captured $SHOT_COUNT screenshots in $SCREENSHOT_DIR"
     fi
+
+    # The script runs under `set -e`, and a non-zero status from the LAST command
+    # in an EXIT trap replaces the script's own exit status. Every command above
+    # is diagnostics — a failing grep/cp/test must never turn a PASSING run into
+    # a failure (headless runs captured no screenshots and exited 2 this way).
+    # `return 0` here leaves a real `exit 1` from the test intact; verified.
+    return 0
 }
 trap cleanup EXIT
 
@@ -168,6 +179,24 @@ echo "[setup] Zed binary: $ZED_BINARY"
 echo "[setup] Mock server: $MOCK_SERVER"
 echo "[setup] Timeout: ${TEST_TIMEOUT}s"
 echo ""
+
+# ---- Smoke mode ----
+# E2E_SMOKE=1 runs a single tool-call phase instead of the full suite: the agent
+# reads magic-number.txt and echoes the value. Cheap enough to gate every CI
+# build on. The value is not in the prompt, so it can only come from a tool call.
+export E2E_SMOKE="${E2E_SMOKE:-0}"
+if [ "$E2E_SMOKE" = "1" ]; then
+    if [ -z "${E2E_SMOKE_FILE:-}" ]; then
+        export E2E_SMOKE_FILE="$PROJECT_DIR/magic-number.txt"
+        echo "4242" > "$E2E_SMOKE_FILE"
+        echo "[setup] E2E_SMOKE=1: wrote $E2E_SMOKE_FILE (single tool-call phase)"
+    else
+        # Caller pointed the smoke test at their own file — don't create it.
+        # Pointing it at a path that does not exist is how you verify the gate
+        # can actually fail.
+        echo "[setup] E2E_SMOKE=1: using caller-provided E2E_SMOKE_FILE=$E2E_SMOKE_FILE"
+    fi
+fi
 
 # ---- Start Go WebSocket Test Server ----
 echo "[mock-server] Starting Go test server (shares wsprotocol with production Helix)..."
@@ -264,11 +293,15 @@ if echo "$E2E_AGENTS" | grep -q "codex"; then
     CODEX_ACP_PKG="@agentclientprotocol/codex-acp"
     CODEX_ACP_VERSION=$(npm view "$CODEX_ACP_PKG" version 2>/dev/null || echo "unknown")
     echo "[setup] Using npm-installed codex-acp $CODEX_ACP_PKG (auto-install, latest=$CODEX_ACP_VERSION)"
+    # codex-acp model ids are "model[effort]" (ModelId.fromString in the package).
+    # E2E_CODEX_MODEL lets CI pick a cheaper model/effort than the local default.
+    CODEX_MODEL="${E2E_CODEX_MODEL:-gpt-5.6-terra}"
+    echo "[setup] Codex model: $CODEX_MODEL"
     AGENT_SERVER_ENTRIES="${AGENT_SERVER_ENTRIES}
     \"codex-acp\": {
       \"type\": \"registry\",
       \"default_mode\": \"agent-full-access\",
-      \"default_model\": \"gpt-5.6-terra\",
+      \"default_model\": \"${CODEX_MODEL}\",
       \"env\": {
         \"OPENAI_API_KEY\": \"${CODEX_KEY}\"
       }
@@ -285,18 +318,55 @@ AGENTEOF
 )
 fi
 
+# ---- Native (zed-agent) model selection ----
+# Defaults keep the historical Anthropic config. E2E_MODEL_PROVIDER=openai lets
+# CI drive the native agent from an OpenAI model instead — the OpenAI provider
+# accepts an explicit available_models entry, so new model ids work without a
+# Zed release.
+#
+# reasoning_effort defaults to "none" because Zed's OpenAI provider talks to
+# /v1/chat/completions, and that endpoint rejects any other effort when the
+# request carries function tools ("use /v1/responses or set reasoning_effort to
+# 'none'"). The smoke test needs tools, so "none" is the only working value —
+# and the cheapest.
+E2E_MODEL_PROVIDER="${E2E_MODEL_PROVIDER:-anthropic}"
+if [ "$E2E_MODEL_PROVIDER" = "openai" ]; then
+    E2E_MODEL="${E2E_MODEL:-gpt-5.6-luna}"
+    LANGUAGE_MODELS_JSON=$(cat << MODELEOF
+    "openai": {
+      "api_url": "${OPENAI_BASE_URL:-https://api.openai.com/v1}",
+      "available_models": [
+        {
+          "name": "${E2E_MODEL}",
+          "display_name": "${E2E_MODEL}",
+          "max_tokens": 128000,
+          "reasoning_effort": "${E2E_REASONING_EFFORT:-none}"
+        }
+      ]
+    }
+MODELEOF
+)
+else
+    E2E_MODEL="${E2E_MODEL:-claude-sonnet-4-6}"
+    LANGUAGE_MODELS_JSON=$(cat << MODELEOF
+    "anthropic": {
+      "api_url": "${ANTHROPIC_BASE_URL:-https://api.anthropic.com}"
+    }
+MODELEOF
+)
+fi
+echo "[setup] Native agent model: ${E2E_MODEL_PROVIDER}/${E2E_MODEL}"
+
 cat > "$ZED_CONFIG_DIR/settings.json" << JSONEOF
 {
 ${AGENT_SERVERS_JSON}
   "language_models": {
-    "anthropic": {
-      "api_url": "${ANTHROPIC_BASE_URL:-https://api.anthropic.com}"
-    }
+${LANGUAGE_MODELS_JSON}
   },
   "agent": {
     "default_model": {
-      "provider": "anthropic",
-      "model": "claude-sonnet-4-6"
+      "provider": "${E2E_MODEL_PROVIDER}",
+      "model": "${E2E_MODEL}"
     },
     "always_allow_tool_actions": true,
     "show_onboarding": false,

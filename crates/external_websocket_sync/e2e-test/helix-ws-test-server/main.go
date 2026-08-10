@@ -25,6 +25,13 @@
 //	          streaming-reveal task drains text into the markdown entity without re-emitting EntryUpdated,
 //	          so external_websocket_sync only sees stale snapshots until message_completed.)
 //
+// Smoke mode (E2E_SMOKE=1) replaces the phase chain above with a single phase:
+// the agent is asked to read a file holding a magic number and echo it back. It
+// proves the whole path end-to-end — WebSocket sync, ACP turn, agent tool call,
+// streamed response, interaction completion — for the price of one short turn.
+// It exists so CI can gate `zed --headless` on every build without burning the
+// tokens the full suite costs.
+//
 // Exit codes: 0 = all tests passed, 1 = test failure
 package main
 
@@ -213,7 +220,7 @@ func (d *testDriver) syncEventCallback(sessionID string, syncMsg *types.SyncMess
 			log.Printf("\n##################################################")
 			log.Printf("  ROUND %d/%d: Agent = %s", d.currentRoundIdx+1, len(d.agentRounds), d.round.agentName)
 			log.Printf("##################################################")
-			d.runPhase1()
+			d.startRound()
 			return
 		}
 
@@ -642,6 +649,41 @@ func (d *testDriver) sendQueryUiState(queryID string) {
 
 const phaseTimeout = 90 * time.Second
 
+// Smoke mode: a single tool-call phase instead of the full suite. See the
+// package comment. smokePhase is deliberately outside the 1..17 range so no
+// phase-numbered branch elsewhere can mistake it for a real phase.
+const (
+	smokePhase      = 100
+	smokeMagicValue = "4242"
+)
+
+var smokeMode = os.Getenv("E2E_SMOKE") == "1"
+
+// Absolute path, written by run_e2e.sh. Zed's file tools resolve a bare
+// relative path against the worktree name ("project/magic-number.txt"), so an
+// absolute path is the one form every agent resolves the same way.
+var smokeMagicFile = envOr("E2E_SMOKE_FILE", "/test/project/magic-number.txt")
+
+func envOr(name, fallback string) string {
+	if v := os.Getenv(name); v != "" {
+		return v
+	}
+	return fallback
+}
+
+// The completion router filters on a "req-phase{N}-" prefix, so the smoke
+// request id has to follow the same convention or its completion is dropped.
+var smokeReqTag = fmt.Sprintf("phase%d", smokePhase)
+
+// startRound begins a round with either the smoke phase or the full phase chain.
+func (d *testDriver) startRound() {
+	if smokeMode {
+		d.runSmokePhase()
+		return
+	}
+	d.runPhase1()
+}
+
 // startPhaseTimeout launches a watchdog that fires if the current phase
 // doesn't complete within phaseTimeout. On timeout it dumps diagnostic
 // state and advances to the next round (failing the current one).
@@ -732,6 +774,8 @@ func (d *testDriver) advanceAfterCompletion(completedPhase int) {
 	d.mu.Unlock()
 
 	switch completedPhase {
+	case smokePhase:
+		d.advanceToNextRound()
 	case 1:
 		d.mu.Lock()
 		d.phase = 2
@@ -866,7 +910,60 @@ func (d *testDriver) advanceToNextRound() {
 	log.Printf("[test-server] Waiting 10s for previous round events to drain...")
 	time.Sleep(10 * time.Second)
 
-	d.runPhase1()
+	d.startRound()
+}
+
+// runSmokePhase asks the agent to read a file and echo the number inside it.
+// The value is not derivable from the prompt, so a correct answer proves the
+// agent actually ran a tool rather than guessing.
+func (d *testDriver) runSmokePhase() {
+	d.mu.Lock()
+	d.phase = smokePhase
+	agent := d.round.agentName
+	d.mu.Unlock()
+
+	log.Printf("\n==================================================")
+	log.Printf("  [%s] SMOKE: tool call + single value", agent)
+	log.Printf("==================================================")
+	d.startPhaseTimeout(smokePhase)
+	d.sendChatMessage(
+		"Use your file-reading tool to read the file "+smokeMagicFile+" at the root of this project. "+
+			"Do not search for it. Reply with only the number it contains.",
+		d.round.reqID(smokeReqTag), agent)
+}
+
+// validateSmokeRound checks the single smoke phase. Callers must hold d.mu.
+func (d *testDriver) validateSmokeRound() roundResult {
+	agent := d.round.agentName
+	var errors []string
+
+	if len(d.filterRoundEvents("thread_created")) < 1 {
+		errors = append(errors, "Smoke: no thread_created event")
+	}
+	if !d.hasRoundCompletion(d.round.reqID(smokeReqTag)) {
+		errors = append(errors, "Smoke: no message_completed for "+d.round.reqID(smokeReqTag))
+	}
+
+	// The magic value must appear in a completed response. Smoke mode runs one
+	// turn, and the interaction for a brand-new thread carries no PromptMessage
+	// (it is created by thread_created, before any prompt text is attached), so
+	// match on the response alone rather than trying to identify the prompt.
+	found := false
+	for _, i := range d.store.GetAllInteractions() {
+		if strings.Contains(i.ResponseMessage, smokeMagicValue) {
+			found = true
+			log.Printf("[%s] Smoke: ✅ agent returned %s via tool call (interaction %s, state=%s)",
+				agent, smokeMagicValue, truncate(i.ID, 12), i.State)
+			break
+		}
+		log.Printf("[%s] Smoke: interaction %s state=%s response=%q",
+			agent, truncate(i.ID, 12), i.State, truncate(i.ResponseMessage, 200))
+	}
+	if !found {
+		errors = append(errors, "Smoke: response never contained magic value "+smokeMagicValue)
+	}
+
+	return roundResult{agentName: agent, passed: len(errors) == 0, errors: errors}
 }
 
 func (d *testDriver) runPhase1() {
@@ -1511,6 +1608,10 @@ func (d *testDriver) validateRound() roundResult {
 	log.Printf("  VALIDATION: %s", agent)
 	log.Printf("==================================================")
 
+	if smokeMode {
+		return d.validateSmokeRound()
+	}
+
 	var errors []string
 
 	// --- Event-level validation ---
@@ -2139,7 +2240,12 @@ func (d *testDriver) validateStore() bool {
 	log.Printf("[store] Interactions in store: %d", len(interactions))
 
 	// Each round creates 5 threads (phases 1, 3, 8, 13, 15) = 5 sessions per round.
-	expectedSessions := 5 * len(d.agentRounds)
+	// Smoke mode runs one phase, so one thread/session per round.
+	perRoundSessions := 5
+	if smokeMode {
+		perRoundSessions = 1
+	}
+	expectedSessions := perRoundSessions * len(d.agentRounds)
 	if len(sessions) < expectedSessions {
 		errors = append(errors, fmt.Sprintf("Expected at least %d sessions (%d rounds * 4 threads), got %d",
 			expectedSessions, len(d.agentRounds), len(sessions)))
@@ -2262,13 +2368,18 @@ func (d *testDriver) validateStore() bool {
 	//   - Phase 9:  on-the-fly interaction (from user interrupt)
 	//   - Phase 11: sendChatMessageToExternalAgent via spectask routing
 	//   - Phase 15: thread_created → new session + interaction (streaming-cadence)
-	expectedCompleted := 8 * len(d.agentRounds)
+	// Smoke mode runs a single turn per round, so one of each.
+	perRoundCompleted := 8
+	if smokeMode {
+		perRoundCompleted = 1
+	}
+	expectedCompleted := perRoundCompleted * len(d.agentRounds)
 	if completedInteractions < expectedCompleted {
 		errors = append(errors, fmt.Sprintf("Expected at least %d completed interactions, got %d", expectedCompleted, completedInteractions))
 	}
 
 	// Expect at least 8 interactions WITH content per round.
-	expectedWithContent := 8 * len(d.agentRounds)
+	expectedWithContent := perRoundCompleted * len(d.agentRounds)
 	if completedWithContent < expectedWithContent {
 		errors = append(errors, fmt.Sprintf("Expected at least %d completed interactions with content, got %d (accumulation may be broken)",
 			expectedWithContent, completedWithContent))
