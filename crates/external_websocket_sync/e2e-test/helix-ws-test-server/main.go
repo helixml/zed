@@ -25,6 +25,13 @@
 //	          streaming-reveal task drains text into the markdown entity without re-emitting EntryUpdated,
 //	          so external_websocket_sync only sees stale snapshots until message_completed.)
 //
+// Smoke mode (E2E_SMOKE=1) replaces the phase chain above with a single phase:
+// the agent is asked to read a file holding a magic number and echo it back. It
+// proves the whole path end-to-end — WebSocket sync, ACP turn, agent tool call,
+// streamed response, interaction completion — for the price of one short turn.
+// It exists so CI can gate `zed --headless` on every build without burning the
+// tokens the full suite costs.
+//
 // Exit codes: 0 = all tests passed, 1 = test failure
 package main
 
@@ -74,18 +81,18 @@ type roundState struct {
 	phase8Completions   int    // number of message_completed events received for phase 8 thread
 
 	// Phase 9: rapid 3-turn cancel state
-	phase9ThreadID  string // thread ID (reuses phase 8's thread)
-	phase9RapidSent bool   // whether the rapid sequence has been sent
-	phase9Completions int  // number of message_completed events for phase 9
+	phase9ThreadID    string // thread ID (reuses phase 8's thread)
+	phase9RapidSent   bool   // whether the rapid sequence has been sent
+	phase9Completions int    // number of message_completed events for phase 9
 
 	// Phase 10: user-created thread (multi-thread sync)
-	phase10NewThreadID       string // synthetic thread ID injected via ProcessSyncEvent
-	phase10WorkSessionFound  bool   // whether the work session was created
-	phase10ChatCompleted     bool   // whether chat on the new thread completed
+	phase10NewThreadID      string // synthetic thread ID injected via ProcessSyncEvent
+	phase10WorkSessionFound bool   // whether the work session was created
+	phase10ChatCompleted    bool   // whether chat on the new thread completed
 
 	// Phase 11: spectask routing (verifies findConnectedSessionForSpecTask
 	// picks the most recently active session)
-	phase11RoutedSessionID string // which session the routing picked
+	phase11RoutedSessionID  string // which session the routing picked
 	phase11ExpectedThreadID string // which thread we expect the message to land on
 	phase11Completed        bool   // whether the routed message completed
 
@@ -93,10 +100,10 @@ type roundState struct {
 	phase12Completed bool // whether the reconnected message completed
 
 	// Phase 13: Helix-initiated cancel via cancel_current_turn
-	phase13ThreadID     string // thread ID for the long-running turn
-	phase13CancelSent   bool   // whether cancel_current_turn has been sent
-	phase13TurnCancelled bool  // whether turn_cancelled event was received
-	phase13CancelStatus string // status from turn_cancelled ("cancelled" or "noop")
+	phase13ThreadID      string // thread ID for the long-running turn
+	phase13CancelSent    bool   // whether cancel_current_turn has been sent
+	phase13TurnCancelled bool   // whether turn_cancelled event was received
+	phase13CancelStatus  string // status from turn_cancelled ("cancelled" or "noop")
 
 	// Phase 14: cancel no-op (request_id not found)
 	phase14TurnCancelled bool   // whether turn_cancelled event was received
@@ -104,7 +111,6 @@ type roundState struct {
 
 	// Phase 15: streaming-cadence regression test
 	phase15ThreadID    string             // thread ID created in phase 15
-	phase15ChatSentAt  time.Time          // when we sent the chat_message
 	phase15CompletedAt time.Time          // when message_completed arrived
 	phase15Adds        []phase15AddSample // per message_added: timestamp + content length
 	phase15FinalLen    int                // length of the final assistant content
@@ -210,9 +216,9 @@ type testDriver struct {
 	agentID string // agent connection ID (discovered at runtime)
 
 	// Multi-agent round management
-	agentRounds    []string     // agent names to test (e.g., ["zed-agent", "claude"])
+	agentRounds     []string // agent names to test (e.g., ["zed-agent", "claude"])
 	currentRoundIdx int
-	round          *roundState  // current round state
+	round           *roundState // current round state
 
 	// Collected round results for final summary
 	roundResults []roundResult
@@ -223,7 +229,7 @@ type testDriver struct {
 	roundGeneration int
 
 	// Per-phase timeout tracking
-	phaseStarted time.Time
+	phaseStarted  time.Time
 	phaseTimedOut map[int]bool // phases that timed out (skip in validation)
 
 	// Phases whose success condition has been met but which have not yet
@@ -270,7 +276,7 @@ func (d *testDriver) syncEventCallback(sessionID string, syncMsg *types.SyncMess
 			log.Printf("  ROUND %d/%d: Agent = %s", d.currentRoundIdx+1, len(d.agentRounds), d.round.agentName)
 			log.Printf("##################################################")
 			d.stampRoundAgentOnSeedSession(d.round.agentName)
-			d.runPhase1()
+			d.startRound()
 			return
 		}
 
@@ -716,6 +722,41 @@ func (d *testDriver) sendQueryUiState(queryID string) {
 
 const phaseTimeout = 90 * time.Second
 
+// Smoke mode: a single tool-call phase instead of the full suite. See the
+// package comment. smokePhase is deliberately outside the 1..17 range so no
+// phase-numbered branch elsewhere can mistake it for a real phase.
+const (
+	smokePhase      = 100
+	smokeMagicValue = "4242"
+)
+
+var smokeMode = os.Getenv("E2E_SMOKE") == "1"
+
+// Absolute path, written by run_e2e.sh. Zed's file tools resolve a bare
+// relative path against the worktree name ("project/magic-number.txt"), so an
+// absolute path is the one form every agent resolves the same way.
+var smokeMagicFile = envOr("E2E_SMOKE_FILE", "/test/project/magic-number.txt")
+
+func envOr(name, fallback string) string {
+	if v := os.Getenv(name); v != "" {
+		return v
+	}
+	return fallback
+}
+
+// The completion router filters on a "req-phase{N}-" prefix, so the smoke
+// request id has to follow the same convention or its completion is dropped.
+var smokeReqTag = fmt.Sprintf("phase%d", smokePhase)
+
+// startRound begins a round with either the smoke phase or the full phase chain.
+func (d *testDriver) startRound() {
+	if smokeMode {
+		d.runSmokePhase()
+		return
+	}
+	d.runPhase1()
+}
+
 // startPhaseTimeout launches a watchdog that fires if the current phase
 // doesn't complete within phaseTimeout. On timeout it dumps diagnostic
 // state and advances to the next round (failing the current one).
@@ -825,6 +866,8 @@ func (d *testDriver) advanceAfterCompletion(completedPhase int) {
 	d.mu.Unlock()
 
 	switch completedPhase {
+	case smokePhase:
+		d.advanceToNextRound()
 	case 1:
 		d.mu.Lock()
 		d.phase = 2
@@ -960,7 +1003,60 @@ func (d *testDriver) advanceToNextRound() {
 	log.Printf("[test-server] Waiting 10s for previous round events to drain...")
 	time.Sleep(10 * time.Second)
 
-	d.runPhase1()
+	d.startRound()
+}
+
+// runSmokePhase asks the agent to read a file and echo the number inside it.
+// The value is not derivable from the prompt, so a correct answer proves the
+// agent actually ran a tool rather than guessing.
+func (d *testDriver) runSmokePhase() {
+	d.mu.Lock()
+	d.phase = smokePhase
+	agent := d.round.agentName
+	d.mu.Unlock()
+
+	log.Printf("\n==================================================")
+	log.Printf("  [%s] SMOKE: tool call + single value", agent)
+	log.Printf("==================================================")
+	d.startPhaseTimeout(smokePhase)
+	d.sendChatMessage(
+		"Use your file-reading tool to read the file "+smokeMagicFile+" at the root of this project. "+
+			"Do not search for it. Reply with only the number it contains.",
+		d.round.reqID(smokeReqTag), agent)
+}
+
+// validateSmokeRound checks the single smoke phase. Callers must hold d.mu.
+func (d *testDriver) validateSmokeRound() roundResult {
+	agent := d.round.agentName
+	var errors []string
+
+	if len(d.filterRoundEvents("thread_created")) < 1 {
+		errors = append(errors, "Smoke: no thread_created event")
+	}
+	if !d.hasRoundCompletion(d.round.reqID(smokeReqTag)) {
+		errors = append(errors, "Smoke: no message_completed for "+d.round.reqID(smokeReqTag))
+	}
+
+	// The magic value must appear in a completed response. Smoke mode runs one
+	// turn, and the interaction for a brand-new thread carries no PromptMessage
+	// (it is created by thread_created, before any prompt text is attached), so
+	// match on the response alone rather than trying to identify the prompt.
+	found := false
+	for _, i := range d.store.GetAllInteractions() {
+		if strings.Contains(i.ResponseMessage, smokeMagicValue) {
+			found = true
+			log.Printf("[%s] Smoke: ✅ agent returned %s via tool call (interaction %s, state=%s)",
+				agent, smokeMagicValue, truncate(i.ID, 12), i.State)
+			break
+		}
+		log.Printf("[%s] Smoke: interaction %s state=%s response=%q",
+			agent, truncate(i.ID, 12), i.State, truncate(i.ResponseMessage, 200))
+	}
+	if !found {
+		errors = append(errors, "Smoke: response never contained magic value "+smokeMagicValue)
+	}
+
+	return roundResult{agentName: agent, passed: len(errors) == 0, errors: errors}
 }
 
 func (d *testDriver) runPhase1() {
@@ -1103,10 +1199,10 @@ func (d *testDriver) runPhase9() {
 	d.round.phase9ThreadID = d.round.phase8ThreadID
 	d.mu.Unlock()
 
-	// Turn 1: start a long-running response. The syncEventCallback will
+	// Turn 1: start a bounded streaming response. The syncEventCallback will
 	// fire the rapid sequence as soon as the first assistant token arrives.
 	d.sendChatMessage(
-		"Write a detailed explanation of merge sort with code examples.",
+		"Output the numbers 1 through 100, one per line, and nothing else.",
 		d.round.reqID("phase9-initial"),
 		agent,
 		d.round.phase8ThreadID,
@@ -1393,7 +1489,6 @@ func (d *testDriver) runPhase15() {
 	log.Println("  external_websocket_sync sees fresh content as it grows).")
 
 	d.mu.Lock()
-	d.round.phase15ChatSentAt = time.Now()
 	d.mu.Unlock()
 
 	// Long-form, plain-prose prompt with NO tool calls. ~400 words gives ~30+
@@ -1606,6 +1701,10 @@ func (d *testDriver) validateRound() roundResult {
 	log.Printf("  VALIDATION: %s", agent)
 	log.Printf("==================================================")
 
+	if smokeMode {
+		return d.validateSmokeRound()
+	}
+
 	var errors []string
 
 	// --- Event-level validation ---
@@ -1679,8 +1778,10 @@ func (d *testDriver) validateRound() roundResult {
 				agent, activeView, truncate(threadID, 12), entryCount)
 		}
 
-		// Validate MCP server status (only for first round -- MCP servers are agent-independent)
-		if d.currentRoundIdx == 0 {
+		// Validate the Native Agent's MCP server status. External ACP agents own
+		// their MCP surface and do not necessarily expose Zed context servers in
+		// ui_state_response.
+		if agent == "zed-agent" {
 			mcpServers, _ := resp.Data["mcp_servers"].(map[string]interface{})
 			if len(mcpServers) == 0 {
 				errors = append(errors, "Phase 6: ui_state_response mcp_servers is empty (expected at least slow-mcp-test)")
@@ -1943,8 +2044,12 @@ func (d *testDriver) validateRound() roundResult {
 			// for long responses), which makes the midpoint metric agent-specific.
 			// The "did everything land in the final burst?" question is the actual
 			// regression signal we care about and works uniformly across agents.
-			if !d.round.phase15ChatSentAt.IsZero() && !d.round.phase15CompletedAt.IsZero() && d.round.phase15FinalLen > 0 {
-				totalElapsed := d.round.phase15CompletedAt.Sub(d.round.phase15ChatSentAt)
+			// Measure from the first assistant text sample, not from prompt dispatch.
+			// ACP agents may emit no user-visible text while the model reasons; that
+			// inference gap is not evidence that Zed's streaming-reveal drain stalled.
+			if len(d.round.phase15Adds) > 0 && !d.round.phase15CompletedAt.IsZero() && d.round.phase15FinalLen > 0 {
+				streamStartedAt := d.round.phase15Adds[0].ts
+				totalElapsed := d.round.phase15CompletedAt.Sub(streamStartedAt)
 				finalWindowStart := d.round.phase15CompletedAt.Add(-totalElapsed / 5) // last 20%
 
 				lenBeforeFinalWindow := 0
@@ -1967,6 +2072,19 @@ func (d *testDriver) validateRound() roundResult {
 						pctInFinalWindow, bytesInFinalWindow, d.round.phase15FinalLen, maxPctInFinalWindow))
 				}
 			}
+		}
+	}
+
+	// A healthy round must never emit the terminal error used by the silent
+	// watchdog. Codex runs set HELIX_ACP_SILENCE_TIMEOUT_SECS=1 so any accidental
+	// global watchdog would fire during normal model reasoning.
+	for _, event := range d.round.events {
+		if event.EventType != "chat_response_error" {
+			continue
+		}
+		errMsg, _ := event.Data["error"].(string)
+		if strings.Contains(errMsg, "helix_silent_prompt_wedge") {
+			errors = append(errors, "Silent-prompt watchdog fired during a healthy round: "+errMsg)
 		}
 	}
 
@@ -2215,7 +2333,12 @@ func (d *testDriver) validateStore() bool {
 	log.Printf("[store] Interactions in store: %d", len(interactions))
 
 	// Each round creates 5 threads (phases 1, 3, 8, 13, 15) = 5 sessions per round.
-	expectedSessions := 5 * len(d.agentRounds)
+	// Smoke mode runs one phase, so one thread/session per round.
+	perRoundSessions := 5
+	if smokeMode {
+		perRoundSessions = 1
+	}
+	expectedSessions := perRoundSessions * len(d.agentRounds)
 	if len(sessions) < expectedSessions {
 		errors = append(errors, fmt.Sprintf("Expected at least %d sessions (%d rounds * 4 threads), got %d",
 			expectedSessions, len(d.agentRounds), len(sessions)))
@@ -2338,13 +2461,18 @@ func (d *testDriver) validateStore() bool {
 	//   - Phase 9:  on-the-fly interaction (from user interrupt)
 	//   - Phase 11: sendChatMessageToExternalAgent via spectask routing
 	//   - Phase 15: thread_created → new session + interaction (streaming-cadence)
-	expectedCompleted := 8 * len(d.agentRounds)
+	// Smoke mode runs a single turn per round, so one of each.
+	perRoundCompleted := 8
+	if smokeMode {
+		perRoundCompleted = 1
+	}
+	expectedCompleted := perRoundCompleted * len(d.agentRounds)
 	if completedInteractions < expectedCompleted {
 		errors = append(errors, fmt.Sprintf("Expected at least %d completed interactions, got %d", expectedCompleted, completedInteractions))
 	}
 
 	// Expect at least 8 interactions WITH content per round.
-	expectedWithContent := 8 * len(d.agentRounds)
+	expectedWithContent := perRoundCompleted * len(d.agentRounds)
 	if completedWithContent < expectedWithContent {
 		errors = append(errors, fmt.Sprintf("Expected at least %d completed interactions with content, got %d (accumulation may be broken)",
 			expectedWithContent, completedWithContent))

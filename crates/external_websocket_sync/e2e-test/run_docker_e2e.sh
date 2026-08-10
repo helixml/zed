@@ -5,7 +5,7 @@ set -euo pipefail
 #
 # Prerequisites:
 #   - Pre-built Zed binary at ./zed-binary (from: ./stack build-zed release, then cp zed-build/zed here)
-#   - ANTHROPIC_API_KEY set in environment (or in ~/.env.usercreds)
+#   - Provider API key for each LLM-backed agent selected in E2E_AGENTS
 #
 # Usage:
 #   ./run_docker_e2e.sh              # build Go test server + Docker image + run
@@ -24,9 +24,12 @@ HELIX_DIR="$(cd "$ZED_DIR/../helix" 2>/dev/null && pwd || echo "")"
 if [ -n "$HELIX_DIR" ]; then
     for envfile in "$HELIX_DIR/.env" "$HELIX_DIR/.env.usercreds"; do
         if [ -f "$envfile" ]; then
-            # Always pick up ANTHROPIC_API_KEY and ANTHROPIC_BASE_URL from the file
+            # Pick up provider credentials without overwriting explicit env values.
             if grep -q ANTHROPIC_API_KEY "$envfile"; then
                 [ -z "${ANTHROPIC_API_KEY:-}" ] && ANTHROPIC_API_KEY=$(grep '^ANTHROPIC_API_KEY=' "$envfile" | cut -d= -f2-)
+            fi
+            if grep -q OPENAI_API_KEY "$envfile"; then
+                [ -z "${OPENAI_API_KEY:-}" ] && OPENAI_API_KEY=$(grep '^OPENAI_API_KEY=' "$envfile" | cut -d= -f2-)
             fi
             if grep -q ANTHROPIC_BASE_URL "$envfile"; then
                 ANTHROPIC_BASE_URL=$(grep '^ANTHROPIC_BASE_URL=' "$envfile" | cut -d= -f2-)
@@ -36,9 +39,16 @@ if [ -n "$HELIX_DIR" ]; then
     done
 fi
 
-if [ -z "${ANTHROPIC_API_KEY:-}" ]; then
+E2E_AGENTS="${E2E_AGENTS:-zed-agent}"
+if echo "$E2E_AGENTS" | grep -q "claude" && [ -z "${ANTHROPIC_API_KEY:-}" ]; then
     echo "ERROR: ANTHROPIC_API_KEY not set."
     echo "Either: export ANTHROPIC_API_KEY=sk-..."
+    echo "Or:     add it to ${HELIX_DIR:-(helix repo)}/.env.usercreds"
+    exit 1
+fi
+if echo "$E2E_AGENTS" | grep -q "codex" && [ -z "${OPENAI_API_KEY:-}" ]; then
+    echo "ERROR: OPENAI_API_KEY not set."
+    echo "Either: export OPENAI_API_KEY=sk-..."
     echo "Or:     add it to ${HELIX_DIR:-(helix repo)}/.env.usercreds"
     exit 1
 fi
@@ -83,7 +93,6 @@ SCREENSHOTS_DIR="$SCRIPT_DIR/screenshots"
 mkdir -p "$SCREENSHOTS_DIR"
 
 # Run E2E test
-E2E_AGENTS="${E2E_AGENTS:-zed-agent}"
 echo "=== Running E2E test (agents: $E2E_AGENTS) ==="
 
 # Mount local claude-agent-acp if available (for testing local changes).
@@ -102,18 +111,32 @@ if [ -n "${ANTHROPIC_BASE_URL:-}" ]; then
     ANTHROPIC_BASE_URL_ARG="-e ANTHROPIC_BASE_URL=$ANTHROPIC_BASE_URL"
 fi
 
+E2E_RC=0
 docker run --rm \
     --add-host=host.docker.internal:host-gateway \
-    -e ANTHROPIC_API_KEY="$ANTHROPIC_API_KEY" \
+    -e ANTHROPIC_API_KEY="${ANTHROPIC_API_KEY:-}" \
+    -e OPENAI_API_KEY="${OPENAI_API_KEY:-}" \
     ${ANTHROPIC_BASE_URL_ARG} \
     -e E2E_AGENTS="$E2E_AGENTS" \
     -e E2E_HEADLESS="${E2E_HEADLESS:-0}" \
+    -e E2E_SMOKE="${E2E_SMOKE:-0}" \
+    -e E2E_SMOKE_FILE="${E2E_SMOKE_FILE:-}" \
+    -e E2E_CODEX_MODEL="${E2E_CODEX_MODEL:-}" \
+    -e E2E_MODEL_PROVIDER="${E2E_MODEL_PROVIDER:-}" \
+    -e E2E_MODEL="${E2E_MODEL:-}" \
+    -e E2E_REASONING_EFFORT="${E2E_REASONING_EFFORT:-}" \
+    -e HELIX_ACP_SILENCE_TIMEOUT_SECS="${HELIX_ACP_SILENCE_TIMEOUT_SECS:-}" \
     -v "$SCREENSHOTS_DIR:/test/screenshots" \
     $CLAUDE_ACP_MOUNT \
-    zed-ws-e2e
+    zed-ws-e2e || E2E_RC=$?
 
-# Report screenshots
-SHOT_COUNT=$(ls -1 "$SCREENSHOTS_DIR"/*.png 2>/dev/null | wc -l || echo 0)
+# Report screenshots.
+# The fallback belongs on the ASSIGNMENT, not inside the substitution: `ls` exits
+# non-zero when the glob matches nothing (a headless run captures no
+# screenshots), `set -o pipefail` propagates that through `| wc -l`, and `set -e`
+# then kills the script. Putting `|| echo 0` inside the substitution instead
+# yields the two-line string "0\n0", which breaks the `-gt` test below.
+SHOT_COUNT=$(ls -1 "$SCREENSHOTS_DIR"/*.png 2>/dev/null | wc -l) || SHOT_COUNT=0
 if [ "$SHOT_COUNT" -gt 0 ]; then
     echo ""
     echo "=== Screenshots ==="
@@ -121,3 +144,9 @@ if [ "$SHOT_COUNT" -gt 0 ]; then
     ls -lh "$SCREENSHOTS_DIR"/*.png | tail -5
     echo "(showing last 5)"
 fi
+
+# Exit with the test's status, not whatever the reporting above happened to
+# return. A headless run captures no screenshots, so the trailing `[ -gt ]` was
+# the script's last command and its status became the script's — reporting a
+# failure for a test that passed.
+exit "$E2E_RC"

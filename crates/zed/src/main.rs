@@ -882,7 +882,7 @@ fn main() {
         .detach_and_log_err(cx);
 
         if args.headless {
-            initialize_headless(app_state.clone(), cx);
+            initialize_headless(app_state.clone(), args.paths_or_urls.clone(), cx);
             return;
         }
 
@@ -1406,12 +1406,13 @@ async fn installation_id(db: KeyValueStore) -> Result<IdType> {
 /// Initialize Zed in headless mode: no windows, no workspace.
 ///
 /// Sets up the external WebSocket sync (Helix) and the agent thread handler so the
-/// process can drive ACP threads from the WebSocket without any UI. The GPUI event
-/// loop continues running until the process is signalled.
+/// process can drive ACP threads from the WebSocket without any UI, and opens each
+/// path argument as a worktree so agent file tools can reach the repo. The GPUI
+/// event loop continues running until the process is signalled.
 ///
 /// Without `external_websocket_sync` enabled this is effectively a no-op idle loop —
 /// the flag is mostly useful for the Helix integration.
-fn initialize_headless(app_state: Arc<AppState>, cx: &mut App) {
+fn initialize_headless(app_state: Arc<AppState>, paths: Vec<String>, cx: &mut App) {
     log::info!("🟢 [HEADLESS] Starting Zed in headless mode (no windows, no display)");
     eprintln!("🟢 [HEADLESS] Starting Zed in headless mode (no windows, no display)");
 
@@ -1437,6 +1438,36 @@ fn initialize_headless(app_state: Arc<AppState>, cx: &mut App) {
             },
             cx,
         );
+
+        // Open the paths from the command line as worktrees. Headless mode skips
+        // restore_or_create_workspace, and it is the workspace that normally turns
+        // a path argument into a worktree — so without this the project is empty
+        // and every agent file tool fails with "Path ... is not in the project".
+        for path in paths {
+            let abs_path = std::path::PathBuf::from(&path);
+            let abs_path = if abs_path.is_absolute() {
+                abs_path
+            } else {
+                match std::env::current_dir() {
+                    Ok(cwd) => cwd.join(abs_path),
+                    Err(e) => {
+                        log::error!("🔴 [HEADLESS] cannot resolve {path:?} against cwd: {e:#}");
+                        continue;
+                    }
+                }
+            };
+            let task = project.update(cx, |project, cx| {
+                project.find_or_create_worktree(abs_path.clone(), true, cx)
+            });
+            cx.spawn(async move |_| match task.await {
+                Ok(_) => log::info!("🟢 [HEADLESS] Opened worktree {}", abs_path.display()),
+                Err(e) => log::error!(
+                    "🔴 [HEADLESS] Failed to open worktree {}: {e:#}",
+                    abs_path.display()
+                ),
+            })
+            .detach();
+        }
 
         let thread_store = agent::ThreadStore::global(cx);
 
@@ -1560,6 +1591,7 @@ fn initialize_headless(app_state: Arc<AppState>, cx: &mut App) {
     #[cfg(not(feature = "external_websocket_sync"))]
     {
         let _ = app_state;
+        let _ = paths;
         let _ = cx;
         log::warn!(
             "🟡 [HEADLESS] Built without `external_websocket_sync` feature; --headless has nothing to do"
