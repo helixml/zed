@@ -61,9 +61,24 @@ async fn create_native_session_when_ready(
 }
 
 fn report_thread_open_failure(request: &ThreadOpenRequest, error: &anyhow::Error) {
-    let Some(request_id) = request.request_id.clone().filter(|id| !id.is_empty()) else {
-        return;
-    };
+    // Report even when there is no request_id to correlate against.
+    //
+    // "this thread no longer exists" is a property of the THREAD, not of any
+    // particular request, and Helix's recovery gate keys on
+    // isAuthoritativeMissingThreadError(error) && acp_thread_id != "" — it does
+    // not need a request_id (that is only used for the optional HTTP-streaming
+    // reply). Bailing out early here therefore starved a recovery path that was
+    // otherwise fully wired up.
+    //
+    // The case that matters is exactly the one with no request_id: the
+    // open_thread sent automatically on reconnect. When a task's workspace has
+    // been reaped, that load fails with "Resource not found", the error was
+    // logged locally and never sent, Helix kept a zed_thread_id pointing at a
+    // session the agent no longer has, and every subsequent reconnect
+    // re-failed the same way — surfacing to the user as a permanently blank
+    // agent panel. Sending it lets recoverMissingThread clear the stale pointer
+    // so the next message forks a clean thread.
+    let request_id = request.request_id.clone().unwrap_or_default();
     let event = SyncEvent::ThreadLoadError {
         acp_thread_id: request.acp_thread_id.clone(),
         request_id,
@@ -3086,7 +3101,16 @@ mod thread_open_failure_tests {
     }
 
     #[test]
-    fn uncorrelated_thread_open_failure_emits_no_event() {
+    /// A load failure with NO request_id must still be reported.
+    ///
+    /// This previously asserted the opposite (emits_no_event), which encoded the
+    /// bug: the reconnect-driven open_thread carries no request_id, so when a
+    /// task's workspace had been reaped the "Resource not found" was swallowed,
+    /// Helix never learned the thread was gone, and the user got a permanently
+    /// blank agent panel. Helix's recovery gate is
+    /// isAuthoritativeMissingThreadError(error) && acp_thread_id != "" — it does
+    /// not need a request_id — so withholding the event only starved recovery.
+    fn uncorrelated_thread_open_failure_still_reports() {
         let _guard = super::TEST_WEBSOCKET_SERVICE_GUARD.lock();
         let (service, mut events) = WebSocketSync::new_test();
         *WEBSOCKET_SERVICE.lock() = Some(service);
@@ -3097,10 +3121,28 @@ mod thread_open_failure_tests {
                 request_id: None,
                 agent_name: None,
             },
-            &anyhow::anyhow!("no thread found"),
+            &anyhow::anyhow!(
+                "Resource not found: uncorrelated-thread: {{\"uri\": \"uncorrelated-thread\"}}"
+            ),
         );
 
-        assert!(events.try_recv().is_err());
+        let event = events.try_recv().expect(
+            "a missing-thread failure must be reported even with no request_id, \
+             otherwise Helix can never clear the stale zed_thread_id",
+        );
+        match event {
+            SyncEvent::ThreadLoadError { acp_thread_id, request_id, error } => {
+                assert_eq!(acp_thread_id, "uncorrelated-thread");
+                assert_eq!(request_id, "", "uncorrelated failures carry an empty request_id");
+                // Helix matches on this exact prefix before recovering.
+                assert!(
+                    error.starts_with("Failed to load thread: Resource not found: "),
+                    "error must keep the prefix Helix's isAuthoritativeMissingThreadError \
+                     requires, got: {error}"
+                );
+            }
+            other => panic!("expected ThreadLoadError, got {other:?}"),
+        }
         *WEBSOCKET_SERVICE.lock() = None;
     }
 
