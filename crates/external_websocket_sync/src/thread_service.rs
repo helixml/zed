@@ -1821,15 +1821,12 @@ pub fn setup_thread_handler(
                 announce_full = true;
             }
 
-            match cx.update(|cx| resync_all_elicitations(cx, announce_full)) {
-                Ok(count) if count > 0 => {
-                    log::info!("[ELICITATION] Heartbeat: {} question(s) outstanding", count);
-                }
-                Ok(_) => {}
-                Err(e) => {
-                    log::warn!("[ELICITATION] Heartbeat stopping: {}", e);
-                    return;
-                }
+            // `AsyncApp::update` returns the closure's value directly — it does not wrap
+            // it in a Result — so there is no teardown error to observe here. The task is
+            // detached and simply stops with the app.
+            let count = cx.update(|cx| resync_all_elicitations(cx, announce_full));
+            if count > 0 {
+                log::info!("[ELICITATION] Heartbeat: {} question(s) outstanding", count);
             }
         }
     })
@@ -1895,8 +1892,11 @@ pub fn setup_thread_handler(
                 })
             });
 
+            // `AsyncApp::update` is infallible and returns the closure's value directly;
+            // the only Result here is the entity update, which fails if the thread was
+            // dropped between the lookup above and this call.
             match result {
-                Ok(Ok(status)) => {
+                Ok(status) => {
                     log::info!(
                         "[ELICITATION] Answer for {} → {}",
                         request.elicitation_id,
@@ -1909,7 +1909,7 @@ pub fn setup_thread_handler(
                     };
                     send_elicitation_ack(&request.elicitation_id, status, error);
                 }
-                Ok(Err(e)) | Err(e) => {
+                Err(e) => {
                     log::warn!(
                         "[ELICITATION] Failed to answer {}: {}",
                         request.elicitation_id,
