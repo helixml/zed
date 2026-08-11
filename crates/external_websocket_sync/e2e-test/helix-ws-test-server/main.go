@@ -1887,6 +1887,10 @@ func (d *testDriver) runElicitationPhase(sessID, threadID string) {
 
 	ctx := context.Background()
 	elicitationID := fmt.Sprintf("elicit-e2e-%s-%d", agent, time.Now().UnixNano())
+	// Real Zed stamps elicitation events with the turn-scoped request_id. Sending one
+	// keeps this phase on the mapped-request path rather than the empty-request_id
+	// fallback, which is a different code path with its own test coverage.
+	requestID := fmt.Sprintf("req-phase18-%s", agent)
 
 	// A schema shaped like the real adapter's: a question with two labelled options plus
 	// the sibling free-text field. Asserting it survives the round trip non-empty guards
@@ -1922,6 +1926,7 @@ func (d *testDriver) runElicitationPhase(sessID, threadID string) {
 		Data: map[string]interface{}{
 			"acp_thread_id":    threadID,
 			"elicitation_id":   elicitationID,
+			"request_id":       requestID,
 			"entry_index":      "0",
 			"mode":             "form",
 			"message":          "Which cache backend should I use?",
@@ -2006,6 +2011,7 @@ func (d *testDriver) runElicitationPhase(sessID, threadID string) {
 		Data: map[string]interface{}{
 			"acp_thread_id":    threadID,
 			"elicitation_id":   resolvedID,
+			"request_id":       requestID,
 			"entry_index":      "0",
 			"mode":             "form",
 			"message":          "Which cache backend should I use?",
@@ -2830,7 +2836,10 @@ func (d *testDriver) validateStore() bool {
 					if e.Type == "text" {
 						hasText = true
 					}
-					if e.Type != "text" && e.Type != "tool_call" && e.Type != "plan" {
+					// "elicitation" is a question the agent asked the user; it lives
+					// inline in the transcript so it renders in conversation order and
+					// stays there once answered (Phase 18).
+					if e.Type != "text" && e.Type != "tool_call" && e.Type != "plan" && e.Type != "elicitation" {
 						errors = append(errors, fmt.Sprintf("Interaction %s: unexpected entry type %q",
 							truncate(i.ID, 12), e.Type))
 					}
