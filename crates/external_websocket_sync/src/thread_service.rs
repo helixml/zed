@@ -609,6 +609,249 @@ async fn trailing_flush_timer(key: String) {
     }
 }
 
+/// The `toolCallId` the agent attached to an elicitation, if any. It rides on the
+/// request's scope rather than on the request itself.
+fn elicitation_tool_call_id(request: &acp::CreateElicitationRequest) -> String {
+    match request.scope() {
+        acp::ElicitationScope::Session(scope) => scope
+            .tool_call_id
+            .as_ref()
+            .map(|id| id.0.to_string())
+            .unwrap_or_default(),
+        _ => String::new(),
+    }
+}
+
+/// Mode name plus the `requestedSchema` as verbatim JSON. The schema is passed straight
+/// through because Helix renders the question from it — flattening here would silently
+/// drop options and descriptions the agent offered.
+fn elicitation_mode_and_schema(
+    request: &acp::CreateElicitationRequest,
+) -> (String, serde_json::Value) {
+    match &request.mode {
+        acp::ElicitationMode::Form(mode) => (
+            "form".to_string(),
+            serde_json::to_value(&mode.requested_schema).unwrap_or(serde_json::Value::Null),
+        ),
+        acp::ElicitationMode::Url(mode) => (
+            "url".to_string(),
+            serde_json::json!({ "url": mode.url }),
+        ),
+        _ => ("other".to_string(), serde_json::Value::Null),
+    }
+}
+
+/// Announce a question to Helix. Safe to call repeatedly for the same elicitation —
+/// the Go side upserts by id, which is what makes the reconnect resync cheap.
+fn send_elicitation_requested(
+    thread: &AcpThread,
+    acp_thread_id: &str,
+    request_id: &str,
+    elicitation_id: &acp_thread::ElicitationEntryId,
+) {
+    let Some((entry_index, elicitation)) = thread.elicitation(elicitation_id) else {
+        log::warn!(
+            "[ELICITATION] Requested event for unknown elicitation {} on thread {}",
+            elicitation_id.0,
+            acp_thread_id
+        );
+        return;
+    };
+    let (mode, requested_schema) = elicitation_mode_and_schema(&elicitation.request);
+    log::info!(
+        "[ELICITATION] Question on thread {} entry {} id {} ({})",
+        acp_thread_id,
+        entry_index,
+        elicitation_id.0,
+        mode
+    );
+    crate::send_websocket_event(SyncEvent::ElicitationRequested {
+        acp_thread_id: acp_thread_id.to_string(),
+        request_id: request_id.to_string(),
+        entry_index: entry_index.to_string(),
+        elicitation_id: elicitation_id.0.to_string(),
+        tool_call_id: elicitation_tool_call_id(&elicitation.request),
+        mode,
+        message: elicitation.request.message.clone(),
+        requested_schema,
+        status: crate::types::elicitation_status_str(&elicitation.status).to_string(),
+        timestamp: chrono::Utc::now().timestamp(),
+    })
+    .log_err();
+}
+
+/// Report an elicitation's current status. Emitted on every terminal transition so the
+/// Helix card stops being answerable the moment the question is gone, whatever resolved
+/// it (an answer, a skip, turn teardown, or a follow-up prompt).
+///
+/// `content` is always None: `ElicitationStatus::Accepted` is a unit variant, so Zed does
+/// not retain what was submitted. Helix persists the answer it sent instead.
+fn send_elicitation_resolved(
+    thread: &AcpThread,
+    acp_thread_id: &str,
+    request_id: &str,
+    elicitation_id: &acp_thread::ElicitationEntryId,
+) {
+    let Some((entry_index, elicitation)) = thread.elicitation(elicitation_id) else {
+        return;
+    };
+    let status = crate::types::elicitation_status_str(&elicitation.status);
+    if status == "pending" {
+        return;
+    }
+    log::info!(
+        "[ELICITATION] {} resolved as {} on thread {}",
+        elicitation_id.0,
+        status,
+        acp_thread_id
+    );
+    crate::send_websocket_event(SyncEvent::ElicitationResolved {
+        acp_thread_id: acp_thread_id.to_string(),
+        request_id: request_id.to_string(),
+        entry_index: entry_index.to_string(),
+        elicitation_id: elicitation_id.0.to_string(),
+        status: status.to_string(),
+        content: None,
+        timestamp: chrono::Utc::now().timestamp(),
+    })
+    .log_err();
+}
+
+fn send_elicitation_ack(elicitation_id: &str, status: &str, error: &str) {
+    crate::send_websocket_event(SyncEvent::ElicitationResponseAck {
+        elicitation_id: elicitation_id.to_string(),
+        status: status.to_string(),
+        error: error.to_string(),
+    })
+    .log_err();
+}
+
+/// Convert one JSON answer into the typed value ACP expects. Returns None for shapes
+/// that have no ACP equivalent, so a malformed field is skipped rather than failing the
+/// whole answer.
+fn elicitation_content_value(value: &serde_json::Value) -> Option<acp::ElicitationContentValue> {
+    match value {
+        serde_json::Value::String(text) => Some(text.clone().into()),
+        serde_json::Value::Bool(flag) => Some((*flag).into()),
+        serde_json::Value::Number(number) => {
+            if let Some(int) = number.as_i64() {
+                Some(int.into())
+            } else {
+                number.as_f64().map(Into::into)
+            }
+        }
+        // Multi-select. Non-string members can't be represented, so they're dropped.
+        serde_json::Value::Array(items) => Some(
+            items
+                .iter()
+                .filter_map(|item| item.as_str().map(str::to_string))
+                .collect::<Vec<String>>()
+                .into(),
+        ),
+        _ => None,
+    }
+}
+
+/// Build the ACP response for a user's answer.
+///
+/// `decline` is deliberately NOT an abort: the adapter turns it into an empty answers map
+/// and the agent's turn continues, which is why the Helix UI labels it "Skip".
+fn build_elicitation_response(
+    request: &crate::ElicitationResponseRequest,
+) -> Result<acp::CreateElicitationResponse> {
+    match request.action.as_str() {
+        "accept" => {
+            let mut content = std::collections::BTreeMap::new();
+            if let Some(serde_json::Value::Object(fields)) = &request.content {
+                for (name, value) in fields {
+                    if let Some(value) = elicitation_content_value(value) {
+                        content.insert(name.clone(), value);
+                    }
+                }
+            }
+            Ok(acp::CreateElicitationResponse::new(
+                acp::ElicitationAction::Accept(
+                    acp::ElicitationAcceptAction::new().content(content),
+                ),
+            ))
+        }
+        "decline" => Ok(acp::CreateElicitationResponse::new(
+            acp::ElicitationAction::Decline,
+        )),
+        "cancel" => Ok(acp::CreateElicitationResponse::new(
+            acp::ElicitationAction::Cancel,
+        )),
+        other => anyhow::bail!("unsupported elicitation action: {}", other),
+    }
+}
+
+/// How often a thread holding a pending question tells Helix it still holds it.
+/// Must stay comfortably below Helix's reap grace window.
+const ELICITATION_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(15);
+
+/// Report which elicitations this thread still holds.
+///
+/// This is what lets Helix tell "the agent died" from "the API restarted". A reconnect on
+/// its own proves nothing — `agent_ready` fires whenever the WebSocket comes back, and the
+/// commonest cause is the Helix API restarting while this process and its `respond_tx`
+/// live on. So instead of treating a reconnect as evidence, the thread that owns a pending
+/// question keeps saying so; Helix reaps a question only when those statements stop.
+///
+/// `announce_full` re-sends each question's full payload, which a Helix that lost its
+/// state needs. The periodic heartbeat sends only the id list, to avoid republishing
+/// transcript entries every few seconds.
+pub fn resync_elicitations(acp_thread_id: &str, thread: &AcpThread, announce_full: bool) -> usize {
+    let request_id = get_thread_request_id(acp_thread_id).unwrap_or_default();
+    let mut pending_ids = Vec::new();
+    for entry in thread.entries() {
+        let acp_thread::AgentThreadEntry::Elicitation(elicitation_id) = entry else {
+            continue;
+        };
+        let Some((_, elicitation)) = thread.elicitation(elicitation_id) else {
+            continue;
+        };
+        if !matches!(
+            elicitation.status,
+            acp_thread::ElicitationStatus::Pending { .. }
+        ) {
+            continue;
+        }
+        if announce_full {
+            send_elicitation_requested(thread, acp_thread_id, &request_id, elicitation_id);
+        }
+        pending_ids.push(elicitation_id.0.to_string());
+    }
+
+    // An empty list is meaningful — it tells Helix this thread holds nothing, so any
+    // question it still thinks is pending here is gone. Always send it.
+    let pending_count = pending_ids.len();
+    crate::send_websocket_event(SyncEvent::ElicitationResync {
+        acp_thread_id: acp_thread_id.to_string(),
+        elicitation_ids: pending_ids,
+        timestamp: chrono::Utc::now().timestamp(),
+    })
+    .log_err();
+    pending_count
+}
+
+/// Resync every registered thread. Returns how many questions are outstanding overall.
+pub fn resync_all_elicitations(cx: &mut App, announce_full: bool) -> usize {
+    let Some(registry) = THREAD_REGISTRY.lock().clone() else {
+        return 0;
+    };
+    let threads: Vec<(String, Entity<AcpThread>)> = registry
+        .read()
+        .iter()
+        .map(|(id, thread)| (id.clone(), thread.clone()))
+        .collect();
+    threads
+        .into_iter()
+        .map(|(acp_thread_id, thread)| {
+            resync_elicitations(&acp_thread_id, thread.read(cx), announce_full)
+        })
+        .sum()
+}
+
 /// Flush all pending throttled messages for a given thread and clean up throttle state.
 /// Called before message_completed to ensure the final content is sent.
 pub fn flush_streaming_throttle(acp_thread_id: &str) {
@@ -1047,8 +1290,35 @@ pub fn ensure_thread_subscription(
                     });
                 }
             }
+            // An ACP agent asked the user a question. Without these arms the
+            // elicitation entry is dropped and Helix only ever sees the dead
+            // tool-call stub the adapter emitted just before it.
+            AcpThreadEvent::ElicitationRequested(elicitation_id) => {
+                let thread = thread_entity.read(cx);
+                let rid = turn_request_id.borrow().clone();
+                send_elicitation_requested(thread, &thread_id_for_sub, &rid, elicitation_id);
+            }
+            AcpThreadEvent::ElicitationResponded(elicitation_id) => {
+                let thread = thread_entity.read(cx);
+                let rid = turn_request_id.borrow().clone();
+                send_elicitation_resolved(thread, &thread_id_for_sub, &rid, elicitation_id);
+            }
             AcpThreadEvent::EntryUpdated(entry_idx) => {
                 let thread = thread_entity.read(cx);
+                // Elicitation status changes (answered, skipped, cancelled by turn
+                // teardown or by a follow-up prompt) arrive as EntryUpdated, not as a
+                // dedicated event — `respond_to_elicitation` and `cancel_elicitation`
+                // both emit only this. Resolving it here is what keeps the Helix card
+                // from staying answerable after the question is gone. Duplicate
+                // resolved events (this + ElicitationResponded) are harmless: the Go
+                // side applies them as conditional updates.
+                if let Some(acp_thread::AgentThreadEntry::Elicitation(elicitation_id)) =
+                    thread.entries().get(*entry_idx)
+                {
+                    let rid = turn_request_id.borrow().clone();
+                    send_elicitation_resolved(thread, &thread_id_for_sub, &rid, elicitation_id);
+                    return;
+                }
                 if let Some(entry) = thread.entries().get(*entry_idx) {
                     let (content, entry_type, tool_name, tool_status) = match entry {
                         acp_thread::AgentThreadEntry::AssistantMessage(msg) => {
@@ -1480,6 +1750,133 @@ pub fn setup_thread_handler(
             }
         }
     }).detach();
+
+    // Heartbeat for outstanding questions. A thread that holds a pending elicitation
+    // keeps telling Helix so; Helix reaps a question only when those statements stop for
+    // longer than its grace window. Without this, Helix could not distinguish a question
+    // whose agent died from one the user is simply taking a while to answer.
+    //
+    // Also drains resync requests raised when the WebSocket reconnects, which re-announce
+    // full payloads so a Helix that lost its state can rebuild it.
+    let (resync_tx, mut resync_rx) = mpsc::unbounded_channel::<()>();
+    crate::init_elicitation_resync_callback(resync_tx);
+    cx.spawn(async move |cx| {
+        log::info!("[ELICITATION] Heartbeat task started");
+        loop {
+            // GPUI's timer, not tokio's — this task runs on GPUI's executor, where a
+            // tokio timer has no reactor to register with.
+            cx.background_executor()
+                .timer(ELICITATION_HEARTBEAT_INTERVAL)
+                .await;
+
+            // Any reconnect since the last tick means Helix may have lost its state, so
+            // re-announce the full payloads rather than just the id list. Drain the
+            // channel so a burst of reconnects collapses into one announce.
+            let mut announce_full = false;
+            while resync_rx.try_recv().is_ok() {
+                announce_full = true;
+            }
+
+            match cx.update(|cx| resync_all_elicitations(cx, announce_full)) {
+                Ok(count) if count > 0 => {
+                    log::info!("[ELICITATION] Heartbeat: {} question(s) outstanding", count);
+                }
+                Ok(_) => {}
+                Err(e) => {
+                    log::warn!("[ELICITATION] Heartbeat stopping: {}", e);
+                    return;
+                }
+            }
+        }
+    })
+    .detach();
+
+    // Spawn dedicated elicitation-response task. Like the cancel task, this must run
+    // independently of the callback_rx loop: that loop is blocked awaiting the very turn
+    // that is waiting for this answer, so routing through it would deadlock.
+    let (elicitation_tx, mut elicitation_rx) =
+        mpsc::unbounded_channel::<crate::ElicitationResponseRequest>();
+    crate::init_elicitation_response_callback(elicitation_tx);
+    cx.spawn(async move |cx| {
+        log::info!("[ELICITATION] Response task started");
+        while let Some(request) = elicitation_rx.recv().await {
+            let elicitation_id = acp_thread::ElicitationEntryId(
+                request.elicitation_id.clone().into(),
+            );
+
+            let Some(thread) = crate::get_thread(&request.acp_thread_id) else {
+                log::warn!(
+                    "[ELICITATION] Thread {} not in registry; cannot answer {}",
+                    request.acp_thread_id,
+                    request.elicitation_id
+                );
+                send_elicitation_ack(&request.elicitation_id, "not_found", "thread not found");
+                continue;
+            };
+
+            let response = match build_elicitation_response(&request) {
+                Ok(response) => response,
+                Err(e) => {
+                    log::warn!(
+                        "[ELICITATION] Rejecting answer for {}: {}",
+                        request.elicitation_id,
+                        e
+                    );
+                    send_elicitation_ack(&request.elicitation_id, "noop", &e.to_string());
+                    continue;
+                }
+            };
+
+            // Snapshot the status either side of the update. `respond_to_elicitation`
+            // is already a safe no-op for an unknown id or an already-resolved
+            // question, but it returns nothing — comparing tells us which happened so
+            // we can report it instead of leaving Helix guessing.
+            let result = cx.update(|cx| {
+                thread.update(cx, |thread, cx| {
+                    let was_pending = thread.elicitation(&elicitation_id).is_some_and(
+                        |(_, elicitation)| {
+                            matches!(
+                                elicitation.status,
+                                acp_thread::ElicitationStatus::Pending { .. }
+                            )
+                        },
+                    );
+                    if !was_pending {
+                        return thread
+                            .elicitation(&elicitation_id)
+                            .map_or("not_found", |_| "noop");
+                    }
+                    thread.respond_to_elicitation(&elicitation_id, response, cx);
+                    "accepted"
+                })
+            });
+
+            match result {
+                Ok(Ok(status)) => {
+                    log::info!(
+                        "[ELICITATION] Answer for {} → {}",
+                        request.elicitation_id,
+                        status
+                    );
+                    let error = match status {
+                        "noop" => "elicitation already resolved",
+                        "not_found" => "elicitation not found on thread",
+                        _ => "",
+                    };
+                    send_elicitation_ack(&request.elicitation_id, status, error);
+                }
+                Ok(Err(e)) | Err(e) => {
+                    log::warn!(
+                        "[ELICITATION] Failed to answer {}: {}",
+                        request.elicitation_id,
+                        e
+                    );
+                    send_elicitation_ack(&request.elicitation_id, "not_found", &e.to_string());
+                }
+            }
+        }
+    })
+    .detach();
 
     // Spawn handler task to process thread creation requests
     cx.spawn(async move |cx| {

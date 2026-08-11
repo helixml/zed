@@ -161,6 +161,11 @@ impl WebSocketSync {
                     eprintln!("✅ [WEBSOCKET] Connected! Running message loop...");
                     log::info!("✅ [WEBSOCKET] Connected! Running message loop...");
 
+                    // The Helix on the other end may have restarted and lost track of
+                    // which questions are still outstanding. Re-announce them in full so
+                    // it can rebuild rather than guess.
+                    crate::request_elicitation_resync();
+
                     // Run until connection drops
                     Self::run_connection(ws_sink, ws_stream, &mut outgoing_rx).await;
 
@@ -403,6 +408,7 @@ impl WebSocketSync {
             "open_thread" => Self::handle_open_thread(command.data).await,
             "query_ui_state" => Self::handle_query_ui_state(command.data).await,
             "cancel_current_turn" => Self::handle_cancel_current_turn(command.data).await,
+            "respond_elicitation" => Self::handle_respond_elicitation(command.data).await,
             _ => {
                 eprintln!("⚠️  [WEBSOCKET-IN] Ignoring unknown command: {}", command.command_type);
                 log::warn!("⚠️  [WEBSOCKET-IN] Ignoring unknown command: {}", command.command_type);
@@ -567,6 +573,26 @@ impl WebSocketSync {
         crate::request_thread_cancellation(crate::CancellationRequest { request_id })?;
 
         Ok(())
+    }
+
+    /// Handle respond_elicitation command — the user answered a question the agent asked.
+    async fn handle_respond_elicitation(data: serde_json::Value) -> Result<()> {
+        let response: crate::IncomingElicitationResponse = serde_json::from_value(data)
+            .context("Failed to parse respond_elicitation data")?;
+
+        log::info!(
+            "[WEBSOCKET-IN] Processing respond_elicitation: thread={} elicitation={} action={}",
+            response.acp_thread_id,
+            response.elicitation_id,
+            response.action
+        );
+
+        crate::request_elicitation_response(crate::ElicitationResponseRequest {
+            acp_thread_id: response.acp_thread_id,
+            elicitation_id: response.elicitation_id,
+            action: response.action,
+            content: response.content,
+        })
     }
 
     /// Send event to external system
