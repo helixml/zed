@@ -156,6 +156,7 @@ type roundState struct {
 	// Phase 18: agent questions (ACP elicitations). See runElicitationPhase.
 	phase18Recorded  bool // elicitation_requested produced a live row carrying a non-empty schema
 	phase18Commanded bool // respond_elicitation reached Zed over the wire
+	phase18Acked     bool // Zed's ack round-tripped and reconciled the answered question
 	phase18Resolved  bool // elicitation_resolved(accepted) made the question terminal
 	phase18TurnOK    bool // a normal turn still completes on the same thread afterwards
 }
@@ -1856,10 +1857,23 @@ func (d *testDriver) runQueuePhases() {
 //
 // Consequence worth stating plainly: because the question was injected rather than
 // raised by Zed, the live Zed process does not hold it. When Helix delivers
-// respond_elicitation, Zed correctly answers elicitation_response_ack{not_found}. That
-// ack is the RIGHT answer for an elicitation it never held, so this phase logs it and
-// moves on. It is never a failure condition. What is asserted is that the command
-// reached the wire at all.
+// respond_elicitation, Zed correctly answers elicitation_response_ack{not_found}, and
+// Helix's ack handler then reconciles that question to cancelled(agent_no_longer_holds).
+// That is right — an answer the agent could not apply must stop being offered.
+//
+// It also means one synthetic question cannot test both halves: the ack cancels it, and
+// cancelled is terminal, so a later elicitation_resolved(accepted) correctly affects zero
+// rows. So this phase uses TWO questions:
+//
+//	18a (egress): injected, answered through the production claim-and-send path, then
+//	     asserted to have been reconciled to a terminal state by Zed's real ack. This is
+//	     the round trip — Helix → Zed → Helix — proven end to end.
+//	18b (resolution): injected, then resolved with an injected
+//	     elicitation_resolved(accepted) exactly as a real agent reports it, with no
+//	     command sent, so nothing races the terminal write.
+//
+// Do not "simplify" this back into one question: the merge would silently stop testing
+// one of the two paths.
 func (d *testDriver) runElicitationPhase(sessID, threadID string) {
 	agent := d.round.agentName
 
@@ -1947,49 +1961,86 @@ func (d *testDriver) runElicitationPhase(sessID, threadID string) {
 			agent, len(recorded.Schema))
 	}
 
-	// Answer it through the production claim-then-send path the REST endpoint uses.
+	// --- 18a: egress. Answer through the production claim-then-send path. ---
 	if err := d.srv.RespondToElicitation(ctx, sessID, elicitationID, "accept",
 		map[string]interface{}{"question_0": "redis"}); err != nil {
-		log.Printf("[%s] Phase 18: FAIL — respond_elicitation was not delivered: %v", agent, err)
+		log.Printf("[%s] Phase 18a: FAIL — respond_elicitation was not delivered: %v", agent, err)
 	} else {
 		d.mu.Lock()
 		d.round.phase18Commanded = true
 		d.mu.Unlock()
-		log.Printf("[%s] Phase 18: ✅ respond_elicitation delivered to Zed (expect a not_found ack — see the doc comment)", agent)
+		log.Printf("[%s] Phase 18a: ✅ respond_elicitation delivered to Zed", agent)
 	}
 
-	// Give the real Zed a moment to send its ack back, purely so it lands in the log.
-	time.Sleep(2 * time.Second)
+	// Wait for Zed's real ack to come back and be reconciled. not_found is the correct
+	// ack for a question this Zed never held, and the handler turns it into
+	// cancelled(agent_no_longer_holds) — an answer the agent could not apply must stop
+	// being offered. Asserting the question went terminal proves the whole round trip.
+	acked := false
+	for i := 0; i < 20; i++ {
+		time.Sleep(500 * time.Millisecond)
+		current, err := d.store.GetAgentElicitation(ctx, elicitationID)
+		if err == nil && !current.IsLive() {
+			acked = true
+			log.Printf("[%s] Phase 18a: ✅ Zed's ack round-tripped: question is now %s (%s)",
+				agent, current.Status, current.ResolutionReason)
+			break
+		}
+	}
+	if !acked {
+		log.Printf("[%s] Phase 18a: FAIL — no ack from Zed reconciled the answered question", agent)
+	} else {
+		d.mu.Lock()
+		d.round.phase18Acked = true
+		d.mu.Unlock()
+	}
 	for _, event := range d.filterRoundEvents("elicitation_response_ack") {
 		status, _ := event.Data["status"].(string)
-		log.Printf("[%s] Phase 18: ack from Zed: status=%s (tolerated, not asserted)", agent, status)
+		log.Printf("[%s] Phase 18a: ack event from Zed: status=%s", agent, status)
 	}
 
-	// The agent reports the authoritative terminal status; inject it the same way.
+	// --- 18b: resolution. A fresh question, resolved the way a real agent reports it. ---
+	resolvedID := elicitationID + "-resolved"
+	if err := d.srv.ProcessSyncEvent(sessID, &types.SyncMessage{
+		EventType: "elicitation_requested",
+		Data: map[string]interface{}{
+			"acp_thread_id":    threadID,
+			"elicitation_id":   resolvedID,
+			"entry_index":      "0",
+			"mode":             "form",
+			"message":          "Which cache backend should I use?",
+			"status":           "pending",
+			"requested_schema": requestedSchema,
+		},
+	}); err != nil {
+		log.Printf("[%s] Phase 18b: FAIL — injecting the second elicitation_requested: %v", agent, err)
+		return
+	}
+
 	if err := d.srv.ProcessSyncEvent(sessID, &types.SyncMessage{
 		EventType: "elicitation_resolved",
 		Data: map[string]interface{}{
 			"acp_thread_id":  threadID,
-			"elicitation_id": elicitationID,
+			"elicitation_id": resolvedID,
 			"status":         "accepted",
 		},
 	}); err != nil {
-		log.Printf("[%s] Phase 18: FAIL — injecting elicitation_resolved: %v", agent, err)
+		log.Printf("[%s] Phase 18b: FAIL — injecting elicitation_resolved: %v", agent, err)
 	}
 
-	resolved, err := d.store.GetAgentElicitation(ctx, elicitationID)
+	resolved, err := d.store.GetAgentElicitation(ctx, resolvedID)
 	switch {
 	case err != nil:
-		log.Printf("[%s] Phase 18: FAIL — reloading resolved question: %v", agent, err)
+		log.Printf("[%s] Phase 18b: FAIL — reloading resolved question: %v", agent, err)
 	case resolved.Status != "accepted":
-		log.Printf("[%s] Phase 18: FAIL — question status is %q, wanted accepted", agent, resolved.Status)
+		log.Printf("[%s] Phase 18b: FAIL — question status is %q, wanted accepted", agent, resolved.Status)
 	case resolved.IsLive():
-		log.Printf("[%s] Phase 18: FAIL — question is still answerable after being accepted", agent)
+		log.Printf("[%s] Phase 18b: FAIL — question is still answerable after being accepted", agent)
 	default:
 		d.mu.Lock()
 		d.round.phase18Resolved = true
 		d.mu.Unlock()
-		log.Printf("[%s] Phase 18: ✅ question is terminal (accepted) and no longer answerable", agent)
+		log.Printf("[%s] Phase 18b: ✅ question is terminal (accepted) and no longer answerable", agent)
 	}
 
 	// The elicitation assertions are done; the follow-up turn below has its own explicit
@@ -2589,16 +2640,20 @@ func (d *testDriver) validateRound() roundResult {
 	if !d.round.phase17Delivered {
 		errors = append(errors, "Phase 17: interrupt queue message was never delivered")
 	}
-	// Phase 18: agent questions (ACP elicitations). The ack Zed returns is deliberately
-	// not validated here — see runElicitationPhase for why a not_found is correct.
+	// Phase 18: agent questions (ACP elicitations). 18a proves the Helix → Zed → Helix
+	// round trip; 18b proves the resolution path. See runElicitationPhase for why these
+	// need two separate questions.
 	if !d.round.phase18Recorded {
 		errors = append(errors, "Phase 18: the question was not recorded live with a populated schema")
 	}
 	if !d.round.phase18Commanded {
-		errors = append(errors, "Phase 18: respond_elicitation was never delivered to the agent")
+		errors = append(errors, "Phase 18a: respond_elicitation was never delivered to the agent")
+	}
+	if !d.round.phase18Acked {
+		errors = append(errors, "Phase 18a: Zed's ack never round-tripped to reconcile the answered question")
 	}
 	if !d.round.phase18Resolved {
-		errors = append(errors, "Phase 18: the question did not become terminal after being accepted")
+		errors = append(errors, "Phase 18b: the question did not become terminal after being accepted")
 	}
 	if !d.round.phase18TurnOK {
 		errors = append(errors, "Phase 18: no normal turn completed after the question cycle (thread wedged)")
