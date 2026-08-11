@@ -2207,6 +2207,7 @@ pub enum AcpThreadEvent {
     ModeUpdated(acp::SessionModeId),
     ConfigOptionsUpdated(Vec<acp::SessionConfigOption>),
     WorkingDirectoriesUpdated,
+    PlanUpdated,
 }
 
 impl EventEmitter<AcpThreadEvent> for AcpThread {}
@@ -3636,6 +3637,7 @@ impl AcpThread {
         }
         self.plan.entries.truncate(new_entries_len);
 
+        cx.emit(AcpThreadEvent::PlanUpdated);
         cx.notify();
     }
 
@@ -3655,6 +3657,7 @@ impl AcpThread {
 
     pub fn clear_plan(&mut self, cx: &mut Context<Self>) {
         self.plan.entries.clear();
+        cx.emit(AcpThreadEvent::PlanUpdated);
         cx.notify();
     }
 
