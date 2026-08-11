@@ -32,6 +32,11 @@
 // It exists so CI can gate `zed --headless` on every build without burning the
 // tokens the full suite costs.
 //
+// Plan mode (E2E_PLAN=1) uses a deterministic ACP agent for two turns. The
+// first publishes a plan and the second publishes no plan. It verifies that a
+// new turn emits an empty plan snapshot and does not persist the prior turn's
+// steps in the new interaction.
+//
 // Exit codes: 0 = all tests passed, 1 = test failure
 package main
 
@@ -728,9 +733,12 @@ const phaseTimeout = 90 * time.Second
 const (
 	smokePhase      = 100
 	smokeMagicValue = "4242"
+	planFirstPhase  = 101
+	planSecondPhase = 102
 )
 
 var smokeMode = os.Getenv("E2E_SMOKE") == "1"
+var planMode = os.Getenv("E2E_PLAN") == "1"
 
 // Absolute path, written by run_e2e.sh. Zed's file tools resolve a bare
 // relative path against the worktree name ("project/magic-number.txt"), so an
@@ -752,6 +760,10 @@ var smokeReqTag = fmt.Sprintf("phase%d", smokePhase)
 func (d *testDriver) startRound() {
 	if smokeMode {
 		d.runSmokePhase()
+		return
+	}
+	if planMode {
+		d.runPlanFirstPhase()
 		return
 	}
 	d.runPhase1()
@@ -867,6 +879,13 @@ func (d *testDriver) advanceAfterCompletion(completedPhase int) {
 
 	switch completedPhase {
 	case smokePhase:
+		d.advanceToNextRound()
+	case planFirstPhase:
+		d.mu.Lock()
+		d.phase = planSecondPhase
+		d.mu.Unlock()
+		d.runPlanSecondPhase()
+	case planSecondPhase:
 		d.advanceToNextRound()
 	case 1:
 		d.mu.Lock()
@@ -1025,6 +1044,37 @@ func (d *testDriver) runSmokePhase() {
 		d.round.reqID(smokeReqTag), agent)
 }
 
+func (d *testDriver) runPlanFirstPhase() {
+	d.mu.Lock()
+	d.phase = planFirstPhase
+	agent := d.round.agentName
+	d.mu.Unlock()
+
+	log.Printf("\n==================================================")
+	log.Printf("  [%s] PLAN TURN 1: publish plan snapshots", agent)
+	log.Printf("==================================================")
+	d.startPhaseTimeout(planFirstPhase)
+	d.sendChatMessage("Publish the deterministic first-turn plan.", d.round.reqID("phase101"), agent)
+}
+
+func (d *testDriver) runPlanSecondPhase() {
+	d.mu.Lock()
+	agent := d.round.agentName
+	if len(d.round.threadIDs) == 0 {
+		d.mu.Unlock()
+		log.Printf("[%s] PLAN TURN 2: no thread from turn 1", agent)
+		os.Exit(1)
+	}
+	threadID := d.round.threadIDs[0]
+	d.mu.Unlock()
+
+	log.Printf("\n==================================================")
+	log.Printf("  [%s] PLAN TURN 2: no plan (must clear turn 1)", agent)
+	log.Printf("==================================================")
+	d.startPhaseTimeout(planSecondPhase)
+	d.sendChatMessage("Reply without publishing a plan.", d.round.reqID("phase102"), agent, threadID)
+}
+
 // validateSmokeRound checks the single smoke phase. Callers must hold d.mu.
 func (d *testDriver) validateSmokeRound() roundResult {
 	agent := d.round.agentName
@@ -1054,6 +1104,87 @@ func (d *testDriver) validateSmokeRound() roundResult {
 	}
 	if !found {
 		errors = append(errors, "Smoke: response never contained magic value "+smokeMagicValue)
+	}
+
+	return roundResult{agentName: agent, passed: len(errors) == 0, errors: errors}
+}
+
+func planEntries(interaction *types.Interaction) ([]map[string]interface{}, error) {
+	var entries []struct {
+		Type    string `json:"type"`
+		Content string `json:"content"`
+	}
+	if err := json.Unmarshal(interaction.ResponseEntries, &entries); err != nil {
+		return nil, err
+	}
+	for _, entry := range entries {
+		if entry.Type != "plan" {
+			continue
+		}
+		var payload struct {
+			Steps []map[string]interface{} `json:"steps"`
+		}
+		if err := json.Unmarshal([]byte(entry.Content), &payload); err != nil {
+			return nil, err
+		}
+		return payload.Steps, nil
+	}
+	return nil, fmt.Errorf("no plan entry")
+}
+
+func (d *testDriver) validatePlanRound() roundResult {
+	agent := d.round.agentName
+	var errors []string
+
+	if len(d.filterRoundEvents("thread_created")) != 1 {
+		errors = append(errors, fmt.Sprintf("Plan: expected one thread, got %d", len(d.filterRoundEvents("thread_created"))))
+	}
+	if !d.hasRoundCompletion(d.round.reqID("phase101")) {
+		errors = append(errors, "Plan: first turn did not complete")
+	}
+	if !d.hasRoundCompletion(d.round.reqID("phase102")) {
+		errors = append(errors, "Plan: second turn did not complete")
+	}
+
+	foundEmptyResetEvent := false
+	for _, event := range d.round.events {
+		if event.EventType != "message_added" || event.Data["request_id"] != d.round.reqID("phase102") || event.Data["entry_type"] != "plan" {
+			continue
+		}
+		content, _ := event.Data["content"].(string)
+		if strings.Contains(content, `"steps":[]`) {
+			foundEmptyResetEvent = true
+		}
+	}
+	if !foundEmptyResetEvent {
+		errors = append(errors, "Plan: second turn did not emit an empty plan snapshot")
+	}
+
+	var first, second *types.Interaction
+	for _, interaction := range d.store.GetAllInteractions() {
+		switch {
+		case strings.Contains(interaction.ResponseMessage, "First turn complete."):
+			first = interaction
+		case strings.Contains(interaction.ResponseMessage, "Second turn has no plan."):
+			second = interaction
+		}
+	}
+	if first == nil {
+		errors = append(errors, "Plan: first interaction was not persisted")
+	} else if steps, err := planEntries(first); err != nil {
+		errors = append(errors, "Plan: first interaction has no valid plan: "+err.Error())
+	} else if len(steps) != 2 {
+		errors = append(errors, fmt.Sprintf("Plan: first interaction has %d steps, expected 2", len(steps)))
+	} else if steps[0]["step"] != "Inspect the plan pipeline" || steps[0]["status"] != "completed" ||
+		steps[1]["step"] != "Verify turn isolation" || steps[1]["status"] != "inProgress" {
+		errors = append(errors, fmt.Sprintf("Plan: first interaction did not persist the latest snapshot: %#v", steps))
+	}
+	if second == nil {
+		errors = append(errors, "Plan: second interaction was not persisted")
+	} else if steps, err := planEntries(second); err != nil {
+		errors = append(errors, "Plan: second interaction has no reset snapshot: "+err.Error())
+	} else if len(steps) != 0 {
+		errors = append(errors, fmt.Sprintf("Plan: second interaction retained %d stale steps", len(steps)))
 	}
 
 	return roundResult{agentName: agent, passed: len(errors) == 0, errors: errors}
@@ -1704,6 +1835,9 @@ func (d *testDriver) validateRound() roundResult {
 	if smokeMode {
 		return d.validateSmokeRound()
 	}
+	if planMode {
+		return d.validatePlanRound()
+	}
 
 	var errors []string
 
@@ -2335,7 +2469,7 @@ func (d *testDriver) validateStore() bool {
 	// Each round creates 5 threads (phases 1, 3, 8, 13, 15) = 5 sessions per round.
 	// Smoke mode runs one phase, so one thread/session per round.
 	perRoundSessions := 5
-	if smokeMode {
+	if smokeMode || planMode {
 		perRoundSessions = 1
 	}
 	expectedSessions := perRoundSessions * len(d.agentRounds)
@@ -2433,7 +2567,7 @@ func (d *testDriver) validateStore() bool {
 					if e.Type == "text" {
 						hasText = true
 					}
-					if e.Type != "text" && e.Type != "tool_call" {
+					if e.Type != "text" && e.Type != "tool_call" && e.Type != "plan" {
 						errors = append(errors, fmt.Sprintf("Interaction %s: unexpected entry type %q",
 							truncate(i.ID, 12), e.Type))
 					}
@@ -2465,6 +2599,8 @@ func (d *testDriver) validateStore() bool {
 	perRoundCompleted := 8
 	if smokeMode {
 		perRoundCompleted = 1
+	} else if planMode {
+		perRoundCompleted = 2
 	}
 	expectedCompleted := perRoundCompleted * len(d.agentRounds)
 	if completedInteractions < expectedCompleted {
@@ -2526,6 +2662,7 @@ func (d *testDriver) validateStore() bool {
 		// Collect message_ids from each interaction
 		type parsedEntry struct {
 			MessageID string `json:"message_id"`
+			Type      string `json:"type"`
 		}
 
 		// For each follow-up interaction, check it doesn't contain message_ids from earlier ones
@@ -2538,7 +2675,10 @@ func (d *testDriver) validateStore() bool {
 
 			// Check for leakage: does this interaction contain message_ids from a previous one?
 			for _, e := range entries {
-				if e.MessageID == "" {
+				// Plan snapshots intentionally use the stable ID "plan" in every
+				// interaction so a new snapshot replaces the old one in place.
+				// Their content, not the ID, is turn-scoped.
+				if e.MessageID == "" || e.Type == "plan" {
 					continue
 				}
 				if ownerID, leaked := previousMessageIDs[e.MessageID]; leaked {
@@ -2550,7 +2690,7 @@ func (d *testDriver) validateStore() bool {
 
 			// Register this interaction's message_ids
 			for _, e := range entries {
-				if e.MessageID != "" {
+				if e.MessageID != "" && e.Type != "plan" {
 					previousMessageIDs[e.MessageID] = inter.ID
 				}
 			}

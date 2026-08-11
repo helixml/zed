@@ -30,7 +30,13 @@ COPY slow-mcp-server /app
 WORKDIR /app
 RUN CGO_ENABLED=0 go build -o /slow-mcp-server .
 
-# Stage 3: Runtime
+# Stage 3: Build the deterministic ACP plan agent.
+FROM golang:1.25-alpine AS plan-agent-builder
+COPY plan-test-agent /app
+WORKDIR /app
+RUN CGO_ENABLED=0 go build -o /plan-test-agent .
+
+# Stage 4: Runtime
 FROM ubuntu:25.10
 ENV DEBIAN_FRONTEND=noninteractive
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -50,8 +56,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 COPY --from=go-builder /helix-ws-test-server /usr/local/bin/helix-ws-test-server
 COPY --from=mcp-builder /slow-mcp-server /usr/local/bin/slow-mcp-server
+COPY --from=plan-agent-builder /plan-test-agent /usr/local/bin/plan-test-agent
 COPY zed-binary /usr/local/bin/zed
-RUN chmod +x /usr/local/bin/zed /usr/local/bin/helix-ws-test-server /usr/local/bin/slow-mcp-server
+RUN chmod +x /usr/local/bin/zed /usr/local/bin/helix-ws-test-server /usr/local/bin/slow-mcp-server /usr/local/bin/plan-test-agent
 COPY run_e2e.sh /test/run_e2e.sh
 RUN chmod +x /test/run_e2e.sh
 ENV DISPLAY=:99

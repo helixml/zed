@@ -3648,13 +3648,6 @@ impl AcpThread {
         }
     }
 
-    fn clear_completed_plan_entries(&mut self, cx: &mut Context<Self>) {
-        self.plan
-            .entries
-            .retain(|entry| !matches!(entry.status, acp::PlanEntryStatus::Completed));
-        cx.notify();
-    }
-
     pub fn clear_plan(&mut self, cx: &mut Context<Self>) {
         self.plan.entries.clear();
         cx.emit(AcpThreadEvent::PlanUpdated);
@@ -3779,7 +3772,12 @@ impl AcpThread {
         cx: &mut Context<Self>,
         f: impl 'static + AsyncFnOnce(WeakEntity<Self>, &mut AsyncApp) -> Result<acp::PromptResponse>,
     ) -> BoxFuture<'static, Result<Option<acp::PromptResponse>>> {
-        self.clear_completed_plan_entries(cx);
+        // Plans are scoped to a single prompt turn. Keeping pending entries here
+        // makes a follow-up prompt inherit the previous turn's unfinished plan,
+        // even when the agent does not publish a plan for the new work.
+        // Emit the empty snapshot before starting the turn so external clients
+        // can clear their persisted plan entry as well.
+        self.clear_plan(cx);
         self.had_error = false;
 
         self.turn_token_usage = None;
