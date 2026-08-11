@@ -40,7 +40,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 COPY zed-binary /usr/local/bin/zed
 COPY helix-ws-test-server/helix-ws-test-server /usr/local/bin/helix-ws-test-server
 COPY slow-mcp-server/slow-mcp-server /usr/local/bin/slow-mcp-server
-RUN chmod +x /usr/local/bin/zed /usr/local/bin/helix-ws-test-server /usr/local/bin/slow-mcp-server
+COPY plan-test-agent/plan-test-agent /usr/local/bin/plan-test-agent
+RUN chmod +x /usr/local/bin/zed /usr/local/bin/helix-ws-test-server /usr/local/bin/slow-mcp-server /usr/local/bin/plan-test-agent
 
 # Copy test script
 COPY run_e2e.sh /test/run_e2e.sh

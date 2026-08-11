@@ -1093,9 +1093,10 @@ pub fn get_thread(acp_thread_id: &str) -> Option<WeakEntity<AcpThread>> {
 /// that create or load threads must call this to set up the subscription. It is
 /// idempotent — if a persistent subscription already exists, it does nothing.
 ///
-/// Handles four events:
+/// Handles five events:
 /// - `NewEntry`: new user/assistant message → send `message_added`
 /// - `EntryUpdated`: streaming tokens / tool call updates → throttled `message_added`
+/// - `PlanUpdated`: ACP plans/TodoWrite updates → structured `message_added`
 /// - `Stopped`: turn completed → flush throttle + send `message_completed`
 /// - `Error`: turn aborted (agent process exited mid-turn, or MaxTokens) →
 ///   flush + send `chat_response_error` so Helix errors the interaction
@@ -1363,6 +1364,49 @@ pub fn ensure_thread_subscription(
                         &tool_status,
                     );
                 }
+            }
+            AcpThreadEvent::PlanUpdated => {
+                let thread = thread_entity.read(cx);
+                let steps = thread
+                    .plan()
+                    .entries
+                    .iter()
+                    .map(|entry| {
+                        let status = match entry.status {
+                            acp::PlanEntryStatus::Completed => "completed",
+                            acp::PlanEntryStatus::InProgress => "inProgress",
+                            _ => "pending",
+                        };
+                        serde_json::json!({
+                            "step": entry.content.read(cx).source().to_string(),
+                            "status": status,
+                        })
+                    })
+                    .collect::<Vec<_>>();
+                let content = serde_json::json!({ "steps": steps }).to_string();
+
+                // A plan can arrive before the first assistant entry. In that
+                // case the turn-scoped id still belongs to the completed turn,
+                // while THREAD_REQUEST_MAP already contains the current one.
+                let captured = turn_request_id.borrow().clone();
+                let last_completed = last_completed_request_id.borrow().clone();
+                let rid = if captured.is_empty() || captured == last_completed {
+                    crate::get_thread_request_id(&thread_id_for_sub).unwrap_or_default()
+                } else {
+                    captured
+                };
+
+                crate::send_websocket_event(SyncEvent::MessageAdded {
+                    acp_thread_id: thread_id_for_sub.clone(),
+                    message_id: "plan".to_string(),
+                    role: "assistant".to_string(),
+                    content,
+                    request_id: rid,
+                    entry_type: "plan".to_string(),
+                    tool_name: String::new(),
+                    tool_status: String::new(),
+                    timestamp: chrono::Utc::now().timestamp(),
+                }).log_err();
             }
             // Stopped and Error are both turn-terminal and must send Helix a
             // terminal frame to free the activation lane. Stopped → completed;
