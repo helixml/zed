@@ -20,10 +20,12 @@ echo "============================================"
 echo ""
 
 ZED_BINARY="${ZED_BINARY:-/usr/local/bin/zed}"
-# Default timeout scales with number of agent rounds (each round takes ~150s
-# including Phase 15's long-form prose streaming).
+# Default timeout scales with number of agent rounds. A zed-agent round measured
+# ~190s once Phase 18 (agent questions) was added, and the claude round is slower
+# still, so 300s/round no longer leaves headroom — a two-agent run was timing out
+# mid-round-2 with every phase passing.
 AGENT_COUNT=$(echo "${E2E_AGENTS:-zed-agent}" | tr ',' '\n' | wc -l)
-DEFAULT_TIMEOUT=$((300 * AGENT_COUNT))
+DEFAULT_TIMEOUT=$((450 * AGENT_COUNT))
 TEST_TIMEOUT="${TEST_TIMEOUT:-$DEFAULT_TIMEOUT}"
 MOCK_SERVER="${HELIX_WS_TEST_SERVER:-/usr/local/bin/helix-ws-test-server}"
 PROJECT_DIR="/test/project"
