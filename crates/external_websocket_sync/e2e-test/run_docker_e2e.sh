@@ -73,6 +73,12 @@ if [ "${1:-}" != "--no-build" ]; then
     CGO_ENABLED=0 go build -o slow-mcp-server .
     echo "Built: $SCRIPT_DIR/slow-mcp-server/slow-mcp-server"
     echo ""
+
+    echo "=== Building deterministic plan test agent ==="
+    cd "$SCRIPT_DIR/plan-test-agent"
+    CGO_ENABLED=0 go build -o plan-test-agent .
+    echo "Built: $SCRIPT_DIR/plan-test-agent/plan-test-agent"
+    echo ""
 fi
 
 # Print binary versions so it's obvious what we're testing
@@ -80,6 +86,7 @@ echo "=== Binary versions ==="
 echo "  zed-binary:          $(stat -c '%y' "$SCRIPT_DIR/zed-binary" 2>/dev/null | cut -d. -f1)  $(md5sum "$SCRIPT_DIR/zed-binary" 2>/dev/null | cut -c1-12)"
 echo "  helix-ws-test-server: $(stat -c '%y' "$SCRIPT_DIR/helix-ws-test-server/helix-ws-test-server" 2>/dev/null | cut -d. -f1)  $(md5sum "$SCRIPT_DIR/helix-ws-test-server/helix-ws-test-server" 2>/dev/null | cut -c1-12)"
 echo "  slow-mcp-server:     $(stat -c '%y' "$SCRIPT_DIR/slow-mcp-server/slow-mcp-server" 2>/dev/null | cut -d. -f1)  $(md5sum "$SCRIPT_DIR/slow-mcp-server/slow-mcp-server" 2>/dev/null | cut -c1-12)"
+echo "  plan-test-agent:     $(stat -c '%y' "$SCRIPT_DIR/plan-test-agent/plan-test-agent" 2>/dev/null | cut -d. -f1)  $(md5sum "$SCRIPT_DIR/plan-test-agent/plan-test-agent" 2>/dev/null | cut -c1-12)"
 echo ""
 
 # Build Docker image

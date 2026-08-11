@@ -185,6 +185,7 @@ echo ""
 # reads magic-number.txt and echoes the value. Cheap enough to gate every CI
 # build on. The value is not in the prompt, so it can only come from a tool call.
 export E2E_SMOKE="${E2E_SMOKE:-0}"
+export E2E_PLAN="${E2E_PLAN:-0}"
 if [ "$E2E_SMOKE" = "1" ]; then
     if [ -z "${E2E_SMOKE_FILE:-}" ]; then
         export E2E_SMOKE_FILE="$PROJECT_DIR/magic-number.txt"
@@ -307,6 +308,18 @@ if echo "$E2E_AGENTS" | grep -q "codex"; then
       }
     }"
     echo "[setup] Codex agent configured with API key"
+fi
+
+if echo "$E2E_AGENTS" | grep -q "plan-test-agent"; then
+    if [ -n "$AGENT_SERVER_ENTRIES" ]; then
+        AGENT_SERVER_ENTRIES="${AGENT_SERVER_ENTRIES},"
+    fi
+    AGENT_SERVER_ENTRIES="${AGENT_SERVER_ENTRIES}
+    \"plan-test-agent\": {
+      \"type\": \"custom\",
+      \"command\": \"/usr/local/bin/plan-test-agent\"
+    }"
+    echo "[setup] Deterministic plan test agent configured"
 fi
 
 if [ -n "$AGENT_SERVER_ENTRIES" ]; then
