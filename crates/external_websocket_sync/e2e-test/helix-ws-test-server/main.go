@@ -4,7 +4,7 @@
 // tests and production.
 //
 // The server runs multiple "rounds", one per agent type (zed-agent, claude, etc.).
-// Each round executes the same 15 test phases:
+// Each round executes the same 18 test phases:
 //
 //	Phase 1: Basic thread creation (new chat_message, no thread ID)
 //	Phase 2: Follow-up on existing thread (same thread ID)
@@ -24,6 +24,12 @@
 //	          arrive throughout the response, not bunched at the end. Catches the regression where Zed's
 //	          streaming-reveal task drains text into the markdown entity without re-emitting EntryUpdated,
 //	          so external_websocket_sync only sees stale snapshots until message_completed.)
+//	Phase 16: Queue busy-defer (enqueue interrupt=false while busy — assert it is HELD, then delivered once idle)
+//	Phase 17: Queue interrupt (enqueue interrupt=true while busy — assert it cancels the running turn and delivers)
+//	Phase 18: Agent question / ACP elicitation (inject elicitation_requested with a non-empty schema →
+//	          respond_elicitation over the wire → elicitation_resolved(accepted) → a normal turn still
+//	          completes. Synthetic by design: a real question depends on the model choosing to call
+//	          AskUserQuestion, which no prompt reliably forces. See runElicitationPhase.)
 //
 // Smoke mode (E2E_SMOKE=1) replaces the phase chain above with a single phase:
 // the agent is asked to read a file holding a magic number and echo it back. It
@@ -146,6 +152,13 @@ type roundState struct {
 	phase16Delivered   bool   // the deferred message was delivered as the next turn once idle
 	phase17Interrupted bool   // interrupt=true cancelled the running turn (interaction went interrupted)
 	phase17Delivered   bool   // the interrupt message was delivered
+
+	// Phase 18: agent questions (ACP elicitations). See runElicitationPhase.
+	phase18Recorded  bool // elicitation_requested produced a live row carrying a non-empty schema
+	phase18Commanded bool // respond_elicitation reached Zed over the wire
+	phase18Acked     bool // Zed's ack round-tripped and reconciled the answered question
+	phase18Resolved  bool // elicitation_resolved(accepted) made the question terminal
+	phase18TurnOK    bool // a normal turn still completes on the same thread afterwards
 }
 
 // phase15AddSample records a single message_added event tied to phase 15's
@@ -1476,6 +1489,13 @@ func (d *testDriver) runPhase11() {
 		return
 	}
 
+	// The SpecTask row must exist before any session points at it. Production
+	// resolves the code-agent configuration for every chat message
+	// (codeAgentConfigSnapshot), and that lookup is a hard error when the task is
+	// missing — a session carrying a SpecTaskID whose row does not exist is a state
+	// production never reaches, so failing there is correct and seeding here is the fix.
+	d.store.SeedSpecTask(&types.SpecTask{ID: specTaskID})
+
 	// Set SpecTaskID on both sessions
 	for _, sid := range []string{sessionA, sessionB} {
 		ses, err := d.store.GetSession(ctx, sid)
@@ -1817,7 +1837,238 @@ func (d *testDriver) runQueuePhases() {
 		log.Printf("[%s] Phase 17: FAIL — interrupt message never delivered", agent)
 	}
 
+	d.runElicitationPhase(sessID, threadID)
+
 	d.advanceToNextRound()
+}
+
+// runElicitationPhase drives Phase 18: an agent question (ACP elicitation) is recorded,
+// answered, resolved, and the turn keeps working afterwards.
+//
+// WHY THIS IS SYNTHETIC — do not "fix" it into a model-driven phase.
+//
+// A real elicitation originates from Claude Code choosing to call its built-in
+// AskUserQuestion tool. That is a model-behaviour coin flip: no prompt reliably forces
+// it, and a CI phase that waits for one is flaky by construction. So the question is
+// injected through the same seam Phase 10 uses for user_created_thread — the event is
+// fabricated and handed to the REAL production handler via ProcessSyncEvent. Everything
+// downstream of that injection is production code: the row, the transcript entry, the
+// conditional status transitions, and the command egress to the live Zed.
+//
+// Consequence worth stating plainly: because the question was injected rather than
+// raised by Zed, the live Zed process does not hold it. When Helix delivers
+// respond_elicitation, Zed correctly answers elicitation_response_ack{not_found}, and
+// Helix's ack handler then reconciles that question to cancelled(agent_no_longer_holds).
+// That is right — an answer the agent could not apply must stop being offered.
+//
+// It also means one synthetic question cannot test both halves: the ack cancels it, and
+// cancelled is terminal, so a later elicitation_resolved(accepted) correctly affects zero
+// rows. So this phase uses TWO questions:
+//
+//	18a (egress): injected, answered through the production claim-and-send path, then
+//	     asserted to have been reconciled to a terminal state by Zed's real ack. This is
+//	     the round trip — Helix → Zed → Helix — proven end to end.
+//	18b (resolution): injected, then resolved with an injected
+//	     elicitation_resolved(accepted) exactly as a real agent reports it, with no
+//	     command sent, so nothing races the terminal write.
+//
+// Do not "simplify" this back into one question: the merge would silently stop testing
+// one of the two paths.
+func (d *testDriver) runElicitationPhase(sessID, threadID string) {
+	agent := d.round.agentName
+
+	d.mu.Lock()
+	d.phase = 18
+	d.mu.Unlock()
+	log.Printf("\n==================================================")
+	log.Printf("  [%s] PHASE 18: Agent question (ACP elicitation)", agent)
+	log.Printf("==================================================")
+	d.startPhaseTimeout(18)
+
+	ctx := context.Background()
+	elicitationID := fmt.Sprintf("elicit-e2e-%s-%d", agent, time.Now().UnixNano())
+	// Real Zed stamps elicitation events with the turn-scoped request_id. Sending one
+	// keeps this phase on the mapped-request path rather than the empty-request_id
+	// fallback, which is a different code path with its own test coverage.
+	requestID := fmt.Sprintf("req-phase18-%s", agent)
+
+	// A schema shaped like the real adapter's: a question with two labelled options plus
+	// the sibling free-text field. Asserting it survives the round trip non-empty guards
+	// the failure this whole feature exists to prevent — a question reaching the user
+	// with no options to pick.
+	requestedSchema := map[string]interface{}{
+		"type": "object",
+		"properties": map[string]interface{}{
+			"question_0": map[string]interface{}{
+				"type":        "string",
+				"title":       "Which cache backend should I use?",
+				"description": "Pick one",
+				"oneOf": []interface{}{
+					map[string]interface{}{"const": "redis", "title": "Redis"},
+					map[string]interface{}{"const": "memcached", "title": "Memcached"},
+				},
+			},
+			"question_0_custom": map[string]interface{}{
+				"type":  "string",
+				"title": "Other",
+				"_meta": map[string]interface{}{
+					"_askUserQuestionCustomAnswer": map[string]interface{}{
+						"isCustomAnswer": true,
+						"questionId":     "question_0",
+					},
+				},
+			},
+		},
+	}
+
+	if err := d.srv.ProcessSyncEvent(sessID, &types.SyncMessage{
+		EventType: "elicitation_requested",
+		Data: map[string]interface{}{
+			"acp_thread_id":    threadID,
+			"elicitation_id":   elicitationID,
+			"request_id":       requestID,
+			"entry_index":      "0",
+			"mode":             "form",
+			"message":          "Which cache backend should I use?",
+			"status":           "pending",
+			"requested_schema": requestedSchema,
+		},
+	}); err != nil {
+		log.Printf("[%s] Phase 18: FAIL — injecting elicitation_requested: %v", agent, err)
+		return
+	}
+
+	// The row must exist, be answerable, and still carry the schema.
+	live, err := d.store.ListLiveAgentElicitationsForSession(ctx, sessID)
+	if err != nil {
+		log.Printf("[%s] Phase 18: FAIL — listing live questions: %v", agent, err)
+		return
+	}
+	var recorded *types.AgentElicitation
+	for _, elicitation := range live {
+		if elicitation.ID == elicitationID {
+			recorded = elicitation
+			break
+		}
+	}
+	switch {
+	case recorded == nil:
+		log.Printf("[%s] Phase 18: FAIL — question was not recorded as live on session %s", agent, sessID)
+	case len(recorded.Schema) == 0:
+		log.Printf("[%s] Phase 18: FAIL — question recorded with an EMPTY schema (the user would see no options)", agent)
+	case !strings.Contains(string(recorded.Schema), "memcached"):
+		log.Printf("[%s] Phase 18: FAIL — schema lost its options in transit: %s", agent, string(recorded.Schema))
+	default:
+		d.mu.Lock()
+		d.round.phase18Recorded = true
+		d.mu.Unlock()
+		log.Printf("[%s] Phase 18: ✅ question recorded pending with a %d-byte schema carrying both options",
+			agent, len(recorded.Schema))
+	}
+
+	// --- 18a: egress. Answer through the production claim-then-send path. ---
+	if err := d.srv.RespondToElicitation(ctx, sessID, elicitationID, "accept",
+		map[string]interface{}{"question_0": "redis"}); err != nil {
+		log.Printf("[%s] Phase 18a: FAIL — respond_elicitation was not delivered: %v", agent, err)
+	} else {
+		d.mu.Lock()
+		d.round.phase18Commanded = true
+		d.mu.Unlock()
+		log.Printf("[%s] Phase 18a: ✅ respond_elicitation delivered to Zed", agent)
+	}
+
+	// Wait for Zed's real ack to come back and be reconciled. not_found is the correct
+	// ack for a question this Zed never held, and the handler turns it into
+	// cancelled(agent_no_longer_holds) — an answer the agent could not apply must stop
+	// being offered. Asserting the question went terminal proves the whole round trip.
+	acked := false
+	for i := 0; i < 20; i++ {
+		time.Sleep(500 * time.Millisecond)
+		current, err := d.store.GetAgentElicitation(ctx, elicitationID)
+		if err == nil && !current.IsLive() {
+			acked = true
+			log.Printf("[%s] Phase 18a: ✅ Zed's ack round-tripped: question is now %s (%s)",
+				agent, current.Status, current.ResolutionReason)
+			break
+		}
+	}
+	if !acked {
+		log.Printf("[%s] Phase 18a: FAIL — no ack from Zed reconciled the answered question", agent)
+	} else {
+		d.mu.Lock()
+		d.round.phase18Acked = true
+		d.mu.Unlock()
+	}
+	for _, event := range d.filterRoundEvents("elicitation_response_ack") {
+		status, _ := event.Data["status"].(string)
+		log.Printf("[%s] Phase 18a: ack event from Zed: status=%s", agent, status)
+	}
+
+	// --- 18b: resolution. A fresh question, resolved the way a real agent reports it. ---
+	resolvedID := elicitationID + "-resolved"
+	if err := d.srv.ProcessSyncEvent(sessID, &types.SyncMessage{
+		EventType: "elicitation_requested",
+		Data: map[string]interface{}{
+			"acp_thread_id":    threadID,
+			"elicitation_id":   resolvedID,
+			"request_id":       requestID,
+			"entry_index":      "0",
+			"mode":             "form",
+			"message":          "Which cache backend should I use?",
+			"status":           "pending",
+			"requested_schema": requestedSchema,
+		},
+	}); err != nil {
+		log.Printf("[%s] Phase 18b: FAIL — injecting the second elicitation_requested: %v", agent, err)
+		return
+	}
+
+	if err := d.srv.ProcessSyncEvent(sessID, &types.SyncMessage{
+		EventType: "elicitation_resolved",
+		Data: map[string]interface{}{
+			"acp_thread_id":  threadID,
+			"elicitation_id": resolvedID,
+			"status":         "accepted",
+		},
+	}); err != nil {
+		log.Printf("[%s] Phase 18b: FAIL — injecting elicitation_resolved: %v", agent, err)
+	}
+
+	resolved, err := d.store.GetAgentElicitation(ctx, resolvedID)
+	switch {
+	case err != nil:
+		log.Printf("[%s] Phase 18b: FAIL — reloading resolved question: %v", agent, err)
+	case resolved.Status != "accepted":
+		log.Printf("[%s] Phase 18b: FAIL — question status is %q, wanted accepted", agent, resolved.Status)
+	case resolved.IsLive():
+		log.Printf("[%s] Phase 18b: FAIL — question is still answerable after being accepted", agent)
+	default:
+		d.mu.Lock()
+		d.round.phase18Resolved = true
+		d.mu.Unlock()
+		log.Printf("[%s] Phase 18b: ✅ question is terminal (accepted) and no longer answerable", agent)
+	}
+
+	// The elicitation assertions are done; the follow-up turn below has its own explicit
+	// deadline and is reported as a validation failure, not an abort. Release the phase
+	// watchdog first, or its 90s timer races that wait and os.Exit(1)s a passing phase.
+	d.markPhaseSucceeded(18)
+
+	// Test the NEXT operation, not just the state change: a normal turn must still
+	// complete on this thread once the question cycle is done.
+	promptZ, err := d.srv.EnqueueQueuedPrompt(sessID, "Reply with exactly this one sentence: The cache is warm.", false)
+	if err != nil {
+		log.Printf("[%s] Phase 18: FAIL — enqueue after question failed: %v", agent, err)
+		return
+	}
+	if d.waitInteractionState(promptZ, map[string]bool{"complete": true}, 90*time.Second) {
+		d.mu.Lock()
+		d.round.phase18TurnOK = true
+		d.mu.Unlock()
+		log.Printf("[%s] Phase 18: ✅ a normal turn still completes after the question cycle", agent)
+	} else {
+		log.Printf("[%s] Phase 18: FAIL — the thread is wedged: no turn completed after the question", agent)
+	}
 }
 
 // --- Per-round validation ---
@@ -2395,6 +2646,24 @@ func (d *testDriver) validateRound() roundResult {
 	if !d.round.phase17Delivered {
 		errors = append(errors, "Phase 17: interrupt queue message was never delivered")
 	}
+	// Phase 18: agent questions (ACP elicitations). 18a proves the Helix → Zed → Helix
+	// round trip; 18b proves the resolution path. See runElicitationPhase for why these
+	// need two separate questions.
+	if !d.round.phase18Recorded {
+		errors = append(errors, "Phase 18: the question was not recorded live with a populated schema")
+	}
+	if !d.round.phase18Commanded {
+		errors = append(errors, "Phase 18a: respond_elicitation was never delivered to the agent")
+	}
+	if !d.round.phase18Acked {
+		errors = append(errors, "Phase 18a: Zed's ack never round-tripped to reconcile the answered question")
+	}
+	if !d.round.phase18Resolved {
+		errors = append(errors, "Phase 18b: the question did not become terminal after being accepted")
+	}
+	if !d.round.phase18TurnOK {
+		errors = append(errors, "Phase 18: no normal turn completed after the question cycle (thread wedged)")
+	}
 
 	// --- SUMMARY ---
 	passed := len(errors) == 0
@@ -2567,7 +2836,10 @@ func (d *testDriver) validateStore() bool {
 					if e.Type == "text" {
 						hasText = true
 					}
-					if e.Type != "text" && e.Type != "tool_call" && e.Type != "plan" {
+					// "elicitation" is a question the agent asked the user; it lives
+					// inline in the transcript so it renders in conversation order and
+					// stays there once answered (Phase 18).
+					if e.Type != "text" && e.Type != "tool_call" && e.Type != "plan" && e.Type != "elicitation" {
 						errors = append(errors, fmt.Sprintf("Interaction %s: unexpected entry type %q",
 							truncate(i.ID, 12), e.Type))
 					}

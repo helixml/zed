@@ -277,6 +277,58 @@ pub enum SyncEvent {
         /// Currently selected model ID for the active thread (if available)
         active_model: Option<String>,
     },
+    /// An ACP agent asked the user a question (`session/request_elicitation`).
+    /// The turn is blocked until Helix answers via the `respond_elicitation` command.
+    /// Re-emitted verbatim on reconnect for elicitations that are still pending, so a
+    /// Helix that restarted can rebuild its view without inventing state.
+    #[serde(rename = "elicitation_requested")]
+    ElicitationRequested {
+        acp_thread_id: String,
+        request_id: String,
+        /// Position in `AcpThread::entries()` — the same value used as `message_id` for
+        /// `message_added`, so Helix can slot the question into the transcript in order.
+        entry_index: String,
+        elicitation_id: String,
+        tool_call_id: String,
+        mode: String,
+        message: String,
+        /// The full `requestedSchema`, passed through verbatim. Helix renders from this,
+        /// so flattening it here would silently drop options the agent offered.
+        requested_schema: serde_json::Value,
+        status: String,
+        timestamp: i64,
+    },
+    /// An elicitation reached a terminal status — answered, skipped, or cancelled by turn
+    /// teardown / a follow-up prompt. Helix stops offering to answer on receipt.
+    #[serde(rename = "elicitation_resolved")]
+    ElicitationResolved {
+        acp_thread_id: String,
+        request_id: String,
+        entry_index: String,
+        elicitation_id: String,
+        status: String,
+        content: Option<serde_json::Value>,
+        timestamp: i64,
+    },
+    /// Completeness marker sent after re-announcing pending elicitations on reconnect.
+    /// Lists every elicitation this thread still holds (an empty list is meaningful).
+    /// Helix reaps its own pending rows that are absent from this list — the only
+    /// evidence-based way to tell "the agent died" from "the API restarted".
+    #[serde(rename = "elicitation_resync")]
+    ElicitationResync {
+        acp_thread_id: String,
+        elicitation_ids: Vec<String>,
+        timestamp: i64,
+    },
+    /// Reply to a `respond_elicitation` command. `noop` means the elicitation was no longer
+    /// pending (already answered, or cancelled); `not_found` means the id or its thread is
+    /// gone. Both are clean outcomes, not errors that should wedge a turn.
+    #[serde(rename = "elicitation_response_ack")]
+    ElicitationResponseAck {
+        elicitation_id: String,
+        status: String,
+        error: String,
+    },
 }
 
 impl SyncEvent {
@@ -368,10 +420,83 @@ impl SyncEvent {
                     "active_model": active_model,
                 })
             ),
+            SyncEvent::ElicitationRequested {
+                acp_thread_id, request_id, entry_index, elicitation_id, tool_call_id,
+                mode, message, requested_schema, status, timestamp,
+            } => (
+                "elicitation_requested".to_string(),
+                serde_json::json!({
+                    "acp_thread_id": acp_thread_id,
+                    "request_id": request_id,
+                    "entry_index": entry_index,
+                    "elicitation_id": elicitation_id,
+                    "tool_call_id": tool_call_id,
+                    "mode": mode,
+                    "message": message,
+                    "requested_schema": requested_schema,
+                    "status": status,
+                    "timestamp": timestamp,
+                })
+            ),
+            SyncEvent::ElicitationResolved {
+                acp_thread_id, request_id, entry_index, elicitation_id, status, content, timestamp,
+            } => (
+                "elicitation_resolved".to_string(),
+                serde_json::json!({
+                    "acp_thread_id": acp_thread_id,
+                    "request_id": request_id,
+                    "entry_index": entry_index,
+                    "elicitation_id": elicitation_id,
+                    "status": status,
+                    "content": content,
+                    "timestamp": timestamp,
+                })
+            ),
+            SyncEvent::ElicitationResync { acp_thread_id, elicitation_ids, timestamp } => (
+                "elicitation_resync".to_string(),
+                serde_json::json!({
+                    "acp_thread_id": acp_thread_id,
+                    "elicitation_ids": elicitation_ids,
+                    "timestamp": timestamp,
+                })
+            ),
+            SyncEvent::ElicitationResponseAck { elicitation_id, status, error } => (
+                "elicitation_response_ack".to_string(),
+                serde_json::json!({
+                    "elicitation_id": elicitation_id,
+                    "status": status,
+                    "error": error,
+                })
+            ),
         };
 
         Ok(OutgoingMessage { event_type, data })
     }
+}
+
+/// Wire spelling for an elicitation status. Zed spells the cancelled state `Canceled`;
+/// the wire protocol uses `cancelled`. This is the ONLY place the two spellings meet —
+/// keep it that way.
+pub fn elicitation_status_str(status: &acp_thread::ElicitationStatus) -> &'static str {
+    match status {
+        acp_thread::ElicitationStatus::Pending { .. } => "pending",
+        acp_thread::ElicitationStatus::Accepted => "accepted",
+        acp_thread::ElicitationStatus::Declined => "declined",
+        acp_thread::ElicitationStatus::Canceled => "cancelled",
+        acp_thread::ElicitationStatus::Completed => "completed",
+    }
+}
+
+/// A request from Helix to answer a pending elicitation, delivered as the
+/// `respond_elicitation` command.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct IncomingElicitationResponse {
+    pub acp_thread_id: String,
+    pub elicitation_id: String,
+    /// "accept" | "decline". "cancel" is reserved for teardown and is not sent by users.
+    pub action: String,
+    #[serde(default)]
+    pub content: Option<serde_json::Value>,
 }
 
 /// Incoming command from external system to Zed

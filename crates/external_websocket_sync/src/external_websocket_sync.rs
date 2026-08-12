@@ -116,6 +116,30 @@ static GLOBAL_CANCEL_THREAD_CALLBACK: parking_lot::Mutex<Option<mpsc::UnboundedS
 static PENDING_UI_STATE_QUERIES: parking_lot::Mutex<Vec<UiStateQueryRequest>> =
     parking_lot::Mutex::new(Vec::new());
 
+/// A user's answer to a pending elicitation, arriving from Helix.
+#[derive(Clone, Debug)]
+pub struct ElicitationResponseRequest {
+    pub acp_thread_id: String,
+    pub elicitation_id: String,
+    /// "accept" | "decline". "cancel" is reserved for teardown, never sent by a user.
+    pub action: String,
+    /// Field name → answer, straight from the form the user filled in.
+    pub content: Option<serde_json::Value>,
+}
+
+/// Static global for the elicitation-response callback.
+/// Answering runs on its own GPUI task for the same reason cancelling does: the
+/// sequential creation loop is blocked awaiting the very turn that is waiting on this
+/// answer, so delivering through it would deadlock.
+static GLOBAL_ELICITATION_RESPONSE_CALLBACK: parking_lot::Mutex<
+    Option<mpsc::UnboundedSender<ElicitationResponseRequest>>,
+> = parking_lot::Mutex::new(None);
+
+/// Static global for requesting a full elicitation resync (on WebSocket reconnect).
+static GLOBAL_ELICITATION_RESYNC_CALLBACK: parking_lot::Mutex<
+    Option<mpsc::UnboundedSender<()>>,
+> = parking_lot::Mutex::new(None);
+
 /// Request to create ACP thread from external WebSocket message
 #[derive(Clone, Debug)]
 pub struct ThreadCreationRequest {
@@ -600,6 +624,63 @@ pub fn init_cancel_thread_callback(sender: mpsc::UnboundedSender<CancelThreadReq
     eprintln!("🔧 [CANCEL] init_cancel_thread_callback() called - registering global callback");
     log::info!("🔧 [CANCEL] init_cancel_thread_callback() called - registering global callback");
     *GLOBAL_CANCEL_THREAD_CALLBACK.lock() = Some(sender);
+}
+
+/// Deliver a user's answer to a pending elicitation, unblocking the agent's turn.
+pub fn request_elicitation_response(request: ElicitationResponseRequest) -> Result<()> {
+    log::info!(
+        "[ELICITATION] Answer for {} on thread {} (action={})",
+        request.elicitation_id,
+        request.acp_thread_id,
+        request.action
+    );
+
+    let sender = GLOBAL_ELICITATION_RESPONSE_CALLBACK.lock().clone();
+    let Some(sender) = sender else {
+        // No task to deliver to means no thread is loaded, so there is nothing to
+        // answer. Tell Helix rather than dropping it silently — a swallowed answer
+        // leaves the user staring at a question that never resolves.
+        log::warn!(
+            "[ELICITATION] Response callback not initialized; cannot answer {}",
+            request.elicitation_id
+        );
+        if let Err(e) = send_websocket_event(SyncEvent::ElicitationResponseAck {
+            elicitation_id: request.elicitation_id,
+            status: "not_found".to_string(),
+            error: "no thread service running".to_string(),
+        }) {
+            log::warn!("[ELICITATION] Failed to send not_found ack: {}", e);
+        }
+        return Ok(());
+    };
+
+    sender
+        .send(request)
+        .map_err(|_| anyhow::anyhow!("Failed to send elicitation response"))
+}
+
+/// Initialize the global elicitation-response callback (called from thread_service).
+pub fn init_elicitation_response_callback(
+    sender: mpsc::UnboundedSender<ElicitationResponseRequest>,
+) {
+    log::info!("[ELICITATION] Registering elicitation response callback");
+    *GLOBAL_ELICITATION_RESPONSE_CALLBACK.lock() = Some(sender);
+}
+
+/// Ask the heartbeat task to re-announce outstanding questions in full. Called when the
+/// WebSocket reconnects, because the Helix on the other end may have restarted and lost
+/// track of what is pending.
+pub fn request_elicitation_resync() {
+    if let Some(sender) = GLOBAL_ELICITATION_RESYNC_CALLBACK.lock().clone() {
+        if sender.send(()).is_err() {
+            log::warn!("[ELICITATION] Resync channel closed");
+        }
+    }
+}
+
+/// Initialize the global elicitation-resync callback (called from thread_service).
+pub fn init_elicitation_resync_callback(sender: mpsc::UnboundedSender<()>) {
+    *GLOBAL_ELICITATION_RESYNC_CALLBACK.lock() = Some(sender);
 }
 
 
