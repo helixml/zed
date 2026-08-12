@@ -1495,6 +1495,7 @@ func (d *testDriver) runPhase11() {
 	// Thread B should be more recently active (Phase 7 completed on it).
 	// Verify routing picks Thread B's session.
 	specTask := &types.SpecTask{ID: specTaskID}
+	d.store.SeedSpecTask(specTask)
 	routedSessionID, err := d.srv.FindConnectedSessionForSpecTask(ctx, specTask)
 	if err != nil {
 		log.Printf("[%s] Phase 11: ERROR FindConnectedSessionForSpecTask failed: %v", agent, err)
