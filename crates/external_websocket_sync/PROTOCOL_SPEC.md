@@ -207,7 +207,9 @@ Sent when Zed fails to load a thread (e.g., thread is already active in the UI, 
 
 ### `turn_cancelled`
 
-Sent when Zed has processed a `cancel_current_turn` command. Indicates whether the active turn was actually cancelled or there was nothing to cancel.
+Sent when Zed has processed a `cancel_current_turn` command. Indicates whether
+the accepted request was stopped or suppressed before dispatch, or whether Zed
+has never accepted that request ID.
 
 ```json
 {
@@ -222,7 +224,7 @@ Sent when Zed has processed a `cancel_current_turn` command. Indicates whether t
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
 | `request_id` | string | yes | Echoed from the `cancel_current_turn` command |
-| `status` | string | yes | `"cancelled"` if a turn was stopped, `"noop"` if no active turn for that request_id |
+| `status` | string | yes | `"cancelled"` if a running turn was stopped or a queued request was suppressed; `"noop"` if Zed has not accepted that request ID |
 
 ## Helix -> Zed Command Types
 
@@ -270,7 +272,9 @@ Open/focus an existing thread in Zed's UI. This loads the thread from the databa
 
 ### `cancel_current_turn`
 
-Cancel an in-progress AI agent turn. Zed stops the active ACP task for the given `request_id` and replies with a `turn_cancelled` event. If no turn is active for that `request_id`, Zed replies with `turn_cancelled` with `status: "noop"`.
+Cancel an accepted AI agent turn. Zed stops an active ACP task or tombstones a
+request waiting behind another turn, then replies with `status: "cancelled"`.
+Only an unknown or already-completed request ID returns `status: "noop"`.
 
 ```json
 {
