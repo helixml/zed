@@ -18,7 +18,9 @@ use fs::Fs;
 use project::Project;
 use tokio::sync::mpsc;
 use util::ResultExt;
-use crate::{ExternalAgent, SyncEvent, ThreadCreationRequest, ThreadOpenRequest, TurnUsage};
+use crate::{
+    ContextUsage, ExternalAgent, SyncEvent, ThreadCreationRequest, ThreadOpenRequest, TurnUsage,
+};
 
 fn zed_agent_server_id(agent_name: &str) -> &str {
     match agent_name {
@@ -1286,6 +1288,10 @@ pub fn ensure_thread_subscription(
                                 cached_read_tokens: usage.cached_read_tokens,
                                 cached_write_tokens: usage.cached_write_tokens,
                             }
+                        }),
+                        context_usage: thread.token_usage().map(|usage| ContextUsage {
+                            used_tokens: usage.used_tokens,
+                            max_tokens: usage.max_tokens,
                         }),
                     });
                 }

@@ -688,7 +688,7 @@ impl MockHelixServer {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::{IncomingChatMessage, OutgoingMessage, SyncEvent, TurnUsage};
+    use crate::types::{ContextUsage, IncomingChatMessage, OutgoingMessage, SyncEvent, TurnUsage};
 
     // -----------------------------------------------------------------------
     // Protocol serialization tests
@@ -751,6 +751,10 @@ mod tests {
                 cached_read_tokens: 40,
                 cached_write_tokens: 10,
             }),
+            context_usage: Some(ContextUsage {
+                used_tokens: 120_000,
+                max_tokens: 200_000,
+            }),
         };
 
         let outgoing = event.to_outgoing_message().unwrap();
@@ -761,6 +765,8 @@ mod tests {
         assert_eq!(outgoing.data["agent_name"], "codex-acp");
         assert_eq!(outgoing.data["usage"]["total_tokens"], 175);
         assert_eq!(outgoing.data["usage"]["cached_read_tokens"], 40);
+        assert_eq!(outgoing.data["context_usage"]["used_tokens"], 120_000);
+        assert_eq!(outgoing.data["context_usage"]["max_tokens"], 200_000);
     }
 
     #[test]
@@ -961,6 +967,7 @@ mod tests {
                     request_id: "r2".to_string(),
                     agent_name: "test-agent".to_string(),
                     usage: None,
+                    context_usage: None,
                 },
                 "message_completed",
             ),
