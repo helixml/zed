@@ -11,7 +11,7 @@ use tokio::sync::mpsc;
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 use session::AppSession;
-use std::sync::Arc;
+use std::{collections::HashMap, sync::{Arc, LazyLock}};
 
 mod websocket_sync;
 
@@ -86,6 +86,120 @@ static GLOBAL_UI_STATE_QUERY_CALLBACK: parking_lot::Mutex<Option<mpsc::Unbounded
 /// Static global for cancellation callback (cancels active ACP thread turn by request_id)
 static GLOBAL_CANCELLATION_CALLBACK: parking_lot::Mutex<Option<mpsc::UnboundedSender<CancellationRequest>>> =
     parking_lot::Mutex::new(None);
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RequestLifecycle {
+    Queued,
+    Running,
+    Cancelled,
+}
+
+/// Process-level request lifecycle shared by WebSocket ingress, sequential
+/// dispatch, and out-of-band cancellation. This prevents an accepted request
+/// queued behind another turn from running after it was cancelled.
+static REQUEST_LIFECYCLES: LazyLock<parking_lot::Mutex<HashMap<String, RequestLifecycle>>> =
+    LazyLock::new(|| parking_lot::Mutex::new(HashMap::new()));
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CancellationTarget {
+    Queued,
+    Running,
+    AlreadyCancelled,
+    Unknown,
+}
+
+fn register_queued_request(request_id: &str) {
+    REQUEST_LIFECYCLES.lock().entry(request_id.to_string()).or_insert(RequestLifecycle::Queued);
+}
+
+fn cancel_registered_request(request_id: &str) -> CancellationTarget {
+    let mut requests = REQUEST_LIFECYCLES.lock();
+    match requests.get_mut(request_id) {
+        Some(state @ RequestLifecycle::Queued) => {
+            *state = RequestLifecycle::Cancelled;
+            CancellationTarget::Queued
+        }
+        Some(state @ RequestLifecycle::Running) => {
+            *state = RequestLifecycle::Cancelled;
+            CancellationTarget::Running
+        }
+        Some(RequestLifecycle::Cancelled) => CancellationTarget::AlreadyCancelled,
+        None => CancellationTarget::Unknown,
+    }
+}
+
+pub(crate) struct RequestLifecycleGuard(String);
+
+impl RequestLifecycleGuard {
+    pub(crate) fn can_continue(&self) -> bool {
+        matches!(REQUEST_LIFECYCLES.lock().get(&self.0), Some(RequestLifecycle::Running))
+    }
+}
+
+impl Drop for RequestLifecycleGuard {
+    fn drop(&mut self) {
+        REQUEST_LIFECYCLES.lock().remove(&self.0);
+    }
+}
+
+/// Cross queued -> running and invoke `start` under the cancellation mutex.
+/// If cancellation won the race, the closure is never called.
+pub(crate) fn start_registered_request<T>(request_id: &str, start: impl FnOnce() -> T) -> Option<(T, RequestLifecycleGuard)> {
+    let mut requests = REQUEST_LIFECYCLES.lock();
+    match requests.get_mut(request_id) {
+        Some(RequestLifecycle::Cancelled) => {
+            requests.remove(request_id);
+            None
+        }
+        Some(state) => {
+            *state = RequestLifecycle::Running;
+            Some((start(), RequestLifecycleGuard(request_id.to_string())))
+        }
+        None => {
+            // Preserve local/UI callers that bypass WebSocket ingress.
+            requests.insert(request_id.to_string(), RequestLifecycle::Running);
+            Some((start(), RequestLifecycleGuard(request_id.to_string())))
+        }
+    }
+}
+
+pub(crate) fn registered_request_is_cancelled(request_id: &str) -> bool {
+    matches!(REQUEST_LIFECYCLES.lock().get(request_id), Some(RequestLifecycle::Cancelled))
+}
+
+#[cfg(test)]
+mod request_lifecycle_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    #[test]
+    fn queued_cancellation_suppresses_dispatch() {
+        let request_id = "request-lifecycle-queued-cancel";
+        register_queued_request(request_id);
+        assert_eq!(cancel_registered_request(request_id), CancellationTarget::Queued);
+
+        let started = AtomicBool::new(false);
+        let result = start_registered_request(request_id, || started.store(true, Ordering::SeqCst));
+
+        assert!(result.is_none());
+        assert!(!started.load(Ordering::SeqCst));
+        assert!(!registered_request_is_cancelled(request_id));
+    }
+
+    #[test]
+    fn running_cancellation_stops_retries() {
+        let request_id = "request-lifecycle-running-cancel";
+        register_queued_request(request_id);
+        let (_, guard) = start_registered_request(request_id, || ()).unwrap();
+        assert!(guard.can_continue());
+
+        assert_eq!(cancel_registered_request(request_id), CancellationTarget::Running);
+        assert!(!guard.can_continue());
+        assert!(registered_request_is_cancelled(request_id));
+        drop(guard);
+        assert!(!registered_request_is_cancelled(request_id));
+    }
+}
 
 /// Request to cancel a thread's running turn out-of-band.
 #[derive(Clone, Debug)]
@@ -176,11 +290,14 @@ pub fn request_thread_creation(request: ThreadCreationRequest) -> Result<()> {
     eprintln!("🔧 [CALLBACK] request_thread_creation() called: acp_thread_id={:?}, request_id={}",
                request.acp_thread_id, request.request_id);
 
+    register_queued_request(&request.request_id);
     let sender = GLOBAL_THREAD_CREATION_CALLBACK.lock().clone();
     if let Some(sender) = sender {
         log::info!("✅ [CALLBACK] Found global callback sender, sending request...");
+        let request_id = request.request_id.clone();
         sender.send(request)
             .map_err(|e| {
+                REQUEST_LIFECYCLES.lock().remove(&request_id);
                 log::error!("❌ [CALLBACK] Failed to send to channel: {:?}", e);
                 anyhow::anyhow!("Failed to send thread creation request")
             })?;
@@ -354,11 +471,22 @@ pub fn init_cancellation_callback(sender: mpsc::UnboundedSender<CancellationRequ
     *GLOBAL_CANCELLATION_CALLBACK.lock() = Some(sender);
 }
 
-/// Request cancellation of an active thread turn (called from WebSocket handler)
-/// Unlike thread creation, cancellation requests are not queued — if the handler
-/// isn't ready, we immediately send back a noop turn_cancelled event.
+/// Request cancellation of an accepted thread turn. Queued requests are
+/// tombstoned immediately; running requests go to the out-of-band handler.
 pub fn request_thread_cancellation(request: CancellationRequest) -> Result<()> {
     log::info!("[CALLBACK] request_thread_cancellation() called: request_id={}", request.request_id);
+
+    match cancel_registered_request(&request.request_id) {
+        CancellationTarget::Queued | CancellationTarget::AlreadyCancelled => {
+            log::info!("[CALLBACK] Accepted cancellation before dispatch: request_id={}", request.request_id);
+            send_websocket_event(SyncEvent::TurnCancelled {
+                request_id: request.request_id,
+                status: "cancelled".to_string(),
+            })?;
+            return Ok(());
+        }
+        CancellationTarget::Running | CancellationTarget::Unknown => {}
+    }
 
     let sender = GLOBAL_CANCELLATION_CALLBACK.lock().clone();
     if let Some(sender) = sender {
@@ -601,5 +729,4 @@ pub fn init_cancel_thread_callback(sender: mpsc::UnboundedSender<CancelThreadReq
     log::info!("🔧 [CANCEL] init_cancel_thread_callback() called - registering global callback");
     *GLOBAL_CANCEL_THREAD_CALLBACK.lock() = Some(sender);
 }
-
 

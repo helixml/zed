@@ -1924,22 +1924,34 @@ pub fn setup_thread_handler(
                         task.await;
                         log::info!("[THREAD_SERVICE] Cancelled turn for request_id={}", request.request_id);
                     } else {
-                        log::info!("[THREAD_SERVICE] Thread exists but no turn running for request_id={}, sending noop", request.request_id);
+                        let status = if crate::registered_request_is_cancelled(&request.request_id) {
+                            // Cancellation won between retries or while crossing
+                            // dispatch; the tombstone guarantees no later send.
+                            "cancelled"
+                        } else {
+                            "noop"
+                        };
+                        log::info!("[THREAD_SERVICE] Thread exists but no turn running for request_id={}, sending {}", request.request_id, status);
                         if let Err(e) = crate::send_websocket_event(SyncEvent::TurnCancelled {
                             request_id: request.request_id,
-                            status: "noop".to_string(),
+                            status: status.to_string(),
                         }) {
-                            log::error!("[THREAD_SERVICE] Failed to send turn_cancelled noop event: {}", e);
+                            log::error!("[THREAD_SERVICE] Failed to send turn_cancelled event: {}", e);
                         }
                     }
                 }
                 None => {
-                    log::info!("[THREAD_SERVICE] No active thread for request_id={}, sending noop", request.request_id);
+                    let status = if crate::registered_request_is_cancelled(&request.request_id) {
+                        "cancelled"
+                    } else {
+                        "noop"
+                    };
+                    log::info!("[THREAD_SERVICE] No active thread for request_id={}, sending {}", request.request_id, status);
                     if let Err(e) = crate::send_websocket_event(SyncEvent::TurnCancelled {
                         request_id: request.request_id,
-                        status: "noop".to_string(),
+                        status: status.to_string(),
                     }) {
-                        log::error!("[THREAD_SERVICE] Failed to send turn_cancelled noop event: {}", e);
+                        log::error!("[THREAD_SERVICE] Failed to send turn_cancelled event: {}", e);
                     }
                 }
             }
@@ -2237,15 +2249,20 @@ fn create_new_thread_sync(
 
         // Send the initial message to the thread to trigger AI response
         eprintln!("🔧 [THREAD_SERVICE] About to send message to thread...");
-        let send_task = cx.update(|cx| {
-            thread_entity.update(cx, |thread: &mut AcpThread, cx| {
-                let message = vec![ContentBlock::Text(
-                    TextContent::new(request_clone.message.clone())
-                )];
-                eprintln!("🔧 [THREAD_SERVICE] Calling thread.send() with message: {}", request_clone.message);
-                thread.send(message, cx)
+        let Some((send_task, _request_guard)) = crate::start_registered_request(&request_clone.request_id, || {
+            cx.update(|cx| {
+                thread_entity.update(cx, |thread: &mut AcpThread, cx| {
+                    let message = vec![ContentBlock::Text(
+                        TextContent::new(request_clone.message.clone())
+                    )];
+                    eprintln!("🔧 [THREAD_SERVICE] Calling thread.send() with message: {}", request_clone.message);
+                    thread.send(message, cx)
+                })
             })
-        });
+        }) else {
+            log::info!("[THREAD_SERVICE] Suppressed cancelled request before initial dispatch: {}", request_clone.request_id);
+            return Ok(());
+        };
 
         // Await the send task directly (don't spawn and detach)
         eprintln!("🔧 [THREAD_SERVICE] Awaiting send task...");
@@ -2326,19 +2343,38 @@ async fn handle_follow_up_message(
         thread.update(cx, |thread, _| thread.agent_telemetry_id())
     })?;
     let silence_budget = silent_prompt_wedge_timeout(agent_telemetry_id.as_ref());
+    let mut request_guard = None;
     for attempt in 1..=max_attempts {
         // Snapshot BEFORE dispatch so the watchdog only credits activity that
         // this prompt produced.
         let activity_baseline = activity_count(&thread_id);
 
-        let send_task = cx.update(|cx| {
-            thread.update(cx, |thread: &mut AcpThread, cx| {
-                let message = vec![ContentBlock::Text(
-                    TextContent::new(message.clone())
-                )];
-                thread.send(message, cx)
-            })
-        })?;
+        let send_task = if request_guard.is_none() {
+            let Some((send_task, guard)) = crate::start_registered_request(&request_id, || {
+                cx.update(|cx| {
+                    thread.update(cx, |thread: &mut AcpThread, cx| {
+                        let message = vec![ContentBlock::Text(TextContent::new(message.clone()))];
+                        thread.send(message, cx)
+                    })
+                })
+            }) else {
+                log::info!("[THREAD_SERVICE] Suppressed cancelled follow-up before dispatch: {}", request_id);
+                return Ok(());
+            };
+            request_guard = Some(guard);
+            send_task?
+        } else {
+            if !request_guard.as_ref().unwrap().can_continue() {
+                log::info!("[THREAD_SERVICE] Suppressed cancelled follow-up retry: {}", request_id);
+                return Ok(());
+            }
+            cx.update(|cx| {
+                thread.update(cx, |thread: &mut AcpThread, cx| {
+                    let message = vec![ContentBlock::Text(TextContent::new(message.clone()))];
+                    thread.send(message, cx)
+                })
+            })?
+        };
 
         // Silent-prompt watchdog. Race the turn against a time-to-first-event
         // budget: if the agent produces literally nothing, `send_task` would
