@@ -74,7 +74,9 @@ type roundState struct {
 	completions map[string][]string // threadID -> list of request_ids
 
 	// Track UI state responses (from query_ui_state)
-	uiStateResponses []types.SyncMessage
+	uiStateResponses       []types.SyncMessage
+	phase7ExpectedThreadID string
+	phase7ChatSent         bool
 
 	// Track timing for MCP tools wait validation
 	phase1ChatSentAt    time.Time // when we sent the chat_message for phase 1
@@ -103,6 +105,8 @@ type roundState struct {
 
 	// Phase 12: reconnect test (kill Zed, reconnect, verify message delivery)
 	phase12Completed bool // whether the reconnected message completed
+	phase12OpenSent  bool
+	phase12ChatSent  bool
 
 	// Phase 13: Helix-initiated cancel via cancel_current_turn
 	phase13ThreadID      string // thread ID for the long-running turn
@@ -154,6 +158,16 @@ type roundState struct {
 type phase15AddSample struct {
 	ts         time.Time
 	contentLen int
+}
+
+type responseEntryKey struct {
+	messageID string
+	content   string
+}
+
+func responseEntryLeak(previous map[responseEntryKey]string, messageID, content string) (string, bool) {
+	owner, leaked := previous[responseEntryKey{messageID: messageID, content: content}]
+	return owner, leaked
 }
 
 func newRoundState(agentName string) *roundState {
@@ -274,6 +288,7 @@ func (d *testDriver) syncEventCallback(sessionID string, syncMsg *types.SyncMess
 
 	switch syncMsg.EventType {
 	case "agent_ready":
+		threadID, _ := syncMsg.Data["thread_id"].(string)
 		if d.phase == 0 {
 			d.phase = 1
 			d.mu.Unlock()
@@ -282,6 +297,38 @@ func (d *testDriver) syncEventCallback(sessionID string, syncMsg *types.SyncMess
 			log.Printf("##################################################")
 			d.stampRoundAgentOnSeedSession(d.round.agentName)
 			d.startRound()
+			return
+		}
+		if d.phase == 7 && !d.round.phase7ChatSent && threadID == d.round.phase7ExpectedThreadID {
+			d.round.phase7ChatSent = true
+			agentName := d.round.agentName
+			requestID := d.round.reqID("phase7")
+			d.mu.Unlock()
+			log.Printf("[%s] Phase 7: open_thread ready for Thread B (%s); sending follow-up", agentName, truncate(threadID, 16))
+			d.sendChatMessage("What is 8 + 8? Reply with just the number.", requestID, agentName, threadID)
+			return
+		}
+		if d.phase == 12 && !d.round.phase12OpenSent {
+			d.round.phase12OpenSent = true
+			agentName := d.round.agentName
+			if len(d.round.threadIDs) == 0 {
+				d.mu.Unlock()
+				log.Printf("[%s] Phase 12: ERROR no thread IDs available", agentName)
+				return
+			}
+			threadID := d.round.threadIDs[0]
+			d.mu.Unlock()
+			log.Printf("[%s] Phase 12: Agent ready after reconnect; opening Thread A (%s)", agentName, truncate(threadID, 16))
+			d.sendOpenThread(threadID, agentName)
+			return
+		}
+		if d.phase == 12 && d.round.phase12OpenSent && !d.round.phase12ChatSent && len(d.round.threadIDs) > 0 && threadID == d.round.threadIDs[0] {
+			d.round.phase12ChatSent = true
+			agentName := d.round.agentName
+			requestID := d.round.reqID("phase12")
+			d.mu.Unlock()
+			log.Printf("[%s] Phase 12: open_thread ready for Thread A (%s); sending follow-up", agentName, truncate(threadID, 16))
+			d.sendChatMessage("What is 12 + 12? Reply with just the number.", requestID, agentName, threadID)
 			return
 		}
 
@@ -586,13 +633,14 @@ func (d *testDriver) syncEventCallback(sessionID string, syncMsg *types.SyncMess
 	case "ui_state_response":
 		d.round.uiStateResponses = append(d.round.uiStateResponses, *syncMsg)
 		currentPhase := d.phase
+		agentName := d.round.agentName
 		queryID, _ := syncMsg.Data["query_id"].(string)
 		activeView, _ := syncMsg.Data["active_view"].(string)
 		threadID, _ := syncMsg.Data["thread_id"].(string)
 		d.mu.Unlock()
 
 		log.Printf("[%s] UI state: query_id=%s active_view=%s thread_id=%s (phase %d)",
-			d.round.agentName, queryID, activeView, truncate(threadID, 12), currentPhase)
+			agentName, queryID, activeView, truncate(threadID, 12), currentPhase)
 
 		if currentPhase == 6 {
 			go d.advanceAfterUiState()
@@ -1287,16 +1335,11 @@ func (d *testDriver) runPhase7() {
 	}
 	// Open Thread B (created in phase 3), then send a follow-up
 	tid := d.round.threadIDs[1]
+	d.round.phase7ExpectedThreadID = tid
 	d.mu.Unlock()
 
 	log.Printf("[%s] Opening Thread B: %s", agent, truncate(tid, 16))
 	d.sendOpenThread(tid, agent)
-
-	// Wait for Zed to open the thread before sending follow-up
-	time.Sleep(3 * time.Second)
-
-	log.Printf("[%s] Sending follow-up to Thread B after open_thread", agent)
-	d.sendChatMessage("What is 8 + 8? Reply with just the number.", d.round.reqID("phase7"), agent, tid)
 }
 
 func (d *testDriver) runPhase8() {
@@ -2328,7 +2371,9 @@ func (d *testDriver) validateRound() roundResult {
 		log.Printf("  [%s] MCP TOOLS WAIT VALIDATION", agent)
 		log.Println("--------------------------------------------------")
 
-		if !d.round.phase1ChatSentAt.IsZero() && !d.round.phase1ThreadCreated.IsZero() {
+		if agent == "lifecycle-test-agent" {
+			log.Printf("[%s] Not applicable: deterministic lifecycle agent has no MCP capability", agent)
+		} else if !d.round.phase1ChatSentAt.IsZero() && !d.round.phase1ThreadCreated.IsZero() {
 			mcpWaitDuration := d.round.phase1ThreadCreated.Sub(d.round.phase1ChatSentAt)
 			log.Printf("[%s] MCP wait: chat_message sent -> thread_created = %s", agent, mcpWaitDuration)
 
@@ -2664,10 +2709,12 @@ func (d *testDriver) validateStore() bool {
 		type parsedEntry struct {
 			MessageID string `json:"message_id"`
 			Type      string `json:"type"`
+			Content   string `json:"content"`
 		}
 
-		// For each follow-up interaction, check it doesn't contain message_ids from earlier ones
-		previousMessageIDs := make(map[string]string) // message_id → interaction_id that owns it
+		// Helix's accumulator identifies an entry by message_id and content.
+		// Agents may reuse a message ID for different content across turns.
+		previousEntries := make(map[responseEntryKey]string)
 		for _, inter := range ints {
 			var entries []parsedEntry
 			if err := json.Unmarshal(inter.ResponseEntries, &entries); err != nil {
@@ -2682,9 +2729,9 @@ func (d *testDriver) validateStore() bool {
 				if e.MessageID == "" || e.Type == "plan" {
 					continue
 				}
-				if ownerID, leaked := previousMessageIDs[e.MessageID]; leaked {
+				if ownerID, leaked := responseEntryLeak(previousEntries, e.MessageID, e.Content); leaked {
 					errors = append(errors, fmt.Sprintf(
-						"ISOLATION VIOLATION: Interaction %s (session %s) contains message_id %q which belongs to earlier interaction %s — response_entries leaked across interactions",
+						"ISOLATION VIOLATION: Interaction %s (session %s) repeats message_id %q with content from earlier interaction %s — response_entries leaked across interactions",
 						truncate(inter.ID, 12), truncate(sessionID, 12), e.MessageID, truncate(ownerID, 12)))
 				}
 			}
@@ -2692,7 +2739,7 @@ func (d *testDriver) validateStore() bool {
 			// Register this interaction's message_ids
 			for _, e := range entries {
 				if e.MessageID != "" && e.Type != "plan" {
-					previousMessageIDs[e.MessageID] = inter.ID
+					previousEntries[responseEntryKey{messageID: e.MessageID, content: e.Content}] = inter.ID
 				}
 			}
 			isolationChecked++
@@ -2846,40 +2893,8 @@ func main() {
 			srv.SetExternalAgentUserMapping(agentID, "e2e-test-user")
 			driver.mu.Lock()
 			driver.agentID = agentID
-			currentPhase := driver.phase
 			driver.mu.Unlock()
-			log.Printf("[test-server] Agent connecting: %s (phase=%d)", agentID, currentPhase)
-
-			// Phase 12: detect reconnection after Zed restart
-			if currentPhase == 12 {
-				go func() {
-					agent := driver.round.agentName
-					log.Printf("[%s] Phase 12: Zed reconnected (new agentID=%s), waiting 5s for initialization...", agent, agentID)
-					time.Sleep(5 * time.Second)
-
-					// Send open_thread first so Zed loads the thread from its DB
-					driver.mu.Lock()
-					if len(driver.round.threadIDs) == 0 {
-						driver.mu.Unlock()
-						log.Printf("[%s] Phase 12: ERROR no thread IDs available", agent)
-						return
-					}
-					threadA := driver.round.threadIDs[0]
-					driver.mu.Unlock()
-
-					log.Printf("[%s] Phase 12: Sending open_thread for Thread A (%s) before chat_message", agent, truncate(threadA, 16))
-					driver.sendOpenThread(threadA, agent)
-
-					// Wait for Zed to load the thread before sending the message.
-					// Thread loading is async — Zed receives open_thread, spawns load task,
-					// connects to agent, loads session from DB. This can take several seconds.
-					time.Sleep(10 * time.Second)
-
-					reqID := driver.round.reqID("phase12")
-					log.Printf("[%s] Phase 12: Sending chat_message to Thread A (%s) with reqID=%s", agent, truncate(threadA, 16), reqID)
-					driver.sendChatMessage("What is 12 + 12? Reply with just the number.", reqID, agent, threadA)
-				}()
-			}
+			log.Printf("[test-server] Agent connecting: %s", agentID)
 		}
 
 		// Delegate to the REAL production handler

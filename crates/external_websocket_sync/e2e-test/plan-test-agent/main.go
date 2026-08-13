@@ -9,6 +9,9 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"sync"
+	"sync/atomic"
+	"time"
 )
 
 type request struct {
@@ -18,7 +21,14 @@ type request struct {
 	Params  map[string]interface{} `json:"params,omitempty"`
 }
 
-var promptCount int
+var (
+	promptCount    int
+	sessionCount   atomic.Int64
+	lifecycleCount atomic.Int64
+	writeMu        sync.Mutex
+	cancelMu       sync.Mutex
+	cancels        = make(map[string]chan struct{})
+)
 
 func write(value interface{}) {
 	encoded, err := json.Marshal(value)
@@ -26,6 +36,8 @@ func write(value interface{}) {
 		fmt.Fprintf(os.Stderr, "[plan-test-agent] marshal: %v\n", err)
 		return
 	}
+	writeMu.Lock()
+	defer writeMu.Unlock()
 	fmt.Fprintln(os.Stdout, string(encoded))
 }
 
@@ -89,15 +101,22 @@ func handle(req request) {
 		}
 		respond(req.ID, map[string]interface{}{
 			"protocolVersion":   protocolVersion,
-			"agentCapabilities": map[string]interface{}{},
+			"agentCapabilities": map[string]interface{}{"loadSession": true},
 			"agentInfo": map[string]interface{}{
 				"name":    "helix-plan-test-agent",
 				"version": "1.0.0",
 			},
 		})
 	case "session/new":
-		respond(req.ID, map[string]interface{}{"sessionId": "plan-test-session"})
+		sessionID := fmt.Sprintf("plan-test-session-%d-%d", os.Getpid(), sessionCount.Add(1))
+		respond(req.ID, map[string]interface{}{"sessionId": sessionID})
+	case "session/load":
+		respond(req.ID, map[string]interface{}{})
 	case "session/prompt":
+		if os.Getenv("E2E_SCRIPTED_LIFECYCLE") == "1" {
+			runLifecyclePrompt(req)
+			return
+		}
 		promptCount++
 		sessionID := stringParam(req.Params, "sessionId", "plan-test-session")
 		if promptCount == 1 {
@@ -115,7 +134,14 @@ func handle(req request) {
 		}
 		respond(req.ID, map[string]interface{}{"stopReason": "end_turn"})
 	case "session/cancel":
-		// Notifications have no response.
+		sessionID := stringParam(req.Params, "sessionId", "")
+		cancelMu.Lock()
+		cancel := cancels[sessionID]
+		delete(cancels, sessionID)
+		cancelMu.Unlock()
+		if cancel != nil {
+			close(cancel)
+		}
 	default:
 		if len(req.ID) > 0 {
 			write(map[string]interface{}{
@@ -128,6 +154,38 @@ func handle(req request) {
 			})
 		}
 	}
+}
+
+func runLifecyclePrompt(req request) {
+	sessionID := stringParam(req.Params, "sessionId", "")
+	turn := lifecycleCount.Add(1)
+	cancel := make(chan struct{})
+	cancelMu.Lock()
+	if previous := cancels[sessionID]; previous != nil {
+		close(previous)
+	}
+	cancels[sessionID] = cancel
+	cancelMu.Unlock()
+
+	go func() {
+		stopReason := "end_turn"
+		for i := 1; i <= 60; i++ {
+			select {
+			case <-cancel:
+				stopReason = "cancelled"
+				i = 60
+			default:
+				publishText(sessionID, fmt.Sprintf("scripted turn %02d chunk %02d. ", turn, i))
+				time.Sleep(120 * time.Millisecond)
+			}
+		}
+		respond(req.ID, map[string]interface{}{"stopReason": stopReason})
+		cancelMu.Lock()
+		if cancels[sessionID] == cancel {
+			delete(cancels, sessionID)
+		}
+		cancelMu.Unlock()
+	}()
 }
 
 func main() {
