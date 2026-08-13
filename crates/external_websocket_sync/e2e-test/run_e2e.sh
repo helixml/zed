@@ -252,8 +252,7 @@ if echo "$E2E_AGENTS" | grep -q "claude"; then
         LOCAL_VERSION=$(node -e "console.log(require('/opt/claude-agent-acp/package.json').version)" 2>/dev/null || echo "unknown")
         echo "[setup] Using LOCAL claude-agent-acp v$LOCAL_VERSION from /opt/claude-agent-acp"
     else
-        # Log which version npx will install so we can correlate failures with
-        # claude-agent-acp upgrades. This is a quick check, not an install.
+        # Resolve latest once so the logged version is the version this run executes.
         #
         # The scope matters and has been wrong before: Zed installs
         # @agentclientprotocol/claude-agent-acp (see crates/agent_servers/), NOT
@@ -263,12 +262,11 @@ if echo "$E2E_AGENTS" | grep -q "claude"; then
         CLAUDE_ACP_PKG="@agentclientprotocol/claude-agent-acp"
         CLAUDE_ACP_VERSION=$(npm view "$CLAUDE_ACP_PKG" version 2>/dev/null || echo "")
         if [ -z "$CLAUDE_ACP_VERSION" ]; then
-            echo "[setup] WARNING: could not resolve a version for $CLAUDE_ACP_PKG."
-            echo "[setup]          A claude-round failure will NOT be attributable to an agent-package change."
-            CLAUDE_ACP_VERSION="unknown"
+            echo "[error] Could not resolve $CLAUDE_ACP_PKG@latest"
+            exit 1
         fi
-        echo "[setup] Using npm-installed claude-agent-acp $CLAUDE_ACP_PKG (auto-install, latest=$CLAUDE_ACP_VERSION)"
-        echo "[setup] NOTE: this install is UNPINNED — the claude round is not reproducible across time."
+        CLAUDE_PATH_JSON="\"path\": \"npx\", \"args\": [\"-y\", \"$CLAUDE_ACP_PKG@$CLAUDE_ACP_VERSION\"],"
+        echo "[setup] Latest-provider lane: $CLAUDE_ACP_PKG@$CLAUDE_ACP_VERSION (latest resolved at run start)"
     fi
     AGENT_SERVER_ENTRIES=$(cat << AGENTEOF
     "claude": {
@@ -320,6 +318,19 @@ if echo "$E2E_AGENTS" | grep -q "plan-test-agent"; then
       \"command\": \"/usr/local/bin/plan-test-agent\"
     }"
     echo "[setup] Deterministic plan test agent configured"
+fi
+
+if echo "$E2E_AGENTS" | grep -q "lifecycle-test-agent"; then
+    if [ -n "$AGENT_SERVER_ENTRIES" ]; then
+        AGENT_SERVER_ENTRIES="${AGENT_SERVER_ENTRIES},"
+    fi
+    AGENT_SERVER_ENTRIES="${AGENT_SERVER_ENTRIES}
+    \"lifecycle-test-agent\": {
+      \"type\": \"custom\",
+      \"command\": \"/usr/local/bin/plan-test-agent\",
+      \"env\": { \"E2E_SCRIPTED_LIFECYCLE\": \"1\" }
+    }"
+    echo "[setup] Deterministic lifecycle test agent configured"
 fi
 
 if [ -n "$AGENT_SERVER_ENTRIES" ]; then
@@ -435,7 +446,6 @@ while [ "$ELAPSED" -lt "$TEST_TIMEOUT" ]; do
         rm -f /tmp/zed-restart-requested
         kill "$ZED_PID" 2>/dev/null || true
         wait "$ZED_PID" 2>/dev/null || true
-        sleep 2
         echo "[zed] Restarting Zed..."
         "$ZED_BINARY" \
             --allow-multiple-instances \
