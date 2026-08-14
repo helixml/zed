@@ -173,7 +173,20 @@ Sent when the AI agent finishes its response for a given request.
   "data": {
     "acp_thread_id": "thread-uuid-here",
     "message_id": "msg-123",
-    "request_id": "req-001"
+    "request_id": "req-001",
+    "agent_name": "codex-acp",
+    "usage": {
+      "total_tokens": 175,
+      "input_tokens": 100,
+      "output_tokens": 75,
+      "thought_tokens": 0,
+      "cached_read_tokens": 40,
+      "cached_write_tokens": 10
+    },
+    "context_usage": {
+      "used_tokens": 120000,
+      "max_tokens": 200000
+    }
   }
 }
 ```
@@ -183,6 +196,9 @@ Sent when the AI agent finishes its response for a given request.
 | `acp_thread_id` | string | yes | Thread the message belongs to |
 | `message_id` | string | yes | The completed message's identifier |
 | `request_id` | string | yes | Echoed from the originating `chat_message` for correlation |
+| `agent_name` | string | yes | ACP agent that completed the turn |
+| `usage` | object | no | Token usage for the completed turn, when reported by the agent |
+| `context_usage` | object | no | Current context-window usage, with `used_tokens` and `max_tokens`, when reported by the agent |
 
 ### `thread_load_error`
 

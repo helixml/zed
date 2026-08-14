@@ -124,6 +124,7 @@ mod tests {
                     request_id: request.request_id.clone(),
                     agent_name: "test-agent".to_string(),
                     usage: None,
+                    context_usage: None,
                 };
                 zed_to_ext_tx_clone.send(serde_json::to_string(&message_completed).unwrap()).unwrap();
                 println!("📤 Sent message_completed");
@@ -323,6 +324,7 @@ mod tests {
                     request_id: request.request_id.clone(),
                     agent_name: "test-agent".to_string(),
                     usage: None,
+                    context_usage: None,
                 };
                 zed_to_ext_tx_clone.send(serde_json::to_string(&message_completed).unwrap()).unwrap();
                 println!("📤 Sent message_completed");
