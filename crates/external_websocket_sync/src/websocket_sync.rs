@@ -264,14 +264,34 @@ impl WebSocketSync {
             tokio::select! {
                 // Fallback timer: send agent_ready if no open_thread arrived
                 () = &mut agent_ready_timer, if !agent_ready_sent => {
-                    let agent_ready_msg = serde_json::json!({
-                        "event_type": "agent_ready",
-                        "data": {
-                            "agent_name": "zed-connection",
-                            "thread_id": null
+                    // Build this through SyncEvent rather than hand-rolling the
+                    // JSON. Helix reads `active_turns` on every agent_ready to
+                    // decide whether a waiting turn may be re-sent, and treats
+                    // an ABSENT field as "this agent cannot report" — the legacy
+                    // path. A second, hand-built shape on the wire would make a
+                    // current Zed indistinguishable from an old one on exactly
+                    // the connect where no thread was loaded.
+                    //
+                    // The snapshot is meaningful here even with no thread
+                    // loaded: the request registry is process-global, so a turn
+                    // still running from before this connection is reported.
+                    let ready_event = SyncEvent::AgentReady {
+                        agent_name: "zed-connection".to_string(),
+                        thread_id: None,
+                        active_turns: crate::active_turns_snapshot(),
+                    };
+                    let agent_ready_msg = match ready_event
+                        .to_outgoing_message()
+                        .and_then(|m| serde_json::to_string(&m))
+                    {
+                        Ok(json) => json,
+                        Err(e) => {
+                            log::error!("❌ [WEBSOCKET] Failed to serialize timer-based agent_ready: {}", e);
+                            agent_ready_sent = true;
+                            continue;
                         }
-                    });
-                    if let Err(e) = ws_sink.send(Message::Text(agent_ready_msg.to_string().into())).await {
+                    };
+                    if let Err(e) = ws_sink.send(Message::Text(agent_ready_msg.into())).await {
                         eprintln!("⚠️ [WEBSOCKET] Failed to send timer-based agent_ready: {}", e);
                         log::warn!("⚠️ [WEBSOCKET] Failed to send timer-based agent_ready: {}", e);
                     } else {
@@ -695,14 +715,22 @@ pub fn send_websocket_event(event: SyncEvent) -> Result<()> {
 /// This should be called after the agent process (e.g., qwen-code) has initialized via ACP
 /// It prevents race conditions where Helix sends prompts before the agent is ready
 pub fn send_agent_ready(agent_name: String, thread_id: Option<String>) {
-    log::info!("🚀 [WEBSOCKET] Sending agent_ready event: agent_name={}, thread_id={:?}",
-               agent_name, thread_id);
-    eprintln!("🚀 [WEBSOCKET] Sending agent_ready event: agent_name={}, thread_id={:?}",
-              agent_name, thread_id);
+    // Report the turns this agent already owns. A Helix API restart drops the
+    // WebSocket but not this process, so without this report Helix cannot tell a
+    // turn it already handed over from one the agent never received — and
+    // re-sends it into a live ACP session. See
+    // helix/design/2026-08-16-api-restart-live-turn-reconnect.md.
+    let active_turns = crate::active_turns_snapshot();
+
+    log::info!("🚀 [WEBSOCKET] Sending agent_ready event: agent_name={}, thread_id={:?}, active_turns={:?}",
+               agent_name, thread_id, active_turns);
+    eprintln!("🚀 [WEBSOCKET] Sending agent_ready event: agent_name={}, thread_id={:?}, active_turns={:?}",
+              agent_name, thread_id, active_turns);
 
     match send_websocket_event(SyncEvent::AgentReady {
         agent_name: agent_name.clone(),
         thread_id: thread_id.clone(),
+        active_turns,
     }) {
         Ok(_) => {
             log::info!("✅ [WEBSOCKET] agent_ready event sent successfully");

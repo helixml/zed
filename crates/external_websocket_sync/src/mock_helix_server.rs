@@ -774,12 +774,19 @@ mod tests {
         let event = SyncEvent::AgentReady {
             agent_name: "qwen".to_string(),
             thread_id: Some("thread-existing".to_string()),
+            active_turns: vec![crate::ActiveTurn {
+                request_id: "req-1".to_string(),
+                acp_thread_id: Some("thread-existing".to_string()),
+                state: "running".to_string(),
+            }],
         };
 
         let outgoing = event.to_outgoing_message().unwrap();
         assert_eq!(outgoing.event_type, "agent_ready");
         assert_eq!(outgoing.data["agent_name"], "qwen");
         assert_eq!(outgoing.data["thread_id"], "thread-existing");
+        assert_eq!(outgoing.data["active_turns"][0]["request_id"], "req-1");
+        assert_eq!(outgoing.data["active_turns"][0]["state"], "running");
     }
 
     #[test]
@@ -787,12 +794,16 @@ mod tests {
         let event = SyncEvent::AgentReady {
             agent_name: "zed-agent".to_string(),
             thread_id: None,
+            active_turns: Vec::new(),
         };
 
         let outgoing = event.to_outgoing_message().unwrap();
         assert_eq!(outgoing.event_type, "agent_ready");
         assert_eq!(outgoing.data["agent_name"], "zed-agent");
         assert!(outgoing.data["thread_id"].is_null());
+        // Always serialized, even when empty: Helix distinguishes "reported
+        // nothing running" from "this agent cannot report at all".
+        assert_eq!(outgoing.data["active_turns"].as_array().unwrap().len(), 0);
     }
 
     #[test]
@@ -922,6 +933,7 @@ mod tests {
                 SyncEvent::AgentReady {
                     agent_name: "test".to_string(),
                     thread_id: None,
+                    active_turns: Vec::new(),
                 },
                 "agent_ready",
             ),
