@@ -260,6 +260,12 @@ pub enum SyncEvent {
         agent_name: String,
         /// Optional thread ID if a thread was loaded from session
         thread_id: Option<String>,
+        /// Turns this agent already owns, from the process-level request
+        /// lifecycle registry. Helix reads this on reconnect to tell "already
+        /// running this turn" from "never received it"; the ABSENCE of the
+        /// field (an agent build predating it) is meaningfully different from
+        /// an empty array, so it is always serialized.
+        active_turns: Vec<crate::ActiveTurn>,
     },
     /// Sent in response to cancel_current_turn command from Helix
     #[serde(rename = "turn_cancelled")]
@@ -359,11 +365,12 @@ impl SyncEvent {
                     "error": error,
                 })
             ),
-            SyncEvent::AgentReady { agent_name, thread_id } => (
+            SyncEvent::AgentReady { agent_name, thread_id, active_turns } => (
                 "agent_ready".to_string(),
                 serde_json::json!({
                     "agent_name": agent_name,
                     "thread_id": thread_id,
+                    "active_turns": active_turns,
                 })
             ),
             SyncEvent::TurnCancelled { request_id, status } => (
