@@ -1006,8 +1006,8 @@ fn log_acp_thread_event(
         acp_thread::AcpThreadEvent::Stopped(reason) => {
             eprintln!("\n[eval-cli] stopped: {reason:?}");
         }
-        acp_thread::AcpThreadEvent::Error => {
-            eprintln!("[eval-cli] error event");
+        acp_thread::AcpThreadEvent::Error(cause) => {
+            eprintln!("[eval-cli] error event: {cause}");
         }
         acp_thread::AcpThreadEvent::Retry(status) => {
             eprintln!("[eval-cli] retry: {status:?}");

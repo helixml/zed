@@ -247,6 +247,11 @@ pub enum SyncEvent {
     /// Sent when a turn aborts (ACP agent process exited mid-turn, or MaxTokens).
     /// Helix's handleChatResponseError marks the interaction state=error with
     /// this message and ends the activation, freeing the per-Worker lane.
+    ///
+    /// `error` carries the real cause, taken from `AcpThreadEvent::Error`'s
+    /// payload — a provider error, a process exit, or the max-token limit.
+    /// Helix shows it to the user verbatim, so it must name what went wrong
+    /// rather than tell the reader to go and find a log.
     #[serde(rename = "chat_response_error")]
     ChatResponseError {
         request_id: String,

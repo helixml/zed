@@ -320,7 +320,7 @@ impl Conversation {
                     | AcpThreadEvent::Retry(_)
                     | AcpThreadEvent::SubagentSpawned(_)
                     | AcpThreadEvent::Stopped(_)
-                    | AcpThreadEvent::Error
+                    | AcpThreadEvent::Error(_)
                     | AcpThreadEvent::LoadError(_)
                     | AcpThreadEvent::PromptCapabilitiesUpdated
                     | AcpThreadEvent::Refusal
@@ -568,7 +568,7 @@ fn affects_thread_metadata(event: &AcpThreadEvent) -> bool {
         | AcpThreadEvent::ElicitationRequested(_)
         | AcpThreadEvent::ElicitationResponded(_)
         | AcpThreadEvent::Stopped(_)
-        | AcpThreadEvent::Error
+        | AcpThreadEvent::Error(_)
         | AcpThreadEvent::LoadError(_)
         | AcpThreadEvent::Refusal
         | AcpThreadEvent::WorkingDirectoriesUpdated => true,
@@ -2126,7 +2126,7 @@ impl ConversationView {
                     self.notify_with_sound(&notification_message, IconName::Warning, window, cx);
                 }
             }
-            AcpThreadEvent::Error => {
+            AcpThreadEvent::Error(_) => {
                 if let Some(active) = self.thread_view(&session_id) {
                     let is_generating =
                         matches!(thread.read(cx).status(), ThreadStatus::Generating);
