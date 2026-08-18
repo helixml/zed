@@ -2199,7 +2199,16 @@ pub enum AcpThreadEvent {
     Retry(RetryStatus),
     SubagentSpawned(acp::SessionId),
     Stopped(acp::StopReason),
-    Error,
+    /// A turn ended abnormally. The payload is the cause, in human-readable
+    /// form: the underlying `run_turn` error, or the max-tokens explanation.
+    ///
+    /// This used to be a bare variant, which forced every downstream consumer
+    /// to guess between "the agent process died" and "the turn hit max
+    /// tokens" — Helix surfaced that guess to users as a single unactionable
+    /// string telling them to read a log file inside a sandbox that no longer
+    /// exists. The cause is known at every emit site, so it travels with the
+    /// event.
+    Error(SharedString),
     LoadError(LoadError),
     PromptCapabilitiesUpdated,
     Refusal,
@@ -3851,7 +3860,9 @@ impl AcpThread {
                                 cx.emit(AcpThreadEvent::StatusChanged);
                             }
                             this.had_error = true;
-                            cx.emit(AcpThreadEvent::Error);
+                            cx.emit(AcpThreadEvent::Error(
+                                "the turn hit the model's max token limit".into(),
+                            ));
                             log::error!("Max tokens reached. Usage: {:?}", this.token_usage);
 
                             let exceeded_max_output_tokens =
@@ -3965,7 +3976,7 @@ impl AcpThread {
                             this.cancel_pending_turn_entries(cx);
                         }
                         this.had_error = true;
-                        cx.emit(AcpThreadEvent::Error);
+                        cx.emit(AcpThreadEvent::Error(format!("{e:#}").into()));
                         log::error!("Error in run turn: {:?}", e);
                         Err(e)
                     }

@@ -1145,8 +1145,11 @@ pub fn ensure_thread_subscription(
             // Error (agent process exited mid-turn, or MaxTokens — run_turn's Err
             // arm) → chat_response_error. Without the Error arm a crashed agent
             // that streamed partial output wedges the worker forever.
-            AcpThreadEvent::Stopped(_) | AcpThreadEvent::Error => {
-                let is_error = matches!(event, AcpThreadEvent::Error);
+            AcpThreadEvent::Stopped(_) | AcpThreadEvent::Error(_) => {
+                let abort_cause = match event {
+                    AcpThreadEvent::Error(cause) => Some(cause.clone()),
+                    _ => None,
+                };
                 flush_streaming_throttle(&thread_id_for_sub);
 
                 // AcpThread calls flush_streaming_text before emitting Stopped/Error, so all
@@ -1230,18 +1233,18 @@ pub fn ensure_thread_subscription(
                     captured_rid
                 };
                 *last_completed_request_id.borrow_mut() = completed_rid.clone();
-                if is_error {
+                if let Some(cause) = abort_cause {
                     // Turn aborted (agent process exited mid-turn, or MaxTokens).
                     // Emit chat_response_error, NOT message_completed: Helix's
                     // handleChatResponseError marks the interaction state=error
                     // (vs masking a crash as a normal completion) and ends the
                     // activation, freeing the per-Worker lane.
                     //
-                    // AcpThreadEvent::Error carries no cause string, so the
-                    // payload is generic — the real exit reason (e.g. "process
-                    // exited with code 143") is logged by acp_thread::run_turn
-                    // just before this fires: grep Zed.log for "Error in run
-                    // turn" near this request_id. We also log the
+                    // AcpThreadEvent::Error carries the cause (the run_turn
+                    // error, or the max-tokens explanation), so it goes on the
+                    // wire and Helix can show the user what actually happened
+                    // instead of a guess pointing at a log inside a sandbox
+                    // that no longer exists. We also log the
                     // streamed-then-died signal (partial entry count + bytes) so
                     // a future wedge is identifiable from Zed.log alone, without
                     // reconstructing it from Helix DB state.
@@ -1259,15 +1262,14 @@ pub fn ensure_thread_subscription(
                         .sum();
                     log::warn!(
                         "🛑 [THREAD_SERVICE] turn ABORTED (AcpThreadEvent::Error) thread={} request_id={} \
-                         streamed {} partial entries / {} bytes before dying — emitting chat_response_error \
-                         to mark the interaction errored and free the Helix activation lane",
-                        thread_id_for_sub, completed_rid, turn_entries, partial_bytes
+                         cause={} streamed {} partial entries / {} bytes before dying — emitting \
+                         chat_response_error to mark the interaction errored and free the Helix \
+                         activation lane",
+                        thread_id_for_sub, completed_rid, cause, turn_entries, partial_bytes
                     );
                     let _ = crate::send_websocket_event(SyncEvent::ChatResponseError {
                         request_id: completed_rid,
-                        error: "agent turn aborted: the ACP agent process exited mid-turn or hit \
-                                max tokens (see Zed.log 'Error in run turn' for the cause)"
-                            .to_string(),
+                        error: format!("agent turn aborted: {cause}"),
                     });
                 } else {
                     eprintln!(
