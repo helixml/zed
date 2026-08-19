@@ -81,6 +81,11 @@ fn report_thread_open_failure(request: &ThreadOpenRequest, error: &anyhow::Error
     // agent panel. Sending it lets recoverMissingThread clear the stale pointer
     // so the next message forks a clean thread.
     let request_id = request.request_id.clone().unwrap_or_default();
+    // Nothing was dispatched for this turn, so let Helix redeliver it under the
+    // same request_id (see abandon_queued_request).
+    if !request_id.is_empty() {
+        crate::abandon_queued_request(&request_id);
+    }
     let event = SyncEvent::ThreadLoadError {
         acp_thread_id: request.acp_thread_id.clone(),
         request_id,
@@ -1805,6 +1810,13 @@ pub fn setup_thread_handler(
                                 "❌ [THREAD_SERVICE] Failed to load thread {} from agent: {}",
                                 existing_thread_id, e
                             );
+
+                            // This turn never reached the agent, so it is not
+                            // in flight. Release its ingress registration or the
+                            // recovery Helix runs next — which replays the turn
+                            // under the same request_id — is refused as a
+                            // duplicate and the interaction waits forever.
+                            crate::abandon_queued_request(&request.request_id);
 
                             let error_event = SyncEvent::ThreadLoadError {
                                 acp_thread_id: existing_thread_id.clone(),
