@@ -206,6 +206,30 @@ fn register_queued_request(request_id: &str, acp_thread_id: Option<&str>) -> Req
     }
 }
 
+/// Drop a turn's ingress registration after refusing it before it ever ran.
+///
+/// `register_queued_request` admits a turn at ingress and only
+/// `RequestLifecycleGuard::drop` clears it — and the guard is created when a
+/// prompt actually STARTS. A turn refused before that (the thread could not be
+/// loaded, and for an agent with no `loadSession` capability it never will be)
+/// therefore leaks a Queued entry that never drops, so every later delivery of
+/// that same turn is rejected as a duplicate. Helix's recovery replays such a
+/// turn under its original request_id, which made the replay silently
+/// unreachable and left the interaction waiting forever.
+///
+/// Only a Queued entry is dropped. A Running one belongs to a live turn (a
+/// duplicate is already refused at ingress and never reaches the refusal path),
+/// and a Cancelled one is a tombstone `start_registered_request` must still
+/// consume.
+pub(crate) fn abandon_queued_request(request_id: &str) {
+    let mut requests = REQUEST_LIFECYCLES.lock();
+    if let Some(tracked) = requests.get(request_id) {
+        if tracked.lifecycle == RequestLifecycle::Queued {
+            requests.remove(request_id);
+        }
+    }
+}
+
 fn cancel_registered_request(request_id: &str) -> CancellationTarget {
     let mut requests = REQUEST_LIFECYCLES.lock();
     match requests.get_mut(request_id) {
@@ -303,6 +327,47 @@ mod request_lifecycle_tests {
         assert!(registered_request_is_cancelled(request_id));
         drop(guard);
         assert!(!registered_request_is_cancelled(request_id));
+    }
+
+    #[test]
+    fn refused_turn_can_be_redelivered() {
+        // A turn whose thread could not be loaded never reaches the agent.
+        // Helix replays it under the same request_id, so ingress has to admit
+        // it again — otherwise the replay is dropped and the turn is stranded.
+        let request_id = "request-lifecycle-refused";
+        assert_eq!(register_queued_request(request_id, Some("thread-gone")), RequestAdmission::Accepted);
+        assert_eq!(register_queued_request(request_id, Some("thread-gone")), RequestAdmission::AlreadyActive);
+
+        abandon_queued_request(request_id);
+
+        assert_eq!(register_queued_request(request_id, None), RequestAdmission::Accepted);
+    }
+
+    #[test]
+    fn abandoning_leaves_a_running_turn_alone() {
+        // Only a turn that never started may be released. A live turn keeps its
+        // lane so a duplicate delivery still cannot push a second prompt into it.
+        let request_id = "request-lifecycle-abandon-running";
+        register_queued_request(request_id, None);
+        let (_, _guard) = start_registered_request(request_id, || ()).unwrap();
+
+        abandon_queued_request(request_id);
+
+        assert_eq!(register_queued_request(request_id, None), RequestAdmission::AlreadyActive);
+    }
+
+    #[test]
+    fn abandoning_preserves_a_cancellation_tombstone() {
+        // The tombstone must survive: start_registered_request consumes it to
+        // suppress a dispatch that cancellation already won the race against.
+        let request_id = "request-lifecycle-abandon-cancelled";
+        register_queued_request(request_id, None);
+        assert_eq!(cancel_registered_request(request_id), CancellationTarget::Queued);
+
+        abandon_queued_request(request_id);
+
+        assert!(registered_request_is_cancelled(request_id));
+        assert!(start_registered_request(request_id, || ()).is_none());
     }
 
     #[test]
