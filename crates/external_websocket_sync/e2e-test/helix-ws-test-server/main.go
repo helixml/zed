@@ -27,10 +27,9 @@
 //
 // Smoke mode (E2E_SMOKE=1) replaces the phase chain above with a single phase:
 // the agent is asked to read a file holding a magic number and echo it back. It
-// proves the whole path end-to-end — WebSocket sync, ACP turn, agent tool call,
-// streamed response, interaction completion — for the price of one short turn.
-// It exists so CI can gate `zed --headless` on every build without burning the
-// tokens the full suite costs.
+// proves the whole path end-to-end — WebSocket sync, agent turn, agent tool
+// call, streamed response, and interaction completion. A local deterministic
+// model drives the native Zed agent so CI does not depend on an external model.
 //
 // Plan mode (E2E_PLAN=1) uses a deterministic ACP agent for two turns. The
 // first publishes a plan and the second publishes no plan. It verifies that a
@@ -2900,6 +2899,9 @@ func main() {
 		// Delegate to the REAL production handler
 		srv.ExternalAgentSyncHandler()(w, r)
 	})
+	if smokeMode {
+		http.HandleFunc("/v1/chat/completions", smokeChatCompletionHandler)
+	}
 
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {

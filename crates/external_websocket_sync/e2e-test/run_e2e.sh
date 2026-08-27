@@ -182,8 +182,8 @@ echo ""
 
 # ---- Smoke mode ----
 # E2E_SMOKE=1 runs a single tool-call phase instead of the full suite: the agent
-# reads magic-number.txt and echoes the value. Cheap enough to gate every CI
-# build on. The value is not in the prompt, so it can only come from a tool call.
+# reads magic-number.txt and echoes the value. A deterministic local model drives
+# the native agent, so this can gate every CI build without external credentials.
 export E2E_SMOKE="${E2E_SMOKE:-0}"
 export E2E_PLAN="${E2E_PLAN:-0}"
 if [ "$E2E_SMOKE" = "1" ]; then
@@ -213,6 +213,14 @@ fi
 MOCK_PORT=$(cat "$MOCK_PORT_FILE")
 echo "[mock-server] Running on port $MOCK_PORT"
 echo ""
+
+if [ "$E2E_SMOKE" = "1" ]; then
+    export E2E_MODEL_PROVIDER=openai
+    export E2E_MODEL=e2e-smoke-model
+    export OPENAI_API_KEY=e2e-smoke-key
+    export OPENAI_BASE_URL="http://127.0.0.1:${MOCK_PORT}/v1"
+    echo "[setup] Smoke mode: using deterministic local model at $OPENAI_BASE_URL"
+fi
 
 # ---- Configure Zed via environment variables ----
 # ExternalSyncSettings reads from env vars, not settings.json
