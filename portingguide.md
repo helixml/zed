@@ -483,16 +483,15 @@ panel is the source of those in headful mode and we don't track them here).
 
 ### Smoke mode (`E2E_SMOKE=1`) — the CI gate
 
-The full suite costs a lot of tokens, which is why it was gated to main + tags
-and headless was never gated at all. `E2E_SMOKE=1` replaces the phase chain with
-a single phase: the agent reads `magic-number.txt` and replies with the value.
-One short turn covers WebSocket sync, worktree setup, an agent tool call,
-streaming and interaction completion. The value never appears in the prompt, so
-only a real tool call can produce it.
+`E2E_SMOKE=1` replaces the phase chain with a single phase: the native Zed agent
+reads `magic-number.txt` and replies with the value. A deterministic local
+OpenAI-compatible server requests the `read_file` tool, validates its result,
+and returns the value. This covers WebSocket sync, worktree setup, a native
+agent tool call, streaming, and interaction completion without an external
+model dependency.
 
 ```bash
-E2E_HEADLESS=1 E2E_SMOKE=1 E2E_AGENTS=zed-agent \
-  E2E_MODEL_PROVIDER=openai E2E_MODEL=gpt-5.6-luna ./run_docker_e2e.sh
+E2E_HEADLESS=1 E2E_SMOKE=1 E2E_AGENTS=zed-agent ./run_docker_e2e.sh
 ```
 
 Knobs (all optional, all default to today's behaviour):
@@ -501,8 +500,8 @@ Knobs (all optional, all default to today's behaviour):
 |-----|---------|---------|
 | `E2E_SMOKE` | `0` | Single tool-call phase instead of the full suite |
 | `E2E_SMOKE_FILE` | `<project>/magic-number.txt` | Absolute path the agent is told to read |
-| `E2E_MODEL_PROVIDER` | `anthropic` | Native-agent provider (`openai` emits an `available_models` entry) |
-| `E2E_MODEL` | `claude-sonnet-4-6` | Native-agent model id |
+| `E2E_MODEL_PROVIDER` | `anthropic` | Native-agent provider outside smoke mode (`openai` emits an `available_models` entry) |
+| `E2E_MODEL` | `claude-sonnet-4-6` | Native-agent model id outside smoke mode |
 | `E2E_REASONING_EFFORT` | `none` | OpenAI only. Must stay `none`: `/v1/chat/completions` rejects any other effort when the request carries function tools |
 | `E2E_CODEX_MODEL` | `gpt-5.6-terra` | codex-acp model id, `model[effort]` form |
 
