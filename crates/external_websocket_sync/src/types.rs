@@ -1,13 +1,13 @@
 //! Types for Helix integration
 
 use chrono::{DateTime, Utc};
-use serde::{Deserialize, Serialize};
+use gpui::SharedString;
+use project::{AgentId, agent_server_store::AgentServerCommand};
 use schemars::JsonSchema;
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::rc::Rc;
 use std::sync::Arc;
-use gpui::SharedString;
-use project::{AgentId, agent_server_store::AgentServerCommand};
 
 /// External agent type for thread creation
 #[derive(Default, Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
@@ -39,8 +39,12 @@ impl ExternalAgent {
         history: gpui::Entity<agent::ThreadStore>,
     ) -> Rc<dyn agent_servers::AgentServer> {
         match self {
-            Self::Gemini => Rc::new(agent_servers::CustomAgentServer::new(AgentId("gemini-cli".into()))),
-            Self::ClaudeCode => Rc::new(agent_servers::CustomAgentServer::new(AgentId("claude".into()))),
+            Self::Gemini => Rc::new(agent_servers::CustomAgentServer::new(AgentId(
+                "gemini-cli".into(),
+            ))),
+            Self::ClaudeCode => Rc::new(agent_servers::CustomAgentServer::new(AgentId(
+                "claude".into(),
+            ))),
             Self::NativeAgent => Rc::new(agent::NativeAgentServer::new(fs, history)),
             Self::Custom { name, command: _ } => {
                 Rc::new(agent_servers::CustomAgentServer::new(AgentId(name.clone())))
@@ -222,6 +226,15 @@ pub enum SyncEvent {
         /// For tool_call entries: status string (e.g. "Completed", "In Progress")
         #[serde(default, skip_serializing_if = "String::is_empty")]
         tool_status: String,
+        /// Stable ACP tool-call id. Unlike the display label, this survives title changes.
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        tool_call_id: String,
+        /// Provider tool name from ACP metadata (for example `spawn_agent`).
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        tool_call_name: String,
+        /// Stable child ACP session id when this tool call represents a subagent.
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        subagent_id: String,
         timestamp: i64,
     },
 
@@ -253,10 +266,7 @@ pub enum SyncEvent {
     /// Helix shows it to the user verbatim, so it must name what went wrong
     /// rather than tell the reader to go and find a log.
     #[serde(rename = "chat_response_error")]
-    ChatResponseError {
-        request_id: String,
-        error: String,
-    },
+    ChatResponseError { request_id: String, error: String },
     /// Sent when the agent (e.g., qwen-code) has finished initialization and is ready to receive prompts
     /// This prevents race conditions where Helix sends prompts before the agent is ready
     #[serde(rename = "agent_ready")]
@@ -302,28 +312,50 @@ impl SyncEvent {
     /// Convert to OutgoingMessage format expected by API
     pub fn to_outgoing_message(&self) -> Result<OutgoingMessage, serde_json::Error> {
         let (event_type, data) = match self {
-            SyncEvent::ThreadCreated { acp_thread_id, request_id } => (
+            SyncEvent::ThreadCreated {
+                acp_thread_id,
+                request_id,
+            } => (
                 "thread_created".to_string(),
                 serde_json::json!({
                     "acp_thread_id": acp_thread_id,
                     "request_id": request_id,
-                })
+                }),
             ),
-            SyncEvent::UserCreatedThread { acp_thread_id, title } => (
+            SyncEvent::UserCreatedThread {
+                acp_thread_id,
+                title,
+            } => (
                 "user_created_thread".to_string(),
                 serde_json::json!({
                     "acp_thread_id": acp_thread_id,
                     "title": title,
-                })
+                }),
             ),
-            SyncEvent::ThreadTitleChanged { acp_thread_id, title } => (
+            SyncEvent::ThreadTitleChanged {
+                acp_thread_id,
+                title,
+            } => (
                 "thread_title_changed".to_string(),
                 serde_json::json!({
                     "acp_thread_id": acp_thread_id,
                     "title": title,
-                })
+                }),
             ),
-            SyncEvent::MessageAdded { acp_thread_id, message_id, role, content, request_id, entry_type, tool_name, tool_status, timestamp } => (
+            SyncEvent::MessageAdded {
+                acp_thread_id,
+                message_id,
+                role,
+                content,
+                request_id,
+                entry_type,
+                tool_name,
+                tool_status,
+                tool_call_id,
+                tool_call_name,
+                subagent_id,
+                timestamp,
+            } => (
                 "message_added".to_string(),
                 serde_json::json!({
                     "acp_thread_id": acp_thread_id,
@@ -335,7 +367,10 @@ impl SyncEvent {
                     "entry_type": entry_type,
                     "tool_name": tool_name,
                     "tool_status": tool_status,
-                })
+                    "tool_call_id": tool_call_id,
+                    "tool_call_name": tool_call_name,
+                    "subagent_id": subagent_id,
+                }),
             ),
             SyncEvent::MessageCompleted {
                 acp_thread_id,
@@ -353,39 +388,54 @@ impl SyncEvent {
                     "agent_name": agent_name,
                     "usage": usage,
                     "context_usage": context_usage,
-                })
+                }),
             ),
-            SyncEvent::ThreadLoadError { acp_thread_id, request_id, error } => (
+            SyncEvent::ThreadLoadError {
+                acp_thread_id,
+                request_id,
+                error,
+            } => (
                 "thread_load_error".to_string(),
                 serde_json::json!({
                     "acp_thread_id": acp_thread_id,
                     "request_id": request_id,
                     "error": error,
-                })
+                }),
             ),
             SyncEvent::ChatResponseError { request_id, error } => (
                 "chat_response_error".to_string(),
                 serde_json::json!({
                     "request_id": request_id,
                     "error": error,
-                })
+                }),
             ),
-            SyncEvent::AgentReady { agent_name, thread_id, active_turns } => (
+            SyncEvent::AgentReady {
+                agent_name,
+                thread_id,
+                active_turns,
+            } => (
                 "agent_ready".to_string(),
                 serde_json::json!({
                     "agent_name": agent_name,
                     "thread_id": thread_id,
                     "active_turns": active_turns,
-                })
+                }),
             ),
             SyncEvent::TurnCancelled { request_id, status } => (
                 "turn_cancelled".to_string(),
                 serde_json::json!({
                     "request_id": request_id,
                     "status": status,
-                })
+                }),
             ),
-            SyncEvent::UiStateResponse { query_id, active_view, thread_id, entry_count, mcp_servers, active_model } => (
+            SyncEvent::UiStateResponse {
+                query_id,
+                active_view,
+                thread_id,
+                entry_count,
+                mcp_servers,
+                active_model,
+            } => (
                 "ui_state_response".to_string(),
                 serde_json::json!({
                     "query_id": query_id,
@@ -394,7 +444,7 @@ impl SyncEvent {
                     "entry_count": entry_count,
                     "mcp_servers": mcp_servers,
                     "active_model": active_model,
-                })
+                }),
             ),
         };
 
@@ -451,13 +501,9 @@ pub enum WebSocketMessage {
     /// Error message
     Error(ErrorResponse),
     /// Subscribe to events
-    Subscribe {
-        events: Vec<String>,
-    },
+    Subscribe { events: Vec<String> },
     /// Unsubscribe from events
-    Unsubscribe {
-        events: Vec<String>,
-    },
+    Unsubscribe { events: Vec<String> },
 }
 
 /// MCP tool call request

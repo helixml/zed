@@ -7,7 +7,9 @@ use agent_client_protocol::schema::{
     ProtocolVersion,
     v1::{self as acp, ErrorCode},
 };
-use agent_client_protocol::{Agent, Client, ConnectionTo, JsonRpcResponse, Lines, Responder};
+use agent_client_protocol::{
+    Agent, Client, ConnectionTo, JsonRpcNotification, JsonRpcResponse, Lines, Responder,
+};
 use anyhow::anyhow;
 use async_channel;
 use collections::{HashMap, HashSet};
@@ -21,7 +23,7 @@ use project::agent_server_store::{
 };
 use project::{AgentId, Project};
 use remote::remote_client::Interactive;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use settings::{AgentConfigOptionValue, SettingsStore};
 use std::path::PathBuf;
 use std::process::{ExitStatus, Stdio};
@@ -46,6 +48,16 @@ use crate::{CURSOR_ID, GEMINI_ID};
 pub const GEMINI_TERMINAL_AUTH_METHOD_ID: &str = "spawn-gemini-cli";
 const PARAMETERIZED_MODEL_PICKER_META_KEY: &str = "parameterizedModelPicker";
 const MAX_DEBUG_BACKLOG_MESSAGES: usize = 2000;
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonRpcNotification)]
+#[notification(method = "session/update")]
+#[serde(rename_all = "camelCase")]
+struct RawSessionNotification {
+    session_id: acp::SessionId,
+    update: serde_json::Value,
+    #[serde(default, rename = "_meta")]
+    meta: Option<acp::Meta>,
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AcpDebugMessageDirection {
@@ -750,7 +762,7 @@ fn connect_client_future(
         )
         // --- Notification handlers (agent→client) ---
         .on_receive_notification(
-            on_notification!(handle_session_notification),
+            on_notification!(handle_raw_session_notification),
             agent_client_protocol::on_receive_notification!(),
         )
         .on_receive_notification(
@@ -796,6 +808,18 @@ fn client_capabilities_for_agent(agent_id: &AgentId) -> acp::ClientCapabilities 
 
     if agent_id.as_ref() == CURSOR_ID {
         meta.insert(PARAMETERIZED_MODEL_PICKER_META_KEY.into(), true.into());
+    }
+
+    if agent_id.as_ref() == crate::CODEX_ID {
+        meta.insert(
+            "jetbrains".into(),
+            serde_json::json!({
+                "air": {
+                    "version": 1,
+                    "capabilities": ["nativeSubagentSessions"],
+                }
+            }),
+        );
     }
 
     acp::ClientCapabilities::new()
@@ -3172,6 +3196,24 @@ mod tests {
     }
 
     #[test]
+    fn codex_client_capabilities_enable_native_subagent_sessions() {
+        let capabilities = client_capabilities_for_agent(&AgentId::new(crate::CODEX_ID));
+        let meta = capabilities
+            .meta
+            .expect("expected client capabilities meta");
+
+        assert_eq!(
+            meta.get("jetbrains"),
+            Some(&serde_json::json!({
+                "air": {
+                    "version": 1,
+                    "capabilities": ["nativeSubagentSessions"],
+                }
+            }))
+        );
+    }
+
+    #[test]
     fn client_capabilities_include_boolean_config_options() {
         let capabilities = client_capabilities_for_agent(&AgentId::new("codex-acp"));
 
@@ -5015,6 +5057,108 @@ fn handle_read_text_file(
         respond_result(responder, result.map(acp::ReadTextFileResponse::new));
     })
     .detach();
+}
+
+fn handle_raw_session_notification(
+    notification: RawSessionNotification,
+    cx: &mut AsyncApp,
+    ctx: &ClientContext,
+) {
+    if let Ok(update) = serde_json::from_value::<acp::SessionUpdate>(notification.update.clone()) {
+        let mut typed = acp::SessionNotification::new(notification.session_id, update);
+        typed.meta = notification.meta;
+        handle_session_notification(typed, cx, ctx);
+        return;
+    }
+
+    let Some(update_type) = notification
+        .update
+        .get("sessionUpdate")
+        .and_then(serde_json::Value::as_str)
+    else {
+        log::warn!(
+            "Received malformed ACP session update: {}",
+            notification.update
+        );
+        return;
+    };
+
+    let normalized = match update_type {
+        "subagent_spawned" => {
+            let Some(subagent_id) = notification
+                .update
+                .get("subagentSessionId")
+                .and_then(serde_json::Value::as_str)
+            else {
+                log::warn!("ACP subagent_spawned update has no subagentSessionId");
+                return;
+            };
+            let name = notification
+                .update
+                .get("name")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("Subagent");
+            serde_json::json!({
+                "sessionUpdate": "tool_call",
+                "toolCallId": format!("subagent-{subagent_id}"),
+                "title": format!("Start subagent {name}"),
+                "kind": "other",
+                "status": "in_progress",
+                "rawInput": {
+                    "agentThreadId": subagent_id,
+                    "activityKind": "started",
+                },
+                "_meta": {
+                    "subagent_session_info": {
+                        "session_id": subagent_id,
+                        "message_start_index": 0,
+                    }
+                }
+            })
+        }
+        "subagent_state_update" => {
+            let Some(subagent_id) = notification
+                .update
+                .get("subagentSessionId")
+                .and_then(serde_json::Value::as_str)
+            else {
+                log::warn!("ACP subagent_state_update has no subagentSessionId");
+                return;
+            };
+            let state = notification
+                .update
+                .get("state")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("failed");
+            let status = if state == "completed" {
+                "completed"
+            } else {
+                "failed"
+            };
+            serde_json::json!({
+                "sessionUpdate": "tool_call_update",
+                "toolCallId": format!("subagent-{subagent_id}"),
+                "status": status,
+                "rawInput": {
+                    "agentThreadId": subagent_id,
+                    "activityKind": if state == "completed" { "completed" } else { "interrupted" },
+                }
+            })
+        }
+        _ => {
+            log::warn!("Received unsupported ACP session update type: {update_type}");
+            return;
+        }
+    };
+
+    match serde_json::from_value::<acp::SessionUpdate>(normalized) {
+        Ok(update) => handle_session_notification(
+            acp::SessionNotification::new(notification.session_id, update),
+            cx,
+            ctx,
+        ),
+        Err(error) => log::error!("Failed to normalize ACP {update_type} update: {error}"),
+    }
 }
 
 fn handle_session_notification(

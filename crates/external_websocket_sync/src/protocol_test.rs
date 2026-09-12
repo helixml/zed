@@ -12,14 +12,14 @@ mod tests {
     use super::super::types::{IncomingChatMessage, SyncEvent};
     use super::super::{ThreadCreationRequest, init_thread_creation_callback};
     use anyhow::Result;
+    use futures::{SinkExt, StreamExt};
+    use gpui::prelude::*;
     use serde_json::json;
+    use std::sync::Arc;
     use tokio::net::TcpListener;
     use tokio::sync::mpsc;
     use tokio_tungstenite::accept_async;
-    use futures::{SinkExt, StreamExt};
     use tokio_tungstenite::tungstenite::Message;
-    use std::sync::Arc;
-    use gpui::prelude::*;
 
     // Global mutex to prevent tests from running concurrently and racing on callback registration
     static TEST_LOCK: parking_lot::Mutex<()> = parking_lot::const_mutex(());
@@ -88,7 +88,9 @@ mod tests {
                     acp_thread_id: acp_thread_id.clone(),
                     request_id: request.request_id.clone(),
                 };
-                zed_to_ext_tx_clone.send(serde_json::to_string(&thread_created).unwrap()).unwrap();
+                zed_to_ext_tx_clone
+                    .send(serde_json::to_string(&thread_created).unwrap())
+                    .unwrap();
                 println!("📤 Sent thread_created");
 
                 // Simulate AI streaming response
@@ -111,9 +113,14 @@ mod tests {
                         entry_type: "text".to_string(),
                         tool_name: String::new(),
                         tool_status: String::new(),
+                        tool_call_id: String::new(),
+                        tool_call_name: String::new(),
+                        subagent_id: String::new(),
                         timestamp: chrono::Utc::now().timestamp(),
                     };
-                    zed_to_ext_tx_clone.send(serde_json::to_string(&message_added).unwrap()).unwrap();
+                    zed_to_ext_tx_clone
+                        .send(serde_json::to_string(&message_added).unwrap())
+                        .unwrap();
                     println!("📤 Sent message_added chunk {}: {}", i, content);
                 }
 
@@ -126,7 +133,9 @@ mod tests {
                     usage: None,
                     context_usage: None,
                 };
-                zed_to_ext_tx_clone.send(serde_json::to_string(&message_completed).unwrap()).unwrap();
+                zed_to_ext_tx_clone
+                    .send(serde_json::to_string(&message_completed).unwrap())
+                    .unwrap();
                 println!("📤 Sent message_completed");
             }
         });
@@ -161,16 +170,14 @@ mod tests {
 
         // 5. Collect responses from Zed
         let mut responses = Vec::new();
-        let timeout = tokio::time::timeout(
-            tokio::time::Duration::from_secs(5),
-            async {
-                for _ in 0..5 { // Expect: thread_created + 3 message_added + message_completed
-                    if let Some(msg) = zed_to_ext_rx.recv().await {
-                        responses.push(msg);
-                    }
+        let timeout = tokio::time::timeout(tokio::time::Duration::from_secs(5), async {
+            for _ in 0..5 {
+                // Expect: thread_created + 3 message_added + message_completed
+                if let Some(msg) = zed_to_ext_rx.recv().await {
+                    responses.push(msg);
                 }
             }
-        );
+        });
 
         timeout.await?;
 
@@ -183,7 +190,8 @@ mod tests {
         assert_eq!(responses.len(), 5, "Should receive 5 messages total");
 
         // Parse responses
-        let parsed: Vec<serde_json::Value> = responses.iter()
+        let parsed: Vec<serde_json::Value> = responses
+            .iter()
             .map(|r| serde_json::from_str(r).unwrap())
             .collect();
 
@@ -198,7 +206,12 @@ mod tests {
             assert_eq!(parsed[i]["type"], "message_added");
             assert_eq!(parsed[i]["message_id"], "msg-123");
             assert_eq!(parsed[i]["role"], "assistant");
-            assert!(parsed[i]["content"].as_str().unwrap().starts_with("The answer"));
+            assert!(
+                parsed[i]["content"]
+                    .as_str()
+                    .unwrap()
+                    .starts_with("The answer")
+            );
         }
 
         // Verify content gets progressively longer
@@ -273,7 +286,10 @@ mod tests {
         // Spawn task to handle thread creation and messages
         tokio::spawn(async move {
             while let Some(request) = callback_rx.recv().await {
-                println!("🎯 Received request: acp_thread_id={:?}", request.acp_thread_id);
+                println!(
+                    "🎯 Received request: acp_thread_id={:?}",
+                    request.acp_thread_id
+                );
 
                 let acp_thread_id = if let Some(id) = request.acp_thread_id {
                     println!("📬 Follow-up message to existing thread: {}", id);
@@ -287,7 +303,9 @@ mod tests {
                         acp_thread_id: id.clone(),
                         request_id: request.request_id.clone(),
                     };
-                    zed_to_ext_tx_clone.send(serde_json::to_string(&thread_created).unwrap()).unwrap();
+                    zed_to_ext_tx_clone
+                        .send(serde_json::to_string(&thread_created).unwrap())
+                        .unwrap();
                     println!("📤 Sent thread_created");
 
                     // Notify test of the thread ID
@@ -311,9 +329,14 @@ mod tests {
                         entry_type: "text".to_string(),
                         tool_name: String::new(),
                         tool_status: String::new(),
+                        tool_call_id: String::new(),
+                        tool_call_name: String::new(),
+                        subagent_id: String::new(),
                         timestamp: chrono::Utc::now().timestamp(),
                     };
-                    zed_to_ext_tx_clone.send(serde_json::to_string(&message_added).unwrap()).unwrap();
+                    zed_to_ext_tx_clone
+                        .send(serde_json::to_string(&message_added).unwrap())
+                        .unwrap();
                     println!("📤 Sent message_added: {}", content);
                 }
 
@@ -326,7 +349,9 @@ mod tests {
                     usage: None,
                     context_usage: None,
                 };
-                zed_to_ext_tx_clone.send(serde_json::to_string(&message_completed).unwrap()).unwrap();
+                zed_to_ext_tx_clone
+                    .send(serde_json::to_string(&message_completed).unwrap())
+                    .unwrap();
                 println!("📤 Sent message_completed");
             }
         });
@@ -359,27 +384,30 @@ mod tests {
         println!("📤 External system sent first chat_message");
 
         // 5. Get thread_created response and extract acp_thread_id
-        let thread_id = tokio::time::timeout(
-            tokio::time::Duration::from_secs(2),
-            thread_id_rx.recv()
-        ).await
-        .map_err(|_| anyhow::anyhow!("Timeout waiting for thread ID"))?
-        .ok_or_else(|| anyhow::anyhow!("No thread ID received"))?;
+        let thread_id =
+            tokio::time::timeout(tokio::time::Duration::from_secs(2), thread_id_rx.recv())
+                .await
+                .map_err(|_| anyhow::anyhow!("Timeout waiting for thread ID"))?
+                .ok_or_else(|| anyhow::anyhow!("No thread ID received"))?;
 
         println!("✅ Received thread ID: {}", thread_id);
 
         // Consume first batch of responses (including thread_created)
         let mut first_batch = Vec::new();
-        for _ in 0..4 { // thread_created + 2 message_added + message_completed
-            if let Ok(Some(msg)) = tokio::time::timeout(
-                tokio::time::Duration::from_secs(1),
-                zed_to_ext_rx.recv()
-            ).await {
+        for _ in 0..4 {
+            // thread_created + 2 message_added + message_completed
+            if let Ok(Some(msg)) =
+                tokio::time::timeout(tokio::time::Duration::from_secs(1), zed_to_ext_rx.recv())
+                    .await
+            {
                 first_batch.push(msg);
             }
         }
 
-        println!("📥 Received {} messages from first interaction", first_batch.len());
+        println!(
+            "📥 Received {} messages from first interaction",
+            first_batch.len()
+        );
 
         // 6. Send FOLLOW-UP message (reuses thread)
         tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
@@ -398,35 +426,46 @@ mod tests {
 
         // 7. Collect follow-up responses
         let mut followup_batch = Vec::new();
-        let timeout = tokio::time::timeout(
-            tokio::time::Duration::from_secs(2),
-            async {
-                for _ in 0..3 { // 2 message_added + message_completed
-                    if let Some(msg) = zed_to_ext_rx.recv().await {
-                        followup_batch.push(msg);
-                    }
+        let timeout = tokio::time::timeout(tokio::time::Duration::from_secs(2), async {
+            for _ in 0..3 {
+                // 2 message_added + message_completed
+                if let Some(msg) = zed_to_ext_rx.recv().await {
+                    followup_batch.push(msg);
                 }
             }
-        );
+        });
 
         timeout.await?;
 
         println!("\n📥 Received {} follow-up messages:", followup_batch.len());
         for (i, msg) in followup_batch.iter().enumerate() {
             let parsed: serde_json::Value = serde_json::from_str(msg)?;
-            println!("  {}. {} - {}", i + 1, parsed["type"], parsed.get("content").and_then(|v| v.as_str()).unwrap_or(""));
+            println!(
+                "  {}. {} - {}",
+                i + 1,
+                parsed["type"],
+                parsed.get("content").and_then(|v| v.as_str()).unwrap_or("")
+            );
         }
 
         // 8. Verify follow-up responses
-        assert_eq!(followup_batch.len(), 3, "Should receive 3 messages for follow-up");
+        assert_eq!(
+            followup_batch.len(),
+            3,
+            "Should receive 3 messages for follow-up"
+        );
 
-        let parsed: Vec<serde_json::Value> = followup_batch.iter()
+        let parsed: Vec<serde_json::Value> = followup_batch
+            .iter()
             .map(|r| serde_json::from_str(r).unwrap())
             .collect();
 
         // Check no second thread_created
         for msg in &parsed {
-            assert_ne!(msg["type"], "thread_created", "Should NOT send thread_created for follow-up");
+            assert_ne!(
+                msg["type"], "thread_created",
+                "Should NOT send thread_created for follow-up"
+            );
         }
 
         // Check message_added
@@ -515,12 +554,11 @@ mod tests {
         println!("📤 External system sent cancel_current_turn");
 
         // 5. Expect turn_cancelled response with status=noop
-        let response = tokio::time::timeout(
-            tokio::time::Duration::from_secs(5),
-            zed_to_ext_rx.recv()
-        ).await
-        .map_err(|_| anyhow::anyhow!("Timeout waiting for turn_cancelled"))?
-        .ok_or_else(|| anyhow::anyhow!("No response received"))?;
+        let response =
+            tokio::time::timeout(tokio::time::Duration::from_secs(5), zed_to_ext_rx.recv())
+                .await
+                .map_err(|_| anyhow::anyhow!("Timeout waiting for turn_cancelled"))?
+                .ok_or_else(|| anyhow::anyhow!("No response received"))?;
 
         println!("📥 Received: {}", response);
 
@@ -582,7 +620,10 @@ mod tests {
         // Spawn handler: receives CancellationRequest and sends turn_cancelled event
         tokio::spawn(async move {
             while let Some(request) = cancel_rx.recv().await {
-                println!("🎯 Received cancellation request: request_id={}", request.request_id);
+                println!(
+                    "🎯 Received cancellation request: request_id={}",
+                    request.request_id
+                );
                 // Simulate successful cancellation by sending turn_cancelled event
                 let event = SyncEvent::TurnCancelled {
                     request_id: request.request_id,
@@ -622,12 +663,11 @@ mod tests {
         println!("📤 External system sent cancel_current_turn");
 
         // 5. Expect turn_cancelled response with status=cancelled
-        let response = tokio::time::timeout(
-            tokio::time::Duration::from_secs(5),
-            zed_to_ext_rx.recv()
-        ).await
-        .map_err(|_| anyhow::anyhow!("Timeout waiting for turn_cancelled"))?
-        .ok_or_else(|| anyhow::anyhow!("No response received"))?;
+        let response =
+            tokio::time::timeout(tokio::time::Duration::from_secs(5), zed_to_ext_rx.recv())
+                .await
+                .map_err(|_| anyhow::anyhow!("Timeout waiting for turn_cancelled"))?
+                .ok_or_else(|| anyhow::anyhow!("No response received"))?;
 
         println!("📥 Received: {}", response);
 

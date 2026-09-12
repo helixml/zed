@@ -3,24 +3,24 @@
 //! This is the NON-UI service layer that manages ACP threads for external WebSocket control.
 //! Called from workspace creation, contains all business logic.
 
-use anyhow::Result;
-use acp_thread::{AcpThread, AcpThreadEvent};
-use agent::ThreadStore;
-use agent_client_protocol::schema::v1 as acp;
-use acp::{ContentBlock, TextContent};
-use util::path_list::PathList;
-use gpui::{App, Entity, WeakEntity};
-use parking_lot::RwLock;
-use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
-use std::time::{Duration, Instant};
-use fs::Fs;
-use project::Project;
-use tokio::sync::mpsc;
-use util::ResultExt;
 use crate::{
     ContextUsage, ExternalAgent, SyncEvent, ThreadCreationRequest, ThreadOpenRequest, TurnUsage,
 };
+use acp::{ContentBlock, TextContent};
+use acp_thread::{AcpThread, AcpThreadEvent};
+use agent::ThreadStore;
+use agent_client_protocol::schema::v1 as acp;
+use anyhow::Result;
+use fs::Fs;
+use gpui::{App, Entity, WeakEntity};
+use parking_lot::RwLock;
+use project::Project;
+use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+use tokio::sync::mpsc;
+use util::ResultExt;
+use util::path_list::PathList;
 
 fn zed_agent_server_id(agent_name: &str) -> &str {
     match agent_name {
@@ -35,7 +35,10 @@ fn report_thread_creation_failure(request_id: &str, error: &str) {
         request_id: request_id.to_string(),
         error: error.to_string(),
     }) {
-        log::error!("[THREAD_SERVICE] Failed to send thread creation error: {}", send_err);
+        log::error!(
+            "[THREAD_SERVICE] Failed to send thread creation error: {}",
+            send_err
+        );
     }
 }
 
@@ -48,9 +51,9 @@ async fn create_native_session_when_ready(
     let executor = cx.background_executor().clone();
     let deadline = executor.now() + Duration::from_secs(15);
     loop {
-        if let Some(entity) = cx.update(|cx| {
-            connection.new_session_with_configured_model(project.clone(), cx)
-        }) {
+        if let Some(entity) =
+            cx.update(|cx| connection.new_session_with_configured_model(project.clone(), cx))
+        {
             return Ok(entity);
         }
         if executor.now() >= deadline {
@@ -92,7 +95,10 @@ fn report_thread_open_failure(request: &ThreadOpenRequest, error: &anyhow::Error
         error: format!("Failed to load thread: {}", error),
     };
     if let Err(send_err) = crate::send_websocket_event(event) {
-        log::error!("❌ [THREAD_SERVICE] Failed to send thread open error: {}", send_err);
+        log::error!(
+            "❌ [THREAD_SERVICE] Failed to send thread open error: {}",
+            send_err
+        );
     }
 }
 
@@ -110,16 +116,18 @@ mod agent_server_id_tests {
 
 /// Global registry of active ACP threads (service layer)
 /// Stores STRONG references to keep threads alive for follow-up messages
-static THREAD_REGISTRY: parking_lot::Mutex<Option<Arc<RwLock<HashMap<String, Entity<AcpThread>>>>>> =
-    parking_lot::Mutex::new(None);
+static THREAD_REGISTRY: parking_lot::Mutex<
+    Option<Arc<RwLock<HashMap<String, Entity<AcpThread>>>>>,
+> = parking_lot::Mutex::new(None);
 
 /// Keeps strong references to ALL threads ever created/loaded, preventing them
 /// from being released when the UI switches to a different thread. Unlike
 /// THREAD_REGISTRY (which gets cleaned up by unregister_thread on UI transitions),
 /// this map is append-only. This ensures follow-up messages to non-visible threads
 /// can find the thread entity without needing load_session.
-static THREAD_KEEP_ALIVE: parking_lot::Mutex<Option<Arc<RwLock<HashMap<String, Entity<AcpThread>>>>>> =
-    parking_lot::Mutex::new(None);
+static THREAD_KEEP_ALIVE: parking_lot::Mutex<
+    Option<Arc<RwLock<HashMap<String, Entity<AcpThread>>>>>,
+> = parking_lot::Mutex::new(None);
 
 /// Monotonically increasing per-thread counter of observed `AcpThreadEvent`s.
 ///
@@ -184,19 +192,27 @@ static REQUEST_TO_THREAD_MAP: parking_lot::Mutex<Option<Arc<RwLock<HashMap<Strin
 
 /// Global map of thread_id -> Set of entry indices that originated from external system
 /// Prevents echoing external messages back (initial + follow-ups)
-static EXTERNAL_ORIGINATED_ENTRIES: parking_lot::Mutex<Option<Arc<RwLock<HashMap<String, HashSet<usize>>>>>> =
-    parking_lot::Mutex::new(None);
+static EXTERNAL_ORIGINATED_ENTRIES: parking_lot::Mutex<
+    Option<Arc<RwLock<HashMap<String, HashSet<usize>>>>>,
+> = parking_lot::Mutex::new(None);
 
 /// Set of thread_ids that already have a persistent event subscription
 /// Prevents creating duplicate subscriptions when follow-up messages arrive
 static PERSISTENT_SUBSCRIPTIONS: parking_lot::Mutex<Option<Arc<RwLock<HashSet<String>>>>> =
     parking_lot::Mutex::new(None);
 
+/// Parent/child pairs whose child tool activity is mirrored into the parent's
+/// Helix interaction. Child assistant text stays in the child transcript;
+/// tool calls provide the useful live work log without duplicating answers.
+static SUBAGENT_SUBSCRIPTIONS: std::sync::LazyLock<parking_lot::Mutex<HashMap<String, usize>>> =
+    std::sync::LazyLock::new(|| parking_lot::Mutex::new(HashMap::new()));
+static SUBAGENT_LOADS: std::sync::LazyLock<parking_lot::Mutex<HashSet<String>>> =
+    std::sync::LazyLock::new(|| parking_lot::Mutex::new(HashSet::new()));
+
 /// Guards against concurrent thread loading. Only one thread load can be
 /// in progress at a time (the UI only shows one thread anyway). Prevents
 /// double-load when workspace restore and open_thread race.
-static THREAD_LOAD_IN_PROGRESS: parking_lot::Mutex<Option<String>> =
-    parking_lot::Mutex::new(None);
+static THREAD_LOAD_IN_PROGRESS: parking_lot::Mutex<Option<String>> = parking_lot::Mutex::new(None);
 
 /// Pending `UserCreatedThread` emissions for draft threads.
 ///
@@ -216,8 +232,9 @@ static THREAD_LOAD_IN_PROGRESS: parking_lot::Mutex<Option<String>> =
 /// every new entry; on the first user-role entry the emit is flushed and
 /// the entry removed. Threads the user never types into are never
 /// announced to Helix and never produce a phantom session row.
-static PENDING_USER_CREATED_EMITS: std::sync::LazyLock<parking_lot::Mutex<HashMap<String, Option<String>>>> =
-    std::sync::LazyLock::new(|| parking_lot::Mutex::new(HashMap::new()));
+static PENDING_USER_CREATED_EMITS: std::sync::LazyLock<
+    parking_lot::Mutex<HashMap<String, Option<String>>>,
+> = std::sync::LazyLock::new(|| parking_lot::Mutex::new(HashMap::new()));
 
 /// Defer the `UserCreatedThread` emission for `acp_thread_id` until the
 /// first user-role `NewEntry` arrives on the thread. Called from
@@ -229,7 +246,8 @@ pub fn defer_user_created_thread(acp_thread_id: String, title: Option<String>) {
     );
     log::info!(
         "📌 [THREAD_SERVICE] Deferring UserCreatedThread for {} (title={:?}) until first user message",
-        acp_thread_id, title
+        acp_thread_id,
+        title
     );
     PENDING_USER_CREATED_EMITS
         .lock()
@@ -259,7 +277,8 @@ fn try_flush_pending_user_created_thread(acp_thread_id: &str) -> bool {
     }) {
         log::error!(
             "Failed to send deferred UserCreatedThread WebSocket event for {}: {}",
-            acp_thread_id, e
+            acp_thread_id,
+            e
         );
     }
     true
@@ -287,7 +306,10 @@ pub fn try_acquire_thread_load_lock(thread_id: &str) -> bool {
         );
         false
     } else {
-        eprintln!("🔒 [THREAD_SERVICE] Acquired thread load lock for {} (from panel restoration)", thread_id);
+        eprintln!(
+            "🔒 [THREAD_SERVICE] Acquired thread load lock for {} (from panel restoration)",
+            thread_id
+        );
         *loading = Some(thread_id.to_string());
         true
     }
@@ -296,7 +318,10 @@ pub fn try_acquire_thread_load_lock(thread_id: &str) -> bool {
 /// Release the thread load lock after a load completes or fails.
 pub fn release_thread_load_lock() {
     let mut loading = THREAD_LOAD_IN_PROGRESS.lock();
-    eprintln!("🔓 [THREAD_SERVICE] Released thread load lock (was {:?}, from panel restoration)", loading);
+    eprintln!(
+        "🔓 [THREAD_SERVICE] Released thread load lock (was {:?}, from panel restoration)",
+        loading
+    );
     *loading = None;
 }
 
@@ -307,8 +332,9 @@ pub fn get_load_in_progress_thread() -> Option<String> {
 
 /// Streaming throttle state per message entry.
 /// Keyed by "{thread_id}:{entry_idx}" to support multi-entry streaming.
-static STREAMING_THROTTLE: parking_lot::Mutex<Option<Arc<RwLock<HashMap<String, StreamingThrottleState>>>>> =
-    parking_lot::Mutex::new(None);
+static STREAMING_THROTTLE: parking_lot::Mutex<
+    Option<Arc<RwLock<HashMap<String, StreamingThrottleState>>>>,
+> = parking_lot::Mutex::new(None);
 
 /// Minimum interval between message_added events for the same entry.
 /// Reduces Zed→Go wire traffic by ~90% (10 events/sec instead of 100+).
@@ -331,6 +357,274 @@ struct PendingMessage {
     entry_type: String,
     tool_name: String,
     tool_status: String,
+    tool_call_id: String,
+    tool_call_name: String,
+    subagent_id: String,
+}
+
+fn codex_subagent_activity(raw_input: Option<&serde_json::Value>) -> Option<(&str, &str)> {
+    let raw_input = raw_input?;
+    Some((
+        raw_input.get("agentThreadId")?.as_str()?,
+        raw_input.get("activityKind")?.as_str()?,
+    ))
+}
+
+fn tool_message_metadata(tool_call: &acp_thread::ToolCall) -> (String, String, String) {
+    let tool_call_id = tool_call.id.0.to_string();
+    let mut tool_call_name = tool_call
+        .tool_name
+        .as_ref()
+        .map(ToString::to_string)
+        .unwrap_or_default();
+    let mut subagent_id = tool_call
+        .subagent_session_info
+        .as_ref()
+        .map(|info| info.session_id.0.to_string())
+        .unwrap_or_default();
+    if let Some((agent_thread_id, activity_kind)) =
+        codex_subagent_activity(tool_call.raw_input.as_ref())
+    {
+        if subagent_id.is_empty() {
+            subagent_id = agent_thread_id.to_string();
+        }
+        if tool_call_name.is_empty() {
+            tool_call_name = match activity_kind {
+                "started" => "spawn_agent",
+                "interacted" => "send_message",
+                "interrupted" => "stop_agent",
+                "completed" => "subagent_completed",
+                _ => "",
+            }
+            .to_string();
+        }
+    }
+    if tool_call_name.is_empty() && !subagent_id.is_empty() {
+        tool_call_name = "spawn_agent".to_string();
+    }
+    (tool_call_id, tool_call_name, subagent_id)
+}
+
+fn codex_subagent_activity_for_tool_call(
+    tool_call: &acp_thread::ToolCall,
+) -> Option<(acp::SessionId, String)> {
+    let (agent_thread_id, activity_kind) = codex_subagent_activity(tool_call.raw_input.as_ref())?;
+    Some((
+        acp::SessionId::new(agent_thread_id),
+        activity_kind.to_string(),
+    ))
+}
+
+fn subagent_subscription_key(parent_thread_id: &str, subagent_id: &str) -> String {
+    format!("{}:{}", parent_thread_id, subagent_id)
+}
+
+fn subagent_message_id(subagent_id: &str, tool_call_id: &str, entry_idx: usize) -> String {
+    let activity_id = if tool_call_id.is_empty() {
+        entry_idx.to_string()
+    } else {
+        tool_call_id.to_string()
+    };
+    format!("subagent:{}:{}", subagent_id, activity_id)
+}
+
+fn send_subagent_tool_entry(
+    parent_thread_id: &str,
+    subagent_id: &str,
+    entry_idx: usize,
+    tool_call: &acp_thread::ToolCall,
+    cx: &App,
+) {
+    let key = subagent_subscription_key(parent_thread_id, subagent_id);
+    let start_index = SUBAGENT_SUBSCRIPTIONS
+        .lock()
+        .get(&key)
+        .copied()
+        .unwrap_or(usize::MAX);
+    if entry_idx < start_index {
+        return;
+    }
+
+    let (tool_call_id, tool_call_name, _) = tool_message_metadata(tool_call);
+    let _ = crate::send_websocket_event(SyncEvent::MessageAdded {
+        acp_thread_id: parent_thread_id.to_string(),
+        message_id: subagent_message_id(subagent_id, &tool_call_id, entry_idx),
+        role: "assistant".to_string(),
+        content: tool_call.to_markdown(cx),
+        request_id: crate::get_thread_request_id(parent_thread_id).unwrap_or_default(),
+        entry_type: "tool_call".to_string(),
+        tool_name: tool_call.label.read(cx).source().to_string(),
+        tool_status: tool_call.status.to_string(),
+        tool_call_id,
+        tool_call_name,
+        subagent_id: subagent_id.to_string(),
+        timestamp: chrono::Utc::now().timestamp(),
+    });
+}
+
+fn handle_codex_subagent_activity(
+    parent_thread_id: &str,
+    parent_thread: &Entity<AcpThread>,
+    subagent_id: acp::SessionId,
+    activity_kind: &str,
+    cx: &mut App,
+) {
+    if activity_kind == "started" {
+        load_and_subscribe_subagent(
+            parent_thread_id.to_string(),
+            parent_thread,
+            subagent_id,
+            0,
+            cx,
+        );
+    }
+}
+
+fn ensure_subagent_subscription(
+    parent_thread_id: String,
+    subagent_id: String,
+    start_index: usize,
+    thread_entity: &Entity<AcpThread>,
+    cx: &mut App,
+) {
+    let key = subagent_subscription_key(&parent_thread_id, &subagent_id);
+    let already_subscribed = SUBAGENT_SUBSCRIPTIONS
+        .lock()
+        .insert(key, start_index)
+        .is_some();
+
+    let thread = thread_entity.read(cx);
+    for (entry_idx, entry) in thread.entries().iter().enumerate().skip(start_index) {
+        if let acp_thread::AgentThreadEntry::ToolCall(tool_call) = entry {
+            send_subagent_tool_entry(&parent_thread_id, &subagent_id, entry_idx, tool_call, cx);
+        }
+    }
+    if already_subscribed {
+        return;
+    }
+
+    cx.subscribe(thread_entity, move |thread_entity, event, cx| {
+        let thread = thread_entity.read(cx);
+        match event {
+            AcpThreadEvent::NewEntry => {
+                let entry_idx = thread.entries().len().saturating_sub(1);
+                if let Some(acp_thread::AgentThreadEntry::ToolCall(tool_call)) =
+                    thread.entries().get(entry_idx)
+                {
+                    send_subagent_tool_entry(
+                        &parent_thread_id,
+                        &subagent_id,
+                        entry_idx,
+                        tool_call,
+                        cx,
+                    );
+                }
+            }
+            AcpThreadEvent::EntryUpdated(entry_idx) => {
+                if let Some(acp_thread::AgentThreadEntry::ToolCall(tool_call)) =
+                    thread.entries().get(*entry_idx)
+                {
+                    send_subagent_tool_entry(
+                        &parent_thread_id,
+                        &subagent_id,
+                        *entry_idx,
+                        tool_call,
+                        cx,
+                    );
+                }
+            }
+            AcpThreadEvent::Stopped(_) | AcpThreadEvent::Error(_) => {
+                for (entry_idx, entry) in thread.entries().iter().enumerate() {
+                    if let acp_thread::AgentThreadEntry::ToolCall(tool_call) = entry {
+                        send_subagent_tool_entry(
+                            &parent_thread_id,
+                            &subagent_id,
+                            entry_idx,
+                            tool_call,
+                            cx,
+                        );
+                    }
+                }
+            }
+            _ => {}
+        }
+    })
+    .detach();
+}
+
+fn load_and_subscribe_subagent(
+    parent_thread_id: String,
+    parent_thread: &Entity<AcpThread>,
+    subagent_id: acp::SessionId,
+    start_index: usize,
+    cx: &mut App,
+) {
+    let load_key = subagent_subscription_key(&parent_thread_id, subagent_id.0.as_ref());
+    if !SUBAGENT_LOADS.lock().insert(load_key.clone()) {
+        return;
+    }
+    if let Some(thread) = get_thread(subagent_id.0.as_ref()).and_then(|thread| thread.upgrade()) {
+        SUBAGENT_LOADS.lock().remove(&load_key);
+        ensure_subagent_subscription(
+            parent_thread_id,
+            subagent_id.0.to_string(),
+            start_index,
+            &thread,
+            cx,
+        );
+        return;
+    }
+
+    let parent = parent_thread.read(cx);
+    let connection = parent.connection().clone();
+    if !connection.supports_load_session() {
+        SUBAGENT_LOADS.lock().remove(&load_key);
+        log::warn!(
+            "Cannot mirror subagent {} for parent {}: ACP agent does not support session loading",
+            subagent_id.0,
+            parent_thread_id
+        );
+        return;
+    }
+    let project = parent.project().clone();
+    let work_dirs = parent
+        .work_dirs()
+        .cloned()
+        .unwrap_or_else(|| project.read(cx).default_path_list(cx));
+    let subagent_id_string = subagent_id.0.to_string();
+    log::info!(
+        "Loading subagent session {} for parent {}",
+        subagent_id_string,
+        parent_thread_id
+    );
+    let load_task = connection.load_session(subagent_id, project, work_dirs, None, cx);
+    cx.spawn(async move |cx| match load_task.await {
+        Ok(thread) => {
+            cx.update(|cx| {
+                SUBAGENT_LOADS.lock().remove(&load_key);
+                let entry_count = thread.read(cx).entries().len();
+                log::info!(
+                    "Loaded subagent session {} with {} entries for parent {}",
+                    subagent_id_string,
+                    entry_count,
+                    parent_thread_id
+                );
+                register_thread(subagent_id_string.clone(), thread.clone());
+                ensure_subagent_subscription(
+                    parent_thread_id,
+                    subagent_id_string,
+                    start_index,
+                    &thread,
+                    cx,
+                );
+            });
+        }
+        Err(error) => {
+            SUBAGENT_LOADS.lock().remove(&load_key);
+            log::warn!("Failed to load subagent session for Helix sync: {error:#}");
+        }
+    })
+    .detach();
 }
 
 /// Initialize the thread registry
@@ -381,7 +675,10 @@ fn mark_external_originated_entry(thread_id: String, entry_idx: usize) {
     init_thread_registry();
     let map = EXTERNAL_ORIGINATED_ENTRIES.lock();
     if let Some(m) = map.as_ref() {
-        m.write().entry(thread_id).or_insert_with(HashSet::new).insert(entry_idx);
+        m.write()
+            .entry(thread_id)
+            .or_insert_with(HashSet::new)
+            .insert(entry_idx);
     }
 }
 
@@ -389,7 +686,9 @@ fn mark_external_originated_entry(thread_id: String, entry_idx: usize) {
 pub fn is_external_originated_entry(thread_id: &str, entry_idx: usize) -> bool {
     let map = EXTERNAL_ORIGINATED_ENTRIES.lock();
     if let Some(m) = map.as_ref() {
-        m.read().get(thread_id).map_or(false, |set| set.contains(&entry_idx))
+        m.read()
+            .get(thread_id)
+            .map_or(false, |set| set.contains(&entry_idx))
     } else {
         false
     }
@@ -399,7 +698,8 @@ pub fn is_external_originated_entry(thread_id: &str, entry_idx: usize) -> bool {
 fn has_persistent_subscription(thread_id: &str) -> bool {
     init_thread_registry();
     let subs = PERSISTENT_SUBSCRIPTIONS.lock();
-    subs.as_ref().map_or(false, |s| s.read().contains(thread_id))
+    subs.as_ref()
+        .map_or(false, |s| s.read().contains(thread_id))
 }
 
 /// Mark a thread as having a persistent event subscription
@@ -431,7 +731,9 @@ fn flush_stale_pending_for_thread(acp_thread_id: &str, exclude_entry_idx: usize)
     let mut stale_pending: Vec<PendingMessage> = Vec::new();
     {
         let throttle_map = STREAMING_THROTTLE.lock();
-        let Some(map) = throttle_map.as_ref() else { return };
+        let Some(map) = throttle_map.as_ref() else {
+            return;
+        };
         let mut map = map.write();
 
         for (k, state) in map.iter_mut() {
@@ -455,6 +757,9 @@ fn flush_stale_pending_for_thread(acp_thread_id: &str, exclude_entry_idx: usize)
             entry_type: pending.entry_type,
             tool_name: pending.tool_name,
             tool_status: pending.tool_status,
+            tool_call_id: pending.tool_call_id,
+            tool_call_name: pending.tool_call_name,
+            subagent_id: pending.subagent_id,
             timestamp: chrono::Utc::now().timestamp(),
         });
     }
@@ -472,6 +777,9 @@ fn throttled_send_message_added(
     entry_type: &str,
     tool_name: &str,
     tool_status: &str,
+    tool_call_id: &str,
+    tool_call_name: &str,
+    subagent_id: &str,
 ) -> bool {
     init_streaming_throttle();
     let key = format!("{}:{}", acp_thread_id, entry_idx);
@@ -486,7 +794,9 @@ fn throttled_send_message_added(
 
     {
         let throttle_map = STREAMING_THROTTLE.lock();
-        let Some(map) = throttle_map.as_ref() else { return false };
+        let Some(map) = throttle_map.as_ref() else {
+            return false;
+        };
         let mut map = map.write();
 
         // Flush pending content for all OTHER entries in this thread.
@@ -503,11 +813,13 @@ fn throttled_send_message_added(
             }
         }
 
-        let state = map.entry(key.clone()).or_insert_with(|| StreamingThrottleState {
-            last_sent: Instant::now() - STREAMING_THROTTLE_INTERVAL,
-            pending_content: None,
-            flush_scheduled: false,
-        });
+        let state = map
+            .entry(key.clone())
+            .or_insert_with(|| StreamingThrottleState {
+                last_sent: Instant::now() - STREAMING_THROTTLE_INTERVAL,
+                pending_content: None,
+                flush_scheduled: false,
+            });
 
         // Tool call entries bypass the throttle — they're infrequent and must
         // arrive promptly so the preceding text entry's stale-pending flush
@@ -527,6 +839,9 @@ fn throttled_send_message_added(
                 entry_type: entry_type.to_string(),
                 tool_name: tool_name.to_string(),
                 tool_status: tool_status.to_string(),
+                tool_call_id: tool_call_id.to_string(),
+                tool_call_name: tool_call_name.to_string(),
+                subagent_id: subagent_id.to_string(),
             });
             sent = true;
         } else {
@@ -543,6 +858,9 @@ fn throttled_send_message_added(
                 entry_type: entry_type.to_string(),
                 tool_name: tool_name.to_string(),
                 tool_status: tool_status.to_string(),
+                tool_call_id: tool_call_id.to_string(),
+                tool_call_name: tool_call_name.to_string(),
+                subagent_id: subagent_id.to_string(),
             });
             sent = false;
         }
@@ -559,6 +877,9 @@ fn throttled_send_message_added(
             entry_type: pending.entry_type,
             tool_name: pending.tool_name,
             tool_status: pending.tool_status,
+            tool_call_id: pending.tool_call_id,
+            tool_call_name: pending.tool_call_name,
+            subagent_id: pending.subagent_id,
             timestamp: chrono::Utc::now().timestamp(),
         });
     }
@@ -574,6 +895,9 @@ fn throttled_send_message_added(
             entry_type: msg.entry_type,
             tool_name: msg.tool_name,
             tool_status: msg.tool_status,
+            tool_call_id: msg.tool_call_id,
+            tool_call_name: msg.tool_call_name,
+            subagent_id: msg.subagent_id,
             timestamp: chrono::Utc::now().timestamp(),
         });
     }
@@ -590,9 +914,13 @@ async fn trailing_flush_timer(key: String) {
 
     let pending: Option<PendingMessage> = {
         let throttle_map = STREAMING_THROTTLE.lock();
-        let Some(map) = throttle_map.as_ref() else { return };
+        let Some(map) = throttle_map.as_ref() else {
+            return;
+        };
         let mut map = map.write();
-        let Some(state) = map.get_mut(&key) else { return };
+        let Some(state) = map.get_mut(&key) else {
+            return;
+        };
         state.flush_scheduled = false;
         let msg = state.pending_content.take();
         if msg.is_some() {
@@ -611,6 +939,9 @@ async fn trailing_flush_timer(key: String) {
             entry_type: msg.entry_type,
             tool_name: msg.tool_name,
             tool_status: msg.tool_status,
+            tool_call_id: msg.tool_call_id,
+            tool_call_name: msg.tool_call_name,
+            subagent_id: msg.subagent_id,
             timestamp: chrono::Utc::now().timestamp(),
         });
     }
@@ -625,16 +956,20 @@ pub fn flush_streaming_throttle(acp_thread_id: &str) {
     let pending_messages: Vec<PendingMessage>;
     {
         let throttle_map = STREAMING_THROTTLE.lock();
-        let Some(map) = throttle_map.as_ref() else { return };
+        let Some(map) = throttle_map.as_ref() else {
+            return;
+        };
         let mut map = map.write();
 
         let prefix = format!("{}:", acp_thread_id);
-        let keys_to_remove: Vec<String> = map.keys()
+        let keys_to_remove: Vec<String> = map
+            .keys()
             .filter(|k| k.starts_with(&prefix))
             .cloned()
             .collect();
 
-        pending_messages = keys_to_remove.iter()
+        pending_messages = keys_to_remove
+            .iter()
             .filter_map(|key| map.remove(key))
             .filter_map(|state| state.pending_content)
             .collect();
@@ -651,6 +986,9 @@ pub fn flush_streaming_throttle(acp_thread_id: &str) {
             entry_type: pending.entry_type,
             tool_name: pending.tool_name,
             tool_status: pending.tool_status,
+            tool_call_id: pending.tool_call_id,
+            tool_call_name: pending.tool_call_name,
+            subagent_id: pending.subagent_id,
             timestamp: chrono::Utc::now().timestamp(),
         });
     }
@@ -687,14 +1025,16 @@ pub fn get_thread_id_for_request(request_id: &str) -> Option<String> {
 pub fn set_agent_session_id(acp_thread_id: &str, agent_session_id: String) {
     let map = THREAD_AGENT_SESSION_MAP.lock();
     if let Some(m) = map.as_ref() {
-        m.write().insert(acp_thread_id.to_string(), agent_session_id);
+        m.write()
+            .insert(acp_thread_id.to_string(), agent_session_id);
     }
 }
 
 /// Get the agent's session ID for a thread (for passing to load_session).
 pub fn get_agent_session_id(acp_thread_id: &str) -> Option<String> {
     let map = THREAD_AGENT_SESSION_MAP.lock();
-    map.as_ref().and_then(|m| m.read().get(acp_thread_id).cloned())
+    map.as_ref()
+        .and_then(|m| m.read().get(acp_thread_id).cloned())
 }
 
 /// Record which agent backs a thread (e.g. "claude", "qwen", "zed-agent").
@@ -714,7 +1054,8 @@ pub fn set_thread_agent_name(acp_thread_id: &str, agent_name: String) {
 /// map was introduced).
 pub fn get_thread_agent_name(acp_thread_id: &str) -> Option<String> {
     let map = THREAD_AGENT_NAME_MAP.lock();
-    map.as_ref().and_then(|m| m.read().get(acp_thread_id).cloned())
+    map.as_ref()
+        .and_then(|m| m.read().get(acp_thread_id).cloned())
 }
 
 /// Register an active thread (stores strong reference to keep thread alive)
@@ -754,8 +1095,14 @@ pub fn unregister_thread(acp_thread_id: &str) {
     let registry = THREAD_REGISTRY.lock();
     if let Some(reg) = registry.as_ref() {
         if reg.write().remove(acp_thread_id).is_some() {
-            eprintln!("🗑️ [THREAD_SERVICE] unregister_thread: removed '{}'", acp_thread_id);
-            log::info!("🗑️ [THREAD_SERVICE] unregister_thread: removed '{}'", acp_thread_id);
+            eprintln!(
+                "🗑️ [THREAD_SERVICE] unregister_thread: removed '{}'",
+                acp_thread_id
+            );
+            log::info!(
+                "🗑️ [THREAD_SERVICE] unregister_thread: removed '{}'",
+                acp_thread_id
+            );
         }
     }
 
@@ -768,7 +1115,10 @@ pub fn unregister_thread(acp_thread_id: &str) {
     let subs = PERSISTENT_SUBSCRIPTIONS.lock();
     if let Some(s) = subs.as_ref() {
         if s.write().remove(acp_thread_id) {
-            eprintln!("🗑️ [THREAD_SERVICE] unregister_thread: cleared persistent subscription for '{}'", acp_thread_id);
+            eprintln!(
+                "🗑️ [THREAD_SERVICE] unregister_thread: cleared persistent subscription for '{}'",
+                acp_thread_id
+            );
         }
     }
 }
@@ -803,16 +1153,21 @@ pub fn unregister_thread_if_matches(acp_thread_id: &str, expected_entity_id: gpu
                     );
                     log::info!(
                         "🗑️ [THREAD_SERVICE] unregister_thread_if_matches: removed '{}' (entity={:?})",
-                        acp_thread_id, expected_entity_id
+                        acp_thread_id,
+                        expected_entity_id
                     );
                 } else {
                     eprintln!(
                         "🛡️ [THREAD_SERVICE] unregister_thread_if_matches: skipping '{}' — registry holds different entity (existing={:?}, dropping={:?})",
-                        acp_thread_id, existing.entity_id(), expected_entity_id
+                        acp_thread_id,
+                        existing.entity_id(),
+                        expected_entity_id
                     );
                     log::info!(
                         "🛡️ [THREAD_SERVICE] unregister_thread_if_matches: skipping '{}' — registry holds different entity (existing={:?}, dropping={:?})",
-                        acp_thread_id, existing.entity_id(), expected_entity_id
+                        acp_thread_id,
+                        existing.entity_id(),
+                        expected_entity_id
                     );
                 }
             }
@@ -841,14 +1196,19 @@ pub fn unregister_thread_if_matches(acp_thread_id: &str, expected_entity_id: gpu
 pub fn get_thread(acp_thread_id: &str) -> Option<WeakEntity<AcpThread>> {
     // Check the active registry first
     let registry = THREAD_REGISTRY.lock();
-    if let Some(entity) = registry.as_ref().and_then(|r| r.read().get(acp_thread_id).cloned()) {
+    if let Some(entity) = registry
+        .as_ref()
+        .and_then(|r| r.read().get(acp_thread_id).cloned())
+    {
         return Some(entity.downgrade());
     }
     drop(registry);
 
     // Fall back to the keep-alive map (threads survive UI transitions here)
     let keep_alive = THREAD_KEEP_ALIVE.lock();
-    keep_alive.as_ref().and_then(|ka| ka.read().get(acp_thread_id).map(|e| e.downgrade()))
+    keep_alive
+        .as_ref()
+        .and_then(|ka| ka.read().get(acp_thread_id).map(|e| e.downgrade()))
 }
 
 /// Ensure a thread has an event subscription for syncing to Helix.
@@ -870,7 +1230,10 @@ pub fn ensure_thread_subscription(
     cx: &mut App,
 ) {
     if has_persistent_subscription(thread_id) {
-        eprintln!("🔔 [THREAD_SERVICE] Thread {} already has persistent subscription, skipping", thread_id);
+        eprintln!(
+            "🔔 [THREAD_SERVICE] Thread {} already has persistent subscription, skipping",
+            thread_id
+        );
         return;
     }
 
@@ -881,7 +1244,8 @@ pub fn ensure_thread_subscription(
     );
     log::info!(
         "🔔 [THREAD_SERVICE] Creating NEW subscription for thread {} on entity {:?}",
-        thread_id, entity_id
+        thread_id,
+        entity_id
     );
 
     let thread_id_for_sub = thread_id.to_string();
@@ -891,9 +1255,8 @@ pub fn ensure_thread_subscription(
     // Used by the Stopped handler to flush with the correct request_id,
     // even if a follow-up/interrupt message has already updated the global
     // THREAD_REQUEST_MAP to the next turn's request_id.
-    let turn_request_id: std::cell::RefCell<String> = std::cell::RefCell::new(
-        crate::get_thread_request_id(thread_id).unwrap_or_default()
-    );
+    let turn_request_id: std::cell::RefCell<String> =
+        std::cell::RefCell::new(crate::get_thread_request_id(thread_id).unwrap_or_default());
     // The previous turn's request_id, kept so that background events
     // (e.g. async tool completions) for entries from a completed turn
     // can still be tagged with the correct request_id.
@@ -905,7 +1268,8 @@ pub fn ensure_thread_subscription(
     // the previous turn's id. Detecting this via last_completed_request_id lets
     // us fall back to the global THREAD_REQUEST_MAP which already points to the
     // new turn's request_id.
-    let last_completed_request_id: std::cell::RefCell<String> = std::cell::RefCell::new(String::new());
+    let last_completed_request_id: std::cell::RefCell<String> =
+        std::cell::RefCell::new(String::new());
 
     let sub_entity_id = entity_id;
     cx.subscribe(thread_entity, move |thread_entity, event, cx| {
@@ -919,6 +1283,27 @@ pub fn ensure_thread_subscription(
         touch_activity(&thread_id_for_sub);
         match event {
             AcpThreadEvent::NewEntry => {
+                let subagent_activity = {
+                    let thread = thread_entity.read(cx);
+                    thread
+                        .entries()
+                        .last()
+                        .and_then(|entry| match entry {
+                            acp_thread::AgentThreadEntry::ToolCall(tool_call) => {
+                                codex_subagent_activity_for_tool_call(tool_call)
+                            }
+                            _ => None,
+                        })
+                };
+                if let Some((subagent_id, activity_kind)) = subagent_activity {
+                    handle_codex_subagent_activity(
+                        &thread_id_for_sub,
+                        &thread_entity,
+                        subagent_id,
+                        &activity_kind,
+                        cx,
+                    );
+                }
                 let thread = thread_entity.read(cx);
                 let latest_idx = thread.entries().len().saturating_sub(1);
                 if is_external_originated_entry(&thread_id_for_sub, latest_idx) {
@@ -937,11 +1322,25 @@ pub fn ensure_thread_subscription(
                         }
                         _ => return,
                     };
-                    let (tool_name, tool_status) = match entry {
+                    let (tool_name, tool_status, tool_call_id, tool_call_name, subagent_id) = match entry {
                         acp_thread::AgentThreadEntry::ToolCall(tool_call) => {
-                            (tool_call.label.read(cx).source().to_string(), tool_call.status.to_string())
+                            let (tool_call_id, tool_call_name, subagent_id) =
+                                tool_message_metadata(tool_call);
+                            (
+                                tool_call.label.read(cx).source().to_string(),
+                                tool_call.status.to_string(),
+                                tool_call_id,
+                                tool_call_name,
+                                subagent_id,
+                            )
                         }
-                        _ => (String::new(), String::new()),
+                        _ => (
+                            String::new(),
+                            String::new(),
+                            String::new(),
+                            String::new(),
+                            String::new(),
+                        ),
                     };
                     // A new UserMessage entry is the unambiguous start of a
                     // new turn — force-rotate turn_request_id from the global
@@ -1022,11 +1421,25 @@ pub fn ensure_thread_subscription(
                                 }
                                 _ => continue,
                             };
-                            let (prev_tool_name, prev_tool_status) = match prev_entry {
+                            let (prev_tool_name, prev_tool_status, prev_tool_call_id, prev_tool_call_name, prev_subagent_id) = match prev_entry {
                                 acp_thread::AgentThreadEntry::ToolCall(tool_call) => {
-                                    (tool_call.label.read(cx).source().to_string(), tool_call.status.to_string())
+                                    let (tool_call_id, tool_call_name, subagent_id) =
+                                        tool_message_metadata(tool_call);
+                                    (
+                                        tool_call.label.read(cx).source().to_string(),
+                                        tool_call.status.to_string(),
+                                        tool_call_id,
+                                        tool_call_name,
+                                        subagent_id,
+                                    )
                                 }
-                                _ => (String::new(), String::new()),
+                                _ => (
+                                    String::new(),
+                                    String::new(),
+                                    String::new(),
+                                    String::new(),
+                                    String::new(),
+                                ),
                             };
                             let _ = crate::send_websocket_event(SyncEvent::MessageAdded {
                                 acp_thread_id: thread_id_for_sub.clone(),
@@ -1037,6 +1450,9 @@ pub fn ensure_thread_subscription(
                                 entry_type: prev_entry_type.to_string(),
                                 tool_name: prev_tool_name,
                                 tool_status: prev_tool_status,
+                                tool_call_id: prev_tool_call_id,
+                                tool_call_name: prev_tool_call_name,
+                                subagent_id: prev_subagent_id,
                                 timestamp: chrono::Utc::now().timestamp(),
                             });
                         }
@@ -1051,21 +1467,60 @@ pub fn ensure_thread_subscription(
                         entry_type: entry_type.to_string(),
                         tool_name,
                         tool_status,
+                        tool_call_id,
+                        tool_call_name,
+                        subagent_id,
                         timestamp: chrono::Utc::now().timestamp(),
                     });
                 }
             }
             AcpThreadEvent::EntryUpdated(entry_idx) => {
+                let subagent_activity = {
+                    let thread = thread_entity.read(cx);
+                    thread.entries().get(*entry_idx).and_then(|entry| match entry {
+                        acp_thread::AgentThreadEntry::ToolCall(tool_call) => {
+                            codex_subagent_activity_for_tool_call(tool_call)
+                        }
+                        _ => None,
+                    })
+                };
+                if let Some((subagent_id, activity_kind)) = subagent_activity {
+                    handle_codex_subagent_activity(
+                        &thread_id_for_sub,
+                        &thread_entity,
+                        subagent_id,
+                        &activity_kind,
+                        cx,
+                    );
+                }
                 let thread = thread_entity.read(cx);
                 if let Some(entry) = thread.entries().get(*entry_idx) {
-                    let (content, entry_type, tool_name, tool_status) = match entry {
+                    let (content, entry_type, tool_name, tool_status, tool_call_id, tool_call_name, subagent_id) = match entry {
                         acp_thread::AgentThreadEntry::AssistantMessage(msg) => {
-                            (msg.content_only(cx), "text", String::new(), String::new())
+                            (
+                                msg.content_only(cx),
+                                "text",
+                                String::new(),
+                                String::new(),
+                                String::new(),
+                                String::new(),
+                                String::new(),
+                            )
                         }
                         acp_thread::AgentThreadEntry::ToolCall(tool_call) => {
                             let name = tool_call.label.read(cx).source().to_string();
                             let status = tool_call.status.to_string();
-                            (tool_call.to_markdown(cx), "tool_call", name, status)
+                            let (tool_call_id, tool_call_name, subagent_id) =
+                                tool_message_metadata(tool_call);
+                            (
+                                tool_call.to_markdown(cx),
+                                "tool_call",
+                                name,
+                                status,
+                                tool_call_id,
+                                tool_call_name,
+                                subagent_id,
+                            )
                         }
                         _ => return,
                     };
@@ -1099,8 +1554,34 @@ pub fn ensure_thread_subscription(
                         entry_type,
                         &tool_name,
                         &tool_status,
+                        &tool_call_id,
+                        &tool_call_name,
+                        &subagent_id,
                     );
                 }
+            }
+            AcpThreadEvent::SubagentSpawned(subagent_id) => {
+                let start_index = thread_entity
+                    .read(cx)
+                    .entries()
+                    .iter()
+                    .rev()
+                    .filter_map(|entry| match entry {
+                        acp_thread::AgentThreadEntry::ToolCall(tool_call) => {
+                            tool_call.subagent_session_info.as_ref()
+                        }
+                        _ => None,
+                    })
+                    .find(|info| &info.session_id == subagent_id)
+                    .map(|info| info.message_start_index)
+                    .unwrap_or(0);
+                load_and_subscribe_subagent(
+                    thread_id_for_sub.clone(),
+                    &thread_entity,
+                    subagent_id.clone(),
+                    start_index,
+                    cx,
+                );
             }
             AcpThreadEvent::PlanUpdated => {
                 let thread = thread_entity.read(cx);
@@ -1142,6 +1623,9 @@ pub fn ensure_thread_subscription(
                     entry_type: "plan".to_string(),
                     tool_name: String::new(),
                     tool_status: String::new(),
+                    tool_call_id: String::new(),
+                    tool_call_name: String::new(),
+                    subagent_id: String::new(),
                     timestamp: chrono::Utc::now().timestamp(),
                 }).log_err();
             }
@@ -1191,6 +1675,9 @@ pub fn ensure_thread_subscription(
                                     entry_type: "text".to_string(),
                                     tool_name: String::new(),
                                     tool_status: String::new(),
+                                    tool_call_id: String::new(),
+                                    tool_call_name: String::new(),
+                                    subagent_id: String::new(),
                                     timestamp: chrono::Utc::now().timestamp(),
                                 }).log_err();
                             }
@@ -1200,6 +1687,8 @@ pub fn ensure_thread_subscription(
                             if !content.is_empty() {
                                 let name = tool_call.label.read(cx).source().to_string();
                                 let status = tool_call.status.to_string();
+                                let (tool_call_id, tool_call_name, subagent_id) =
+                                    tool_message_metadata(tool_call);
                                 crate::send_websocket_event(SyncEvent::MessageAdded {
                                     acp_thread_id: thread_id_for_sub.clone(),
                                     message_id: idx.to_string(),
@@ -1209,6 +1698,9 @@ pub fn ensure_thread_subscription(
                                     entry_type: "tool_call".to_string(),
                                     tool_name: name,
                                     tool_status: status,
+                                    tool_call_id,
+                                    tool_call_name,
+                                    subagent_id,
                                     timestamp: chrono::Utc::now().timestamp(),
                                 }).log_err();
                             }
@@ -1424,8 +1916,8 @@ fn spawn_silent_turn_watchdog(thread_entity: &Entity<AcpThread>, thread_id: &str
                     let quiet_for = now.duration_since(quiet_since.unwrap_or(now));
                     if !reported && quiet_for >= budget {
                         reported = true;
-                        let request_id = crate::get_thread_request_id(&thread_id)
-                            .unwrap_or_default();
+                        let request_id =
+                            crate::get_thread_request_id(&thread_id).unwrap_or_default();
                         let msg = format!(
                             "{}: thread {} has been generating with no agent events for {:?} \
                              and nothing outstanding (no running tool, no pending permission) \
@@ -1883,7 +2375,9 @@ pub fn setup_thread_handler(
             }
         }
 
-        log::warn!("⚠️ [THREAD_SERVICE] Open thread handler task exiting - callback channel closed");
+        log::warn!(
+            "⚠️ [THREAD_SERVICE] Open thread handler task exiting - callback channel closed"
+        );
         anyhow::Ok(())
     })
     .detach();
@@ -1991,7 +2485,10 @@ fn create_new_thread_sync(
     request: ThreadCreationRequest,
     cx: &mut App,
 ) -> Result<()> {
-    log::info!("[THREAD_SERVICE] Creating ACP thread with agent: {:?}", request.agent_name);
+    log::info!(
+        "[THREAD_SERVICE] Creating ACP thread with agent: {:?}",
+        request.agent_name
+    );
 
     let agent = match request.agent_name.as_deref() {
         Some("zed-agent") | None => ExternalAgent::NativeAgent,
@@ -2321,24 +2818,39 @@ async fn handle_follow_up_message(
     simulate_input: bool,
     cx: gpui::AsyncApp,
 ) -> Result<()> {
-    log::info!("💬 [THREAD_SERVICE] Sending follow-up message: {} (simulate_input={})", message, simulate_input);
+    log::info!(
+        "💬 [THREAD_SERVICE] Sending follow-up message: {} (simulate_input={})",
+        message,
+        simulate_input
+    );
 
     // CRITICAL: Update the request_id for this thread so message_completed uses the correct ID!
     set_thread_request_id(thread_id.clone(), request_id.clone());
-    eprintln!("🔄 [THREAD_SERVICE] Updated request_id for thread {} to {}", thread_id, request_id);
-    log::info!("🔄 [THREAD_SERVICE] Updated request_id for thread {} to {}", thread_id, request_id);
+    eprintln!(
+        "🔄 [THREAD_SERVICE] Updated request_id for thread {} to {}",
+        thread_id, request_id
+    );
+    log::info!(
+        "🔄 [THREAD_SERVICE] Updated request_id for thread {} to {}",
+        thread_id,
+        request_id
+    );
 
     // Mark the entry that will be created as external-originated (unless simulating user input)
     // When simulate_input=true, we want the NewEntry subscription to fire so the user message
     // syncs back to Helix (testing the Zed → Helix direction)
     if !simulate_input {
-        let entry_idx_to_mark = cx.update(|cx| {
-            thread.update(cx, |thread, _| thread.entries().len())
-        })?;
+        let entry_idx_to_mark =
+            cx.update(|cx| thread.update(cx, |thread, _| thread.entries().len()))?;
         mark_external_originated_entry(thread_id.clone(), entry_idx_to_mark);
-        eprintln!("🏷️ [THREAD_SERVICE] Marked entry {} as external-originated (follow-up)", entry_idx_to_mark);
+        eprintln!(
+            "🏷️ [THREAD_SERVICE] Marked entry {} as external-originated (follow-up)",
+            entry_idx_to_mark
+        );
     } else {
-        eprintln!("🎭 [THREAD_SERVICE] simulate_input=true, NOT marking entry as external-originated (will sync back)");
+        eprintln!(
+            "🎭 [THREAD_SERVICE] simulate_input=true, NOT marking entry as external-originated (will sync back)"
+        );
     }
 
     // Ensure subscription exists (idempotent — skips if already present)
@@ -2359,9 +2871,8 @@ async fn handle_follow_up_message(
     // the agent session and re-invoking us on a fresh thread entity.
     let max_attempts = 2;
     let retry_delay = Duration::from_millis(500);
-    let agent_telemetry_id = cx.update(|cx| {
-        thread.update(cx, |thread, _| thread.agent_telemetry_id())
-    })?;
+    let agent_telemetry_id =
+        cx.update(|cx| thread.update(cx, |thread, _| thread.agent_telemetry_id()))?;
     let silence_budget = silent_prompt_wedge_timeout(agent_telemetry_id.as_ref());
     let mut request_guard = None;
     for attempt in 1..=max_attempts {
@@ -2378,14 +2889,20 @@ async fn handle_follow_up_message(
                     })
                 })
             }) else {
-                log::info!("[THREAD_SERVICE] Suppressed cancelled follow-up before dispatch: {}", request_id);
+                log::info!(
+                    "[THREAD_SERVICE] Suppressed cancelled follow-up before dispatch: {}",
+                    request_id
+                );
                 return Ok(());
             };
             request_guard = Some(guard);
             send_task?
         } else {
             if !request_guard.as_ref().unwrap().can_continue() {
-                log::info!("[THREAD_SERVICE] Suppressed cancelled follow-up retry: {}", request_id);
+                log::info!(
+                    "[THREAD_SERVICE] Suppressed cancelled follow-up retry: {}",
+                    request_id
+                );
                 return Ok(());
             }
             cx.update(|cx| {
@@ -2455,7 +2972,10 @@ async fn handle_follow_up_message(
                     );
                     log::warn!(
                         "⚠️ [THREAD_SERVICE] Follow-up hit claude-agent-acp drain race (attempt {}/{}), retrying after {:?}: {}",
-                        attempt, max_attempts, retry_delay, msg
+                        attempt,
+                        max_attempts,
+                        retry_delay,
+                        msg
                     );
                     cx.background_executor().timer(retry_delay).await;
                     continue;
@@ -2597,7 +3117,10 @@ async fn force_close_agent_session(
 
     log::info!(
         "🧹 [THREAD_SERVICE] force_close_agent_session: thread={} (request agent={:?}, recorded={:?}, effective={:?})",
-        acp_thread_id, agent_name, recorded_agent, effective_agent_name
+        acp_thread_id,
+        agent_name,
+        recorded_agent,
+        effective_agent_name
     );
 
     let agent = match effective_agent_name.as_deref() {
@@ -2620,11 +3143,7 @@ async fn force_close_agent_session(
     let shared = cx.update(|cx| {
         let agent_id = server.agent_id();
         let agent_server_store = project.read(cx).agent_server_store().clone();
-        let delegate = agent_servers::AgentServerDelegate::new(
-            agent_server_store,
-            None,
-            None,
-        );
+        let delegate = agent_servers::AgentServerDelegate::new(agent_server_store, None, None);
         agent_servers::AgentConnectionCache::request_connection(
             cx,
             project.clone(),
@@ -2638,8 +3157,7 @@ async fn force_close_agent_session(
         .await
         .map_err(|e| anyhow::anyhow!("agent connect for force-close failed: {:?}", e))?;
 
-    let agent_sid =
-        get_agent_session_id(&acp_thread_id).unwrap_or_else(|| acp_thread_id.clone());
+    let agent_sid = get_agent_session_id(&acp_thread_id).unwrap_or_else(|| acp_thread_id.clone());
     let session_id = acp::SessionId::new(agent_sid.clone());
 
     // Drop ALL Helix-side references to the wedged entity FIRST, so any
@@ -2675,7 +3193,8 @@ async fn force_close_agent_session(
     close_task.await?;
     log::info!(
         "🧹 [THREAD_SERVICE] force_close_agent_session: wrapper teardown complete for {} (agent session {})",
-        acp_thread_id, agent_sid
+        acp_thread_id,
+        agent_sid
     );
 
     Ok(())
@@ -2691,8 +3210,15 @@ async fn load_thread_from_agent(
     agent_name: Option<String>,
     cx: gpui::AsyncApp,
 ) -> Result<WeakEntity<AcpThread>> {
-    eprintln!("📂 [THREAD_SERVICE] load_thread_from_agent: {} (agent: {:?})", acp_thread_id, agent_name);
-    log::info!("📂 [THREAD_SERVICE] load_thread_from_agent: {} (agent: {:?})", acp_thread_id, agent_name);
+    eprintln!(
+        "📂 [THREAD_SERVICE] load_thread_from_agent: {} (agent: {:?})",
+        acp_thread_id, agent_name
+    );
+    log::info!(
+        "📂 [THREAD_SERVICE] load_thread_from_agent: {} (agent: {:?})",
+        acp_thread_id,
+        agent_name
+    );
 
     // Select agent based on agent_name
     let agent = match agent_name.as_deref() {
@@ -2716,11 +3242,7 @@ async fn load_thread_from_agent(
     let (shared, cwd) = cx.update(|cx| {
         let agent_id = server.agent_id();
         let agent_server_store = project.read(cx).agent_server_store().clone();
-        let delegate = agent_servers::AgentServerDelegate::new(
-            agent_server_store,
-            None,
-            None,
-        );
+        let delegate = agent_servers::AgentServerDelegate::new(agent_server_store, None, None);
         let shared = agent_servers::AgentConnectionCache::request_connection(
             cx,
             project.clone(),
@@ -2733,7 +3255,10 @@ async fn load_thread_from_agent(
             .ok()
             .map(|dir| std::path::PathBuf::from(dir))
             .unwrap_or_else(|| {
-                project.read(cx).worktrees(cx).next()
+                project
+                    .read(cx)
+                    .worktrees(cx)
+                    .next()
                     .map(|wt| wt.read(cx).abs_path().to_path_buf())
                     .unwrap_or_else(|| std::env::current_dir().unwrap_or_default())
             });
@@ -2762,8 +3287,15 @@ async fn load_thread_from_agent(
     // Load the thread from agent using the agent's own session ID (not the Zed thread UUID).
     // ACP agents like Claude Code assign their own session IDs during new_session.
     let agent_sid = get_agent_session_id(&acp_thread_id).unwrap_or_else(|| acp_thread_id.clone());
-    eprintln!("📂 [THREAD_SERVICE] load_session: zed_thread={} agent_session={}", acp_thread_id, agent_sid);
-    log::info!("📂 [THREAD_SERVICE] load_session: zed_thread={} agent_session={}", acp_thread_id, agent_sid);
+    eprintln!(
+        "📂 [THREAD_SERVICE] load_session: zed_thread={} agent_session={}",
+        acp_thread_id, agent_sid
+    );
+    log::info!(
+        "📂 [THREAD_SERVICE] load_session: zed_thread={} agent_session={}",
+        acp_thread_id,
+        agent_sid
+    );
     let session_id = acp::SessionId::new(agent_sid);
     let work_dirs = PathList::new(&[cwd.clone()]);
     let project_clone = project.clone();
@@ -2773,18 +3305,21 @@ async fn load_thread_from_agent(
     // Without this, the NativeAgent entity is released and those tasks fail with
     // "entity released".
     let _connection_keepalive = connection.clone();
-    let load_task = cx.update(|cx| {
-        connection.load_session(session_id, project_clone, work_dirs, None, cx)
-    });
+    let load_task =
+        cx.update(|cx| connection.load_session(session_id, project_clone, work_dirs, None, cx));
 
     let thread_entity: Entity<AcpThread> = load_task.await?;
 
-    let loaded_thread_id = cx.update(|cx| {
-        thread_entity.read(cx).session_id().to_string()
-    });
+    let loaded_thread_id = cx.update(|cx| thread_entity.read(cx).session_id().to_string());
 
-    eprintln!("✅ [THREAD_SERVICE] Loaded thread from agent: {}", loaded_thread_id);
-    log::info!("✅ [THREAD_SERVICE] Loaded thread from agent: {}", loaded_thread_id);
+    eprintln!(
+        "✅ [THREAD_SERVICE] Loaded thread from agent: {}",
+        loaded_thread_id
+    );
+    log::info!(
+        "✅ [THREAD_SERVICE] Loaded thread from agent: {}",
+        loaded_thread_id
+    );
 
     // Subscribe to thread events for streaming responses
     cx.update(|cx| {
@@ -2794,11 +3329,20 @@ async fn load_thread_from_agent(
     // Register thread for future access
     register_thread(loaded_thread_id.clone(), thread_entity.clone());
     set_agent_session_id(&acp_thread_id, loaded_thread_id.clone());
-    eprintln!("📋 [THREAD_SERVICE] Registered loaded thread: {} → agent session: {}", acp_thread_id, loaded_thread_id);
-    log::info!("📋 [THREAD_SERVICE] Registered loaded thread: {} → agent session: {}", acp_thread_id, loaded_thread_id);
+    eprintln!(
+        "📋 [THREAD_SERVICE] Registered loaded thread: {} → agent session: {}",
+        acp_thread_id, loaded_thread_id
+    );
+    log::info!(
+        "📋 [THREAD_SERVICE] Registered loaded thread: {} → agent session: {}",
+        acp_thread_id,
+        loaded_thread_id
+    );
 
     // Send agent_ready event to Helix (signals that agent is ready to receive prompts)
-    let agent_name_for_ready = agent_name.clone().unwrap_or_else(|| "zed-agent".to_string());
+    let agent_name_for_ready = agent_name
+        .clone()
+        .unwrap_or_else(|| "zed-agent".to_string());
     // Persist the agent backing this thread (see set_thread_agent_name doc).
     set_thread_agent_name(&loaded_thread_id, agent_name_for_ready.clone());
     if loaded_thread_id != acp_thread_id {
@@ -2828,16 +3372,27 @@ fn open_existing_thread_sync(
     request: ThreadOpenRequest,
     cx: &mut App,
 ) -> Result<()> {
-    eprintln!("📖 [THREAD_SERVICE] Opening existing ACP thread: {}, agent_name: {:?}",
-              request.acp_thread_id, request.agent_name);
-    log::info!("📖 [THREAD_SERVICE] Opening existing ACP thread: {}, agent_name: {:?}",
-               request.acp_thread_id, request.agent_name);
+    eprintln!(
+        "📖 [THREAD_SERVICE] Opening existing ACP thread: {}, agent_name: {:?}",
+        request.acp_thread_id, request.agent_name
+    );
+    log::info!(
+        "📖 [THREAD_SERVICE] Opening existing ACP thread: {}, agent_name: {:?}",
+        request.acp_thread_id,
+        request.agent_name
+    );
 
     // Check if thread is already in registry — ensure it has a subscription
     // (subscription tracking resets on process restart even if thread entity survived)
     if let Some(thread_weak) = get_thread(&request.acp_thread_id) {
-        eprintln!("✅ [THREAD_SERVICE] Thread already loaded in registry: {}", request.acp_thread_id);
-        log::info!("✅ [THREAD_SERVICE] Thread already loaded in registry: {}", request.acp_thread_id);
+        eprintln!(
+            "✅ [THREAD_SERVICE] Thread already loaded in registry: {}",
+            request.acp_thread_id
+        );
+        log::info!(
+            "✅ [THREAD_SERVICE] Thread already loaded in registry: {}",
+            request.acp_thread_id
+        );
         if let Some(thread_entity) = thread_weak.upgrade() {
             ensure_thread_subscription(&thread_entity, &request.acp_thread_id, cx);
         }
@@ -2873,24 +3428,37 @@ fn open_existing_thread_sync(
         let mut loading = THREAD_LOAD_IN_PROGRESS.lock();
         if let Some(in_progress) = loading.as_ref() {
             let in_progress = in_progress.clone();
-            eprintln!("⏳ [THREAD_SERVICE] Load lock held by '{}', waiting for release before handling '{}'",
-                      in_progress, request.acp_thread_id);
-            log::info!("⏳ [THREAD_SERVICE] Load lock held by '{}', waiting for release before handling '{}'",
-                       in_progress, request.acp_thread_id);
+            eprintln!(
+                "⏳ [THREAD_SERVICE] Load lock held by '{}', waiting for release before handling '{}'",
+                in_progress, request.acp_thread_id
+            );
+            log::info!(
+                "⏳ [THREAD_SERVICE] Load lock held by '{}', waiting for release before handling '{}'",
+                in_progress,
+                request.acp_thread_id
+            );
             drop(loading); // release parking_lot lock before spawning
 
             cx.spawn(async move |cx| {
                 // Poll until the load lock is released (max 30 s).
                 let deadline = Instant::now() + Duration::from_secs(30);
                 loop {
-                    cx.background_executor().timer(Duration::from_millis(50)).await;
+                    cx.background_executor()
+                        .timer(Duration::from_millis(50))
+                        .await;
                     if THREAD_LOAD_IN_PROGRESS.lock().is_none() {
-                        eprintln!("🔓 [THREAD_SERVICE] Load lock released, retrying open for '{}'", request.acp_thread_id);
+                        eprintln!(
+                            "🔓 [THREAD_SERVICE] Load lock released, retrying open for '{}'",
+                            request.acp_thread_id
+                        );
                         break;
                     }
                     if Instant::now() > deadline {
                         let error = anyhow::anyhow!("timed out waiting for thread load lock");
-                        eprintln!("⚠️ [THREAD_SERVICE] Timed out waiting for load lock for '{}'", request.acp_thread_id);
+                        eprintln!(
+                            "⚠️ [THREAD_SERVICE] Timed out waiting for load lock for '{}'",
+                            request.acp_thread_id
+                        );
                         report_thread_open_failure(&request, &error);
                         return;
                     }
@@ -2901,11 +3469,18 @@ fn open_existing_thread_sync(
                 }) {
                     report_thread_open_failure(&request, &error);
                 }
-            }).detach();
+            })
+            .detach();
             return Ok(());
         }
-        eprintln!("🔒 [THREAD_SERVICE] Acquired thread load lock for {}", request.acp_thread_id);
-        log::info!("🔒 [THREAD_SERVICE] Acquired thread load lock for {}", request.acp_thread_id);
+        eprintln!(
+            "🔒 [THREAD_SERVICE] Acquired thread load lock for {}",
+            request.acp_thread_id
+        );
+        log::info!(
+            "🔒 [THREAD_SERVICE] Acquired thread load lock for {}",
+            request.acp_thread_id
+        );
         *loading = Some(request.acp_thread_id.clone());
     }
 
@@ -2935,11 +3510,7 @@ fn open_existing_thread_sync(
     let agent_server_store = project.read(cx).agent_server_store().clone();
 
     // Create delegate for connection
-    let delegate = agent_servers::AgentServerDelegate::new(
-        agent_server_store,
-        None,
-        None,
-    );
+    let delegate = agent_servers::AgentServerDelegate::new(agent_server_store, None, None);
 
     // Get cached connection or create a new one (deduped against concurrent
     // callers in workspace restore / load_thread_from_agent / agent_connection_store).
@@ -2956,7 +3527,10 @@ fn open_existing_thread_sync(
         .ok()
         .map(|dir| std::path::PathBuf::from(dir))
         .unwrap_or_else(|| {
-            project.read(cx).worktrees(cx).next()
+            project
+                .read(cx)
+                .worktrees(cx)
+                .next()
                 .map(|wt| wt.read(cx).abs_path().to_path_buf())
                 .unwrap_or_else(|| std::env::current_dir().unwrap_or_default())
         });
@@ -3128,9 +3702,36 @@ fn open_existing_thread_sync(
 static TEST_WEBSOCKET_SERVICE_GUARD: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
 
 #[cfg(test)]
+mod codex_subagent_activity_tests {
+    use super::*;
+
+    #[test]
+    fn reads_codex_legacy_subagent_metadata() {
+        let raw_input = serde_json::json!({
+            "agentThreadId": "child-session",
+            "agentPath": "/root/reviewer",
+            "activityKind": "started",
+        });
+
+        assert_eq!(
+            codex_subagent_activity(Some(&raw_input)),
+            Some(("child-session", "started"))
+        );
+    }
+
+    #[test]
+    fn child_activity_message_id_is_stable_when_history_indexes_shift() {
+        assert_eq!(
+            subagent_message_id("child-session", "tool-call", 0),
+            subagent_message_id("child-session", "tool-call", 4),
+        );
+    }
+}
+
+#[cfg(test)]
 mod thread_open_failure_tests {
     use super::*;
-    use crate::websocket_sync::{WebSocketSync, WEBSOCKET_SERVICE};
+    use crate::websocket_sync::{WEBSOCKET_SERVICE, WebSocketSync};
     use fs::FakeFs;
     use gpui::{AppContext as _, TestAppContext};
     use project::Project;
@@ -3177,9 +3778,8 @@ mod thread_open_failure_tests {
         let fs = FakeFs::new(cx.executor());
         let project = Project::test(fs.clone(), [], cx).await;
         let thread_store = cx.new(|cx| ThreadStore::new(cx));
-        let agent = cx.update(|cx| {
-            agent::NativeAgent::new(thread_store, agent::Templates::new(), fs, cx)
-        });
+        let agent =
+            cx.update(|cx| agent::NativeAgent::new(thread_store, agent::Templates::new(), fs, cx));
         let connection = Rc::new(agent::NativeAgentConnection(agent));
         let (service, mut events) = WebSocketSync::new_test();
         *WEBSOCKET_SERVICE.lock() = Some(service);
@@ -3203,9 +3803,7 @@ mod thread_open_failure_tests {
         let mut correlated_errors = 0;
         while let Ok(event) = events.try_recv() {
             match event {
-                SyncEvent::ChatResponseError { request_id, .. }
-                    if request_id == "req-timeout" =>
-                {
+                SyncEvent::ChatResponseError { request_id, .. } if request_id == "req-timeout" => {
                     correlated_errors += 1;
                 }
                 SyncEvent::ThreadCreated { .. } | SyncEvent::AgentReady { .. } => {
@@ -3250,9 +3848,16 @@ mod thread_open_failure_tests {
              otherwise Helix can never clear the stale zed_thread_id",
         );
         match event {
-            SyncEvent::ThreadLoadError { acp_thread_id, request_id, error } => {
+            SyncEvent::ThreadLoadError {
+                acp_thread_id,
+                request_id,
+                error,
+            } => {
                 assert_eq!(acp_thread_id, "uncorrelated-thread");
-                assert_eq!(request_id, "", "uncorrelated failures carry an empty request_id");
+                assert_eq!(
+                    request_id, "",
+                    "uncorrelated failures carry an empty request_id"
+                );
                 // Helix matches on this exact prefix before recovering.
                 assert!(
                     error.starts_with("Failed to load thread: Resource not found: "),
@@ -3334,10 +3939,8 @@ mod pending_user_created_emit_tests {
     //!   context server failed to start: Context server request timeout`.
 
     use super::{
-        defer_user_created_thread,
-        drop_pending_user_created_thread,
+        PENDING_USER_CREATED_EMITS, defer_user_created_thread, drop_pending_user_created_thread,
         try_flush_pending_user_created_thread,
-        PENDING_USER_CREATED_EMITS,
     };
 
     /// Each test gets a unique acp_thread_id so they don't trip over one
@@ -3480,7 +4083,7 @@ mod agent_ready_on_reconnect_tests {
 
     use super::*;
     use crate::types::SyncEvent;
-    use crate::websocket_sync::{WebSocketSync, WEBSOCKET_SERVICE};
+    use crate::websocket_sync::{WEBSOCKET_SERVICE, WebSocketSync};
     use acp_thread::{AgentConnection, StubAgentConnection};
     use fs::FakeFs;
     use gpui::{AppContext as _, TestAppContext};
@@ -3728,15 +4331,9 @@ mod silent_prompt_wedge_tests {
         use acp_thread::ToolCallStatus;
 
         // Every status that means "something else legitimately owns the time".
-        for status in [
-            ToolCallStatus::Pending,
-            ToolCallStatus::InProgress,
-        ] {
+        for status in [ToolCallStatus::Pending, ToolCallStatus::InProgress] {
             assert!(
-                matches!(
-                    status,
-                    ToolCallStatus::Pending | ToolCallStatus::InProgress
-                ),
+                matches!(status, ToolCallStatus::Pending | ToolCallStatus::InProgress),
                 "statuses that represent outstanding work must be treated as busy \
                  so a slow tool is never mistaken for a wedged agent"
             );
@@ -3752,10 +4349,7 @@ mod silent_prompt_wedge_tests {
             ToolCallStatus::Canceled,
         ] {
             assert!(
-                !matches!(
-                    status,
-                    ToolCallStatus::Pending | ToolCallStatus::InProgress
-                ),
+                !matches!(status, ToolCallStatus::Pending | ToolCallStatus::InProgress),
                 "a finished tool call must not count as outstanding work"
             );
         }
@@ -3791,7 +4385,7 @@ mod agent_process_crash_tests {
 
     use super::*;
     use crate::types::SyncEvent;
-    use crate::websocket_sync::{WebSocketSync, WEBSOCKET_SERVICE};
+    use crate::websocket_sync::{WEBSOCKET_SERVICE, WebSocketSync};
     use acp_thread::{AcpThread, AgentConnection, StubAgentConnection};
     use fs::FakeFs;
     use gpui::{AppContext as _, TestAppContext};
@@ -3864,9 +4458,16 @@ mod agent_process_crash_tests {
 
         let mut terminal_for_turn = 0;
         while let Ok(event) = events_rx.try_recv() {
-            if let SyncEvent::ChatResponseError { request_id: rid, error } = event {
+            if let SyncEvent::ChatResponseError {
+                request_id: rid,
+                error,
+            } = event
+            {
                 if rid == request_id {
-                    assert!(!error.is_empty(), "chat_response_error must carry an error payload");
+                    assert!(
+                        !error.is_empty(),
+                        "chat_response_error must carry an error payload"
+                    );
                     terminal_for_turn += 1;
                 }
             }

@@ -36,7 +36,7 @@ use std::time::Duration;
 use futures::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
 use tokio::net::TcpListener;
-use tokio::sync::{mpsc, Mutex, Notify, RwLock};
+use tokio::sync::{Mutex, Notify, RwLock, mpsc};
 use tokio_tungstenite::tungstenite::Message;
 
 // ---------------------------------------------------------------------------
@@ -137,7 +137,13 @@ impl MockHelixServer {
         let token_clone = expected_token.clone();
 
         let server_handle = tokio::spawn(async move {
-            Self::accept_loop(listener, sessions_clone, connection_notify_clone, token_clone).await;
+            Self::accept_loop(
+                listener,
+                sessions_clone,
+                connection_notify_clone,
+                token_clone,
+            )
+            .await;
         });
 
         Self {
@@ -722,8 +728,11 @@ mod tests {
             content: "Hello, world!".to_string(),
             request_id: "req-test-001".to_string(),
             entry_type: "text".to_string(),
-                tool_name: String::new(),
-                tool_status: String::new(),
+            tool_name: String::new(),
+            tool_status: String::new(),
+            tool_call_id: String::new(),
+            tool_call_name: String::new(),
+            subagent_id: String::new(),
             timestamp: 1706000000,
         };
 
@@ -734,6 +743,29 @@ mod tests {
         assert_eq!(outgoing.data["role"], "assistant");
         assert_eq!(outgoing.data["content"], "Hello, world!");
         assert_eq!(outgoing.data["timestamp"], 1706000000);
+    }
+
+    #[test]
+    fn test_sync_event_serializes_subagent_metadata() {
+        let event = SyncEvent::MessageAdded {
+            acp_thread_id: "thread-123".to_string(),
+            message_id: "msg-456".to_string(),
+            role: "assistant".to_string(),
+            content: "Delegated work".to_string(),
+            request_id: "req-test-001".to_string(),
+            entry_type: "tool_call".to_string(),
+            tool_name: "Review implementation".to_string(),
+            tool_status: "Completed".to_string(),
+            tool_call_id: "call-123".to_string(),
+            tool_call_name: "spawn_agent".to_string(),
+            subagent_id: "session-child-123".to_string(),
+            timestamp: 1706000000,
+        };
+
+        let outgoing = event.to_outgoing_message().unwrap();
+        assert_eq!(outgoing.data["tool_call_id"], "call-123");
+        assert_eq!(outgoing.data["tool_call_name"], "spawn_agent");
+        assert_eq!(outgoing.data["subagent_id"], "session-child-123");
     }
 
     #[test]
@@ -918,7 +950,10 @@ mod tests {
         let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
 
         // Verify the wire format has the expected fields
-        assert!(parsed.get("event_type").is_some(), "Must have event_type field");
+        assert!(
+            parsed.get("event_type").is_some(),
+            "Must have event_type field"
+        );
         assert!(parsed.get("data").is_some(), "Must have data field");
         assert_eq!(parsed["event_type"], "thread_created");
         assert_eq!(parsed["data"]["acp_thread_id"], "thread-1");
@@ -966,8 +1001,11 @@ mod tests {
                     content: "Hello".to_string(),
                     request_id: String::new(),
                     entry_type: "text".to_string(),
-                tool_name: String::new(),
-                tool_status: String::new(),
+                    tool_name: String::new(),
+                    tool_status: String::new(),
+                    tool_call_id: String::new(),
+                    tool_call_name: String::new(),
+                    subagent_id: String::new(),
                     timestamp: 0,
                 },
                 "message_added",
@@ -1598,7 +1636,12 @@ mod tests {
 
         // Wait for exactly 3
         let events = server
-            .wait_for_event_count("test-session-10", "message_added", 3, Duration::from_secs(2))
+            .wait_for_event_count(
+                "test-session-10",
+                "message_added",
+                3,
+                Duration::from_secs(2),
+            )
             .await
             .unwrap();
 
