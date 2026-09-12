@@ -370,6 +370,16 @@ fn codex_subagent_activity(raw_input: Option<&serde_json::Value>) -> Option<(&st
     ))
 }
 
+fn codex_collaboration_spawn(raw_input: Option<&serde_json::Value>) -> Option<&str> {
+    let raw_input = raw_input?;
+    raw_input.get("prompt")?.as_str()?;
+    raw_input
+        .get("receiverThreadIds")?
+        .as_array()?
+        .first()?
+        .as_str()
+}
+
 fn tool_message_metadata(tool_call: &acp_thread::ToolCall) -> (String, String, String) {
     let tool_call_id = tool_call.id.0.to_string();
     let mut tool_call_name = tool_call
@@ -399,6 +409,14 @@ fn tool_message_metadata(tool_call: &acp_thread::ToolCall) -> (String, String, S
             .to_string();
         }
     }
+    if let Some(agent_thread_id) = codex_collaboration_spawn(tool_call.raw_input.as_ref()) {
+        if subagent_id.is_empty() {
+            subagent_id = agent_thread_id.to_string();
+        }
+        if tool_call_name.is_empty() {
+            tool_call_name = "spawn_agent".to_string();
+        }
+    }
     if tool_call_name.is_empty() && !subagent_id.is_empty() {
         tool_call_name = "spawn_agent".to_string();
     }
@@ -408,11 +426,16 @@ fn tool_message_metadata(tool_call: &acp_thread::ToolCall) -> (String, String, S
 fn codex_subagent_activity_for_tool_call(
     tool_call: &acp_thread::ToolCall,
 ) -> Option<(acp::SessionId, String)> {
-    let (agent_thread_id, activity_kind) = codex_subagent_activity(tool_call.raw_input.as_ref())?;
-    Some((
-        acp::SessionId::new(agent_thread_id),
-        activity_kind.to_string(),
-    ))
+    if let Some((agent_thread_id, activity_kind)) =
+        codex_subagent_activity(tool_call.raw_input.as_ref())
+    {
+        return Some((
+            acp::SessionId::new(agent_thread_id),
+            activity_kind.to_string(),
+        ));
+    }
+    codex_collaboration_spawn(tool_call.raw_input.as_ref())
+        .map(|agent_thread_id| (acp::SessionId::new(agent_thread_id), "started".to_string()))
 }
 
 fn subagent_subscription_key(parent_thread_id: &str, subagent_id: &str) -> String {
@@ -3717,6 +3740,34 @@ mod codex_subagent_activity_tests {
             codex_subagent_activity(Some(&raw_input)),
             Some(("child-session", "started"))
         );
+    }
+
+    #[test]
+    fn reads_current_codex_collaboration_spawn_metadata() {
+        let raw_input = serde_json::json!({
+            "prompt": "Review the authentication changes",
+            "senderThreadId": "parent-session",
+            "receiverThreadIds": ["child-session"],
+            "agentsStates": {"child-session": "pending_init"},
+            "model": "gpt-5.6-luna",
+            "status": "completed",
+        });
+
+        assert_eq!(
+            codex_collaboration_spawn(Some(&raw_input)),
+            Some("child-session")
+        );
+    }
+
+    #[test]
+    fn ignores_codex_collaboration_calls_without_a_spawn_prompt() {
+        let raw_input = serde_json::json!({
+            "receiverThreadIds": ["child-session"],
+            "agentsStates": {"child-session": {"completed": "Finished"}},
+            "status": "completed",
+        });
+
+        assert_eq!(codex_collaboration_spawn(Some(&raw_input)), None);
     }
 
     #[test]
