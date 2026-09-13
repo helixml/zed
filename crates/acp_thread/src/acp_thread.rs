@@ -877,6 +877,7 @@ pub struct ToolCall {
     pub raw_input: Option<serde_json::Value>,
     pub raw_input_markdown: Option<Entity<Markdown>>,
     pub raw_output: Option<serde_json::Value>,
+    pub meta: Option<acp::Meta>,
     pub tool_name: Option<SharedString>,
     pub subagent_session_info: Option<SubagentSessionInfo>,
     pub sandbox_authorization_details: Option<SandboxAuthorizationDetails>,
@@ -949,6 +950,7 @@ impl ToolCall {
             raw_input: tool_call.raw_input,
             raw_input_markdown,
             raw_output: tool_call.raw_output,
+            meta: tool_call.meta,
             tool_name,
             subagent_session_info,
             sandbox_authorization_details,
@@ -986,6 +988,9 @@ impl ToolCall {
             self.update_acp_status(status);
         }
 
+        if meta.is_some() {
+            self.meta.clone_from(&meta);
+        }
         if let Some(subagent_session_info) = subagent_session_info_from_meta(&meta) {
             self.subagent_session_info = Some(subagent_session_info);
         }
@@ -1224,6 +1229,7 @@ pub struct SelectedPermissionOutcome {
     pub option_id: acp::PermissionOptionId,
     pub option_kind: acp::PermissionOptionKind,
     pub params: Option<SelectedPermissionParams>,
+    pub response_answers: Option<HashMap<String, String>>,
 }
 
 impl SelectedPermissionOutcome {
@@ -1232,11 +1238,17 @@ impl SelectedPermissionOutcome {
             option_id,
             option_kind,
             params: None,
+            response_answers: None,
         }
     }
 
     pub fn params(mut self, params: Option<SelectedPermissionParams>) -> Self {
         self.params = params;
+        self
+    }
+
+    pub fn response_answers(mut self, answers: HashMap<String, String>) -> Self {
+        self.response_answers = Some(answers);
         self
     }
 }
@@ -3191,6 +3203,7 @@ impl AcpThread {
                     raw_input: None,
                     raw_input_markdown: None,
                     raw_output: None,
+                    meta: None,
                     tool_name: None,
                     subagent_session_info: None,
                     sandbox_authorization_details: None,

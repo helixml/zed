@@ -15,8 +15,8 @@ use fs::Fs;
 use gpui::{App, Entity, WeakEntity};
 use parking_lot::RwLock;
 use project::Project;
-use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
+use std::collections::{BTreeMap, HashMap, HashSet};
+use std::sync::{Arc, LazyLock};
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 use util::ResultExt;
@@ -360,6 +360,334 @@ struct PendingMessage {
     tool_call_id: String,
     tool_call_name: String,
     subagent_id: String,
+}
+
+#[derive(Clone)]
+struct PendingQuestionState {
+    question: crate::PendingQuestion,
+    native_id: String,
+    custom_answer_ids: HashMap<String, String>,
+    answers: Option<HashMap<String, String>>,
+}
+
+static PENDING_QUESTIONS: LazyLock<parking_lot::Mutex<HashMap<String, PendingQuestionState>>> =
+    LazyLock::new(|| parking_lot::Mutex::new(HashMap::new()));
+
+fn question_request_id(source: &str, thread_id: &str, native_id: &str) -> String {
+    format!("{source}:{thread_id}:{native_id}")
+}
+
+fn emit_question_requested(state: &PendingQuestionState) {
+    crate::send_websocket_event(SyncEvent::QuestionRequested(state.question.clone())).log_err();
+}
+
+fn register_question(state: PendingQuestionState) {
+    PENDING_QUESTIONS
+        .lock()
+        .insert(state.question.request_id.clone(), state.clone());
+    emit_question_requested(&state);
+}
+
+fn resolve_question(request_id: &str, outcome: &str) {
+    let Some(state) = PENDING_QUESTIONS.lock().remove(request_id) else {
+        return;
+    };
+    crate::send_websocket_event(SyncEvent::QuestionResolved {
+        thread_id: state.question.thread_id,
+        request_id: state.question.request_id,
+        turn_request_id: state.question.turn_request_id,
+        outcome: outcome.to_string(),
+        answers: state.answers,
+    })
+    .log_err();
+}
+
+fn resolve_native_question(thread_id: &str, source: &str, native_id: &str, outcome: &str) {
+    resolve_question(
+        &question_request_id(source, thread_id, native_id),
+        outcome,
+    );
+}
+
+fn resolve_permission_question(thread_id: &str, tool_call_id: &acp::ToolCallId) {
+    let request_id = question_request_id("permission", thread_id, tool_call_id.0.as_ref());
+    let outcome = PENDING_QUESTIONS
+        .lock()
+        .get(&request_id)
+        .map(|state| if state.answers.is_some() { "answered" } else { "cancelled" })
+        .unwrap_or("cancelled");
+    resolve_question(&request_id, outcome);
+}
+
+fn resolve_elicitation_question(
+    thread: &AcpThread,
+    thread_id: &str,
+    elicitation_id: &acp_thread::ElicitationEntryId,
+) {
+    let Some((_, elicitation)) = thread.elicitation(elicitation_id) else {
+        return;
+    };
+    let outcome = match elicitation.status {
+        acp_thread::ElicitationStatus::Pending { .. } => return,
+        acp_thread::ElicitationStatus::Accepted
+        | acp_thread::ElicitationStatus::Declined
+        | acp_thread::ElicitationStatus::Completed => "answered",
+        acp_thread::ElicitationStatus::Canceled => "cancelled",
+    };
+    resolve_native_question(
+        thread_id,
+        "elicitation",
+        elicitation_id.0.as_ref(),
+        outcome,
+    );
+}
+
+fn reemit_pending_questions() {
+    let pending = PENDING_QUESTIONS.lock().values().cloned().collect::<Vec<_>>();
+    for state in pending {
+        emit_question_requested(&state);
+    }
+}
+
+fn settle_pending_questions_for_thread(thread_id: &str) {
+    let questions = PENDING_QUESTIONS
+        .lock()
+        .iter()
+        .filter_map(|(request_id, state)| {
+            (state.question.thread_id == thread_id)
+                .then(|| (request_id.clone(), state.answers.is_some()))
+        })
+        .collect::<Vec<_>>();
+    for (request_id, answered) in questions {
+        resolve_question(
+            &request_id,
+            if answered { "answered" } else { "cancelled" },
+        );
+    }
+}
+
+fn json_string(value: Option<&serde_json::Value>) -> Option<String> {
+    value?.as_str().map(str::to_string).filter(|s| !s.is_empty())
+}
+
+fn question_options(value: Option<&serde_json::Value>) -> Vec<crate::UserQuestionOption> {
+    let Some(items) = value.and_then(serde_json::Value::as_array) else {
+        return Vec::new();
+    };
+    items
+        .iter()
+        .filter_map(|item| {
+            if let Some(label) = item.as_str() {
+                return Some(crate::UserQuestionOption {
+                    label: label.to_string(),
+                    description: String::new(),
+                });
+            }
+            let item = item.as_object()?;
+            let label = json_string(item.get("label"))
+                .or_else(|| json_string(item.get("title")))
+                .or_else(|| {
+                    item.get("const").and_then(|value| match value {
+                        serde_json::Value::String(value) => Some(value.clone()),
+                        serde_json::Value::Number(value) => Some(value.to_string()),
+                        serde_json::Value::Bool(value) => Some(value.to_string()),
+                        _ => None,
+                    })
+                })?;
+            Some(crate::UserQuestionOption {
+                label,
+                description: json_string(item.get("description")).unwrap_or_default(),
+            })
+        })
+        .collect()
+}
+
+fn elicitation_questions(
+    request: &acp::CreateElicitationRequest,
+) -> Option<(Vec<crate::UserQuestion>, HashMap<String, String>)> {
+    let acp::ElicitationMode::Form(form) = &request.mode else {
+        return None;
+    };
+    let schema = serde_json::to_value(&form.requested_schema).ok()?;
+    let properties = schema.get("properties")?.as_object()?;
+    let mut custom_answer_ids = HashMap::new();
+    for (id, property) in properties {
+        let custom_answer = property
+            .get("_meta")
+            .and_then(|meta| meta.get("_askUserQuestionCustomAnswer"))
+            .filter(|meta| meta.get("isCustomAnswer").and_then(serde_json::Value::as_bool) == Some(true));
+        let Some(question_id) = custom_answer.and_then(|meta| json_string(meta.get("questionId"))) else {
+            continue;
+        };
+        custom_answer_ids.insert(question_id, id.clone());
+    }
+    let mut questions = Vec::new();
+    for (id, property) in properties {
+        if custom_answer_ids.values().any(|custom_id| custom_id == id) {
+            continue;
+        }
+        let Some(property) = property.as_object() else {
+            continue;
+        };
+        let multi_select = property.get("type").and_then(serde_json::Value::as_str)
+            == Some("array");
+        let items = property.get("items").and_then(serde_json::Value::as_object);
+        let options = question_options(
+            property
+                .get("oneOf")
+                .or_else(|| property.get("enum"))
+                .or_else(|| items.and_then(|items| items.get("oneOf")))
+                .or_else(|| items.and_then(|items| items.get("anyOf")))
+                .or_else(|| items.and_then(|items| items.get("enum"))),
+        );
+        let title = json_string(property.get("title")).unwrap_or_else(|| id.clone());
+        let description = json_string(property.get("description"));
+        let question = description
+            .clone()
+            .unwrap_or_else(|| request.message.clone());
+        questions.push(crate::UserQuestion {
+            id: id.clone(),
+            header: title,
+            question,
+            allow_custom_answer: options.is_empty() || custom_answer_ids.contains_key(id),
+            options,
+            multi_select,
+        });
+    }
+    (!questions.is_empty()).then_some((questions, custom_answer_ids))
+}
+
+fn elicitation_response_content(
+    state: &PendingQuestionState,
+    answers: &HashMap<String, String>,
+) -> BTreeMap<String, acp::ElicitationContentValue> {
+    let mut content = BTreeMap::new();
+    for question in &state.question.questions {
+        let Some(answer) = answers.get(&question.id) else {
+            continue;
+        };
+        let selected_option = if question.multi_select {
+            answer.split('\n').filter(|item| !item.is_empty()).all(|item| {
+                question
+                    .options
+                    .iter()
+                    .any(|option| option.label == item)
+            })
+        } else {
+            question
+                .options
+                .iter()
+                .any(|option| option.label == *answer)
+        };
+        if !selected_option {
+            if let Some(custom_id) = state.custom_answer_ids.get(&question.id) {
+                content.insert(custom_id.clone(), answer.clone().into());
+                continue;
+            }
+        }
+        let value = if question.multi_select {
+            answer
+                .split('\n')
+                .filter(|item| !item.is_empty())
+                .map(str::to_string)
+                .collect::<Vec<_>>()
+                .into()
+        } else {
+            answer.clone().into()
+        };
+        content.insert(question.id.clone(), value);
+    }
+    content
+}
+
+fn qwen_questions(tool_call: &acp_thread::ToolCall) -> Option<Vec<crate::UserQuestion>> {
+    let meta = tool_call.meta.as_ref()?;
+    qwen_questions_from_meta(meta)
+}
+
+fn qwen_questions_from_meta(meta: &acp::Meta) -> Option<Vec<crate::UserQuestion>> {
+    if meta.get("qwenInteractionKind")?.as_str()? != "user_question" {
+        return None;
+    }
+    let questions = meta.get("qwenQuestions")?.as_array()?;
+    let parsed = questions
+        .iter()
+        .enumerate()
+        .filter_map(|(index, question)| {
+            let question = question.as_object()?;
+            let header = json_string(question.get("header"))?;
+            let prompt = json_string(question.get("question"))?;
+            let options = question_options(question.get("options"));
+            Some(crate::UserQuestion {
+                id: index.to_string(),
+                header,
+                question: prompt,
+                options,
+                multi_select: question
+                    .get("multiSelect")
+                    .and_then(serde_json::Value::as_bool)
+                    .unwrap_or(false),
+                allow_custom_answer: true,
+            })
+        })
+        .collect::<Vec<_>>();
+    (!parsed.is_empty()).then_some(parsed)
+}
+
+fn register_elicitation_question(
+    thread: &AcpThread,
+    thread_id: &str,
+    turn_request_id: &str,
+    elicitation_id: &acp_thread::ElicitationEntryId,
+) {
+    let Some((_, elicitation)) = thread.elicitation(elicitation_id) else {
+        return;
+    };
+    let Some((questions, custom_answer_ids)) = elicitation_questions(&elicitation.request) else {
+        return;
+    };
+    let native_id = elicitation_id.0.to_string();
+    register_question(PendingQuestionState {
+        question: crate::PendingQuestion {
+            thread_id: thread_id.to_string(),
+            request_id: question_request_id("elicitation", thread_id, &native_id),
+            turn_request_id: turn_request_id.to_string(),
+            source: "elicitation".to_string(),
+            questions,
+            tool_call_id: None,
+        },
+        native_id,
+        custom_answer_ids,
+        answers: None,
+    });
+}
+
+fn register_permission_question(
+    thread: &AcpThread,
+    thread_id: &str,
+    turn_request_id: &str,
+    tool_call_id: &acp::ToolCallId,
+) {
+    let Some((_, tool_call)) = thread.tool_call(tool_call_id) else {
+        return;
+    };
+    let Some(questions) = qwen_questions(tool_call) else {
+        return;
+    };
+    let native_id = tool_call_id.0.to_string();
+    register_question(PendingQuestionState {
+        question: crate::PendingQuestion {
+            thread_id: thread_id.to_string(),
+            request_id: question_request_id("permission", thread_id, &native_id),
+            turn_request_id: turn_request_id.to_string(),
+            source: "permission".to_string(),
+            questions,
+            tool_call_id: Some(native_id.clone()),
+        },
+        native_id,
+        custom_answer_ids: HashMap::new(),
+        answers: None,
+    });
 }
 
 fn codex_subagent_activity(raw_input: Option<&serde_json::Value>) -> Option<(&str, &str)> {
@@ -1474,6 +1802,31 @@ pub fn ensure_thread_subscription(
                     });
                 }
             }
+            AcpThreadEvent::ElicitationRequested(elicitation_id) => {
+                let thread = thread_entity.read(cx);
+                register_elicitation_question(
+                    thread,
+                    &thread_id_for_sub,
+                    &turn_request_id.borrow(),
+                    elicitation_id,
+                );
+            }
+            AcpThreadEvent::ElicitationResponded(elicitation_id) => {
+                let thread = thread_entity.read(cx);
+                resolve_elicitation_question(thread, &thread_id_for_sub, elicitation_id);
+            }
+            AcpThreadEvent::ToolAuthorizationRequested(tool_call_id) => {
+                let thread = thread_entity.read(cx);
+                register_permission_question(
+                    thread,
+                    &thread_id_for_sub,
+                    &turn_request_id.borrow(),
+                    tool_call_id,
+                );
+            }
+            AcpThreadEvent::ToolAuthorizationReceived(tool_call_id) => {
+                resolve_permission_question(&thread_id_for_sub, tool_call_id);
+            }
             AcpThreadEvent::EntryUpdated(entry_idx) => {
                 let subagent_activity = {
                     let thread = thread_entity.read(cx);
@@ -1495,6 +1848,14 @@ pub fn ensure_thread_subscription(
                 }
                 let thread = thread_entity.read(cx);
                 if let Some(entry) = thread.entries().get(*entry_idx) {
+                    if let acp_thread::AgentThreadEntry::Elicitation(elicitation_id) = entry {
+                        resolve_elicitation_question(
+                            thread,
+                            &thread_id_for_sub,
+                            elicitation_id,
+                        );
+                        return;
+                    }
                     let (content, entry_type, tool_name, tool_status, tool_call_id, tool_call_name, subagent_id) = match entry {
                         acp_thread::AgentThreadEntry::AssistantMessage(msg) => {
                             (
@@ -1635,6 +1996,7 @@ pub fn ensure_thread_subscription(
             // arm) → chat_response_error. Without the Error arm a crashed agent
             // that streamed partial output wedges the worker forever.
             AcpThreadEvent::Stopped(_) | AcpThreadEvent::Error(_) => {
+                settle_pending_questions_for_thread(&thread_id_for_sub);
                 let abort_cause = match event {
                     AcpThreadEvent::Error(cause) => Some(cause.clone()),
                     _ => None,
@@ -2029,6 +2391,123 @@ pub fn setup_thread_handler(
             }
         }
     }).detach();
+
+    let (question_tx, mut question_rx) =
+        mpsc::unbounded_channel::<crate::QuestionCommandRequest>();
+    crate::init_question_callback(question_tx);
+    cx.spawn(async move |cx| {
+        while let Some(command) = question_rx.recv().await {
+            match command {
+                crate::QuestionCommandRequest::Resync => reemit_pending_questions(),
+                crate::QuestionCommandRequest::Respond(response) => {
+                    let state = {
+                        let mut pending = PENDING_QUESTIONS.lock();
+                        let Some(state) = pending.get_mut(&response.request_id) else {
+                            continue;
+                        };
+                        state.answers = Some(response.answers.clone());
+                        state.clone()
+                    };
+                    let Some(thread) = get_thread(&state.question.thread_id) else {
+                        resolve_question(&response.request_id, "cancelled");
+                        continue;
+                    };
+                    let update = cx.update(|cx| {
+                        thread.update(cx, |thread, cx| match state.question.source.as_str() {
+                            "elicitation" => {
+                                thread.respond_to_elicitation(
+                                    &acp_thread::ElicitationEntryId(state.native_id.clone().into()),
+                                    acp::CreateElicitationResponse::new(
+                                        acp::ElicitationAction::Accept(
+                                            acp::ElicitationAcceptAction::new().content(
+                                                elicitation_response_content(
+                                                    &state,
+                                                    &response.answers,
+                                                ),
+                                            ),
+                                        ),
+                                    ),
+                                    cx,
+                                );
+                                true
+                            }
+                            "permission" => {
+                                let tool_call_id = acp::ToolCallId::new(state.native_id.clone());
+                                let selected = thread.tool_call(&tool_call_id).and_then(
+                                    |(_, tool_call)| match &tool_call.status {
+                                        acp_thread::ToolCallStatus::WaitingForConfirmation {
+                                            options,
+                                            ..
+                                        } => options
+                                            .first_option_of_kind(
+                                                acp::PermissionOptionKind::AllowOnce,
+                                            )
+                                            .cloned(),
+                                        _ => None,
+                                    },
+                                );
+                                if let Some(selected) = selected {
+                                    thread.authorize_tool_call(
+                                        tool_call_id,
+                                        acp_thread::SelectedPermissionOutcome::new(
+                                            selected.option_id,
+                                            selected.kind,
+                                        )
+                                        .response_answers(response.answers.clone()),
+                                        cx,
+                                    );
+                                    true
+                                } else {
+                                    false
+                                }
+                            }
+                            _ => false,
+                        })
+                    });
+                    if !matches!(update, Ok(true)) {
+                        resolve_question(&response.request_id, "cancelled");
+                    }
+                }
+                crate::QuestionCommandRequest::Cancel(cancellation) => {
+                    let state = PENDING_QUESTIONS
+                        .lock()
+                        .get(&cancellation.request_id)
+                        .cloned();
+                    let Some(state) = state else {
+                        continue;
+                    };
+                    let Some(thread) = get_thread(&state.question.thread_id) else {
+                        resolve_question(&cancellation.request_id, "cancelled");
+                        continue;
+                    };
+                    let update = cx.update(|cx| {
+                        thread.update(cx, |thread, cx| match state.question.source.as_str() {
+                            "elicitation" => {
+                                thread.cancel_elicitation(
+                                    &acp_thread::ElicitationEntryId(state.native_id.clone().into()),
+                                    cx,
+                                );
+                                true
+                            }
+                            "permission" => {
+                                thread.cancel_tool_call_authorization(
+                                    &acp::ToolCallId::new(state.native_id.clone()),
+                                    cx,
+                                );
+                                true
+                            }
+                            _ => false,
+                        })
+                    });
+                    if !matches!(update, Ok(true)) {
+                        resolve_question(&cancellation.request_id, "cancelled");
+                    }
+                }
+            }
+        }
+        anyhow::Ok(())
+    })
+    .detach();
 
     // Spawn handler task to process thread creation requests
     cx.spawn(async move |cx| {
@@ -3725,6 +4204,111 @@ mod codex_subagent_activity_tests {
             subagent_message_id("child-session", "tool-call", 0),
             subagent_message_id("child-session", "tool-call", 4),
         );
+    }
+}
+
+#[cfg(test)]
+mod question_normalization_tests {
+    use super::*;
+
+    #[test]
+    fn parses_claude_enum_options_without_stringifying_objects() {
+        let options = serde_json::json!([
+            {"title": "React", "const": "react", "description": "Use React"},
+            {"title": "Vue", "const": "vue"}
+        ]);
+
+        let parsed = question_options(Some(&options));
+
+        assert_eq!(parsed[0].label, "React");
+        assert_eq!(parsed[0].description, "Use React");
+        assert_eq!(parsed[1].label, "Vue");
+    }
+
+    #[test]
+    fn normalizes_claude_ask_user_question_form_and_routes_custom_answers() {
+        let schema: acp::ElicitationSchema = serde_json::from_value(serde_json::json!({
+            "type": "object",
+            "properties": {
+                "question_0": {
+                    "type": "string",
+                    "title": "Framework",
+                    "oneOf": [
+                        {"const": "React", "title": "React", "description": "Use React"},
+                        {"const": "Vue", "title": "Vue"}
+                    ]
+                },
+                "question_0_custom": {
+                    "type": "string",
+                    "title": "Other",
+                    "_meta": {
+                        "_askUserQuestionCustomAnswer": {
+                            "questionId": "question_0",
+                            "isCustomAnswer": true
+                        }
+                    }
+                }
+            }
+        }))
+        .unwrap();
+        let request = acp::CreateElicitationRequest::new(
+            acp::ElicitationFormMode::new(
+                acp::ElicitationRequestScope::new(acp::RequestId::Number(1)),
+                schema,
+            ),
+            "Which framework?",
+        );
+
+        let (questions, custom_answer_ids) = elicitation_questions(&request).unwrap();
+        assert_eq!(questions.len(), 1);
+        assert_eq!(questions[0].id, "question_0");
+        assert_eq!(questions[0].question, "Which framework?");
+        assert_eq!(questions[0].options[0].label, "React");
+        assert!(questions[0].allow_custom_answer);
+        assert_eq!(custom_answer_ids["question_0"], "question_0_custom");
+
+        let state = PendingQuestionState {
+            question: crate::PendingQuestion {
+                thread_id: "thread".into(),
+                request_id: "request".into(),
+                turn_request_id: "turn".into(),
+                source: "elicitation".into(),
+                questions,
+                tool_call_id: None,
+            },
+            native_id: "native".into(),
+            custom_answer_ids,
+            answers: None,
+        };
+        let content = elicitation_response_content(
+            &state,
+            &HashMap::from([("question_0".into(), "Svelte".into())]),
+        );
+        assert_eq!(
+            content["question_0_custom"],
+            acp::ElicitationContentValue::String("Svelte".into())
+        );
+        assert!(!content.contains_key("question_0"));
+    }
+
+    #[test]
+    fn parses_qwen_question_metadata_from_the_tool_call() {
+        let meta: acp::Meta = serde_json::from_value(serde_json::json!({
+            "qwenInteractionKind": "user_question",
+            "qwenQuestions": [{
+                "header": "Framework",
+                "question": "Which framework?",
+                "options": [{"label": "React", "description": "Use React"}],
+                "multiSelect": false
+            }]
+        }))
+        .unwrap();
+
+        let parsed = qwen_questions_from_meta(&meta).unwrap();
+
+        assert_eq!(parsed[0].id, "0");
+        assert_eq!(parsed[0].question, "Which framework?");
+        assert_eq!(parsed[0].options[0].label, "React");
     }
 }
 

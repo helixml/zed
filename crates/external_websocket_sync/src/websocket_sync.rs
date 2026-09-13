@@ -161,6 +161,8 @@ impl WebSocketSync {
                     eprintln!("✅ [WEBSOCKET] Connected! Running message loop...");
                     log::info!("✅ [WEBSOCKET] Connected! Running message loop...");
 
+                    crate::request_question_resync();
+
                     // Run until connection drops
                     Self::run_connection(ws_sink, ws_stream, &mut outgoing_rx).await;
 
@@ -423,12 +425,26 @@ impl WebSocketSync {
             "open_thread" => Self::handle_open_thread(command.data).await,
             "query_ui_state" => Self::handle_query_ui_state(command.data).await,
             "cancel_current_turn" => Self::handle_cancel_current_turn(command.data).await,
+            "respond_question" => Self::handle_respond_question(command.data).await,
+            "cancel_question" => Self::handle_cancel_question(command.data).await,
             _ => {
                 eprintln!("⚠️  [WEBSOCKET-IN] Ignoring unknown command: {}", command.command_type);
                 log::warn!("⚠️  [WEBSOCKET-IN] Ignoring unknown command: {}", command.command_type);
                 Ok(())
             }
         }
+    }
+
+    async fn handle_respond_question(data: serde_json::Value) -> Result<()> {
+        let response: crate::IncomingQuestionResponse = serde_json::from_value(data)
+            .context("Failed to parse respond_question data")?;
+        crate::request_question_command(crate::QuestionCommandRequest::Respond(response))
+    }
+
+    async fn handle_cancel_question(data: serde_json::Value) -> Result<()> {
+        let cancellation: crate::IncomingQuestionCancellation = serde_json::from_value(data)
+            .context("Failed to parse cancel_question data")?;
+        crate::request_question_command(crate::QuestionCommandRequest::Cancel(cancellation))
     }
 
     /// Handle chat_message command (create/send to thread)
@@ -800,4 +816,3 @@ pub async fn wait_for_websocket_connected(timeout: std::time::Duration) -> bool 
         }
     }
 }
-
