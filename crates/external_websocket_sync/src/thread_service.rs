@@ -502,6 +502,30 @@ fn question_options(value: Option<&serde_json::Value>) -> Vec<crate::UserQuestio
         .collect()
 }
 
+fn custom_answer_question_id(property: &serde_json::Value) -> Option<String> {
+    let meta = property.get("_meta")?;
+    if let Some(custom_answer) = meta
+        .get("_askUserQuestionCustomAnswer")
+        .filter(|meta| {
+            meta.get("isCustomAnswer")
+                .and_then(serde_json::Value::as_bool)
+                == Some(true)
+        })
+    {
+        return json_string(custom_answer.get("questionId"));
+    }
+
+    let codex = meta.get("codex")?.as_object()?;
+    if codex
+        .get("isOtherAnswer")
+        .and_then(serde_json::Value::as_bool)
+        != Some(true)
+    {
+        return None;
+    }
+    json_string(codex.get("questionId"))
+}
+
 fn elicitation_questions(
     request: &acp::CreateElicitationRequest,
 ) -> Option<(Vec<crate::UserQuestion>, HashMap<String, String>)> {
@@ -512,11 +536,7 @@ fn elicitation_questions(
     let properties = schema.get("properties")?.as_object()?;
     let mut custom_answer_ids = HashMap::new();
     for (id, property) in properties {
-        let custom_answer = property
-            .get("_meta")
-            .and_then(|meta| meta.get("_askUserQuestionCustomAnswer"))
-            .filter(|meta| meta.get("isCustomAnswer").and_then(serde_json::Value::as_bool) == Some(true));
-        let Some(question_id) = custom_answer.and_then(|meta| json_string(meta.get("questionId"))) else {
+        let Some(question_id) = custom_answer_question_id(property) else {
             continue;
         };
         custom_answer_ids.insert(question_id, id.clone());
@@ -4289,6 +4309,78 @@ mod question_normalization_tests {
             acp::ElicitationContentValue::String("Svelte".into())
         );
         assert!(!content.contains_key("question_0"));
+    }
+
+    #[test]
+    fn normalizes_codex_request_user_input_form_and_routes_other_answers() {
+        let schema: acp::ElicitationSchema = serde_json::from_value(serde_json::json!({
+            "type": "object",
+            "properties": {
+                "framework": {
+                    "type": "string",
+                    "title": "Framework",
+                    "description": "Which framework?",
+                    "oneOf": [
+                        {"const": "React", "title": "React", "description": "Use React"},
+                        {"const": "Vue", "title": "Vue"}
+                    ],
+                    "_meta": {
+                        "codex": {"isOther": true, "isSecret": false}
+                    }
+                },
+                "framework__other": {
+                    "type": "string",
+                    "title": "Other",
+                    "description": "Type your own answer instead of choosing an option above.",
+                    "_meta": {
+                        "codex": {
+                            "questionId": "framework",
+                            "isOtherAnswer": true,
+                            "isSecret": false
+                        }
+                    }
+                }
+            }
+        }))
+        .unwrap();
+        let request = acp::CreateElicitationRequest::new(
+            acp::ElicitationFormMode::new(
+                acp::ElicitationRequestScope::new(acp::RequestId::Number(2)),
+                schema,
+            ),
+            "Which framework?",
+        );
+
+        let (questions, custom_answer_ids) = elicitation_questions(&request).unwrap();
+        assert_eq!(questions.len(), 1);
+        assert_eq!(questions[0].id, "framework");
+        assert_eq!(questions[0].question, "Which framework?");
+        assert_eq!(questions[0].options[0].label, "React");
+        assert!(questions[0].allow_custom_answer);
+        assert_eq!(custom_answer_ids["framework"], "framework__other");
+
+        let state = PendingQuestionState {
+            question: crate::PendingQuestion {
+                thread_id: "thread".into(),
+                request_id: "request".into(),
+                turn_request_id: "turn".into(),
+                source: "elicitation".into(),
+                questions,
+                tool_call_id: None,
+            },
+            native_id: "native".into(),
+            custom_answer_ids,
+            answers: None,
+        };
+        let content = elicitation_response_content(
+            &state,
+            &HashMap::from([("framework".into(), "Svelte".into())]),
+        );
+        assert_eq!(
+            content["framework__other"],
+            acp::ElicitationContentValue::String("Svelte".into())
+        );
+        assert!(!content.contains_key("framework"));
     }
 
     #[test]
