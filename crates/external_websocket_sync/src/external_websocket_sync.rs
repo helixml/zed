@@ -87,6 +87,17 @@ static GLOBAL_UI_STATE_QUERY_CALLBACK: parking_lot::Mutex<Option<mpsc::Unbounded
 static GLOBAL_CANCELLATION_CALLBACK: parking_lot::Mutex<Option<mpsc::UnboundedSender<CancellationRequest>>> =
     parking_lot::Mutex::new(None);
 
+#[derive(Clone, Debug)]
+pub enum QuestionCommandRequest {
+    Respond(IncomingQuestionResponse),
+    Cancel(IncomingQuestionCancellation),
+    Resync,
+}
+
+static GLOBAL_QUESTION_CALLBACK: parking_lot::Mutex<
+    Option<mpsc::UnboundedSender<QuestionCommandRequest>>,
+> = parking_lot::Mutex::new(None);
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum RequestLifecycle {
     Queued,
@@ -1000,3 +1011,22 @@ pub fn init_cancel_thread_callback(sender: mpsc::UnboundedSender<CancelThreadReq
     *GLOBAL_CANCEL_THREAD_CALLBACK.lock() = Some(sender);
 }
 
+pub fn request_question_command(request: QuestionCommandRequest) -> Result<()> {
+    let sender = GLOBAL_QUESTION_CALLBACK.lock().clone();
+    let Some(sender) = sender else {
+        return Err(anyhow::anyhow!("question handler is not initialized"));
+    };
+    sender
+        .send(request)
+        .map_err(|_| anyhow::anyhow!("question handler stopped"))
+}
+
+pub fn request_question_resync() {
+    if let Some(sender) = GLOBAL_QUESTION_CALLBACK.lock().clone() {
+        sender.send(QuestionCommandRequest::Resync).ok();
+    }
+}
+
+pub fn init_question_callback(sender: mpsc::UnboundedSender<QuestionCommandRequest>) {
+    *GLOBAL_QUESTION_CALLBACK.lock() = Some(sender);
+}

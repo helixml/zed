@@ -183,6 +183,33 @@ pub struct ContextUsage {
     pub max_tokens: u64,
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct UserQuestionOption {
+    pub label: String,
+    pub description: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct UserQuestion {
+    pub id: String,
+    pub header: String,
+    pub question: String,
+    pub options: Vec<UserQuestionOption>,
+    pub multi_select: bool,
+    pub allow_custom_answer: bool,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PendingQuestion {
+    pub thread_id: String,
+    pub request_id: String,
+    pub turn_request_id: String,
+    pub source: String,
+    pub questions: Vec<UserQuestion>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_call_id: Option<String>,
+}
+
 /// Events that Zed sends to external system via WebSocket
 /// Per WEBSOCKET_PROTOCOL_SPEC.md - Zed is stateless and only knows about acp_thread_id
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -305,6 +332,17 @@ pub enum SyncEvent {
         mcp_servers: HashMap<String, String>,
         /// Currently selected model ID for the active thread (if available)
         active_model: Option<String>,
+    },
+    #[serde(rename = "question_requested")]
+    QuestionRequested(PendingQuestion),
+    #[serde(rename = "question_resolved")]
+    QuestionResolved {
+        thread_id: String,
+        request_id: String,
+        turn_request_id: String,
+        outcome: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        answers: Option<HashMap<String, String>>,
     },
 }
 
@@ -446,6 +484,26 @@ impl SyncEvent {
                     "active_model": active_model,
                 }),
             ),
+            SyncEvent::QuestionRequested(question) => (
+                "question_requested".to_string(),
+                serde_json::to_value(question)?,
+            ),
+            SyncEvent::QuestionResolved {
+                thread_id,
+                request_id,
+                turn_request_id,
+                outcome,
+                answers,
+            } => (
+                "question_resolved".to_string(),
+                serde_json::json!({
+                    "thread_id": thread_id,
+                    "request_id": request_id,
+                    "turn_request_id": turn_request_id,
+                    "outcome": outcome,
+                    "answers": answers,
+                }),
+            ),
         };
 
         Ok(OutgoingMessage { event_type, data })
@@ -467,6 +525,17 @@ pub struct IncomingChatMessage {
     pub agent_name: Option<String>,  // Which agent to use (zed-agent or qwen) - defaults to zed-agent
     #[serde(default)]
     pub interrupt: bool,  // If true, cancel the current running turn before sending this message
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct IncomingQuestionResponse {
+    pub request_id: String,
+    pub answers: HashMap<String, String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct IncomingQuestionCancellation {
+    pub request_id: String,
 }
 
 /// Response for health check endpoint

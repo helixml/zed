@@ -8,7 +8,8 @@ use agent_client_protocol::schema::{
     v1::{self as acp, ErrorCode},
 };
 use agent_client_protocol::{
-    Agent, Client, ConnectionTo, JsonRpcNotification, JsonRpcResponse, Lines, Responder,
+    Agent, Client, ConnectionTo, JsonRpcNotification, JsonRpcRequest, JsonRpcResponse, Lines,
+    Responder,
 };
 use anyhow::anyhow;
 use async_channel;
@@ -56,6 +57,27 @@ struct RawSessionNotification {
     session_id: acp::SessionId,
     update: serde_json::Value,
     #[serde(default, rename = "_meta")]
+    meta: Option<acp::Meta>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonRpcRequest)]
+#[request(method = "session/request_permission", response = RawRequestPermissionResponse)]
+#[serde(rename_all = "camelCase")]
+struct RawRequestPermissionRequest {
+    session_id: acp::SessionId,
+    tool_call: acp::ToolCallUpdate,
+    options: Vec<acp::PermissionOption>,
+    #[serde(default, rename = "_meta")]
+    meta: Option<acp::Meta>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonRpcResponse)]
+#[serde(rename_all = "camelCase")]
+struct RawRequestPermissionResponse {
+    outcome: acp::RequestPermissionOutcome,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    answers: Option<std::collections::HashMap<String, String>>,
+    #[serde(default, rename = "_meta", skip_serializing_if = "Option::is_none")]
     meta: Option<acp::Meta>,
 }
 
@@ -2874,6 +2896,19 @@ mod tests {
         });
     }
 
+    #[test]
+    fn qwen_permission_answers_serialize_at_the_response_top_level() {
+        let response: RawRequestPermissionResponse = serde_json::from_value(serde_json::json!({
+            "outcome": {"outcome": "selected", "optionId": "proceed_once"},
+            "answers": {"0": "React"}
+        }))
+        .unwrap();
+
+        let value = serde_json::to_value(response).unwrap();
+        assert_eq!(value["answers"]["0"], "React");
+        assert!(value.get("_meta").is_none());
+    }
+
     #[gpui::test]
     async fn client_capabilities_include_elicitation_without_acp_beta(
         cx: &mut gpui::TestAppContext,
@@ -4828,8 +4863,8 @@ fn respond_result<T: JsonRpcResponse>(responder: Responder<T>, result: Result<T,
 }
 
 fn handle_request_permission(
-    args: acp::RequestPermissionRequest,
-    responder: Responder<acp::RequestPermissionResponse>,
+    args: RawRequestPermissionRequest,
+    responder: Responder<RawRequestPermissionResponse>,
     cx: &mut AsyncApp,
     ctx: &ClientContext,
 ) {
@@ -4860,8 +4895,18 @@ fn handle_request_permission(
 
         match result {
             Ok(outcome) => {
+                let answers = match &outcome {
+                    acp_thread::RequestPermissionOutcome::Selected(selected) => {
+                        selected.response_answers.clone()
+                    }
+                    _ => None,
+                };
                 responder
-                    .respond(acp::RequestPermissionResponse::new(outcome.into()))
+                    .respond(RawRequestPermissionResponse {
+                        outcome: outcome.into(),
+                        answers,
+                        meta: None,
+                    })
                     .log_err();
             }
             Err(e) => {
