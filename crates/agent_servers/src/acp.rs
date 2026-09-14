@@ -44,7 +44,7 @@ use acp_thread::{AcpThread, AuthRequired, LoadError, TerminalProviderEvent};
 use terminal::TerminalBuilder;
 use terminal::terminal_settings::{AlternateScroll, CursorShape};
 
-use crate::{CURSOR_ID, GEMINI_ID};
+use crate::{CLAUDE_AGENT_ID, CURSOR_ID, GEMINI_ID};
 
 pub const GEMINI_TERMINAL_AUTH_METHOD_ID: &str = "spawn-gemini-cli";
 const PARAMETERIZED_MODEL_PICKER_META_KEY: &str = "parameterizedModelPicker";
@@ -832,7 +832,7 @@ fn client_capabilities_for_agent(agent_id: &AgentId) -> acp::ClientCapabilities 
         meta.insert(PARAMETERIZED_MODEL_PICKER_META_KEY.into(), true.into());
     }
 
-    if agent_id.as_ref() == crate::CODEX_ID {
+    if matches!(agent_id.as_ref(), crate::CODEX_ID | CLAUDE_AGENT_ID) {
         meta.insert(
             "jetbrains".into(),
             serde_json::json!({
@@ -3231,21 +3231,23 @@ mod tests {
     }
 
     #[test]
-    fn codex_client_capabilities_enable_native_subagent_sessions() {
-        let capabilities = client_capabilities_for_agent(&AgentId::new(crate::CODEX_ID));
-        let meta = capabilities
-            .meta
-            .expect("expected client capabilities meta");
+    fn codex_and_claude_client_capabilities_enable_native_subagent_sessions() {
+        for agent_id in [crate::CODEX_ID, CLAUDE_AGENT_ID] {
+            let capabilities = client_capabilities_for_agent(&AgentId::new(agent_id));
+            let meta = capabilities
+                .meta
+                .expect("expected client capabilities meta");
 
-        assert_eq!(
-            meta.get("jetbrains"),
-            Some(&serde_json::json!({
-                "air": {
-                    "version": 1,
-                    "capabilities": ["nativeSubagentSessions"],
-                }
-            }))
-        );
+            assert_eq!(
+                meta.get("jetbrains"),
+                Some(&serde_json::json!({
+                    "air": {
+                        "version": 1,
+                        "capabilities": ["nativeSubagentSessions"],
+                    }
+                }))
+            );
+        }
     }
 
     #[test]
