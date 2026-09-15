@@ -2885,7 +2885,6 @@ mod tests {
 
     use super::*;
     use feature_flags::FeatureFlag as _;
-    use gpui::UpdateGlobal as _;
     use settings::Settings as _;
 
     fn init_feature_flags_test(cx: &mut gpui::TestAppContext) {
@@ -4676,67 +4675,6 @@ mod tests {
             load_count.load(Ordering::SeqCst)
         );
     }
-
-    #[gpui::test]
-    async fn mcp_servers_include_configured_http_servers_before_running(
-        cx: &mut gpui::TestAppContext,
-    ) {
-        cx.update(|cx| {
-            let store = settings::SettingsStore::test(cx);
-            cx.set_global(store);
-        });
-
-        let fs = fs::FakeFs::new(cx.executor());
-        fs.insert_tree("/", serde_json::json!({ "a": {} })).await;
-        let project = project::Project::test(fs, [std::path::Path::new("/a")], cx).await;
-
-        cx.update(|cx| {
-            SettingsStore::update_global(cx, |store, cx| {
-                store.update_user_settings(cx, |content| {
-                    content.project.context_servers.insert(
-                        "helix-tasks".into(),
-                        settings::ContextServerSettingsContent::Http {
-                            enabled: true,
-                            url: "https://example.com/mcp".to_string(),
-                            headers: HashMap::from_iter([(
-                                "Authorization".to_string(),
-                                "Bearer token".to_string(),
-                            )]),
-                            timeout: None,
-                            oauth: None,
-                        },
-                    );
-                });
-            });
-        });
-
-        let servers = cx.update(|cx| {
-            let store = project.read(cx).context_server_store();
-            let server_id = store
-                .read(cx)
-                .configured_server_ids()
-                .into_iter()
-                .find(|id| id.0.as_ref() == "helix-tasks")
-                .expect("configured server should be visible before it starts");
-            assert!(
-                store
-                    .read(cx)
-                    .configuration_for_server(&server_id)
-                    .is_none(),
-                "runtime configuration should not exist before the maintenance loop runs"
-            );
-            mcp_servers_for_project(&project, cx)
-        });
-
-        let [acp::McpServer::Http(server)] = servers.as_slice() else {
-            panic!("expected one HTTP MCP server, got {servers:?}");
-        };
-        assert_eq!(server.name, "helix-tasks");
-        assert_eq!(server.url, "https://example.com/mcp");
-        assert_eq!(server.headers.len(), 1);
-        assert_eq!(server.headers[0].name, "Authorization");
-        assert_eq!(server.headers[0].value, "Bearer token");
-    }
 }
 
 fn mcp_servers_for_project(project: &Entity<Project>, cx: &App) -> Vec<acp::McpServer> {
@@ -4746,22 +4684,6 @@ fn mcp_servers_for_project(project: &Entity<Project>, cx: &App) -> Vec<acp::McpS
         .configured_server_ids()
         .iter()
         .filter_map(|id| {
-            if let Some(project::project_settings::ContextServerSettings::Http {
-                url,
-                headers,
-                ..
-            }) = context_server_store.settings_for_server(id)
-            {
-                return Some(acp::McpServer::Http(
-                    acp::McpServerHttp::new(id.0.to_string(), url).headers(
-                        headers
-                            .iter()
-                            .map(|(name, value)| acp::HttpHeader::new(name, value))
-                            .collect(),
-                    ),
-                ));
-            }
-
             let configuration = context_server_store.configuration_for_server(id)?;
             match &*configuration {
                 project::context_server_store::ContextServerConfiguration::Custom {
@@ -4783,6 +4705,19 @@ fn mcp_servers_for_project(project: &Entity<Project>, cx: &App) -> Vec<acp::McpS
                         } else {
                             vec![]
                         }),
+                )),
+                project::context_server_store::ContextServerConfiguration::Http {
+                    url,
+                    headers,
+                    timeout: _,
+                    oauth: _,
+                } => Some(acp::McpServer::Http(
+                    acp::McpServerHttp::new(id.0.to_string(), url.to_string()).headers(
+                        headers
+                            .iter()
+                            .map(|(name, value)| acp::HttpHeader::new(name, value))
+                            .collect(),
+                    ),
                 )),
                 _ => None,
             }
