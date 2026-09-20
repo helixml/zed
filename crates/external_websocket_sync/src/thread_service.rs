@@ -15,12 +15,13 @@ use fs::Fs;
 use gpui::{App, Entity, WeakEntity};
 use parking_lot::RwLock;
 use project::Project;
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::sync::{Arc, LazyLock};
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 use util::ResultExt;
 use util::path_list::PathList;
+use uuid::Uuid;
 
 fn zed_agent_server_id(agent_name: &str) -> &str {
     match agent_name {
@@ -195,6 +196,11 @@ static REQUEST_TO_THREAD_MAP: parking_lot::Mutex<Option<Arc<RwLock<HashMap<Strin
 static EXTERNAL_ORIGINATED_ENTRIES: parking_lot::Mutex<
     Option<Arc<RwLock<HashMap<String, HashSet<usize>>>>>,
 > = parking_lot::Mutex::new(None);
+
+/// Entry indices injected by the Helix simulate_input test path. They must be
+/// echoed like native input while retaining the request_id supplied by Helix.
+static SIMULATED_INPUT_ENTRIES: LazyLock<parking_lot::Mutex<HashMap<String, HashSet<usize>>>> =
+    LazyLock::new(|| parking_lot::Mutex::new(HashMap::new()));
 
 /// Set of thread_ids that already have a persistent event subscription
 /// Prevents creating duplicate subscriptions when follow-up messages arrive
@@ -1053,6 +1059,71 @@ fn mark_external_originated_entry(thread_id: String, entry_idx: usize) {
     }
 }
 
+fn mark_simulated_input_entry(thread_id: String, entry_idx: usize) {
+    SIMULATED_INPUT_ENTRIES
+        .lock()
+        .entry(thread_id)
+        .or_default()
+        .insert(entry_idx);
+}
+
+fn request_id_for_user_entry(thread_id: &str, entry_idx: usize) -> String {
+    let simulated = {
+        let mut by_thread = SIMULATED_INPUT_ENTRIES.lock();
+        let simulated = by_thread
+            .get_mut(thread_id)
+            .is_some_and(|entries| entries.remove(&entry_idx));
+        if by_thread.get(thread_id).is_some_and(HashSet::is_empty) {
+            by_thread.remove(thread_id);
+        }
+        simulated
+    };
+    if simulated {
+        return get_thread_request_id(thread_id).unwrap_or_default();
+    }
+
+    let request_id = Uuid::new_v4().to_string();
+    set_thread_request_id(thread_id.to_string(), request_id.clone());
+    request_id
+}
+
+fn begin_user_turn(
+    active: &mut String,
+    previous: &mut String,
+    last_completed: &mut String,
+    pending: &mut VecDeque<String>,
+    request_id: String,
+) -> String {
+    if active.is_empty() || *active == *last_completed {
+        *previous = std::mem::replace(active, request_id.clone());
+        last_completed.clear();
+    } else {
+        *previous = active.clone();
+        pending.push_back(request_id.clone());
+    }
+    request_id
+}
+
+fn finish_turn(
+    active: &mut String,
+    previous: &mut String,
+    last_completed: &mut String,
+    pending: &mut VecDeque<String>,
+    fallback: String,
+) -> String {
+    let completed = if !active.is_empty() && *active == *last_completed {
+        fallback
+    } else {
+        active.clone()
+    };
+    *last_completed = completed.clone();
+    if let Some(next) = pending.pop_front() {
+        *previous = completed.clone();
+        *active = next;
+    }
+    completed
+}
+
 /// Check if entry originated from external system
 pub fn is_external_originated_entry(thread_id: &str, entry_idx: usize) -> bool {
     let map = EXTERNAL_ORIGINATED_ENTRIES.lock();
@@ -1641,6 +1712,8 @@ pub fn ensure_thread_subscription(
     // new turn's request_id.
     let last_completed_request_id: std::cell::RefCell<String> =
         std::cell::RefCell::new(String::new());
+    let pending_turn_request_ids: std::cell::RefCell<VecDeque<String>> =
+        std::cell::RefCell::new(VecDeque::new());
 
     let sub_entity_id = entity_id;
     cx.subscribe(thread_entity, move |thread_entity, event, cx| {
@@ -1714,12 +1787,10 @@ pub fn ensure_thread_subscription(
                         ),
                     };
                     // A new UserMessage entry is the unambiguous start of a
-                    // new turn — force-rotate turn_request_id from the global
-                    // map regardless of whether the previous turn completed
-                    // cleanly. The chat_message handler updates
-                    // THREAD_REQUEST_MAP when the user's prompt arrives, so by
-                    // the time NewEntry fires for the UserMessage the global
-                    // map already holds the new turn's id.
+                    // new turn. External entries returned above; native input
+                    // gets a fresh request_id here so it cannot reuse the
+                    // previous turn's completed id. simulate_input retains its
+                    // caller-supplied id while still echoing the entry.
                     //
                     // Without this, an interrupted/cancelled prior turn leaves
                     // last_completed_request_id stale, the assistant-only
@@ -1730,31 +1801,29 @@ pub fn ensure_thread_subscription(
                     // resolves both the "messages streaming in Zed don't show
                     // up in Helix" and the "prefix mangled with another
                     // message" symptoms.
-                    if role == "user" {
+                    let rid = if role == "user" {
                         // First user message in a draft thread is the cue
                         // to flush the deferred UserCreatedThread emit.
                         // See `defer_user_created_thread` for the reason
                         // we don't emit at thread-creation time.
                         try_flush_pending_user_created_thread(&thread_id_for_sub);
 
-                        let current = turn_request_id.borrow().clone();
-                        *prev_turn_request_id.borrow_mut() = current;
-                        let global_rid = crate::get_thread_request_id(&thread_id_for_sub)
-                            .unwrap_or_default();
-                        *turn_request_id.borrow_mut() = global_rid;
-                        // Reset completion tracking — the assistant-only
-                        // rotation expects current==completed to detect "I'm
-                        // done with this turn, move on", which is true at the
-                        // start of a fresh turn.
-                        *last_completed_request_id.borrow_mut() = String::new();
-                    }
-                    // Update turn_request_id from the global map only at turn
-                    // boundaries — i.e. when the current turn_request_id has
-                    // already been used for a message_completed (matches
-                    // last_completed_request_id). This prevents a follow-up
-                    // message that overwrites the global map from poisoning
-                    // the current turn's request_id via a late NewEntry.
-                    if role == "assistant" {
+                        let request_id =
+                            request_id_for_user_entry(&thread_id_for_sub, latest_idx);
+                        begin_user_turn(
+                            &mut turn_request_id.borrow_mut(),
+                            &mut prev_turn_request_id.borrow_mut(),
+                            &mut last_completed_request_id.borrow_mut(),
+                            &mut pending_turn_request_ids.borrow_mut(),
+                            request_id,
+                        )
+                    } else {
+                        // Update turn_request_id from the global map only at turn
+                        // boundaries — i.e. when the current turn_request_id has
+                        // already been used for a message_completed (matches
+                        // last_completed_request_id). This prevents a follow-up
+                        // message that overwrites the global map from poisoning
+                        // the current turn's request_id via a late NewEntry.
                         let current = turn_request_id.borrow().clone();
                         let completed = last_completed_request_id.borrow().clone();
                         if current.is_empty() || current == completed {
@@ -1764,11 +1833,12 @@ pub fn ensure_thread_subscription(
                                 .unwrap_or_default();
                             *turn_request_id.borrow_mut() = global_rid;
                         }
-                    }
-                    // Use the turn-scoped request_id for all events, not the
-                    // global THREAD_REQUEST_MAP which can be overwritten by a
-                    // follow-up/interrupt message between turns.
-                    let rid = turn_request_id.borrow().clone();
+                        // Use the turn-scoped request_id for all events, not the
+                        // global THREAD_REQUEST_MAP which can be overwritten by a
+                        // follow-up/interrupt message between turns.
+                        let rid = turn_request_id.borrow().clone();
+                        rid
+                    };
                     // Re-send preceding entries FROM THE CURRENT TURN with their
                     // current content. flush_streaming_text() was called right before
                     // push_entry(), so all Markdown entities have their complete text.
@@ -2119,22 +2189,15 @@ pub fn ensure_thread_subscription(
                 // (because no assistant NewEntry fired to update it — happens when
                 // the interrupt turn is immediately cancelled with no output), use
                 // the current global THREAD_REQUEST_MAP which points to this turn.
-                let captured_rid = turn_request_id.borrow().clone();
-                let last_completed = last_completed_request_id.borrow().clone();
-                let completed_rid = if !captured_rid.is_empty() && captured_rid == last_completed {
-                    // turn_request_id is stale — the previous turn already used it.
-                    // Use the global map which has the current turn's request_id.
-                    let fallback = crate::get_thread_request_id(&thread_id_for_sub)
-                        .unwrap_or_else(|| captured_rid.clone());
-                    eprintln!(
-                        "📤 [THREAD_SERVICE] Stopped: turn_request_id={} already used, falling back to global={}",
-                        captured_rid, fallback
-                    );
-                    fallback
-                } else {
-                    captured_rid
-                };
-                *last_completed_request_id.borrow_mut() = completed_rid.clone();
+                let fallback = crate::get_thread_request_id(&thread_id_for_sub)
+                    .unwrap_or_else(|| turn_request_id.borrow().clone());
+                let completed_rid = finish_turn(
+                    &mut turn_request_id.borrow_mut(),
+                    &mut prev_turn_request_id.borrow_mut(),
+                    &mut last_completed_request_id.borrow_mut(),
+                    &mut pending_turn_request_ids.borrow_mut(),
+                    fallback,
+                );
                 if let Some(cause) = abort_cause {
                     // Turn aborted (agent process exited mid-turn, or MaxTokens).
                     // Emit chat_response_error, NOT message_completed: Helix's
@@ -3276,6 +3339,8 @@ fn create_new_thread_sync(
             mark_external_originated_entry(acp_thread_id.clone(), entry_idx_to_mark);
             eprintln!("🏷️ [THREAD_SERVICE] Marked entry {} as external-originated (won't echo back)", entry_idx_to_mark);
         } else {
+            let entry_idx_to_mark = cx.update(|cx| thread_entity.read(cx).entries().len());
+            mark_simulated_input_entry(acp_thread_id.clone(), entry_idx_to_mark);
             eprintln!("🎭 [THREAD_SERVICE] simulate_input=true, NOT marking entry as external-originated (will sync back)");
         }
 
@@ -3370,6 +3435,9 @@ async fn handle_follow_up_message(
             entry_idx_to_mark
         );
     } else {
+        let entry_idx_to_mark =
+            cx.update(|cx| thread.update(cx, |thread, _| thread.entries().len()))?;
+        mark_simulated_input_entry(thread_id.clone(), entry_idx_to_mark);
         eprintln!(
             "🎭 [THREAD_SERVICE] simulate_input=true, NOT marking entry as external-originated (will sync back)"
         );
@@ -5097,6 +5165,123 @@ mod silent_prompt_wedge_tests {
         assert_eq!(silence_timeout(), None);
 
         unsafe { std::env::remove_var("HELIX_ACP_SILENCE_TIMEOUT_SECS") };
+    }
+}
+
+#[cfg(test)]
+mod native_turn_request_id_tests {
+    use super::*;
+
+    fn test_thread(name: &str) -> String {
+        format!("{}-{}", name, Uuid::new_v4())
+    }
+
+    #[test]
+    fn native_user_entries_get_distinct_request_ids() {
+        let thread_id = test_thread("native-turn");
+        set_thread_request_id(thread_id.clone(), "completed-request".into());
+
+        let first = request_id_for_user_entry(&thread_id, 1);
+        let second = request_id_for_user_entry(&thread_id, 2);
+
+        assert_ne!(first, "completed-request");
+        assert_ne!(first, second);
+        assert!(Uuid::parse_str(&first).is_ok());
+        assert!(Uuid::parse_str(&second).is_ok());
+        assert_eq!(
+            get_thread_request_id(&thread_id).as_deref(),
+            Some(second.as_str())
+        );
+    }
+
+    #[test]
+    fn simulated_input_keeps_supplied_request_id() {
+        let thread_id = test_thread("simulated-turn");
+        let request_id = "helix-supplied-request".to_string();
+        set_thread_request_id(thread_id.clone(), request_id.clone());
+        mark_simulated_input_entry(thread_id.clone(), 4);
+
+        assert_eq!(request_id_for_user_entry(&thread_id, 4), request_id);
+    }
+
+    #[test]
+    fn overlapping_native_turn_keeps_active_id_until_completion() {
+        let mut active = "turn-a".to_string();
+        let mut previous = String::new();
+        let mut last_completed = String::new();
+        let mut pending = VecDeque::new();
+
+        let user_rid = begin_user_turn(
+            &mut active,
+            &mut previous,
+            &mut last_completed,
+            &mut pending,
+            "turn-b".to_string(),
+        );
+        assert_eq!(user_rid, "turn-b");
+        assert_eq!(active, "turn-a");
+        assert_eq!(previous, "turn-a");
+        assert_eq!(pending.front().map(String::as_str), Some("turn-b"));
+
+        begin_user_turn(
+            &mut active,
+            &mut previous,
+            &mut last_completed,
+            &mut pending,
+            "turn-c".to_string(),
+        );
+        assert_eq!(active, "turn-a");
+        assert_eq!(
+            pending.iter().map(String::as_str).collect::<Vec<_>>(),
+            vec!["turn-b", "turn-c"]
+        );
+
+        let completed = finish_turn(
+            &mut active,
+            &mut previous,
+            &mut last_completed,
+            &mut pending,
+            "turn-b".to_string(),
+        );
+        assert_eq!(completed, "turn-a");
+        assert_eq!(previous, "turn-a");
+        assert_eq!(active, "turn-b");
+        assert_eq!(last_completed, "turn-a");
+        assert_eq!(pending.front().map(String::as_str), Some("turn-c"));
+
+        let completed = finish_turn(
+            &mut active,
+            &mut previous,
+            &mut last_completed,
+            &mut pending,
+            "turn-c".to_string(),
+        );
+        assert_eq!(completed, "turn-b");
+        assert_eq!(previous, "turn-b");
+        assert_eq!(active, "turn-c");
+        assert_eq!(last_completed, "turn-b");
+        assert!(pending.is_empty());
+    }
+
+    #[test]
+    fn completed_turn_promotes_next_user_immediately() {
+        let mut active = "turn-a".to_string();
+        let mut previous = String::new();
+        let mut last_completed = "turn-a".to_string();
+        let mut pending = VecDeque::new();
+
+        begin_user_turn(
+            &mut active,
+            &mut previous,
+            &mut last_completed,
+            &mut pending,
+            "turn-b".to_string(),
+        );
+
+        assert_eq!(active, "turn-b");
+        assert_eq!(previous, "turn-a");
+        assert!(last_completed.is_empty());
+        assert!(pending.is_empty());
     }
 }
 
