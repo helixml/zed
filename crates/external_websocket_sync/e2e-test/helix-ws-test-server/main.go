@@ -110,11 +110,6 @@ type roundState struct {
 	// Phase 13: Helix-initiated cancel via cancel_current_turn
 	phase13ThreadID      string // thread ID for the long-running turn
 	phase13CancelSent    bool   // whether cancel_current_turn has been sent
-	// mcpToolCalled records that the agent issued a call to the MCP tool.
-	// The call itself is the proof the agent was handed the MCP server; we
-	// never wait for it to finish, because an ACP agent may hold an MCP tool
-	// call at "Waiting for confirmation" with nobody to confirm it.
-	mcpToolCalled bool
 	phase13TurnCancelled bool   // whether turn_cancelled event was received
 	phase13CancelStatus  string // status from turn_cancelled ("cancelled" or "noop")
 
@@ -453,26 +448,6 @@ func (d *testDriver) syncEventCallback(sessionID string, syncMsg *types.SyncMess
 			}
 		}
 
-		// Phase MCP-TOOL: the agent calling the tool is the whole assertion, so
-		// advance as soon as the call appears rather than waiting for a result
-		// that may never come (tool confirmation has no answerer here).
-		if d.phase == mcpToolPhase && !d.round.mcpToolCalled {
-			entryType, _ := syncMsg.Data["entry_type"].(string)
-			toolName, _ := syncMsg.Data["tool_name"].(string)
-			content, _ := syncMsg.Data["content"].(string)
-			named := strings.Contains(toolName, mcpToolName) || strings.Contains(content, mcpToolName)
-			if entryType == "tool_call" && named {
-				d.round.mcpToolCalled = true
-				agentName := d.round.agentName
-				reqID := d.round.reqID("phase-mcp-tool")
-				d.mu.Unlock()
-				log.Printf("[%s] Phase MCP-TOOL: agent called %s — MCP servers reached the agent", agentName, mcpToolName)
-				d.sendCancelCurrentTurn(reqID)
-				go d.advanceAfterCompletion(mcpToolPhase)
-				return
-			}
-		}
-
 		// Phase 13: send cancel_current_turn as soon as the first assistant token arrives.
 		// This tests the Helix-initiated cancel flow via the cancel_current_turn command.
 		if d.phase == 13 && !d.round.phase13CancelSent {
@@ -807,15 +782,6 @@ const (
 	smokeMagicValue = "4242"
 	planFirstPhase  = 101
 	planSecondPhase = 102
-	// mcpToolPhase proves the MCP servers in settings.json reach the AGENT,
-	// not merely Zed's own context server store (which phase 6 checks). The
-	// two are separate: an ACP session is handed its MCP servers once, at
-	// session/new, so a store that is empty at that moment leaves the agent
-	// toolless for the whole thread even after the store fills in.
-	mcpToolPhase = 103
-	// The tool slow-mcp-server advertises; its presence in a tool_call entry
-	// is the proof.
-	mcpToolName = "slow_mcp_test_tool"
 )
 
 var smokeMode = os.Getenv("E2E_SMOKE") == "1"
@@ -993,11 +959,6 @@ func (d *testDriver) advanceAfterCompletion(completedPhase int) {
 		d.phase = 6
 		d.mu.Unlock()
 		d.runPhase6()
-	case mcpToolPhase:
-		d.mu.Lock()
-		d.phase = 7
-		d.mu.Unlock()
-		d.runPhase7()
 	case 7:
 		d.mu.Lock()
 		d.phase = 8
@@ -1057,9 +1018,9 @@ func (d *testDriver) advanceAfterCompletion(completedPhase int) {
 func (d *testDriver) advanceAfterUiState() {
 	time.Sleep(1 * time.Second)
 	d.mu.Lock()
-	d.phase = mcpToolPhase
+	d.phase = 7
 	d.mu.Unlock()
-	d.runMcpToolPhase()
+	d.runPhase7()
 }
 
 // advanceToNextRound validates the current round, then starts the next one or finishes.
@@ -1246,6 +1207,33 @@ func (d *testDriver) validatePlanRound() roundResult {
 		errors = append(errors, "Plan: second turn did not emit an empty plan snapshot")
 	}
 
+	// The agent reports the MCP servers session/new handed it. Zed resolves
+	// those from the project's worktrees, and headless creates the project
+	// before its worktrees exist — so a regression here hands the agent an
+	// empty list and every MCP tool silently disappears for the whole thread.
+	// See zed-industries/zed#64611 and helixml/zed#101.
+	{
+		report := ""
+		for _, event := range d.round.events {
+			if event.EventType != "message_added" {
+				continue
+			}
+			if content, _ := event.Data["content"].(string); strings.Contains(content, "MCP_SERVERS:") {
+				report = content
+			}
+		}
+		switch {
+		case report == "":
+			errors = append(errors, "Plan: agent never reported its MCP servers (expected an MCP_SERVERS: line)")
+		case !strings.Contains(report, "slow-mcp-test"):
+			errors = append(errors, fmt.Sprintf(
+				"Plan: agent was handed no slow-mcp-test MCP server (%q) — check mcp_servers_for_project / resolve_all_context_server_settings",
+				strings.TrimSpace(report)))
+		default:
+			log.Printf("[%s] Plan: agent received MCP servers: %s", agent, strings.TrimSpace(report))
+		}
+	}
+
 	var first, second *types.Interaction
 	for _, interaction := range d.store.GetAllInteractions() {
 		switch {
@@ -1358,26 +1346,6 @@ func (d *testDriver) runPhase6() {
 	log.Printf("==================================================")
 	d.startPhaseTimeout(6)
 	d.sendQueryUiState(fmt.Sprintf("query-phase6-%s", agent))
-}
-
-func (d *testDriver) runMcpToolPhase() {
-	agent := d.round.agentName
-	log.Printf("\n==================================================")
-	log.Printf("  [%s] PHASE MCP-TOOL: Agent can call an MCP tool", agent)
-	log.Printf("==================================================")
-	d.startPhaseTimeout(mcpToolPhase)
-	d.mu.Lock()
-	if len(d.round.threadIDs) == 0 {
-		d.mu.Unlock()
-		log.Fatalf("[%s] ERROR: No thread IDs available for the MCP tool phase!", agent)
-	}
-	tid := d.round.threadIDs[0]
-	d.mu.Unlock()
-
-	log.Printf("[%s] Asking the agent to call %s on thread %s", agent, mcpToolName, truncate(tid, 16))
-	d.sendChatMessage(
-		"Call the "+mcpToolName+" tool with no arguments, then reply with its result text and nothing else.",
-		d.round.reqID("phase-mcp-tool"), agent, tid)
 }
 
 func (d *testDriver) runPhase7() {
@@ -2045,37 +2013,6 @@ func (d *testDriver) validateRound() roundResult {
 			log.Printf("[%s] WARNING: Phase 6: active_model is empty (model list may not have loaded yet)", agent)
 		} else {
 			log.Printf("[%s] Phase 6: Active model: %s", agent, activeModel)
-		}
-	}
-
-	// Phase MCP-TOOL: the agent must actually be able to call an MCP tool.
-	// Phase 6 only proves Zed's own store connected to slow-mcp-test; the
-	// agent gets its MCP servers separately, in the session/new request.
-	// Regression guard for the empty-mcpServers bug (helixml/zed
-	// fix/mcp-servers-without-worktrees, zed-industries/zed#64611): a project
-	// whose worktrees have not loaded when the session is created hands the
-	// agent no MCP servers at all, for the life of the thread.
-	{
-		called := d.round.mcpToolCalled
-		for _, event := range d.round.events {
-			if called {
-				break
-			}
-			if event.EventType != "message_added" {
-				continue
-			}
-			toolName, _ := event.Data["tool_name"].(string)
-			content, _ := event.Data["content"].(string)
-			if strings.Contains(toolName, mcpToolName) || strings.Contains(content, mcpToolName) {
-				called = true
-			}
-		}
-		if !called {
-			errors = append(errors, fmt.Sprintf(
-				"Phase MCP-TOOL: no tool_call entry naming %q — the agent was handed no MCP servers (check mcp_servers_for_project / session/new)",
-				mcpToolName))
-		} else {
-			log.Printf("[%s] Phase MCP-TOOL: agent called %s", d.round.agentName, mcpToolName)
 		}
 	}
 

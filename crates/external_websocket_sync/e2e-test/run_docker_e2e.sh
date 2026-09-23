@@ -127,6 +127,7 @@ docker run --rm \
     -e E2E_AGENTS="$E2E_AGENTS" \
     -e E2E_HEADLESS="${E2E_HEADLESS:-0}" \
     -e E2E_SMOKE="${E2E_SMOKE:-0}" \
+    -e E2E_PLAN="${E2E_PLAN:-0}" \
     -e E2E_SMOKE_FILE="${E2E_SMOKE_FILE:-}" \
     -e E2E_CODEX_MODEL="${E2E_CODEX_MODEL:-}" \
     -e E2E_MODEL_PROVIDER="${E2E_MODEL_PROVIDER:-}" \
