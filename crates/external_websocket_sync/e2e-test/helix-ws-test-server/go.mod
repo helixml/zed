@@ -235,6 +235,7 @@ require (
 	github.com/sourcegraph/go-diff v0.7.0 // indirect
 	github.com/spf13/cast v1.10.0 // indirect
 	github.com/spiffe/go-spiffe/v2 v2.6.0 // indirect
+	github.com/standard-webhooks/standard-webhooks/libraries v0.0.2-0.20260831104212-7537d2a2d3d5 // indirect
 	github.com/stripe/stripe-go/v76 v76.8.0 // indirect
 	github.com/swaggo/swag v1.16.6 // indirect
 	github.com/syndtr/goleveldb v1.0.0 // indirect
