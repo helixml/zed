@@ -9,6 +9,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -28,7 +29,39 @@ var (
 	writeMu        sync.Mutex
 	cancelMu       sync.Mutex
 	cancels        = make(map[string]chan struct{})
+	mcpMu          sync.Mutex
+	// mcpServerNames is what session/new handed us. An ACP agent is given its
+	// MCP servers once, at session creation, so this is the only chance to see
+	// them — and reporting them is how the suite catches a Zed that creates the
+	// session before the MCP settings are resolved.
+	mcpServerNames []string
 )
+
+// recordMcpServers remembers the server names in a session/new or session/load
+// request.
+func recordMcpServers(params map[string]interface{}) {
+	servers, _ := params["mcpServers"].([]interface{})
+	names := make([]string, 0, len(servers))
+	for _, entry := range servers {
+		server, _ := entry.(map[string]interface{})
+		if name, _ := server["name"].(string); name != "" {
+			names = append(names, name)
+		}
+	}
+	mcpMu.Lock()
+	mcpServerNames = names
+	mcpMu.Unlock()
+}
+
+// mcpReport is the line the suite asserts on.
+func mcpReport() string {
+	mcpMu.Lock()
+	defer mcpMu.Unlock()
+	if len(mcpServerNames) == 0 {
+		return "MCP_SERVERS: none"
+	}
+	return "MCP_SERVERS: " + strings.Join(mcpServerNames, ",")
+}
 
 func write(value interface{}) {
 	encoded, err := json.Marshal(value)
@@ -108,9 +141,11 @@ func handle(req request) {
 			},
 		})
 	case "session/new":
+		recordMcpServers(req.Params)
 		sessionID := fmt.Sprintf("plan-test-session-%d-%d", os.Getpid(), sessionCount.Add(1))
 		respond(req.ID, map[string]interface{}{"sessionId": sessionID})
 	case "session/load":
+		recordMcpServers(req.Params)
 		respond(req.ID, map[string]interface{}{})
 	case "session/prompt":
 		if os.Getenv("E2E_SCRIPTED_LIFECYCLE") == "1" {
@@ -128,6 +163,7 @@ func handle(req request) {
 				planEntry("Inspect the plan pipeline", "completed"),
 				planEntry("Verify turn isolation", "in_progress"),
 			)
+			publishText(sessionID, mcpReport())
 			publishText(sessionID, "First turn complete.")
 		} else {
 			publishText(sessionID, "Second turn has no plan.")
