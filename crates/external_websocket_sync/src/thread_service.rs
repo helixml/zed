@@ -2446,6 +2446,29 @@ pub fn setup_thread_handler(
     let acp_history_store_for_open = acp_history_store.clone();
     let fs_for_open = fs.clone();
 
+    // Close threads Helix has discarded. A cleared Helix session starts a new
+    // thread, and nothing else ends the old ACP session: harnesses that give
+    // every session its own MCP servers (DeepSeek Harness, Goose) would keep
+    // one set running per cleared thread.
+    let (close_tx, mut close_rx) = mpsc::unbounded_channel::<crate::CloseThreadRequest>();
+    crate::init_close_thread_callback(close_tx);
+    let project_for_close = project.clone();
+    let acp_history_store_for_close = acp_history_store.clone();
+    let fs_for_close = fs.clone();
+    cx.spawn(async move |cx| {
+        while let Some(req) = close_rx.recv().await {
+            close_discarded_thread(
+                project_for_close.clone(),
+                acp_history_store_for_close.clone(),
+                fs_for_close.clone(),
+                req.acp_thread_id,
+                cx.clone(),
+            )
+            .await;
+        }
+    })
+    .detach();
+
     // Spawn dedicated cancel task — runs independently of the callback_rx loop so it
     // can cancel a running turn even while callback_rx.recv().await is blocked.
     let (cancel_tx, mut cancel_rx) = mpsc::unbounded_channel::<crate::CancelThreadRequest>();
@@ -3794,6 +3817,38 @@ async fn force_close_agent_session(
     );
 
     Ok(())
+}
+
+/// Close a thread Helix discarded: end its agent-side session, which stops
+/// the MCP servers the harness started for it, and drop every reference Zed
+/// holds. The thread is never reloaded, so unlike wedge recovery this also
+/// forgets its agent session id and agent name. An agent that can't close
+/// sessions only loses Zed's references.
+async fn close_discarded_thread(
+    project: Entity<Project>,
+    acp_history_store: Entity<ThreadStore>,
+    fs: Arc<dyn Fs>,
+    acp_thread_id: String,
+    cx: gpui::AsyncApp,
+) {
+    match force_close_agent_session(project, acp_history_store, fs, acp_thread_id.clone(), None, cx).await {
+        Ok(()) => log::info!("🧹 [THREAD_SERVICE] Closed discarded thread {}", acp_thread_id),
+        Err(e) => log::info!(
+            "🧹 [THREAD_SERVICE] Discarded thread {} released in Zed; agent session not closed: {}",
+            acp_thread_id,
+            e
+        ),
+    }
+    forget_thread_agent_session(&acp_thread_id);
+}
+
+/// Drop a thread's agent session id and agent name.
+fn forget_thread_agent_session(acp_thread_id: &str) {
+    for map in [&THREAD_AGENT_SESSION_MAP, &THREAD_AGENT_NAME_MAP] {
+        if let Some(m) = map.lock().as_ref() {
+            m.write().remove(acp_thread_id);
+        }
+    }
 }
 
 /// Load an existing thread from the agent (async version for use in message handler)
