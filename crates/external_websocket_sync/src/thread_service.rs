@@ -3141,7 +3141,9 @@ fn create_new_thread_sync(
                     }
                     Err(e) => {
                         eprintln!("❌ [THREAD_SERVICE] Failed to connect to agent: {:?}", e);
-                        return Err(anyhow::anyhow!("agent connect failed: {:?}", e));
+                        let error = format!("agent connect failed: {:#}", e);
+                        report_thread_creation_failure(&request_clone.request_id, &error);
+                        return Err(anyhow::anyhow!(error));
                     }
                 }
             }
@@ -3205,6 +3207,10 @@ fn create_new_thread_sync(
                 }
                 Err(e) => {
                     eprintln!("❌ [THREAD_SERVICE] new_session() failed: {}", e);
+                    report_thread_creation_failure(
+                        &request_clone.request_id,
+                        &format!("agent session creation failed: {:#}", e),
+                    );
                     return Err(e);
                 }
             }

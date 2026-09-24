@@ -255,8 +255,9 @@ impl WebSocketSync {
         // Delay agent_ready until we know whether an open_thread is coming.
         // If an open_thread arrives, the thread service sends its own agent_ready
         // after fully loading the thread (preventing the race where chat_message
-        // arrives before history replay is complete). If no open_thread arrives
-        // within 5 seconds, this is a fresh start — send agent_ready from here.
+        // arrives before history replay is complete). Helix sends no_open_thread
+        // when it has no thread to reopen, and agent_ready goes out at once. The
+        // 5-second timer covers a Helix that predates no_open_thread.
         let mut agent_ready_sent = false;
         let agent_ready_timer = tokio::time::sleep(std::time::Duration::from_secs(5));
         tokio::pin!(agent_ready_timer);
@@ -264,42 +265,8 @@ impl WebSocketSync {
         // Main select loop - handle both incoming and outgoing messages
         loop {
             tokio::select! {
-                // Fallback timer: send agent_ready if no open_thread arrived
                 () = &mut agent_ready_timer, if !agent_ready_sent => {
-                    // Build this through SyncEvent rather than hand-rolling the
-                    // JSON. Helix reads `active_turns` on every agent_ready to
-                    // decide whether a waiting turn may be re-sent, and treats
-                    // an ABSENT field as "this agent cannot report" — the legacy
-                    // path. A second, hand-built shape on the wire would make a
-                    // current Zed indistinguishable from an old one on exactly
-                    // the connect where no thread was loaded.
-                    //
-                    // The snapshot is meaningful here even with no thread
-                    // loaded: the request registry is process-global, so a turn
-                    // still running from before this connection is reported.
-                    let ready_event = SyncEvent::AgentReady {
-                        agent_name: "zed-connection".to_string(),
-                        thread_id: None,
-                        active_turns: crate::active_turns_snapshot(),
-                    };
-                    let agent_ready_msg = match ready_event
-                        .to_outgoing_message()
-                        .and_then(|m| serde_json::to_string(&m))
-                    {
-                        Ok(json) => json,
-                        Err(e) => {
-                            log::error!("❌ [WEBSOCKET] Failed to serialize timer-based agent_ready: {}", e);
-                            agent_ready_sent = true;
-                            continue;
-                        }
-                    };
-                    if let Err(e) = ws_sink.send(Message::Text(agent_ready_msg.into())).await {
-                        eprintln!("⚠️ [WEBSOCKET] Failed to send timer-based agent_ready: {}", e);
-                        log::warn!("⚠️ [WEBSOCKET] Failed to send timer-based agent_ready: {}", e);
-                    } else {
-                        eprintln!("✅ [WEBSOCKET] Sent timer-based agent_ready (no open_thread received within 5s)");
-                        log::info!("✅ [WEBSOCKET] Sent timer-based agent_ready (no open_thread received within 5s)");
-                    }
+                    Self::send_connection_agent_ready(&mut ws_sink, "no open_thread received within 5s").await;
                     agent_ready_sent = true;
                 }
                 // Handle outgoing events
@@ -343,18 +310,26 @@ impl WebSocketSync {
                             eprintln!("📥 [WEBSOCKET-IN] Received text: {}", text);
                             log::info!("📥 [WEBSOCKET-IN] Received text: {}", text);
 
-                            // Check if this is an open_thread command BEFORE processing.
-                            // If so, the thread service will send its own agent_ready
-                            // after loading the thread, so we suppress the timer-based one.
-                            let is_open_thread = serde_json::from_str::<serde_json::Value>(&text)
+                            // open_thread: the thread service sends agent_ready after
+                            // loading the thread. no_open_thread: nothing to load, so
+                            // the connection is ready now.
+                            let command_type = serde_json::from_str::<serde_json::Value>(&text)
                                 .ok()
-                                .and_then(|v| v.get("type")?.as_str().map(|s| s == "open_thread"))
-                                .unwrap_or(false);
+                                .and_then(|v| v.get("type")?.as_str().map(str::to_owned));
 
-                            if is_open_thread && !agent_ready_sent {
-                                eprintln!("📖 [WEBSOCKET] open_thread received — thread service will send agent_ready after loading");
-                                log::info!("📖 [WEBSOCKET] open_thread received — thread service will send agent_ready after loading");
-                                agent_ready_sent = true;
+                            if !agent_ready_sent {
+                                match command_type.as_deref() {
+                                    Some("open_thread") => {
+                                        eprintln!("📖 [WEBSOCKET] open_thread received — thread service will send agent_ready after loading");
+                                        log::info!("📖 [WEBSOCKET] open_thread received — thread service will send agent_ready after loading");
+                                        agent_ready_sent = true;
+                                    }
+                                    Some("no_open_thread") => {
+                                        Self::send_connection_agent_ready(&mut ws_sink, "Helix has no thread to open").await;
+                                        agent_ready_sent = true;
+                                    }
+                                    _ => {}
+                                }
                             }
 
                             if let Err(e) = Self::handle_incoming_message(&text).await {
@@ -393,6 +368,46 @@ impl WebSocketSync {
         }
     }
 
+    /// Send the connection-level agent_ready: this connection has no thread to
+    /// load, so Helix may start sending turns.
+    async fn send_connection_agent_ready(
+        ws_sink: &mut futures::stream::SplitSink<tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>, Message>,
+        reason: &str,
+    ) {
+        // Build this through SyncEvent rather than hand-rolling the JSON. Helix
+        // reads `active_turns` on every agent_ready to decide whether a waiting
+        // turn may be re-sent, and treats an ABSENT field as "this agent cannot
+        // report" — the legacy path. A second, hand-built shape on the wire
+        // would make a current Zed indistinguishable from an old one on exactly
+        // the connect where no thread was loaded.
+        //
+        // The snapshot is meaningful here even with no thread loaded: the
+        // request registry is process-global, so a turn still running from
+        // before this connection is reported.
+        let ready_event = SyncEvent::AgentReady {
+            agent_name: "zed-connection".to_string(),
+            thread_id: None,
+            active_turns: crate::active_turns_snapshot(),
+        };
+        let agent_ready_msg = match ready_event
+            .to_outgoing_message()
+            .and_then(|m| serde_json::to_string(&m))
+        {
+            Ok(json) => json,
+            Err(e) => {
+                log::error!("❌ [WEBSOCKET] Failed to serialize connection agent_ready: {}", e);
+                return;
+            }
+        };
+        if let Err(e) = ws_sink.send(Message::Text(agent_ready_msg.into())).await {
+            eprintln!("⚠️ [WEBSOCKET] Failed to send connection agent_ready: {}", e);
+            log::warn!("⚠️ [WEBSOCKET] Failed to send connection agent_ready: {}", e);
+        } else {
+            eprintln!("✅ [WEBSOCKET] Sent connection agent_ready ({})", reason);
+            log::info!("✅ [WEBSOCKET] Sent connection agent_ready ({})", reason);
+        }
+    }
+
     /// Handle incoming messages from external system (chat_message or open_thread)
     async fn handle_incoming_message(text: &str) -> Result<()> {
         eprintln!("🔧 [WEBSOCKET-IN] handle_incoming_message() called with: {}", text);
@@ -427,6 +442,8 @@ impl WebSocketSync {
             "cancel_current_turn" => Self::handle_cancel_current_turn(command.data).await,
             "respond_question" => Self::handle_respond_question(command.data).await,
             "cancel_question" => Self::handle_cancel_question(command.data).await,
+            // Handled by the connection loop, which owns agent_ready.
+            "no_open_thread" => Ok(()),
             _ => {
                 eprintln!("⚠️  [WEBSOCKET-IN] Ignoring unknown command: {}", command.command_type);
                 log::warn!("⚠️  [WEBSOCKET-IN] Ignoring unknown command: {}", command.command_type);
