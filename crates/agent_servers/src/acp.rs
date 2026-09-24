@@ -4737,6 +4737,76 @@ mod tests {
         assert_eq!(server.headers[0].name, "Authorization");
         assert_eq!(server.headers[0].value, "Bearer token");
     }
+
+    #[gpui::test]
+    async fn mcp_servers_include_configured_stdio_servers_before_running(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.update(|cx| {
+            let store = settings::SettingsStore::test(cx);
+            cx.set_global(store);
+        });
+
+        let fs = fs::FakeFs::new(cx.executor());
+        fs.insert_tree("/", serde_json::json!({ "a": {} })).await;
+        let project = project::Project::test(fs, [std::path::Path::new("/a")], cx).await;
+
+        cx.update(|cx| {
+            SettingsStore::update_global(cx, |store, cx| {
+                store.update_user_settings(cx, |content| {
+                    for (name, enabled) in [("chrome-devtools", true), ("disabled-tool", false)] {
+                        content.project.context_servers.insert(
+                            name.into(),
+                            settings::ContextServerSettingsContent::Stdio {
+                                enabled,
+                                remote: false,
+                                command: settings::ContextServerCommand {
+                                    path: "/usr/local/bin/helix-chrome-devtools-mcp".into(),
+                                    args: vec!["--headless".to_string()],
+                                    env: Some(HashMap::from_iter([(
+                                        "CHROME_PATH".to_string(),
+                                        "/usr/bin/google-chrome-stable".to_string(),
+                                    )])),
+                                    timeout: None,
+                                },
+                            },
+                        );
+                    }
+                });
+            });
+        });
+
+        let servers = cx.update(|cx| {
+            let store = project.read(cx).context_server_store();
+            let server_id = store
+                .read(cx)
+                .configured_server_ids()
+                .into_iter()
+                .find(|id| id.0.as_ref() == "chrome-devtools")
+                .expect("configured server should be visible before it starts");
+            assert!(
+                store
+                    .read(cx)
+                    .configuration_for_server(&server_id)
+                    .is_none(),
+                "runtime configuration should not exist before the maintenance loop runs"
+            );
+            mcp_servers_for_project(&project, cx)
+        });
+
+        let [acp::McpServer::Stdio(server)] = servers.as_slice() else {
+            panic!("expected only the enabled stdio MCP server, got {servers:?}");
+        };
+        assert_eq!(server.name, "chrome-devtools");
+        assert_eq!(
+            server.command,
+            std::path::PathBuf::from("/usr/local/bin/helix-chrome-devtools-mcp")
+        );
+        assert_eq!(server.args, vec!["--headless".to_string()]);
+        assert_eq!(server.env.len(), 1);
+        assert_eq!(server.env[0].name, "CHROME_PATH");
+        assert_eq!(server.env[0].value, "/usr/bin/google-chrome-stable");
+    }
 }
 
 fn mcp_servers_for_project(project: &Entity<Project>, cx: &App) -> Vec<acp::McpServer> {
@@ -4746,48 +4816,62 @@ fn mcp_servers_for_project(project: &Entity<Project>, cx: &App) -> Vec<acp::McpS
         .configured_server_ids()
         .iter()
         .filter_map(|id| {
-            if let Some(project::project_settings::ContextServerSettings::Http {
-                url,
-                headers,
-                ..
-            }) = context_server_store.settings_for_server(id)
-            {
-                return Some(acp::McpServer::Http(
-                    acp::McpServerHttp::new(id.0.to_string(), url).headers(
-                        headers
-                            .iter()
-                            .map(|(name, value)| acp::HttpHeader::new(name, value))
-                            .collect(),
-                    ),
-                ));
+            // An ACP agent receives its MCP servers once, at session/new. HTTP and
+            // stdio servers are fully described by settings, so read them from
+            // there: runtime configuration is filled in asynchronously and is
+            // often still missing when the first session starts.
+            match context_server_store.settings_for_server(id) {
+                Some(project::project_settings::ContextServerSettings::Http {
+                    url,
+                    headers,
+                    ..
+                }) => {
+                    return Some(acp::McpServer::Http(
+                        acp::McpServerHttp::new(id.0.to_string(), url).headers(
+                            headers
+                                .iter()
+                                .map(|(name, value)| acp::HttpHeader::new(name, value))
+                                .collect(),
+                        ),
+                    ));
+                }
+                Some(project::project_settings::ContextServerSettings::Stdio {
+                    enabled,
+                    remote,
+                    command,
+                }) => {
+                    return (*enabled && (is_local || *remote))
+                        .then(|| stdio_mcp_server(&id.0, command));
+                }
+                _ => {}
             }
 
+            // Extension servers resolve their command asynchronously.
             let configuration = context_server_store.configuration_for_server(id)?;
             match &*configuration {
-                project::context_server_store::ContextServerConfiguration::Custom {
+                project::context_server_store::ContextServerConfiguration::Extension {
                     command,
                     remote,
                     ..
-                }
-                | project::context_server_store::ContextServerConfiguration::Extension {
-                    command,
-                    remote,
-                    ..
-                } if is_local || *remote => Some(acp::McpServer::Stdio(
-                    acp::McpServerStdio::new(id.0.to_string(), &command.path)
-                        .args(command.args.clone())
-                        .env(if let Some(env) = command.env.as_ref() {
-                            env.iter()
-                                .map(|(name, value)| acp::EnvVariable::new(name, value))
-                                .collect()
-                        } else {
-                            vec![]
-                        }),
-                )),
+                } if is_local || *remote => Some(stdio_mcp_server(&id.0, command)),
                 _ => None,
             }
         })
         .collect()
+}
+
+fn stdio_mcp_server(name: &str, command: &settings::ContextServerCommand) -> acp::McpServer {
+    acp::McpServer::Stdio(
+        acp::McpServerStdio::new(name.to_string(), &command.path)
+            .args(command.args.clone())
+            .env(if let Some(env) = command.env.as_ref() {
+                env.iter()
+                    .map(|(name, value)| acp::EnvVariable::new(name, value))
+                    .collect()
+            } else {
+                vec![]
+            }),
+    )
 }
 
 fn config_state(
