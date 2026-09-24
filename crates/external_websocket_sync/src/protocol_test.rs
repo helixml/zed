@@ -488,6 +488,64 @@ mod tests {
 
     #[tokio::test]
     #[ignore] // Requires HELIX_SESSION_ID env var - run with `cargo test -- --ignored`
+    async fn test_no_open_thread_sends_agent_ready_immediately() -> Result<()> {
+        let _guard = TEST_LOCK.lock();
+
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let addr = listener.local_addr()?;
+        let (zed_to_ext_tx, mut zed_to_ext_rx) = mpsc::unbounded_channel::<String>();
+
+        // Helix with no thread to reopen: no_open_thread straight after connect.
+        tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let ws_stream = accept_async(stream).await.unwrap();
+            let (mut write, mut read) = ws_stream.split();
+            let no_open_thread = json!({"type": "no_open_thread", "data": {}});
+            write
+                .send(Message::Text(no_open_thread.to_string().into()))
+                .await
+                .unwrap();
+            while let Some(msg) = read.next().await {
+                if let Ok(Message::Text(text)) = msg {
+                    let _ = zed_to_ext_tx.send(text.to_string());
+                }
+            }
+        });
+
+        let config = super::super::websocket_sync::WebSocketSyncConfig {
+            enabled: true,
+            url: format!("localhost:{}", addr.port()),
+            auth_token: String::new(),
+            use_tls: false,
+            skip_tls_verify: false,
+        };
+        let started = std::time::Instant::now();
+        let _service = super::super::websocket_sync::WebSocketSync::start(config).await?;
+
+        // Well inside the 5-second timer that covers a Helix without no_open_thread.
+        let agent_ready = tokio::time::timeout(tokio::time::Duration::from_secs(2), async {
+            while let Some(text) = zed_to_ext_rx.recv().await {
+                let parsed: serde_json::Value = serde_json::from_str(&text).unwrap();
+                if parsed["event_type"] == "agent_ready" {
+                    return parsed;
+                }
+            }
+            panic!("connection closed before agent_ready");
+        })
+        .await
+        .map_err(|_| anyhow::anyhow!("agent_ready not sent within 2s of no_open_thread"))?;
+
+        assert!(agent_ready["data"]["thread_id"].is_null());
+        assert!(
+            agent_ready["data"].get("active_turns").is_some(),
+            "connection agent_ready must carry the active-turn report"
+        );
+        assert!(started.elapsed() < std::time::Duration::from_secs(2));
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[ignore] // Requires HELIX_SESSION_ID env var - run with `cargo test -- --ignored`
     async fn test_cancel_current_turn_noop() -> Result<()> {
         let _guard = TEST_LOCK.lock();
         println!("\n🧪 Testing cancel_current_turn noop (no active thread)\n");
