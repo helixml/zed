@@ -440,6 +440,7 @@ impl WebSocketSync {
             "open_thread" => Self::handle_open_thread(command.data).await,
             "query_ui_state" => Self::handle_query_ui_state(command.data).await,
             "cancel_current_turn" => Self::handle_cancel_current_turn(command.data).await,
+            "close_thread" => Self::handle_close_thread(command.data).await,
             "respond_question" => Self::handle_respond_question(command.data).await,
             "cancel_question" => Self::handle_cancel_question(command.data).await,
             // Handled by the connection loop, which owns agent_ready.
@@ -620,6 +621,19 @@ impl WebSocketSync {
         crate::request_thread_cancellation(crate::CancellationRequest { request_id })?;
 
         Ok(())
+    }
+
+    /// Handle close_thread: Helix discarded this thread (the session was
+    /// cleared), so the agent-side session and its MCP servers can go.
+    async fn handle_close_thread(data: serde_json::Value) -> Result<()> {
+        let acp_thread_id = data
+            .get("acp_thread_id")
+            .and_then(|v| v.as_str())
+            .filter(|id| !id.is_empty())
+            .context("close_thread requires acp_thread_id")?
+            .to_string();
+        log::info!("[WEBSOCKET-IN] Processing close_thread: acp_thread_id={}", acp_thread_id);
+        crate::request_thread_close(acp_thread_id)
     }
 
     /// Send event to external system

@@ -489,6 +489,17 @@ pub struct CancelThreadRequest {
 static GLOBAL_CANCEL_THREAD_CALLBACK: parking_lot::Mutex<Option<mpsc::UnboundedSender<CancelThreadRequest>>> =
     parking_lot::Mutex::new(None);
 
+/// Request to close a thread Helix has discarded (a cleared session). Frees
+/// the agent-side session — and with it the MCP servers the harness started
+/// for that session — plus Zed's own references to the thread.
+#[derive(Clone, Debug)]
+pub struct CloseThreadRequest {
+    pub acp_thread_id: String,
+}
+
+static GLOBAL_CLOSE_THREAD_CALLBACK: parking_lot::Mutex<Option<mpsc::UnboundedSender<CloseThreadRequest>>> =
+    parking_lot::Mutex::new(None);
+
 /// Pending UI state queries that arrived before AgentPanel was ready
 static PENDING_UI_STATE_QUERIES: parking_lot::Mutex<Vec<UiStateQueryRequest>> =
     parking_lot::Mutex::new(Vec::new());
@@ -1009,6 +1020,27 @@ pub fn init_cancel_thread_callback(sender: mpsc::UnboundedSender<CancelThreadReq
     eprintln!("🔧 [CANCEL] init_cancel_thread_callback() called - registering global callback");
     log::info!("🔧 [CANCEL] init_cancel_thread_callback() called - registering global callback");
     *GLOBAL_CANCEL_THREAD_CALLBACK.lock() = Some(sender);
+}
+
+/// Request that a discarded thread be closed. Before the thread service is
+/// up there are no threads to close, so the request is dropped.
+pub fn request_thread_close(acp_thread_id: String) -> Result<()> {
+    log::info!("🧹 [CLOSE] request_thread_close() called for thread: {}", acp_thread_id);
+    let sender = GLOBAL_CLOSE_THREAD_CALLBACK.lock().clone();
+    if let Some(sender) = sender {
+        sender
+            .send(CloseThreadRequest { acp_thread_id })
+            .map_err(|_| anyhow::anyhow!("Failed to send close request"))?;
+    } else {
+        log::warn!("⚠️ [CLOSE] Close callback not initialized, no thread to close: {}", acp_thread_id);
+    }
+    Ok(())
+}
+
+/// Initialize the global close-thread callback (called from thread_service).
+pub fn init_close_thread_callback(sender: mpsc::UnboundedSender<CloseThreadRequest>) {
+    log::info!("🔧 [CLOSE] init_close_thread_callback() called - registering global callback");
+    *GLOBAL_CLOSE_THREAD_CALLBACK.lock() = Some(sender);
 }
 
 pub fn request_question_command(request: QuestionCommandRequest) -> Result<()> {
