@@ -52,6 +52,7 @@ if echo "$E2E_AGENTS" | grep -q "codex" && [ -z "${OPENAI_API_KEY:-}" ]; then
     echo "Or:     add it to ${HELIX_DIR:-(helix repo)}/.env.usercreds"
     exit 1
 fi
+export ANTHROPIC_API_KEY OPENAI_API_KEY
 
 # Check for Zed binary
 if [ ! -f "$SCRIPT_DIR/zed-binary" ]; then
@@ -121,8 +122,8 @@ fi
 E2E_RC=0
 docker run --rm \
     --add-host=host.docker.internal:host-gateway \
-    -e ANTHROPIC_API_KEY="${ANTHROPIC_API_KEY:-}" \
-    -e OPENAI_API_KEY="${OPENAI_API_KEY:-}" \
+    -e ANTHROPIC_API_KEY \
+    -e OPENAI_API_KEY \
     ${ANTHROPIC_BASE_URL_ARG} \
     -e E2E_AGENTS="$E2E_AGENTS" \
     -e E2E_HEADLESS="${E2E_HEADLESS:-0}" \
