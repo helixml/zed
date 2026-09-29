@@ -1124,6 +1124,18 @@ fn finish_turn(
     completed
 }
 
+fn capture_current_turn_request_id(
+    active: &mut String,
+    previous: &mut String,
+    last_completed: &str,
+    fallback: String,
+) -> String {
+    if active.is_empty() || active == last_completed {
+        *previous = std::mem::replace(active, fallback);
+    }
+    active.clone()
+}
+
 /// Check if entry originated from external system
 pub fn is_external_originated_entry(thread_id: &str, entry_idx: usize) -> bool {
     let map = EXTERNAL_ORIGINATED_ENTRIES.lock();
@@ -1824,20 +1836,12 @@ pub fn ensure_thread_subscription(
                         // last_completed_request_id). This prevents a follow-up
                         // message that overwrites the global map from poisoning
                         // the current turn's request_id via a late NewEntry.
-                        let current = turn_request_id.borrow().clone();
-                        let completed = last_completed_request_id.borrow().clone();
-                        if current.is_empty() || current == completed {
-                            // Rotate: current → prev before overwriting.
-                            *prev_turn_request_id.borrow_mut() = current;
-                            let global_rid = crate::get_thread_request_id(&thread_id_for_sub)
-                                .unwrap_or_default();
-                            *turn_request_id.borrow_mut() = global_rid;
-                        }
-                        // Use the turn-scoped request_id for all events, not the
-                        // global THREAD_REQUEST_MAP which can be overwritten by a
-                        // follow-up/interrupt message between turns.
-                        let rid = turn_request_id.borrow().clone();
-                        rid
+                        capture_current_turn_request_id(
+                            &mut turn_request_id.borrow_mut(),
+                            &mut prev_turn_request_id.borrow_mut(),
+                            &last_completed_request_id.borrow(),
+                            crate::get_thread_request_id(&thread_id_for_sub).unwrap_or_default(),
+                        )
                     };
                     // Re-send preceding entries FROM THE CURRENT TURN with their
                     // current content. flush_streaming_text() was called right before
@@ -2017,7 +2021,12 @@ pub fn ensure_thread_subscription(
                             turn_request_id.borrow().clone()
                         }
                     } else {
-                        turn_request_id.borrow().clone()
+                        capture_current_turn_request_id(
+                            &mut turn_request_id.borrow_mut(),
+                            &mut prev_turn_request_id.borrow_mut(),
+                            &last_completed_request_id.borrow(),
+                            crate::get_thread_request_id(&thread_id_for_sub).unwrap_or_default(),
+                        )
                     };
                     throttled_send_message_added(
                         &thread_id_for_sub,
@@ -2080,13 +2089,12 @@ pub fn ensure_thread_subscription(
                 // A plan can arrive before the first assistant entry. In that
                 // case the turn-scoped id still belongs to the completed turn,
                 // while THREAD_REQUEST_MAP already contains the current one.
-                let captured = turn_request_id.borrow().clone();
-                let last_completed = last_completed_request_id.borrow().clone();
-                let rid = if captured.is_empty() || captured == last_completed {
-                    crate::get_thread_request_id(&thread_id_for_sub).unwrap_or_default()
-                } else {
-                    captured
-                };
+                let rid = capture_current_turn_request_id(
+                    &mut turn_request_id.borrow_mut(),
+                    &mut prev_turn_request_id.borrow_mut(),
+                    &last_completed_request_id.borrow(),
+                    crate::get_thread_request_id(&thread_id_for_sub).unwrap_or_default(),
+                );
 
                 crate::send_websocket_event(SyncEvent::MessageAdded {
                     acp_thread_id: thread_id_for_sub.clone(),
@@ -2124,10 +2132,16 @@ pub fn ensure_thread_subscription(
                 // content is safe: the Go accumulator uses overwrite semantics for known message_ids.
                 let thread = thread_entity.read(cx);
                 let entries = thread.entries();
-                // Use the request_id captured when this turn started, NOT the current
-                // global request_id. If a follow-up/interrupt message arrived before
-                // Stopped fires, the global ID already points to the next turn.
-                let rid = turn_request_id.borrow().clone();
+                // Use the captured request_id unless it already completed. EntryUpdated
+                // can precede NewEntry, leaving the captured ID on the previous turn.
+                let fallback = crate::get_thread_request_id(&thread_id_for_sub)
+                    .unwrap_or_else(|| turn_request_id.borrow().clone());
+                let rid = capture_current_turn_request_id(
+                    &mut turn_request_id.borrow_mut(),
+                    &mut prev_turn_request_id.borrow_mut(),
+                    &last_completed_request_id.borrow(),
+                    fallback,
+                );
 
                 // Find the start of the current turn: the entry AFTER the last UserMessage.
                 // Only flush entries from the current turn — sending old entries would cause
@@ -2189,14 +2203,12 @@ pub fn ensure_thread_subscription(
                 // (because no assistant NewEntry fired to update it — happens when
                 // the interrupt turn is immediately cancelled with no output), use
                 // the current global THREAD_REQUEST_MAP which points to this turn.
-                let fallback = crate::get_thread_request_id(&thread_id_for_sub)
-                    .unwrap_or_else(|| turn_request_id.borrow().clone());
                 let completed_rid = finish_turn(
                     &mut turn_request_id.borrow_mut(),
                     &mut prev_turn_request_id.borrow_mut(),
                     &mut last_completed_request_id.borrow_mut(),
                     &mut pending_turn_request_ids.borrow_mut(),
-                    fallback,
+                    rid,
                 );
                 if let Some(cause) = abort_cause {
                     // Turn aborted (agent process exited mid-turn, or MaxTokens).
@@ -5343,6 +5355,39 @@ mod native_turn_request_id_tests {
         assert_eq!(previous, "turn-a");
         assert!(last_completed.is_empty());
         assert!(pending.is_empty());
+    }
+
+    #[test]
+    fn streaming_before_new_entry_uses_completion_request_id() {
+        let mut active = "turn-a".to_string();
+        let mut previous = String::new();
+        let mut last_completed = "turn-a".to_string();
+        let mut pending = VecDeque::new();
+
+        let streamed = capture_current_turn_request_id(
+            &mut active,
+            &mut previous,
+            &last_completed,
+            "turn-b".to_string(),
+        );
+        let streamed_after_follow_up = capture_current_turn_request_id(
+            &mut active,
+            &mut previous,
+            &last_completed,
+            "turn-c".to_string(),
+        );
+        let completed = finish_turn(
+            &mut active,
+            &mut previous,
+            &mut last_completed,
+            &mut pending,
+            "turn-c".to_string(),
+        );
+
+        assert_eq!(streamed, "turn-b");
+        assert_eq!(streamed_after_follow_up, "turn-b");
+        assert_eq!(previous, "turn-a");
+        assert_eq!(completed, streamed);
     }
 }
 
