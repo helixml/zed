@@ -4392,11 +4392,13 @@ mod stale_pending_discard_tests {
         let thread = "discard-stale-pending-thread";
         let full = "The board still serves its job after the deploy.";
 
-        // Two sends within the 100ms window: at least the second is stored as
-        // pending (arming the trailing flush timer). Whether the first passes
-        // the throttle is timing-dependent and irrelevant here.
+        // Build up genuine stale pending state: a throttled send does not
+        // advance last_sent, so the send after it passes the throttle and
+        // clears pending; only a third send inside the fresh window is stored
+        // as pending (arming the trailing flush timer).
+        send_text(thread, 0, "The b");
         send_text(thread, 0, "The board");
-        send_text(thread, 0, "The board still serves");
+        assert!(!send_text(thread, 0, "The board still serves"));
 
         // What the NewEntry handler does when the tool call entry appears:
         // discard stale pending, then re-send the entry's complete content.
@@ -4444,6 +4446,70 @@ mod stale_pending_discard_tests {
         assert!(
             sent.iter().skip(full_pos + 1).all(|(id, _)| id != "0"),
             "entry 0 was re-sent after its full content: {sent:?}"
+        );
+
+        *WEBSOCKET_SERVICE.lock() = None;
+    }
+
+    /// Control for the test above: WITHOUT the discard, the stale pending
+    /// snapshot IS re-sent after the fresh full content — by the next entry's
+    /// flush-other-entries step — which is the clobber mechanism behind the
+    /// bug. If this test ever fails, the throttle semantics changed and the
+    /// NewEntry handler's discard_pending_for_thread call should be revisited.
+    #[test]
+    fn without_discard_stale_pending_is_resent_after_fresh_content() {
+        let _guard = super::TEST_WEBSOCKET_SERVICE_GUARD.lock();
+        let (service, mut events) = WebSocketSync::new_test();
+        *WEBSOCKET_SERVICE.lock() = Some(service);
+
+        let thread = "no-discard-control-thread";
+        let full = "The board still serves its job after the deploy.";
+
+        send_text(thread, 0, "The b");
+        send_text(thread, 0, "The board");
+        assert!(!send_text(thread, 0, "The board still serves"));
+
+        // Fresh full re-send without discarding the stale pending first.
+        crate::send_websocket_event(SyncEvent::MessageAdded {
+            acp_thread_id: thread.to_string(),
+            message_id: "0".to_string(),
+            role: "assistant".to_string(),
+            content: full.to_string(),
+            request_id: "req-1".to_string(),
+            entry_type: "text".to_string(),
+            tool_name: String::new(),
+            tool_status: String::new(),
+            tool_call_id: String::new(),
+            tool_call_name: String::new(),
+            subagent_id: String::new(),
+            timestamp: chrono::Utc::now().timestamp(),
+        })
+        .unwrap();
+        throttled_send_message_added(
+            thread,
+            1,
+            "assistant",
+            "Run command".to_string(),
+            "req-1",
+            "tool_call",
+            "terminal",
+            "In Progress",
+            "",
+            "",
+            "",
+        );
+
+        let sent = drain(&mut events);
+        let full_pos = sent
+            .iter()
+            .position(|(id, content)| id == "0" && content == full)
+            .expect("full content for entry 0 was sent");
+        assert!(
+            sent
+                .iter()
+                .skip(full_pos + 1)
+                .any(|(id, content)| id == "0" && content.len() < full.len()),
+            "expected the stale snapshot to clobber the full content without the discard: {sent:?}"
         );
 
         *WEBSOCKET_SERVICE.lock() = None;
