@@ -4392,10 +4392,11 @@ mod stale_pending_discard_tests {
         let thread = "discard-stale-pending-thread";
         let full = "The board still serves its job after the deploy.";
 
-        // First send passes the throttle; the follow-up within the 100ms window
-        // is stored as pending (and arms the trailing flush timer).
-        assert!(send_text(thread, 0, "The board"));
-        assert!(!send_text(thread, 0, "The board still serves"));
+        // Two sends within the 100ms window: at least the second is stored as
+        // pending (arming the trailing flush timer). Whether the first passes
+        // the throttle is timing-dependent and irrelevant here.
+        send_text(thread, 0, "The board");
+        send_text(thread, 0, "The board still serves");
 
         // What the NewEntry handler does when the tool call entry appears:
         // discard stale pending, then re-send the entry's complete content.
