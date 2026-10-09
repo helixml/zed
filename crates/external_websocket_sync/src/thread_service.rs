@@ -1173,49 +1173,29 @@ fn init_streaming_throttle() {
     }
 }
 
-/// Flush pending throttled content for all entries in a thread OTHER than the
-/// specified entry index. Called from the NewEntry handler to ensure the
-/// preceding text entry's content is sent before a new entry (e.g. tool_call).
-fn flush_stale_pending_for_thread(acp_thread_id: &str, exclude_entry_idx: usize) {
+/// Discard pending throttled content for all entries of a thread without
+/// sending it. Called from the NewEntry handler right before it re-sends every
+/// current-turn entry fresh from the thread model: any throttled snapshot is
+/// older than what is about to be sent, and flushing it would arrive AFTER the
+/// fresh content on the ordered channel, clobbering the complete text in Helix
+/// until the end-of-turn re-send (the "text truncated before a long-running
+/// tool call" bug). Taking pending_content also defuses the armed
+/// trailing_flush_timer, which re-checks it when it fires.
+fn discard_pending_for_thread(acp_thread_id: &str) {
     init_streaming_throttle();
     let thread_prefix = format!("{}:", acp_thread_id);
-    let exclude_key = format!("{}:{}", acp_thread_id, exclude_entry_idx);
     let now = Instant::now();
 
-    let mut stale_pending: Vec<PendingMessage> = Vec::new();
-    {
-        let throttle_map = STREAMING_THROTTLE.lock();
-        let Some(map) = throttle_map.as_ref() else {
-            return;
-        };
-        let mut map = map.write();
-
-        for (k, state) in map.iter_mut() {
-            if k.starts_with(&thread_prefix) && *k != exclude_key {
-                if let Some(pending) = state.pending_content.take() {
-                    state.last_sent = now;
-                    state.flush_scheduled = false;
-                    stale_pending.push(pending);
-                }
-            }
+    let throttle_map = STREAMING_THROTTLE.lock();
+    let Some(map) = throttle_map.as_ref() else {
+        return;
+    };
+    let mut map = map.write();
+    for (k, state) in map.iter_mut() {
+        if k.starts_with(&thread_prefix) && state.pending_content.take().is_some() {
+            state.last_sent = now;
+            state.flush_scheduled = false;
         }
-    }
-
-    for pending in stale_pending {
-        let _ = crate::send_websocket_event(SyncEvent::MessageAdded {
-            acp_thread_id: pending.acp_thread_id,
-            message_id: pending.message_id,
-            role: pending.role,
-            content: pending.content,
-            request_id: pending.request_id,
-            entry_type: pending.entry_type,
-            tool_name: pending.tool_name,
-            tool_status: pending.tool_status,
-            tool_call_id: pending.tool_call_id,
-            tool_call_name: pending.tool_call_name,
-            subagent_id: pending.subagent_id,
-            timestamp: chrono::Utc::now().timestamp(),
-        });
     }
 }
 
@@ -1275,9 +1255,8 @@ fn throttled_send_message_added(
                 flush_scheduled: false,
             });
 
-        // Tool call entries bypass the throttle — they're infrequent and must
-        // arrive promptly so the preceding text entry's stale-pending flush
-        // reaches the API before the tool call does.
+        // Tool call entries bypass the throttle — they're infrequent and their
+        // status changes must arrive promptly.
         if now.duration_since(state.last_sent) >= STREAMING_THROTTLE_INTERVAL
             || entry_type == "tool_call"
         {
@@ -1848,6 +1827,12 @@ pub fn ensure_thread_subscription(
                     // push_entry(), so all Markdown entities have their complete text.
                     // Only send entries after the last UserMessage to avoid leaking
                     // old turn entries into the current interaction on the Go side.
+                    //
+                    // Any throttled pending snapshot is now stale relative to the
+                    // fresh content sent below; drop it so neither the trailing
+                    // flush timer nor the next throttled send can emit it after
+                    // (and thereby overwrite) the complete text.
+                    discard_pending_for_thread(&thread_id_for_sub);
                     let entries = thread.entries();
                     let turn_start = entries.iter().enumerate().rev()
                         .find_map(|(i, e)| matches!(e, acp_thread::AgentThreadEntry::UserMessage(_)).then_some(i + 1))
@@ -4363,6 +4348,173 @@ fn open_existing_thread_sync(
 /// parallel cargo threads stomp each other's service and lose events.
 #[cfg(test)]
 static TEST_WEBSOCKET_SERVICE_GUARD: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
+
+#[cfg(test)]
+mod stale_pending_discard_tests {
+    use super::*;
+    use crate::types::SyncEvent;
+    use crate::websocket_sync::{WEBSOCKET_SERVICE, WebSocketSync};
+
+    fn send_text(thread: &str, idx: usize, content: &str) -> bool {
+        throttled_send_message_added(
+            thread, idx, "assistant", content.to_string(), "req-1", "text", "", "", "", "", "",
+        )
+    }
+
+    fn drain(
+        events: &mut tokio::sync::mpsc::UnboundedReceiver<SyncEvent>,
+    ) -> Vec<(String, String)> {
+        let mut out = Vec::new();
+        while let Ok(event) = events.try_recv() {
+            if let SyncEvent::MessageAdded {
+                message_id, content, ..
+            } = event
+            {
+                out.push((message_id, content));
+            }
+        }
+        out
+    }
+
+    /// Regression test for the "text truncated before a long-running tool call"
+    /// bug: a stale throttled snapshot of a text entry must never be sent after
+    /// the NewEntry handler's fresh full-content re-send — neither by the
+    /// trailing flush timer nor by the next entry's "flush other entries'
+    /// pending first" step. On the pre-fix code (no discard_pending_for_thread
+    /// call) the stale "The board still serves" snapshot is emitted after the
+    /// full sentence and overwrites it in Helix until end of turn.
+    #[test]
+    fn new_entry_resend_discards_stale_throttled_pending() {
+        let _guard = super::TEST_WEBSOCKET_SERVICE_GUARD.lock();
+        let (service, mut events) = WebSocketSync::new_test();
+        *WEBSOCKET_SERVICE.lock() = Some(service);
+
+        let thread = "discard-stale-pending-thread";
+        let full = "The board still serves its job after the deploy.";
+
+        // Build up genuine stale pending state: a throttled send does not
+        // advance last_sent, so the send after it passes the throttle and
+        // clears pending; only a third send inside the fresh window is stored
+        // as pending (arming the trailing flush timer).
+        send_text(thread, 0, "The b");
+        send_text(thread, 0, "The board");
+        assert!(!send_text(thread, 0, "The board still serves"));
+
+        // What the NewEntry handler does when the tool call entry appears:
+        // discard stale pending, then re-send the entry's complete content.
+        discard_pending_for_thread(thread);
+        crate::send_websocket_event(SyncEvent::MessageAdded {
+            acp_thread_id: thread.to_string(),
+            message_id: "0".to_string(),
+            role: "assistant".to_string(),
+            content: full.to_string(),
+            request_id: "req-1".to_string(),
+            entry_type: "text".to_string(),
+            tool_name: String::new(),
+            tool_status: String::new(),
+            tool_call_id: String::new(),
+            tool_call_name: String::new(),
+            subagent_id: String::new(),
+            timestamp: chrono::Utc::now().timestamp(),
+        })
+        .unwrap();
+
+        // The tool call bypasses the throttle; its flush-others step must find
+        // nothing pending for entry 0.
+        assert!(throttled_send_message_added(
+            thread,
+            1,
+            "assistant",
+            "Run command".to_string(),
+            "req-1",
+            "tool_call",
+            "terminal",
+            "In Progress",
+            "",
+            "",
+            "",
+        ));
+
+        // Let the armed trailing flush timer fire; it must send nothing.
+        std::thread::sleep(STREAMING_THROTTLE_INTERVAL * 2);
+
+        let sent = drain(&mut events);
+        let full_pos = sent
+            .iter()
+            .position(|(id, content)| id == "0" && content == full)
+            .expect("full content for entry 0 was sent");
+        assert!(
+            sent.iter().skip(full_pos + 1).all(|(id, _)| id != "0"),
+            "entry 0 was re-sent after its full content: {sent:?}"
+        );
+
+        *WEBSOCKET_SERVICE.lock() = None;
+    }
+
+    /// Control for the test above: WITHOUT the discard, the stale pending
+    /// snapshot IS re-sent after the fresh full content — by the next entry's
+    /// flush-other-entries step — which is the clobber mechanism behind the
+    /// bug. If this test ever fails, the throttle semantics changed and the
+    /// NewEntry handler's discard_pending_for_thread call should be revisited.
+    #[test]
+    fn without_discard_stale_pending_is_resent_after_fresh_content() {
+        let _guard = super::TEST_WEBSOCKET_SERVICE_GUARD.lock();
+        let (service, mut events) = WebSocketSync::new_test();
+        *WEBSOCKET_SERVICE.lock() = Some(service);
+
+        let thread = "no-discard-control-thread";
+        let full = "The board still serves its job after the deploy.";
+
+        send_text(thread, 0, "The b");
+        send_text(thread, 0, "The board");
+        assert!(!send_text(thread, 0, "The board still serves"));
+
+        // Fresh full re-send without discarding the stale pending first.
+        crate::send_websocket_event(SyncEvent::MessageAdded {
+            acp_thread_id: thread.to_string(),
+            message_id: "0".to_string(),
+            role: "assistant".to_string(),
+            content: full.to_string(),
+            request_id: "req-1".to_string(),
+            entry_type: "text".to_string(),
+            tool_name: String::new(),
+            tool_status: String::new(),
+            tool_call_id: String::new(),
+            tool_call_name: String::new(),
+            subagent_id: String::new(),
+            timestamp: chrono::Utc::now().timestamp(),
+        })
+        .unwrap();
+        throttled_send_message_added(
+            thread,
+            1,
+            "assistant",
+            "Run command".to_string(),
+            "req-1",
+            "tool_call",
+            "terminal",
+            "In Progress",
+            "",
+            "",
+            "",
+        );
+
+        let sent = drain(&mut events);
+        let full_pos = sent
+            .iter()
+            .position(|(id, content)| id == "0" && content == full)
+            .expect("full content for entry 0 was sent");
+        assert!(
+            sent
+                .iter()
+                .skip(full_pos + 1)
+                .any(|(id, content)| id == "0" && content.len() < full.len()),
+            "expected the stale snapshot to clobber the full content without the discard: {sent:?}"
+        );
+
+        *WEBSOCKET_SERVICE.lock() = None;
+    }
+}
 
 #[cfg(test)]
 mod codex_subagent_activity_tests {
