@@ -1,3 +1,4 @@
+// cache-test 2026-10-10: no-op change to measure incremental Zed rebuild cost
 // Disable command line from opening on release mode
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
