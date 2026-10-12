@@ -441,18 +441,25 @@ func (d *testDriver) syncEventCallback(sessionID string, syncMsg *types.SyncMess
 			}
 		}
 
-		// Phase 8: send an interrupt as soon as the first assistant token arrives for
-		// the phase 8 thread. This guarantees ACP has started generating (running_turn
-		// is set), so the interrupt will properly cancel the active turn via run_turn().
+		// Phase 8: send an interrupt on the first assistant event for the phase 8
+		// thread, while the initial turn is still active.
 		if d.phase == 8 && !d.round.phase8InterruptSent {
 			role, _ := syncMsg.Data["role"].(string)
 			threadID, _ := syncMsg.Data["acp_thread_id"].(string)
 			if role == "assistant" && threadID == d.round.phase8ThreadID {
 				d.round.phase8InterruptSent = true
 				agentName := d.round.agentName
+				requestID := d.round.reqID("phase8-interrupt")
 				d.mu.Unlock()
-				log.Printf("[%s] Phase 8: First assistant token arrived, sending interrupt to %s", agentName, truncate(threadID, 16))
-				d.sendChatMessage("Actually just say 'hello'.", d.round.reqID("phase8-interrupt"), agentName, threadID)
+				log.Printf("[%s] Phase 8: First assistant event arrived, sending interrupt to %s", agentName, truncate(threadID, 16))
+				routedSessionID, ok := d.srv.ContextMappings()[threadID]
+				if !ok {
+					log.Printf("[test-server] WARNING: Phase 8 interrupt %s has no session mapping for thread %s", requestID, threadID)
+					return
+				}
+				if err := d.srv.SendChatMessageWithInterrupt(routedSessionID, "Actually just say 'hello'.", requestID, true); err != nil {
+					log.Printf("[test-server] WARNING: Phase 8 interrupt %s failed for session %s: %v", requestID, routedSessionID, err)
+				}
 				return
 			}
 		}
