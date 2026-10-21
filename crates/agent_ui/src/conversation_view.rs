@@ -1044,6 +1044,10 @@ impl ConversationView {
                                 );
                                 synced_count = total;
                             }
+                            // Turns sent by thread_service don't go through ThreadView,
+                            // so nothing else adds or removes the spinner for them.
+                            // Left in place, it animates forever after the turn ends.
+                            active.update(cx, |active, cx| active.sync_generating_indicator(cx));
                         }
                         cx.notify();
                     }
@@ -3803,6 +3807,7 @@ impl Render for ConversationView {
                             "loading-agent-label",
                             Animation::new(Duration::from_secs(2))
                                 .repeat()
+                                .steps(2 * ui::AMBIENT_ANIMATION_STEPS_PER_SECOND)
                                 .with_easing(pulsating_between(0.3, 0.7)),
                             |label, delta| label.alpha(delta),
                         ),
@@ -5989,6 +5994,68 @@ pub(crate) mod tests {
         cx: &mut TestAppContext,
     ) -> (Entity<ConversationView>, &mut VisualTestContext) {
         setup_conversation_view_with_initial_content_opt(agent, None, cx).await
+    }
+
+    #[cfg(feature = "external_websocket_sync")]
+    #[gpui::test]
+    async fn test_existing_thread_view_drops_generating_indicator_when_turn_ends(
+        cx: &mut TestAppContext,
+    ) {
+        init_test(cx);
+
+        let connection = StubAgentConnection::new();
+        let (conversation_view, cx) =
+            setup_conversation_view(StubAgentServer::new(connection.clone()), cx).await;
+
+        message_editor(&conversation_view, cx).update_in(cx, |editor, window, cx| {
+            editor.set_text("Hello", window, cx);
+        });
+        active_thread(&conversation_view, cx).update_in(cx, |view, window, cx| {
+            view.send(window, cx);
+        });
+        cx.run_until_parked();
+
+        // Open the running thread the way the agent panel does for threads
+        // driven by thread_service.
+        let (thread, session_id) = active_thread(&conversation_view, cx).read_with(cx, |view, cx| {
+            (view.thread.clone(), view.thread.read(cx).session_id().clone())
+        });
+        let existing_view = cx.update(|window, cx| {
+            let source = conversation_view.read(cx);
+            let (agent, connection_store, connection_key, workspace, project, thread_store) = (
+                source.agent.clone(),
+                source.connection_store.clone(),
+                source.connection_key.clone(),
+                source.workspace.clone(),
+                source.project.clone(),
+                source.thread_store.clone(),
+            );
+            cx.new(|cx| {
+                ConversationView::from_existing_thread(
+                    thread,
+                    agent,
+                    connection_store,
+                    connection_key,
+                    workspace,
+                    project,
+                    thread_store,
+                    window,
+                    cx,
+                )
+            })
+        });
+        cx.run_until_parked();
+        active_thread(&existing_view, cx).read_with(cx, |view, cx| {
+            assert!(view.generating_indicator_in_list);
+            assert_thread_list_item_count_matches_entries(view, cx);
+        });
+
+        connection.end_turn(session_id, acp::StopReason::EndTurn);
+        cx.run_until_parked();
+        active_thread(&existing_view, cx).read_with(cx, |view, cx| {
+            assert!(!view.generating_indicator_in_list);
+            assert_thread_list_item_count_matches_entries(view, cx);
+        });
     }
 
     #[gpui::test]
