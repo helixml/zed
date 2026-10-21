@@ -88,7 +88,8 @@ impl RenderOnce for LoadingLabel {
             "loading_label",
             vec![
                 Animation::new(Duration::from_secs(1)),
-                Animation::new(Duration::from_secs(1)).repeat(),
+                // The dots have four states, so redraw only when they change.
+                Animation::new(Duration::from_secs(1)).repeat().steps(4),
             ],
             move |mut label, animation_ix, delta| {
                 match animation_ix {

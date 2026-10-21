@@ -4113,6 +4113,7 @@ impl ThreadView {
                                     "edit-label",
                                     Animation::new(Duration::from_secs(2))
                                         .repeat()
+                                        .steps(2 * ui::AMBIENT_ANIMATION_STEPS_PER_SECOND)
                                         .with_easing(pulsating_between(0.3, 0.7)),
                                     |label, delta| label.alpha(delta),
                                 ),
