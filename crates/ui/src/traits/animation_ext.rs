@@ -4,6 +4,11 @@ use gpui::{Animation, AnimationElement, AnimationExt, Transformation, percentage
 
 use crate::{prelude::*, traits::transformable::Transformable};
 
+/// Rate for ambient, looping animations (loading spinners, pulses), which step
+/// at this rate instead of redrawing the window on every frame. A remote desktop
+/// pays for every frame; at these sizes 15 steps a second still reads as smooth.
+pub const AMBIENT_ANIMATION_STEPS_PER_SECOND: u32 = 15;
+
 /// An extension trait for adding common animations to animatable components.
 pub trait CommonAnimationExt: AnimationExt {
     /// Render this component as rotating over the given duration.
@@ -33,8 +38,15 @@ pub trait CommonAnimationExt: AnimationExt {
     {
         self.with_animation(
             id,
-            Animation::new(Duration::from_secs(duration)).repeat(),
-            |component, delta| component.transform(Transformation::rotate(percentage(delta))),
+            Animation::new(Duration::from_secs(duration))
+                .repeat()
+                .steps((duration as u32 * AMBIENT_ANIMATION_STEPS_PER_SECOND).max(1)),
+            move |component, delta| {
+                // Snap to the step so each redraw shows a new angle.
+                let steps = (duration as u32 * AMBIENT_ANIMATION_STEPS_PER_SECOND).max(1) as f32;
+                let delta = (delta * steps).floor() / steps;
+                component.transform(Transformation::rotate(percentage(delta)))
+            },
         )
     }
 }
