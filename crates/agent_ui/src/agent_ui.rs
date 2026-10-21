@@ -1014,6 +1014,8 @@ mod tests {
             show_merge_conflict_indicator: true,
             sidebar_side: Default::default(),
             thinking_display: Default::default(),
+            show_onboarding: true,
+            auto_open_panel: false,
         };
 
         cx.update(|cx| {
