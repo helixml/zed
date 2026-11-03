@@ -271,8 +271,7 @@ impl WebSocketSync {
                 }
                 // Handle outgoing events
                 Some(event) = outgoing_rx.recv() => {
-                    eprintln!("📤 [WEBSOCKET-OUT] Received event to send: {:?}", std::mem::discriminant(&event));
-                    log::info!("📤 [WEBSOCKET-OUT] Received event to send: {:?}", std::mem::discriminant(&event));
+                    log::trace!("📤 [WEBSOCKET-OUT] Received event to send: {:?}", std::mem::discriminant(&event));
 
                     // Convert to OutgoingMessage format
                     let outgoing = match event.to_outgoing_message() {
@@ -743,13 +742,14 @@ pub fn get_websocket_service() -> Option<Arc<WebSocketSync>> {
 
 /// Send event via global service
 pub fn send_websocket_event(event: SyncEvent) -> Result<()> {
-    eprintln!("🔍 [WEBSOCKET] send_websocket_event() called with event type: {:?}", std::mem::discriminant(&event));
+    // Called for every streamed token, so success is logged at trace only:
+    // stderr is forwarded to the sandbox host's log, where per-event lines
+    // made up most of its volume.
+    log::trace!("[WEBSOCKET] send_websocket_event() called with event type: {:?}", std::mem::discriminant(&event));
     if let Some(service) = get_websocket_service() {
-        eprintln!("✅ [WEBSOCKET] Found WebSocket service, calling send_event()");
         let result = service.send_event(event);
-        match &result {
-            Ok(_) => eprintln!("✅ [WEBSOCKET] send_event() returned Ok"),
-            Err(e) => eprintln!("❌ [WEBSOCKET] send_event() returned Err: {}", e),
+        if let Err(e) = &result {
+            eprintln!("❌ [WEBSOCKET] send_event() returned Err: {}", e);
         }
         result
     } else {
