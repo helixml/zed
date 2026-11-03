@@ -1709,7 +1709,7 @@ pub fn ensure_thread_subscription(
     let sub_entity_id = entity_id;
     cx.subscribe(thread_entity, move |thread_entity, event, cx| {
         let current_entity_id = thread_entity.entity_id();
-        eprintln!(
+        log::trace!(
             "🔔 [THREAD_SERVICE] Subscription FIRED for thread {} on entity {:?} (subscribed to {:?}), event: {:?}",
             thread_id_for_sub, current_entity_id, sub_entity_id, std::mem::discriminant(event)
         );
