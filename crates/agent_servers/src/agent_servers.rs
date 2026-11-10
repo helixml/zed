@@ -12,7 +12,10 @@ use collections::{HashMap, HashSet};
 pub use custom::*;
 use fs::Fs;
 use http_client::read_no_proxy_from_env;
-use project::{AgentId, Project, agent_server_store::AgentServerStore};
+use project::{
+    AgentId, Project,
+    agent_server_store::{AgentServerCommand, AgentServerStore},
+};
 
 use acp_thread::AgentConnection;
 use agent_client_protocol::schema::v1 as acp_schema;
@@ -53,6 +56,10 @@ impl AgentServerDelegate {
 pub trait AgentServer: Send {
     fn logo(&self) -> ui::IconName;
     fn agent_id(&self) -> AgentId;
+
+    fn connection_configuration(&self, _cx: &App) -> Option<AgentServerConnectionConfiguration> {
+        None
+    }
     fn connect(
         &self,
         delegate: AgentServerDelegate,
@@ -104,6 +111,12 @@ pub trait AgentServer: Send {
         _cx: &App,
     ) {
     }
+}
+
+#[derive(Clone, PartialEq, Eq)]
+pub enum AgentServerConnectionConfiguration {
+    Command(AgentServerCommand),
+    RegistryEnvironment(HashMap<String, String>),
 }
 
 impl dyn AgentServer {
