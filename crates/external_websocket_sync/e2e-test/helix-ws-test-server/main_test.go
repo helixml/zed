@@ -36,3 +36,22 @@ func TestHasIntermediatePhase15Content(t *testing.T) {
 		})
 	}
 }
+
+func TestIsCompletedSlowMCPToolCall(t *testing.T) {
+	data := map[string]interface{}{
+		"request_id": "req-phase1-claude", "entry_type": "tool_call",
+		"tool_status": "Completed", "tool_name": "slow_mcp_test_tool",
+	}
+	if !isCompletedSlowMCPToolCall(data, "req-phase1-claude") {
+		t.Fatal("completed slow MCP tool call was not recognized")
+	}
+	data["tool_status"] = "Failed"
+	if isCompletedSlowMCPToolCall(data, "req-phase1-claude") {
+		t.Fatal("failed slow MCP tool call was accepted")
+	}
+	data["tool_status"] = "Completed"
+	data["request_id"] = "req-phase2-claude"
+	if isCompletedSlowMCPToolCall(data, "req-phase1-claude") {
+		t.Fatal("tool call from another turn was accepted")
+	}
+}

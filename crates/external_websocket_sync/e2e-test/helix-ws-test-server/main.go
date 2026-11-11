@@ -77,9 +77,7 @@ type roundState struct {
 	phase7ExpectedThreadID string
 	phase7ChatSent         bool
 
-	// Track timing for MCP tools wait validation
-	phase1ChatSentAt    time.Time // when we sent the chat_message for phase 1
-	phase1ThreadCreated time.Time // when we received thread_created for phase 1
+	phase1SlowMCPToolCalled bool
 
 	// Phase 8: mid-stream interrupt state
 	phase8ThreadID      string // thread ID created in phase 8
@@ -346,9 +344,6 @@ func (d *testDriver) syncEventCallback(sessionID string, syncMsg *types.SyncMess
 			acpThreadID, _ = syncMsg.Data["context_id"].(string)
 		}
 		if acpThreadID != "" {
-			if len(d.round.threadIDs) == 0 {
-				d.round.phase1ThreadCreated = time.Now()
-			}
 			d.round.threadIDs = append(d.round.threadIDs, acpThreadID)
 			log.Printf("[%s] Thread #%d: %s (event=%s)", d.round.agentName, len(d.round.threadIDs), syncMsg.EventType, truncate(acpThreadID, 16))
 			// Capture the thread created for phase 8 so we can send the interrupt to it.
@@ -405,6 +400,10 @@ func (d *testDriver) syncEventCallback(sessionID string, syncMsg *types.SyncMess
 		}
 
 	case "message_added":
+		if isCompletedSlowMCPToolCall(syncMsg.Data, d.round.reqID("phase1")) {
+			d.round.phase1SlowMCPToolCalled = true
+		}
+
 		// Ignore message_added events for threads from previous rounds.
 		// Check if the thread ID belongs to the current round's tracked threads.
 		addedThreadID, _ := syncMsg.Data["acp_thread_id"].(string)
@@ -733,6 +732,15 @@ func (d *testDriver) sendChatMessage(message, requestID, agentName string, acpTh
 	if !d.srv.QueueCommand(d.agentID, cmd) {
 		log.Printf("[test-server] WARNING: Failed to send command to agent %s", d.agentID)
 	}
+}
+
+func isCompletedSlowMCPToolCall(data map[string]interface{}, requestID string) bool {
+	if data["request_id"] != requestID || data["entry_type"] != "tool_call" || data["tool_status"] != "Completed" {
+		return false
+	}
+	toolName, _ := data["tool_name"].(string)
+	toolCallName, _ := data["tool_call_name"].(string)
+	return strings.Contains(toolName, "slow_mcp_test_tool") || strings.Contains(toolCallName, "slow_mcp_test_tool")
 }
 
 func (d *testDriver) sendSimulateUserInput(acpThreadID, message, requestID, agentName string) {
@@ -1286,10 +1294,11 @@ func (d *testDriver) runPhase1() {
 	log.Printf("  [%s] PHASE 1: Basic thread creation", agent)
 	log.Printf("==================================================")
 	d.startPhaseTimeout(1)
-	d.mu.Lock()
-	d.round.phase1ChatSentAt = time.Now()
-	d.mu.Unlock()
-	d.sendChatMessage("What is 2 + 2? Reply with just the number.", d.round.reqID("phase1"), agent)
+	prompt := "Call slow_mcp_test_tool, then reply with just the number 4."
+	if agent == "lifecycle-test-agent" {
+		prompt = "What is 2 + 2? Reply with just the number."
+	}
+	d.sendChatMessage(prompt, d.round.reqID("phase1"), agent)
 }
 
 func (d *testDriver) runPhase2() {
@@ -2407,21 +2416,10 @@ func (d *testDriver) validateRound() roundResult {
 
 		if agent == "lifecycle-test-agent" {
 			log.Printf("[%s] Not applicable: deterministic lifecycle agent has no MCP capability", agent)
-		} else if !d.round.phase1ChatSentAt.IsZero() && !d.round.phase1ThreadCreated.IsZero() {
-			mcpWaitDuration := d.round.phase1ThreadCreated.Sub(d.round.phase1ChatSentAt)
-			log.Printf("[%s] MCP wait: chat_message sent -> thread_created = %s", agent, mcpWaitDuration)
-
-			const minExpectedDelay = 8 * time.Second
-			if mcpWaitDuration < minExpectedDelay {
-				errors = append(errors, fmt.Sprintf(
-					"MCP tools wait: thread_created arrived %.1fs after chat_message (expected >= %.0fs). "+
-						"This means Zed did NOT wait for MCP tools to load before sending the first message.",
-					mcpWaitDuration.Seconds(), minExpectedDelay.Seconds()))
-			} else {
-				log.Printf("[%s] MCP tools wait: Zed correctly waited %.1fs for tools to load", agent, mcpWaitDuration.Seconds())
-			}
+		} else if !d.round.phase1SlowMCPToolCalled {
+			errors = append(errors, "MCP tools wait: the first turn did not complete slow_mcp_test_tool")
 		} else {
-			log.Printf("[%s] WARNING: Could not measure MCP tools wait (missing timestamps)", agent)
+			log.Printf("[%s] MCP tools wait: first turn completed slow_mcp_test_tool", agent)
 		}
 	}
 
