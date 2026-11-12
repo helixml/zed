@@ -2,7 +2,9 @@ use std::rc::Rc;
 
 use acp_thread::{AgentConnection, LoadError};
 use agent_servers::AcpConnection;
-use agent_servers::{AgentServer, AgentServerDelegate};
+use agent_servers::{
+    AgentServer, AgentServerConnectionConfiguration, AgentServerDelegate,
+};
 use anyhow::Result;
 use collections::HashMap;
 use futures::{FutureExt, future::Shared};
@@ -68,8 +70,13 @@ pub struct ActiveAcpConnection {
 
 pub struct AgentConnectionStore {
     project: Entity<Project>,
-    entries: HashMap<Agent, Entity<AgentConnectionEntry>>,
+    entries: HashMap<Agent, CachedAgentConnectionEntry>,
     _subscriptions: Vec<Subscription>,
+}
+
+struct CachedAgentConnectionEntry {
+    configuration: Option<AgentServerConnectionConfiguration>,
+    entry: Entity<AgentConnectionEntry>,
 }
 
 impl AgentConnectionStore {
@@ -88,18 +95,18 @@ impl AgentConnectionStore {
     }
 
     pub fn entry(&self, key: &Agent) -> Option<&Entity<AgentConnectionEntry>> {
-        self.entries.get(key)
+        self.entries.get(key).map(|cached| &cached.entry)
     }
 
     pub fn connection_status(&self, key: &Agent, cx: &App) -> AgentConnectionStatus {
         self.entries
             .get(key)
-            .map(|entry| entry.read(cx).status())
+            .map(|cached| cached.entry.read(cx).status())
             .unwrap_or(AgentConnectionStatus::Disconnected)
     }
 
     pub fn agent_version(&self, key: &Agent, cx: &App) -> Option<SharedString> {
-        match self.entries.get(key)?.read(cx) {
+        match self.entries.get(key)?.entry.read(cx) {
             AgentConnectionEntry::Connected(state) => state.connection.agent_version(),
             AgentConnectionEntry::Connecting { .. } | AgentConnectionEntry::Error { .. } => None,
         }
@@ -108,7 +115,7 @@ impl AgentConnectionStore {
     pub fn active_acp_connections(&self, cx: &App) -> Vec<ActiveAcpConnection> {
         self.entries
             .values()
-            .filter_map(|entry| match entry.read(cx) {
+            .filter_map(|cached| match cached.entry.read(cx) {
                 AgentConnectionEntry::Connected(state) => state
                     .connection
                     .clone()
@@ -130,9 +137,12 @@ impl AgentConnectionStore {
         server: Rc<dyn AgentServer>,
         cx: &mut Context<Self>,
     ) -> Entity<AgentConnectionEntry> {
-        if let Some(entry) = self.entries.get(&key) {
-            if matches!(entry.read(cx), AgentConnectionEntry::Connecting { .. }) {
-                return entry.clone();
+        let configuration = server.connection_configuration(cx);
+        if let Some(cached) = self.entries.get(&key) {
+            if cached.configuration == configuration
+                && matches!(cached.entry.read(cx), AgentConnectionEntry::Connecting { .. })
+            {
+                return cached.entry.clone();
             }
         }
 
@@ -146,8 +156,12 @@ impl AgentConnectionStore {
         server: Rc<dyn AgentServer>,
         cx: &mut Context<Self>,
     ) -> Entity<AgentConnectionEntry> {
-        if let Some(entry) = self.entries.get(&key) {
-            return entry.clone();
+        let configuration = server.connection_configuration(cx);
+        if let Some(cached) = self.entries.get(&key) {
+            if cached.configuration == configuration {
+                return cached.entry.clone();
+            }
+            self.entries.remove(&key);
         }
 
         let (mut new_version_rx, mut loading_status_rx, connect_task) =
@@ -158,7 +172,13 @@ impl AgentConnectionStore {
             connect_task: connect_task.clone(),
         });
 
-        self.entries.insert(key.clone(), entry.clone());
+        self.entries.insert(
+            key.clone(),
+            CachedAgentConnectionEntry {
+                configuration,
+                entry: entry.clone(),
+            },
+        );
         cx.notify();
 
         cx.spawn({
@@ -167,7 +187,9 @@ impl AgentConnectionStore {
             async move |this, cx| match connect_task.await {
                 Ok(connected_state) => {
                     this.update(cx, move |this, cx| {
-                        if this.entries.get(&key) != entry.upgrade().as_ref() {
+                        if this.entries.get(&key).map(|cached| &cached.entry)
+                            != entry.upgrade().as_ref()
+                        {
                             return;
                         }
 
@@ -185,7 +207,9 @@ impl AgentConnectionStore {
                 }
                 Err(error) => {
                     this.update(cx, move |this, cx| {
-                        if this.entries.get(&key) != entry.upgrade().as_ref() {
+                        if this.entries.get(&key).map(|cached| &cached.entry)
+                            != entry.upgrade().as_ref()
+                        {
                             return;
                         }
 
@@ -216,7 +240,9 @@ impl AgentConnectionStore {
                     };
 
                     this.update(cx, move |this, cx| {
-                        if this.entries.get(&key) != entry.upgrade().as_ref() {
+                        if this.entries.get(&key).map(|cached| &cached.entry)
+                            != entry.upgrade().as_ref()
+                        {
                             return;
                         }
 
@@ -245,7 +271,9 @@ impl AgentConnectionStore {
                     let key = key.clone();
                     let entry = entry.clone();
                     this.update(cx, move |this, cx| {
-                        if this.entries.get(&key) != entry.upgrade().as_ref() {
+                        if this.entries.get(&key).map(|cached| &cached.entry)
+                            != entry.upgrade().as_ref()
+                        {
                             return;
                         }
 
@@ -272,9 +300,14 @@ impl AgentConnectionStore {
         cx: &mut Context<Self>,
     ) {
         let store = store.read(cx);
-        self.entries.retain(|key, _| match key {
+        self.entries.retain(|key, cached| match key {
             Agent::NativeAgent => true,
-            Agent::Custom { id } => store.external_agents.contains_key(id),
+            Agent::Custom { id } => {
+                store.external_agents.contains_key(id)
+                    && agent_servers::CustomAgentServer::new(id.clone())
+                        .connection_configuration(cx)
+                        == cached.configuration
+            }
             #[cfg(any(test, feature = "test-support"))]
             Agent::Stub => true,
         });

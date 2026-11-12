@@ -12,9 +12,10 @@ use agent::ThreadStore;
 use agent_client_protocol::schema::v1 as acp;
 use anyhow::Result;
 use fs::Fs;
-use gpui::{App, Entity, WeakEntity};
+use gpui::{App, BorrowAppContext as _, Entity, WeakEntity};
 use parking_lot::RwLock;
 use project::Project;
+use settings::SettingsStore;
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::sync::{Arc, LazyLock};
 use std::time::{Duration, Instant};
@@ -41,6 +42,16 @@ fn report_thread_creation_failure(request_id: &str, error: &str) {
             send_err
         );
     }
+}
+
+async fn reload_user_settings(fs: &Arc<dyn Fs>, cx: &gpui::AsyncApp) -> Result<()> {
+    let settings = SettingsStore::load_settings(fs).await?;
+    cx.update(|cx| {
+        cx.update_global::<SettingsStore, _>(|store, cx| {
+            store.set_user_settings(&settings, cx).result()
+        })
+    })?;
+    Ok(())
 }
 
 async fn create_native_session_when_ready(
@@ -112,6 +123,98 @@ mod agent_server_id_tests {
         assert_eq!(zed_agent_server_id("claude"), "claude-acp");
         assert_eq!(zed_agent_server_id("codex"), "codex-acp");
         assert_eq!(zed_agent_server_id("qwen"), "qwen");
+    }
+}
+
+#[cfg(test)]
+mod settings_reload_tests {
+    use super::reload_user_settings;
+    use collections::HashMap;
+    use fs::{FakeFs, Fs};
+    use gpui::TestAppContext;
+    use project::agent_server_store::{
+        AgentId, AllAgentServersSettings, CustomAgentServerSettings,
+    };
+    use project::Project;
+    use settings::SettingsStore;
+
+    fn settings(model: &str) -> String {
+        serde_json::json!({
+            "agent_servers": {
+                "opencode": {
+                    "type": "custom",
+                    "command": "opencode",
+                    "args": ["acp"],
+                    "env": {
+                        "OPENCODE_CONFIG_CONTENT": format!(r#"{{"model":"{model}"}}"#)
+                    }
+                }
+            }
+        })
+        .to_string()
+    }
+
+    fn configured_model(cx: &gpui::App) -> String {
+        cx.global::<SettingsStore>()
+            .get::<AllAgentServersSettings>(None)
+            .get("opencode")
+            .and_then(|settings| match settings {
+                CustomAgentServerSettings::Custom { command, .. } => command.env.as_ref(),
+                CustomAgentServerSettings::Registry { .. } => None,
+            })
+            .and_then(|env| env.get("OPENCODE_CONFIG_CONTENT"))
+            .cloned()
+            .unwrap()
+    }
+
+    #[gpui::test]
+    async fn new_thread_reload_observes_settings_before_file_watcher(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            let mut store = SettingsStore::test(cx);
+            store
+                .set_user_settings(&settings("glm-5.3-flash"), cx)
+                .result()
+                .unwrap();
+            cx.set_global(store);
+        });
+        assert!(cx.read(configured_model).contains("glm-5.3-flash"));
+
+        let fs = FakeFs::new(cx.executor());
+        fs.create_dir(paths::settings_file().parent().unwrap())
+            .await
+            .unwrap();
+        let project = Project::test(fs.clone(), [], cx).await;
+        fs.insert_file(
+            paths::settings_file(),
+            settings("qwen3.8-flash-next").into_bytes(),
+        )
+        .await;
+        let fs: std::sync::Arc<dyn Fs> = fs;
+
+        let task = cx.update(|cx| {
+            cx.spawn(async move |cx| reload_user_settings(&fs, &cx).await)
+        });
+        task.await.unwrap();
+
+        assert!(cx.read(configured_model).contains("qwen3.8-flash-next"));
+        let store = project.read_with(cx, |project, _| project.agent_server_store().clone());
+        let command_task = cx.update(|cx| {
+            store.update(cx, |store, cx| {
+                store
+                    .get_external_agent(&AgentId::new("opencode"))
+                    .unwrap()
+                    .get_command(vec![], HashMap::default(), &mut cx.to_async())
+            })
+        });
+        let command = command_task.await.unwrap();
+        assert!(
+            command
+                .env
+                .unwrap()
+                .get("OPENCODE_CONFIG_CONTENT")
+                .unwrap()
+                .contains("qwen3.8-flash-next")
+        );
     }
 }
 
@@ -2933,6 +3036,13 @@ pub fn setup_thread_handler(
             // Create new ACP thread (synchronously via cx.update to avoid async context issues)
             eprintln!("🆕 [THREAD_SERVICE] Creating new ACP thread for request: {}", request.request_id);
             log::info!("🆕 [THREAD_SERVICE] Creating new ACP thread for request: {}", request.request_id);
+            if let Err(error) = reload_user_settings(&fs_for_create, &cx).await {
+                let error = format!("failed to reload settings before creating thread: {error:#}");
+                log::error!("[THREAD_SERVICE] {}", error);
+                crate::abandon_queued_request(&request.request_id);
+                report_thread_creation_failure(&request.request_id, &error);
+                continue;
+            }
             if let Err(e) = cx.update(|cx| {
                 create_new_thread_sync(
                     project_for_create.clone(),

@@ -6549,6 +6549,7 @@ dependencies = [
  "language_model",
  "log",
  "parking_lot",
+ "paths",
  "project",
  "prompt_store",
  "rustls 0.23.40",
