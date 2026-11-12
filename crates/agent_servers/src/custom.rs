@@ -1,4 +1,4 @@
-use crate::{AgentServer, AgentServerDelegate, load_proxy_env};
+use crate::{AgentServer, AgentServerConnectionConfiguration, AgentServerDelegate, load_proxy_env};
 use acp_thread::AgentConnection;
 use agent_client_protocol::schema::v1 as acp;
 use anyhow::{Context as _, Result};
@@ -33,6 +33,24 @@ impl CustomAgentServer {
 impl AgentServer for CustomAgentServer {
     fn agent_id(&self) -> AgentId {
         self.agent_id.clone()
+    }
+
+    fn connection_configuration(&self, cx: &App) -> Option<AgentServerConnectionConfiguration> {
+        cx.read_global(|settings: &SettingsStore, _| {
+            settings
+                .get::<AllAgentServersSettings>(None)
+                .get(self.agent_id.0.as_ref())
+                .map(|settings| match settings {
+                    project::agent_server_store::CustomAgentServerSettings::Custom {
+                        command,
+                        ..
+                    } => AgentServerConnectionConfiguration::Command(command.clone()),
+                    project::agent_server_store::CustomAgentServerSettings::Registry {
+                        env,
+                        ..
+                    } => AgentServerConnectionConfiguration::RegistryEnvironment(env.clone()),
+                })
+        })
     }
 
     fn logo(&self) -> IconName {

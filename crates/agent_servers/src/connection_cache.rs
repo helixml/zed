@@ -1,4 +1,5 @@
-//! Process-global cache of `AgentConnection`s keyed by `(Project, AgentId)`.
+//! Process-global cache of `AgentConnection`s keyed by `(Project, AgentId)` and
+//! invalidated when the agent's launch configuration changes.
 //!
 //! Without this cache, multiple call sites can race on `AgentServer::connect()`
 //! for the same agent in the same project — each `connect()` spawns a fresh
@@ -31,14 +32,15 @@ use futures::{FutureExt, future::Shared};
 use gpui::{App, Entity, EntityId, Global, SharedString, Task};
 use project::{AgentId, Project};
 
-use crate::{AgentServer, AgentServerDelegate};
+use crate::{AgentServer, AgentServerConnectionConfiguration, AgentServerDelegate};
 
 /// Stored result type. `LoadError` is `Clone`, which `Shared` requires.
 pub type CachedConnectResult = Result<Rc<dyn AgentConnection>, LoadError>;
 
-/// Process-global cache. One entry per `(Project entity_id, AgentId)`.
+/// Process-global cache. One current entry per `(Project entity_id, AgentId)`.
 pub struct AgentConnectionCache {
-    entries: RefCell<HashMap<CacheKey, Shared<Task<CachedConnectResult>>>>,
+    entries: RefCell<HashMap<CacheKey, CachedConnection>>,
+    next_generation: u64,
 }
 
 impl Global for AgentConnectionCache {}
@@ -49,18 +51,25 @@ struct CacheKey {
     agent_id: AgentId,
 }
 
+struct CachedConnection {
+    configuration: Option<AgentServerConnectionConfiguration>,
+    generation: u64,
+    task: Shared<Task<CachedConnectResult>>,
+}
+
 /// Install the cache as a GPUI global. Idempotent.
 pub fn init(cx: &mut App) {
     if cx.try_global::<AgentConnectionCache>().is_none() {
         cx.set_global(AgentConnectionCache {
             entries: RefCell::new(HashMap::default()),
+            next_generation: 0,
         });
     }
 }
 
 impl AgentConnectionCache {
-    /// Get the cached `AgentConnection` for `(project, agent_id)`, or call
-    /// `server.connect()` and cache the result.
+    /// Get the cached `AgentConnection` for the current launch configuration,
+    /// or call `server.connect()` and cache the result.
     ///
     /// Returns a `Shared<Task>` so concurrent callers awaiting it all observe
     /// the same outcome — first caller drives the connect, others wait. Once
@@ -86,23 +95,29 @@ impl AgentConnectionCache {
             project: project.entity_id(),
             agent_id: agent_id.clone(),
         };
+        let configuration = server.connection_configuration(cx);
 
         // Fast path: an entry exists (in-flight or resolved). `Shared` handles
         // both — awaiting a resolved Shared returns the cached value instantly.
         {
             let cache = cx.global::<AgentConnectionCache>();
-            if let Some(existing) = cache.entries.borrow().get(&key) {
+            let existing = cache.entries.borrow().get(&key).and_then(|entry| {
+                (entry.configuration == configuration).then(|| entry.task.clone())
+            });
+            if let Some(task) = existing {
                 log::info!(
                     "[ACP_DEDUP] Reusing connection project={} agent={:?}",
-                    key.project, key.agent_id
+                    key.project,
+                    key.agent_id
                 );
-                return existing.clone();
+                return task;
             }
         }
 
         log::info!(
-            "[ACP_DEDUP] No cached connection, calling server.connect() project={} agent={:?}",
-            key.project, key.agent_id
+            "[ACP_DEDUP] No reusable cached connection, calling server.connect() project={} agent={:?}",
+            key.project,
+            key.agent_id
         );
 
         // Slow path: spawn a fresh connect, store the Shared task, hand it back.
@@ -115,10 +130,17 @@ impl AgentConnectionCache {
         });
         let shared = connect_task.shared();
 
-        cx.global_mut::<AgentConnectionCache>()
-            .entries
-            .borrow_mut()
-            .insert(key.clone(), shared.clone());
+        let cache = cx.global_mut::<AgentConnectionCache>();
+        cache.next_generation += 1;
+        let generation = cache.next_generation;
+        cache.entries.borrow_mut().insert(
+            key.clone(),
+            CachedConnection {
+                configuration,
+                generation,
+                task: shared.clone(),
+            },
+        );
 
         // Evict on failure so a retry can create a fresh connection. On success
         // we leave the entry in place — the resolved Shared serves subsequent
@@ -128,11 +150,19 @@ impl AgentConnectionCache {
             if let Err(err) = shared_for_completion.await {
                 log::warn!(
                     "[ACP_DEDUP] Connection failed, evicting entry project={} agent={:?}: {:?}",
-                    key.project, key.agent_id, err
+                    key.project,
+                    key.agent_id,
+                    err
                 );
                 cx.update(|cx| {
                     if let Some(cache) = cx.try_global::<AgentConnectionCache>() {
-                        cache.entries.borrow_mut().remove(&key);
+                        let mut entries = cache.entries.borrow_mut();
+                        if entries
+                            .get(&key)
+                            .is_some_and(|entry| entry.generation == generation)
+                        {
+                            entries.remove(&key);
+                        }
                     }
                 });
             }
@@ -164,5 +194,137 @@ impl AgentConnectionCache {
             };
             cache.entries.borrow_mut().remove(&key);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use anyhow::anyhow;
+    use collections::HashMap;
+    use gpui::TestAppContext;
+    use project::agent_server_store::AgentServerCommand;
+    use std::path::PathBuf;
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+
+    struct FakeAgentServer {
+        configuration: AgentServerConnectionConfiguration,
+        connect_count: Arc<AtomicUsize>,
+        connect_gate: async_channel::Receiver<()>,
+    }
+
+    impl AgentServer for FakeAgentServer {
+        fn logo(&self) -> ui::IconName {
+            ui::IconName::ZedAgent
+        }
+
+        fn agent_id(&self) -> AgentId {
+            AgentId::new("opencode")
+        }
+
+        fn connection_configuration(
+            &self,
+            _cx: &App,
+        ) -> Option<AgentServerConnectionConfiguration> {
+            Some(self.configuration.clone())
+        }
+
+        fn connect(
+            &self,
+            _delegate: AgentServerDelegate,
+            _project: Entity<Project>,
+            cx: &mut App,
+        ) -> Task<anyhow::Result<Rc<dyn AgentConnection>>> {
+            self.connect_count.fetch_add(1, Ordering::SeqCst);
+            let connect_gate = self.connect_gate.clone();
+            cx.spawn(async move |_| {
+                connect_gate.recv().await.unwrap();
+                Err(anyhow!("connection failed"))
+            })
+        }
+
+        fn into_any(self: Rc<Self>) -> Rc<dyn std::any::Any> {
+            self
+        }
+    }
+
+    fn command(model: &str) -> AgentServerConnectionConfiguration {
+        AgentServerConnectionConfiguration::Command(AgentServerCommand {
+            path: PathBuf::from("opencode"),
+            args: vec!["acp".into()],
+            env: Some(HashMap::from_iter([(
+                "OPENCODE_CONFIG_CONTENT".into(),
+                format!(r#"{{"model":"{model}"}}"#),
+            )])),
+        })
+    }
+
+    #[gpui::test]
+    async fn changed_agent_environment_starts_a_new_connection(cx: &mut TestAppContext) {
+        let fs = crate::e2e_tests::init_test(cx).await;
+        let project = Project::test(fs, [], cx).await;
+        let store = project.read_with(cx, |project, _| project.agent_server_store().clone());
+        let connect_count = Arc::new(AtomicUsize::new(0));
+        let (old_gate_tx, old_gate_rx) = async_channel::bounded(1);
+        let (new_gate_tx, new_gate_rx) = async_channel::bounded(1);
+        let old_server = Rc::new(FakeAgentServer {
+            configuration: command("glm-5.3-flash"),
+            connect_count: connect_count.clone(),
+            connect_gate: old_gate_rx,
+        });
+
+        cx.update(|cx| {
+            let _ = AgentConnectionCache::request_connection(
+                cx,
+                project.clone(),
+                old_server.agent_id(),
+                old_server.clone(),
+                AgentServerDelegate::new(store.clone(), None, None),
+            );
+            let _ = AgentConnectionCache::request_connection(
+                cx,
+                project.clone(),
+                old_server.agent_id(),
+                old_server.clone(),
+                AgentServerDelegate::new(store.clone(), None, None),
+            );
+        });
+        assert_eq!(connect_count.load(Ordering::SeqCst), 1);
+
+        let new_server = Rc::new(FakeAgentServer {
+            configuration: command("qwen3.8-flash-next"),
+            connect_count: connect_count.clone(),
+            connect_gate: new_gate_rx,
+        });
+        cx.update(|cx| {
+            let _ = AgentConnectionCache::request_connection(
+                cx,
+                project.clone(),
+                new_server.agent_id(),
+                new_server.clone(),
+                AgentServerDelegate::new(store.clone(), None, None),
+            );
+        });
+        assert_eq!(connect_count.load(Ordering::SeqCst), 2);
+
+        old_gate_tx.send(()).await.unwrap();
+        cx.run_until_parked();
+
+        cx.update(|cx| {
+            let _ = AgentConnectionCache::request_connection(
+                cx,
+                project.clone(),
+                new_server.agent_id(),
+                new_server,
+                AgentServerDelegate::new(store, None, None),
+            );
+        });
+        assert_eq!(connect_count.load(Ordering::SeqCst), 2);
+
+        new_gate_tx.send(()).await.unwrap();
+        cx.run_until_parked();
     }
 }
