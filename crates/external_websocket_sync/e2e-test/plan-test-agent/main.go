@@ -1,7 +1,12 @@
-// plan-test-agent is a deterministic ACP agent used by the headless Zed E2E
-// suite. Its first turn publishes two plan snapshots; its second turn publishes
-// no plan. This makes plan replacement and turn isolation testable without an
-// external model or nondeterministic prompting.
+// plan-test-agent is a deterministic ACP agent for the Zed E2E suite, so the
+// suite can test protocol behaviour without an external model.
+//
+// Plan mode (default): the first turn publishes two plan snapshots and the
+// second publishes none, testing plan replacement and turn isolation.
+//
+// Lifecycle mode (E2E_SCRIPTED_LIFECYCLE=1): every turn streams scripted text,
+// short by default and long only for prompts carrying longTurnCue, and honours
+// session/cancel at every chunk. It drives the full lifecycle phase chain.
 package main
 
 import (

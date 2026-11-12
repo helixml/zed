@@ -5,13 +5,12 @@ set -euo pipefail
 # Tests the full flow: Zed connects → sends agent_ready → mock server sends
 # chat_message → Zed creates thread → streams response → sends message_completed
 #
-# The mock server is a Go binary (helix-ws-test-server) that imports the same
-# wsprotocol package used by the production Helix API server — same message
-# parsing, routing, and accumulation code runs in both tests and production.
+# The mock server is a Go binary (helix-ws-test-server) that runs the real
+# production HelixAPIServer handlers against an in-memory store.
 #
 # Environment variables:
 #   ZED_BINARY              - Path to Zed binary (default: /usr/local/bin/zed)
-#   TEST_TIMEOUT            - Timeout in seconds (default: 300)
+#   TEST_TIMEOUT            - Timeout in seconds (default: 300 per agent round)
 #   HELIX_WS_TEST_SERVER    - Path to Go test server binary (default: /usr/local/bin/helix-ws-test-server)
 
 echo "============================================"
