@@ -141,12 +141,16 @@ type roundState struct {
 	// processPendingPromptsForSession → processPromptQueue / processInterruptPrompt
 	// → sendQueuedPromptToSession — the path all production agent sends now use.
 	// Queue prompts get generated request_ids (not "req-phaseN-"), so these
-	// phases are driven by polling the store, not the completion switch.
-	queueThreadID      string // established thread the queue phases reuse
-	phase16Deferred    bool   // interrupt=false was HELD while busy (no concurrent interaction)
-	phase16Delivered   bool   // the deferred message was delivered as the next turn once idle
-	phase17Interrupted bool   // interrupt=true cancelled the running turn (interaction went interrupted)
-	phase17Delivered   bool   // the interrupt message was delivered
+	// phases are driven by store and stream waits, not the completion switch.
+	queueThreadID string // established thread the queue phases reuse
+	// streamingRequests holds the request ids that have streamed assistant
+	// content. The store cannot answer "is this turn streaming?": production
+	// buffers streamed content in memory and flushes it at message_completed.
+	streamingRequests  map[string]bool
+	phase16Deferred    bool // interrupt=false was HELD while busy (no concurrent interaction)
+	phase16Delivered   bool // the deferred message was delivered as the next turn once idle
+	phase17Interrupted bool // interrupt=true cancelled the running turn (interaction went interrupted)
+	phase17Delivered   bool // the interrupt message was delivered
 }
 
 // phase15AddSample records a single message_added event tied to phase 15's
@@ -178,8 +182,9 @@ func responseEntryLeak(previous map[responseEntryKey]string, messageID, content 
 
 func newRoundState(agentName string) *roundState {
 	return &roundState{
-		agentName:   agentName,
-		completions: make(map[string][]string),
+		agentName:         agentName,
+		completions:       make(map[string][]string),
+		streamingRequests: make(map[string]bool),
 	}
 }
 
@@ -248,26 +253,25 @@ type testDriver struct {
 	// Collected round results for final summary
 	roundResults []roundResult
 
-	// Monotonic counter to detect stale advanceToNextRound calls.
-	// Incremented on every round transition. Goroutines capture the value
-	// before sleeping and check it hasn't changed when they wake up.
+	// Monotonic counter, incremented on every round transition, so a phase
+	// timeout armed in one round cannot fire in the next.
 	roundGeneration int
+
+	// storeChanged is signalled after every processed sync event; store waits
+	// re-check on it instead of polling. Buffered(1): one pending wake-up is
+	// enough, since a waiter re-reads the whole store.
+	storeChanged chan struct{}
 
 	// Per-phase timeout tracking
 	phaseStarted  time.Time
 	phaseTimedOut map[int]bool // phases that timed out (skip in validation)
 
 	// Phases whose success condition has been met but which have not yet
-	// bumped d.phase, because the advance path deliberately settles first
-	// (500ms in the completion handler, plus 2s inside advanceAfterCompletion).
-	//
-	// The phase-timeout watcher aborts solely on `d.phase != phase`, so without
-	// this it can declare an ALREADY-SUCCESSFUL phase timed out whenever the
-	// completion lands within ~2.5s of the deadline. That is routine for the
-	// claude round, which is slower than zed-agent, and more likely under load.
-	// Observed directly:
-	//   11:43:57 Phase 9: Received enough completions -- thread did not hang
-	//   11:43:58 PHASE 9 TIMED OUT after 1m30s
+	// bumped d.phase: the advance runs on its own goroutine. The phase-timeout
+	// watcher aborts solely on `d.phase != phase`, so without this it could
+	// declare an already-successful phase timed out when the completion lands
+	// right at the deadline (observed on the slower claude round:
+	// "Phase 9: Received enough completions" then "PHASE 9 TIMED OUT").
 	phaseSucceeded map[int]bool
 }
 
@@ -279,16 +283,26 @@ type roundResult struct {
 
 func newTestDriver(srv *server.HelixAPIServer, store *memorystore.MemoryStore, agents []string) *testDriver {
 	return &testDriver{
-		srv:         srv,
-		store:       store,
-		done:        make(chan struct{}),
-		agentRounds: agents,
-		round:       newRoundState(agents[0]),
+		srv:          srv,
+		store:        store,
+		done:         make(chan struct{}),
+		storeChanged: make(chan struct{}, 1),
+		agentRounds:  agents,
+		round:        newRoundState(agents[0]),
 	}
 }
 
-// syncEventCallback is called by the production handler after every sync event.
+// syncEventCallback is called by the production handler after every sync event,
+// once the event's store writes are done.
 func (d *testDriver) syncEventCallback(sessionID string, syncMsg *types.SyncMessage) {
+	d.handleSyncEvent(syncMsg)
+	select {
+	case d.storeChanged <- struct{}{}:
+	default:
+	}
+}
+
+func (d *testDriver) handleSyncEvent(syncMsg *types.SyncMessage) {
 	d.mu.Lock()
 	d.round.events = append(d.round.events, *syncMsg)
 
@@ -421,6 +435,12 @@ func (d *testDriver) syncEventCallback(sessionID string, syncMsg *types.SyncMess
 		if !isCurrentRoundThread && addedThreadID != "" {
 			d.mu.Unlock()
 			return // silently ignore stale events
+		}
+
+		if role, _ := syncMsg.Data["role"].(string); role == "assistant" {
+			if requestID, _ := syncMsg.Data["request_id"].(string); requestID != "" {
+				d.round.streamingRequests[requestID] = true
+			}
 		}
 
 		// Phase 15: record (timestamp, content_length) for every assistant
@@ -579,8 +599,6 @@ func (d *testDriver) syncEventCallback(sessionID string, syncMsg *types.SyncMess
 				agentName, completions, truncate(acpThreadID, 12), requestID)
 			if completions >= 2 {
 				log.Printf("[%s] Phase 8: Both turns completed (cancelled + interrupt)", agentName)
-				d.markPhaseSucceeded(8)
-				time.Sleep(500 * time.Millisecond)
 				go d.advanceAfterCompletion(8)
 			}
 			return
@@ -596,29 +614,14 @@ func (d *testDriver) syncEventCallback(sessionID string, syncMsg *types.SyncMess
 				agentName, completions, truncate(acpThreadID, 12), requestID)
 			if completions >= 2 {
 				log.Printf("[%s] Phase 9: Received enough completions -- thread did not hang", agentName)
-				// Record the advance IMMEDIATELY. The phase has succeeded at this
-				// point; the pause below is only pacing before phase 10 sends its
-				// first message.
-				//
-				// Previously d.phase stayed at 9 across a 500ms sleep plus
-				// goroutine scheduling, and the phase-timeout watcher aborts
-				// solely on `d.phase != phase`. When completions land near the end
-				// of the 90s window — routine for claude, which is slower than
-				// zed-agent — the watcher fired on an ALREADY-SUCCESSFUL phase:
-				//
-				//   11:43:57 Phase 9: Received enough completions -- thread did not hang
-				//   11:43:58 PHASE 9 TIMED OUT after 1m30s
-				//
-				// Advancing under the lock first closes that window entirely,
-				// rather than papering over it by enlarging the timeout.
+				// Advance under the lock before handing off to a goroutine, so the
+				// phase-timeout watcher (which aborts on `d.phase != phase`) cannot
+				// fire on an already-successful phase in the scheduling gap.
 				d.markPhaseSucceeded(9)
 				d.mu.Lock()
 				d.phase = 10
 				d.mu.Unlock()
-				go func() {
-					time.Sleep(500 * time.Millisecond)
-					d.runPhase10()
-				}()
+				go d.runPhase10()
 			}
 			return
 		}
@@ -798,6 +801,18 @@ func (d *testDriver) sendQueryUiState(queryID string) {
 
 const phaseTimeout = 90 * time.Second
 
+// lifecycleLongTurnCue asks the scripted lifecycle agent (plan-test-agent with
+// E2E_SCRIPTED_LIFECYCLE=1) for a long, slowly streamed turn; every other prompt
+// gets a short one. It goes on exactly the prompts whose turn must still be
+// streaming when the driver acts on it. Model-backed agents read it as part of
+// a request that already asks for a long answer. Must match longTurnCue in
+// plan-test-agent.
+const lifecycleLongTurnCue = "[e2e:long-turn]"
+
+func longTurn(prompt string) string {
+	return prompt + " " + lifecycleLongTurnCue
+}
+
 // Smoke mode: a single tool-call phase instead of the full suite. See the
 // package comment. smokePhase is deliberately outside the 1..17 range so no
 // phase-numbered branch elsewhere can mistake it for a real phase.
@@ -925,28 +940,14 @@ func (d *testDriver) markPhaseSucceeded(phase int) {
 }
 
 func (d *testDriver) advanceAfterCompletion(completedPhase int) {
-	// The caller has already decided this phase passed; record it before the
-	// settle sleeps below so the timeout watcher cannot race them.
+	// The caller has already decided this phase passed; record it before
+	// anything else so the timeout watcher cannot race the advance.
 	d.markPhaseSucceeded(completedPhase)
 	d.mu.Lock()
 	agentName := d.round.agentName
 	actualPhase := d.phase
-	gen := d.roundGeneration
 	d.mu.Unlock()
-	log.Printf("[%s] advanceAfterCompletion(%d) called (current phase=%d gen=%d), sleeping 2s...",
-		agentName, completedPhase, actualPhase, gen)
-	time.Sleep(2 * time.Second) // let Zed settle
-
-	// If the round changed while we slept, this completion is stale — bail out.
-	d.mu.Lock()
-	if d.roundGeneration != gen {
-		curAgent := d.round.agentName
-		d.mu.Unlock()
-		log.Printf("[%s] advanceAfterCompletion(%d) STALE: gen changed %d→%d (now in %s round), ignoring",
-			agentName, completedPhase, gen, d.roundGeneration, curAgent)
-		return
-	}
-	d.mu.Unlock()
+	log.Printf("[%s] advanceAfterCompletion(%d) called (current phase=%d)", agentName, completedPhase, actualPhase)
 
 	switch completedPhase {
 	case smokePhase:
@@ -1040,7 +1041,6 @@ func (d *testDriver) advanceAfterCompletion(completedPhase int) {
 }
 
 func (d *testDriver) advanceAfterUiState() {
-	time.Sleep(1 * time.Second)
 	d.mu.Lock()
 	d.phase = 7
 	d.mu.Unlock()
@@ -1403,7 +1403,7 @@ func (d *testDriver) runPhase8() {
 	// to send an interrupt before it completes. The syncEventCallback will fire the
 	// interrupt the moment the first assistant token arrives.
 	d.sendChatMessage(
-		"Write me a detailed explanation of recursion with three worked examples.",
+		longTurn("Write me a detailed explanation of recursion with three worked examples."),
 		d.round.reqID("phase8-initial"),
 		agent,
 	)
@@ -1427,7 +1427,7 @@ func (d *testDriver) runPhase9() {
 	// Turn 1: start a bounded streaming response. The syncEventCallback will
 	// fire the rapid sequence as soon as the first assistant token arrives.
 	d.sendChatMessage(
-		"Output the numbers 1 through 100, one per line, and nothing else.",
+		longTurn("Output the numbers 1 through 100, one per line, and nothing else."),
 		d.round.reqID("phase9-initial"),
 		agent,
 		d.round.phase8ThreadID,
@@ -1493,8 +1493,7 @@ func (d *testDriver) runPhase10() {
 
 	log.Printf("[%s] Phase 10: Injected user_created_thread for thread=%s", agent, truncate(newThreadID, 12))
 
-	// Verify the session was created by checking context mappings
-	time.Sleep(500 * time.Millisecond)
+	// ProcessSyncEvent handles the event synchronously, so the mapping exists now.
 	mappings := d.srv.ContextMappings()
 	if sessionID, ok := mappings[newThreadID]; ok {
 		log.Printf("[%s] Phase 10: ✅ New session created: %s", agent, sessionID)
@@ -1659,14 +1658,13 @@ func (d *testDriver) runPhase13() {
 	// The syncEventCallback will fire cancel_current_turn when the first
 	// assistant token arrives.
 	d.sendChatMessage(
-		"Write a detailed explanation of binary search trees with three worked examples.",
+		longTurn("Write a detailed explanation of binary search trees with three worked examples."),
 		d.round.reqID("phase13"),
 		agent,
 	)
 }
 
 func (d *testDriver) advanceAfterPhase13() {
-	time.Sleep(1 * time.Second)
 	d.mu.Lock()
 	agentName := d.round.agentName
 	d.mu.Unlock()
@@ -1692,7 +1690,6 @@ func (d *testDriver) runPhase14() {
 }
 
 func (d *testDriver) advanceAfterPhase14() {
-	time.Sleep(1 * time.Second)
 	d.mu.Lock()
 	agentName := d.round.agentName
 	d.phase = 15
@@ -1723,8 +1720,8 @@ func (d *testDriver) runPhase15() {
 	// response into many short text entries and obscure the streaming-cadence
 	// signal we want to assert on.
 	d.sendChatMessage(
-		"Write a 400-word essay about the history of the printing press in plain prose. "+
-			"No headings, no bullet lists, no tool calls — just a single flowing essay.",
+		longTurn("Write a 400-word essay about the history of the printing press in plain prose. "+
+			"No headings, no bullet lists, no tool calls — just a single flowing essay."),
 		d.round.reqID("phase15"),
 		agent,
 	)
@@ -1755,35 +1752,50 @@ func (d *testDriver) findInteractionByPromptID(promptID string) (string, string)
 	return "", ""
 }
 
-// waitInteractionStreaming polls until the interaction for promptID is actively
-// streaming (waiting state with some assistant content) — the same precondition
-// Phase 8 uses before interrupting, so the second message lands mid-turn rather
-// than before the turn has started (cancelling a not-yet-started turn leaves the
-// follow-up wedged). Returns true once streaming, false on timeout.
-func (d *testDriver) waitInteractionStreaming(promptID string, timeout time.Duration) bool {
-	deadline := time.Now().Add(timeout)
-	for time.Now().Before(deadline) {
-		for _, in := range d.store.GetAllInteractions() {
-			if in.PromptID == promptID && in.ResponseMessage != "" {
-				return true
-			}
+// storeRecheckInterval backstops waitForStore for store writes that happen off
+// the sync-event path, such as the queue dispatching its next prompt from a
+// goroutine after a completion.
+const storeRecheckInterval = 250 * time.Millisecond
+
+// waitForStore returns true once cond holds, or false after timeout. It
+// re-checks after every processed sync event and every storeRecheckInterval.
+func (d *testDriver) waitForStore(cond func() bool, timeout time.Duration) bool {
+	deadline := time.NewTimer(timeout)
+	defer deadline.Stop()
+	recheck := time.NewTicker(storeRecheckInterval)
+	defer recheck.Stop()
+	for !cond() {
+		select {
+		case <-d.storeChanged:
+		case <-recheck.C:
+		case <-deadline.C:
+			return cond()
 		}
-		time.Sleep(300 * time.Millisecond)
 	}
-	return false
+	return true
 }
 
-// waitInteractionState polls until the interaction for promptID reaches one of
-// wantStates, returning true on success or false on timeout.
+// waitInteractionStreaming waits until the interaction for promptID has
+// streamed assistant content — the same precondition Phase 8 uses before
+// interrupting, so the second message lands mid-turn rather than before the turn
+// has started (cancelling a not-yet-started turn leaves the follow-up wedged).
+// Queue interactions use their interaction id as the request id.
+func (d *testDriver) waitInteractionStreaming(promptID string, timeout time.Duration) bool {
+	return d.waitForStore(func() bool {
+		interactionID, _ := d.findInteractionByPromptID(promptID)
+		d.mu.Lock()
+		defer d.mu.Unlock()
+		return interactionID != "" && d.round.streamingRequests[interactionID]
+	}, timeout)
+}
+
+// waitInteractionState waits until the interaction for promptID reaches one of
+// wantStates.
 func (d *testDriver) waitInteractionState(promptID string, wantStates map[string]bool, timeout time.Duration) bool {
-	deadline := time.Now().Add(timeout)
-	for time.Now().Before(deadline) {
-		if _, st := d.findInteractionByPromptID(promptID); st != "" && wantStates[st] {
-			return true
-		}
-		time.Sleep(500 * time.Millisecond)
-	}
-	return false
+	return d.waitForStore(func() bool {
+		_, st := d.findInteractionByPromptID(promptID)
+		return wantStates[st]
+	}, timeout)
 }
 
 // runQueuePhases drives the production send path against live Zed:
@@ -1794,8 +1806,8 @@ func (d *testDriver) waitInteractionState(promptID string, wantStates map[string
 //	Phase 17 (interrupt): enqueue interrupt=true while busy and assert it cancels
 //	  the running turn (interaction → interrupted) and its own message is delivered.
 //
-// Driven by polling the store because queue prompts get generated request_ids
-// that don't flow through the phase-completion switch.
+// Driven by store waits because queue prompts get generated request_ids that
+// don't flow through the phase-completion switch.
 func (d *testDriver) runQueuePhases() {
 	agent := d.round.agentName
 	d.mu.Lock()
@@ -1825,7 +1837,7 @@ func (d *testDriver) runQueuePhases() {
 	log.Printf("==================================================")
 	d.startPhaseTimeout(16)
 
-	promptA, err := d.srv.EnqueueQueuedPrompt(sessID, "Count slowly from 1 to 40, writing one number per line with a short fact about each.", false)
+	promptA, err := d.srv.EnqueueQueuedPrompt(sessID, longTurn("Count slowly from 1 to 40, writing one number per line with a short fact about each."), false)
 	if err != nil {
 		log.Printf("[%s] Phase 16: ABORT — enqueue A failed: %v", agent, err)
 		os.Exit(1)
@@ -1874,7 +1886,7 @@ func (d *testDriver) runQueuePhases() {
 	log.Printf("==================================================")
 	d.startPhaseTimeout(17)
 
-	promptX, err := d.srv.EnqueueQueuedPrompt(sessID, "Count slowly from 1 to 60, one number per line, with a short sentence about each.", false)
+	promptX, err := d.srv.EnqueueQueuedPrompt(sessID, longTurn("Count slowly from 1 to 60, one number per line, with a short sentence about each."), false)
 	if err != nil {
 		log.Printf("[%s] Phase 17: ABORT — enqueue X failed: %v", agent, err)
 		os.Exit(1)
@@ -2944,8 +2956,13 @@ func main() {
 	log.Printf("[test-server] Listening on ws://127.0.0.1:%d", port)
 	log.Println("[test-server] Using REAL HelixAPIServer handlers with in-memory store")
 
-	if err := os.WriteFile(portFile, []byte(fmt.Sprintf("%d", port)), 0644); err != nil {
+	// Write then rename, so run_e2e.sh (which starts Zed the moment the file
+	// exists) never reads a half-written port.
+	if err := os.WriteFile(portFile+".tmp", []byte(fmt.Sprintf("%d", port)), 0644); err != nil {
 		log.Fatalf("[test-server] Failed to write port file: %v", err)
+	}
+	if err := os.Rename(portFile+".tmp", portFile); err != nil {
+		log.Fatalf("[test-server] Failed to publish port file: %v", err)
 	}
 
 	go func() {

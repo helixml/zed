@@ -192,6 +192,36 @@ func handle(req request) {
 	}
 }
 
+// longTurnCue marks a prompt whose turn must still be streaming when the
+// lifecycle driver acts on it: an interrupt or cancel aimed mid-turn, a message
+// queued behind a busy session, or the streaming-cadence measurement. Every
+// other prompt gets a short turn, so the suite spends no time on turns it only
+// needs to complete. Must match lifecycleLongTurnCue in helix-ws-test-server.
+const longTurnCue = "[e2e:long-turn]"
+
+// Turn shapes. A long turn is cancellable at every chunk, so turns the driver
+// interrupts end as soon as the cancel lands; only uninterrupted long turns
+// pay the full longTurnChunks*longTurnChunkGap (2.5s), which is ample margin
+// for a driver that reacts to the first streamed chunk within milliseconds.
+const (
+	shortTurnChunks  = 3
+	longTurnChunks   = 25
+	longTurnChunkGap = 100 * time.Millisecond
+)
+
+// promptText concatenates the text blocks of a session/prompt request.
+func promptText(params map[string]interface{}) string {
+	blocks, _ := params["prompt"].([]interface{})
+	var text strings.Builder
+	for _, entry := range blocks {
+		block, _ := entry.(map[string]interface{})
+		if value, _ := block["text"].(string); value != "" {
+			text.WriteString(value)
+		}
+	}
+	return text.String()
+}
+
 func runLifecyclePrompt(req request) {
 	sessionID := stringParam(req.Params, "sessionId", "")
 	turn := lifecycleCount.Add(1)
@@ -203,25 +233,41 @@ func runLifecyclePrompt(req request) {
 	cancels[sessionID] = cancel
 	cancelMu.Unlock()
 
+	chunks, gap := shortTurnChunks, time.Duration(0)
+	if strings.Contains(promptText(req.Params), longTurnCue) {
+		chunks, gap = longTurnChunks, longTurnChunkGap
+	}
+
 	go func() {
-		stopReason := "end_turn"
-		for i := 1; i <= 60; i++ {
-			select {
-			case <-cancel:
-				stopReason = "cancelled"
-				i = 60
-			default:
-				publishText(sessionID, fmt.Sprintf("scripted turn %02d chunk %02d. ", turn, i))
-				time.Sleep(120 * time.Millisecond)
-			}
-		}
-		respond(req.ID, map[string]interface{}{"stopReason": stopReason})
+		respond(req.ID, map[string]interface{}{"stopReason": streamTurn(sessionID, turn, chunks, gap, cancel)})
 		cancelMu.Lock()
 		if cancels[sessionID] == cancel {
 			delete(cancels, sessionID)
 		}
 		cancelMu.Unlock()
 	}()
+}
+
+// streamTurn publishes chunks text chunks gap apart and returns the ACP stop
+// reason: "cancelled" as soon as cancel closes, "end_turn" otherwise.
+func streamTurn(sessionID string, turn int64, chunks int, gap time.Duration, cancel <-chan struct{}) string {
+	for i := 1; i <= chunks; i++ {
+		select {
+		case <-cancel:
+			return "cancelled"
+		default:
+		}
+		publishText(sessionID, fmt.Sprintf("scripted turn %02d chunk %02d. ", turn, i))
+		if i == chunks || gap == 0 {
+			continue
+		}
+		select {
+		case <-cancel:
+			return "cancelled"
+		case <-time.After(gap):
+		}
+	}
+	return "end_turn"
 }
 
 func main() {

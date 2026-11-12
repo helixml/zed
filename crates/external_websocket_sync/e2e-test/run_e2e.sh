@@ -20,8 +20,8 @@ echo "============================================"
 echo ""
 
 ZED_BINARY="${ZED_BINARY:-/usr/local/bin/zed}"
-# Default timeout scales with number of agent rounds (each round takes ~150s
-# including Phase 15's long-form prose streaming).
+# Default timeout scales with number of agent rounds (a model-backed round takes
+# ~150s including Phase 15's long-form prose streaming).
 AGENT_COUNT=$(echo "${E2E_AGENTS:-zed-agent}" | tr ',' '\n' | wc -l)
 DEFAULT_TIMEOUT=$((300 * AGENT_COUNT))
 TEST_TIMEOUT="${TEST_TIMEOUT:-$DEFAULT_TIMEOUT}"
@@ -204,7 +204,12 @@ echo "[mock-server] Starting Go test server (shares wsprotocol with production H
 
 "$MOCK_SERVER" &
 MOCK_PID=$!
-sleep 2
+# The server writes its port file once it is listening.
+for _ in $(seq 100); do
+    [ -f "$MOCK_PORT_FILE" ] && break
+    kill -0 "$MOCK_PID" 2>/dev/null || break
+    sleep 0.1
+done
 
 if [ ! -f "$MOCK_PORT_FILE" ]; then
     echo "[error] Mock server failed to start"
@@ -446,8 +451,10 @@ echo ""
 echo "[test] Waiting for protocol flow to complete (timeout: ${TEST_TIMEOUT}s)..."
 
 # ---- Wait for test to complete ----
-ELAPSED=0
-while [ "$ELAPSED" -lt "$TEST_TIMEOUT" ]; do
+# Polled every 0.2s: Phase 12 waits on the restart below, and the run ends as
+# soon as the server exits.
+DEADLINE=$((SECONDS + TEST_TIMEOUT))
+while [ "$SECONDS" -lt "$DEADLINE" ]; do
     # Check if test server requested Zed restart (Phase 12: reconnect test)
     if [ -f "/tmp/zed-restart-requested" ]; then
         echo "[zed] Restart requested by test server (Phase 12: reconnect test)"
@@ -506,8 +513,7 @@ while [ "$ELAPSED" -lt "$TEST_TIMEOUT" ]; do
         fi
     fi
 
-    sleep 2
-    ELAPSED=$((ELAPSED + 2))
+    sleep 0.2
 done
 
 echo ""

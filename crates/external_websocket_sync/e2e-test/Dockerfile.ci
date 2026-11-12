@@ -11,15 +11,23 @@
 #   helix-api/   — Helix api/ source tree
 #   helix-org/   — Helix helix-org/ subdirectory (api/pkg/server imports it)
 
+# The Go stages share BuildKit cache mounts for the module and build caches.
+# The helix source changes on every CI run, so without them each run
+# re-downloaded every module and recompiled the whole dependency graph cold
+# (~3 minutes); with them only the changed packages rebuild.
+
 # Stage 1: Build Go test server with real Helix server code
 FROM golang:1.25-alpine AS go-builder
+# Before any COPY, so the C toolchain layer stays cached across source changes.
+RUN apk add --no-cache gcc g++ musl-dev
 COPY helix-go.mod /helix/go.mod
 COPY helix-go.sum /helix/go.sum
 COPY helix-api /helix/api
 COPY helix-org /helix/helix-org
 COPY helix-ws-test-server /app
 WORKDIR /app
-RUN apk add --no-cache gcc g++ musl-dev && \
+RUN --mount=type=cache,target=/go/pkg/mod \
+    --mount=type=cache,target=/root/.cache/go-build \
     sed -i 's|../../../../../helix|/helix|g' go.mod && \
     go mod tidy && \
     CGO_ENABLED=1 go build -ldflags '-extldflags "-static"' -o /helix-ws-test-server .
@@ -28,13 +36,15 @@ RUN apk add --no-cache gcc g++ musl-dev && \
 FROM golang:1.25-alpine AS mcp-builder
 COPY slow-mcp-server /app
 WORKDIR /app
-RUN CGO_ENABLED=0 go build -o /slow-mcp-server .
+RUN --mount=type=cache,target=/root/.cache/go-build \
+    CGO_ENABLED=0 go build -o /slow-mcp-server .
 
 # Stage 3: Build the deterministic ACP plan agent.
 FROM golang:1.25-alpine AS plan-agent-builder
 COPY plan-test-agent /app
 WORKDIR /app
-RUN CGO_ENABLED=0 go build -o /plan-test-agent .
+RUN --mount=type=cache,target=/root/.cache/go-build \
+    CGO_ENABLED=0 go build -o /plan-test-agent .
 
 # Stage 4: Runtime
 FROM ubuntu:25.10
