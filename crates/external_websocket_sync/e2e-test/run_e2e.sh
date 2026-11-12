@@ -5,13 +5,12 @@ set -euo pipefail
 # Tests the full flow: Zed connects → sends agent_ready → mock server sends
 # chat_message → Zed creates thread → streams response → sends message_completed
 #
-# The mock server is a Go binary (helix-ws-test-server) that imports the same
-# wsprotocol package used by the production Helix API server — same message
-# parsing, routing, and accumulation code runs in both tests and production.
+# The mock server is a Go binary (helix-ws-test-server) that runs the real
+# production HelixAPIServer handlers against an in-memory store.
 #
 # Environment variables:
 #   ZED_BINARY              - Path to Zed binary (default: /usr/local/bin/zed)
-#   TEST_TIMEOUT            - Timeout in seconds (default: 300)
+#   TEST_TIMEOUT            - Timeout in seconds (default: 300 per agent round)
 #   HELIX_WS_TEST_SERVER    - Path to Go test server binary (default: /usr/local/bin/helix-ws-test-server)
 
 echo "============================================"
@@ -20,11 +19,14 @@ echo "============================================"
 echo ""
 
 ZED_BINARY="${ZED_BINARY:-/usr/local/bin/zed}"
-# Default timeout scales with number of agent rounds (each round takes ~150s
-# including Phase 15's long-form prose streaming).
+# Default timeout scales with number of agent rounds (a model-backed round takes
+# ~150s including Phase 15's long-form prose streaming).
 AGENT_COUNT=$(echo "${E2E_AGENTS:-zed-agent}" | tr ',' '\n' | wc -l)
 DEFAULT_TIMEOUT=$((300 * AGENT_COUNT))
 TEST_TIMEOUT="${TEST_TIMEOUT:-$DEFAULT_TIMEOUT}"
+# The server gets a slightly shorter budget so its own timeout, which dumps the
+# round state, fires before this script gives up on it.
+export E2E_SERVER_TIMEOUT_SECS=$((TEST_TIMEOUT - 20))
 MOCK_SERVER="${HELIX_WS_TEST_SERVER:-/usr/local/bin/helix-ws-test-server}"
 PROJECT_DIR="/test/project"
 MOCK_PORT_FILE="/tmp/mock_helix_port"
@@ -204,7 +206,12 @@ echo "[mock-server] Starting Go test server (shares wsprotocol with production H
 
 "$MOCK_SERVER" &
 MOCK_PID=$!
-sleep 2
+# The server writes its port file once it is listening.
+for _ in $(seq 100); do
+    [ -f "$MOCK_PORT_FILE" ] && break
+    kill -0 "$MOCK_PID" 2>/dev/null || break
+    sleep 0.1
+done
 
 if [ ! -f "$MOCK_PORT_FILE" ]; then
     echo "[error] Mock server failed to start"
@@ -446,8 +453,10 @@ echo ""
 echo "[test] Waiting for protocol flow to complete (timeout: ${TEST_TIMEOUT}s)..."
 
 # ---- Wait for test to complete ----
-ELAPSED=0
-while [ "$ELAPSED" -lt "$TEST_TIMEOUT" ]; do
+# Polled every 0.2s: Phase 12 waits on the restart below, and the run ends as
+# soon as the server exits.
+DEADLINE=$((SECONDS + TEST_TIMEOUT))
+while [ "$SECONDS" -lt "$DEADLINE" ]; do
     # Check if test server requested Zed restart (Phase 12: reconnect test)
     if [ -f "/tmp/zed-restart-requested" ]; then
         echo "[zed] Restart requested by test server (Phase 12: reconnect test)"
@@ -470,8 +479,8 @@ while [ "$ELAPSED" -lt "$TEST_TIMEOUT" ]; do
         echo "[error] Zed exited early with code ${ZED_EXIT:-0}"
         # Still check if mock server got enough events
         if ! kill -0 "$MOCK_PID" 2>/dev/null; then
-            wait "$MOCK_PID"
-            MOCK_EXIT=$?
+            MOCK_EXIT=0
+            wait "$MOCK_PID" || MOCK_EXIT=$?
             if [ "$MOCK_EXIT" -eq 0 ]; then
                 echo ""
                 echo "============================================"
@@ -489,8 +498,8 @@ while [ "$ELAPSED" -lt "$TEST_TIMEOUT" ]; do
 
     # Check if mock server completed successfully
     if ! kill -0 "$MOCK_PID" 2>/dev/null; then
-        wait "$MOCK_PID"
-        MOCK_EXIT=$?
+        MOCK_EXIT=0
+        wait "$MOCK_PID" || MOCK_EXIT=$?
         if [ "$MOCK_EXIT" -eq 0 ]; then
             echo ""
             echo "============================================"
@@ -506,8 +515,7 @@ while [ "$ELAPSED" -lt "$TEST_TIMEOUT" ]; do
         fi
     fi
 
-    sleep 2
-    ELAPSED=$((ELAPSED + 2))
+    sleep 0.2
 done
 
 echo ""

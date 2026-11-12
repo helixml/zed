@@ -4,7 +4,7 @@
 // tests and production.
 //
 // The server runs multiple "rounds", one per agent type (zed-agent, claude, etc.).
-// Each round executes the same 15 test phases:
+// Each round executes the same 17 test phases:
 //
 //	Phase 1: Basic thread creation (new chat_message, no thread ID)
 //	Phase 2: Follow-up on existing thread (same thread ID)
@@ -15,7 +15,7 @@
 //	Phase 7: Open thread + follow-up (open_thread command then chat_message)
 //	Phase 8: Mid-stream interrupt (send follow-up while previous response is streaming)
 //	Phase 9: Rapid 3-turn cancel (chat_message, then simulate_user_input interrupt, then chat_message)
-//	Phase 10: User-created thread (inject user_created_thread, verify work session, send chat on new thread)
+//	Phase 10: User-created thread (inject user_created_thread, verify a session is created for it)
 //	Phase 11: Spectask routing (set SpecTaskID on threads, verify FindConnectedSessionForSpecTask picks most recent)
 //	Phase 12: Reconnect test (kill Zed, wait for reconnection, send message to existing thread, verify delivery)
 //	Phase 13: Helix-initiated cancel (send chat_message, then cancel_current_turn, verify turn_cancelled with status cancelled)
@@ -24,6 +24,8 @@
 //	          arrive throughout the response, not bunched at the end. Catches the regression where Zed's
 //	          streaming-reveal task drains text into the markdown entity without re-emitting EntryUpdated,
 //	          so external_websocket_sync only sees stale snapshots until message_completed.)
+//	Phase 16: Production queue busy-defer (enqueue interrupt=false while busy; held, then delivered when idle)
+//	Phase 17: Production queue interrupt (enqueue interrupt=true while busy; cancels the turn, then delivered)
 //
 // Smoke mode (E2E_SMOKE=1) replaces the phase chain above with a single phase:
 // the agent is asked to read a file holding a magic number and echo it back. It
@@ -48,7 +50,9 @@ import (
 	"net/http"
 	"os"
 	"os/exec"
+	"slices"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -92,7 +96,6 @@ type roundState struct {
 	// Phase 10: user-created thread (multi-thread sync)
 	phase10NewThreadID      string // synthetic thread ID injected via ProcessSyncEvent
 	phase10WorkSessionFound bool   // whether the work session was created
-	phase10ChatCompleted    bool   // whether chat on the new thread completed
 
 	// Phase 11: spectask routing (verifies findConnectedSessionForSpecTask
 	// picks the most recently active session)
@@ -121,7 +124,7 @@ type roundState struct {
 	phase15Adds        []phase15AddSample // per message_added: timestamp + content length
 	phase15FinalLen    int                // length of the final assistant content
 
-	// Phase 16: regression for the speculative-draft `user_created_thread`
+	// Draft-emit check: regression for the speculative-draft `user_created_thread`
 	// emit. Pre-Fix-1a (helixml/zed PR #56), every Zed startup fired a
 	// spontaneous `user_created_thread` for the agent panel's
 	// `activate_draft` ConversationView — see
@@ -141,12 +144,20 @@ type roundState struct {
 	// processPendingPromptsForSession → processPromptQueue / processInterruptPrompt
 	// → sendQueuedPromptToSession — the path all production agent sends now use.
 	// Queue prompts get generated request_ids (not "req-phaseN-"), so these
-	// phases are driven by polling the store, not the completion switch.
-	queueThreadID      string // established thread the queue phases reuse
-	phase16Deferred    bool   // interrupt=false was HELD while busy (no concurrent interaction)
-	phase16Delivered   bool   // the deferred message was delivered as the next turn once idle
-	phase17Interrupted bool   // interrupt=true cancelled the running turn (interaction went interrupted)
-	phase17Delivered   bool   // the interrupt message was delivered
+	// phases are driven by store and stream waits, not the completion switch.
+	queueThreadID string // established thread the queue phases reuse
+	// streamingRequests holds the request ids that have streamed agent output
+	// (isAgentOutput). The store cannot answer "is this turn streaming?":
+	// production buffers streamed content in memory and flushes it at
+	// message_completed.
+	streamingRequests map[string]bool
+	// advancedPhases holds the phases whose success has been claimed
+	// (claimAdvanceLocked). Per round, because phase numbers repeat each round.
+	advancedPhases     map[int]bool
+	phase16Deferred    bool // interrupt=false was HELD while busy (no concurrent interaction)
+	phase16Delivered   bool // the deferred message was delivered as the next turn once idle
+	phase17Interrupted bool // interrupt=true cancelled the running turn (interaction went interrupted)
+	phase17Delivered   bool // the interrupt message was delivered
 }
 
 // phase15AddSample records a single message_added event tied to phase 15's
@@ -178,8 +189,10 @@ func responseEntryLeak(previous map[responseEntryKey]string, messageID, content 
 
 func newRoundState(agentName string) *roundState {
 	return &roundState{
-		agentName:   agentName,
-		completions: make(map[string][]string),
+		agentName:         agentName,
+		completions:       make(map[string][]string),
+		streamingRequests: make(map[string]bool),
+		advancedPhases:    make(map[int]bool),
 	}
 }
 
@@ -212,17 +225,20 @@ func (d *testDriver) stampRoundAgentOnSeedSession(agentName string) {
 	ctx := context.Background()
 	sess, err := d.store.GetSession(ctx, sessionID)
 	if err != nil {
-		log.Printf("[%s] WARNING: could not stamp round agent on seed session %s: %v",
-			agentName, sessionID, err)
-		return
+		d.abort("could not stamp round agent %s on seed session %s: %v", agentName, sessionID, err)
 	}
 	sess.Metadata.ZedAgentName = agentName
 	if _, err := d.store.UpdateSession(ctx, *sess); err != nil {
-		log.Printf("[%s] WARNING: could not persist ZedAgentName=%s on %s: %v",
-			agentName, agentName, sessionID, err)
-		return
+		d.abort("could not persist ZedAgentName=%s on seed session %s: %v", agentName, sessionID, err)
 	}
 	log.Printf("[%s] Seed session %s stamped ZedAgentName=%s", agentName, sessionID, agentName)
+}
+
+// ownsThread reports whether a Zed thread was created in this round. Every
+// phase's thread (including the phase 8/13/15/16 captures) is appended to
+// threadIDs by the thread_created handler before it is captured.
+func (r *roundState) ownsThread(threadID string) bool {
+	return slices.Contains(r.threadIDs, threadID)
 }
 
 // reqID returns a round-namespaced request ID for validation uniqueness.
@@ -248,27 +264,14 @@ type testDriver struct {
 	// Collected round results for final summary
 	roundResults []roundResult
 
-	// Monotonic counter to detect stale advanceToNextRound calls.
-	// Incremented on every round transition. Goroutines capture the value
-	// before sleeping and check it hasn't changed when they wake up.
+	// Monotonic counter, incremented on every round transition, so a phase
+	// timeout armed in one round cannot fire in the next.
 	roundGeneration int
 
-	// Per-phase timeout tracking
-	phaseStarted  time.Time
-	phaseTimedOut map[int]bool // phases that timed out (skip in validation)
-
-	// Phases whose success condition has been met but which have not yet
-	// bumped d.phase, because the advance path deliberately settles first
-	// (500ms in the completion handler, plus 2s inside advanceAfterCompletion).
-	//
-	// The phase-timeout watcher aborts solely on `d.phase != phase`, so without
-	// this it can declare an ALREADY-SUCCESSFUL phase timed out whenever the
-	// completion lands within ~2.5s of the deadline. That is routine for the
-	// claude round, which is slower than zed-agent, and more likely under load.
-	// Observed directly:
-	//   11:43:57 Phase 9: Received enough completions -- thread did not hang
-	//   11:43:58 PHASE 9 TIMED OUT after 1m30s
-	phaseSucceeded map[int]bool
+	// storeChanged is signalled after every processed sync event; store waits
+	// re-check on it instead of polling. Buffered(1): one pending wake-up is
+	// enough, since a waiter re-reads the whole store.
+	storeChanged chan struct{}
 }
 
 type roundResult struct {
@@ -279,16 +282,26 @@ type roundResult struct {
 
 func newTestDriver(srv *server.HelixAPIServer, store *memorystore.MemoryStore, agents []string) *testDriver {
 	return &testDriver{
-		srv:         srv,
-		store:       store,
-		done:        make(chan struct{}),
-		agentRounds: agents,
-		round:       newRoundState(agents[0]),
+		srv:          srv,
+		store:        store,
+		done:         make(chan struct{}),
+		storeChanged: make(chan struct{}, 1),
+		agentRounds:  agents,
+		round:        newRoundState(agents[0]),
 	}
 }
 
-// syncEventCallback is called by the production handler after every sync event.
+// syncEventCallback is called by the production handler after every sync event,
+// once the event's store writes are done.
 func (d *testDriver) syncEventCallback(sessionID string, syncMsg *types.SyncMessage) {
+	d.handleSyncEvent(syncMsg)
+	select {
+	case d.storeChanged <- struct{}{}:
+	default:
+	}
+}
+
+func (d *testDriver) handleSyncEvent(syncMsg *types.SyncMessage) {
 	d.mu.Lock()
 	d.round.events = append(d.round.events, *syncMsg)
 
@@ -319,7 +332,7 @@ func (d *testDriver) syncEventCallback(sessionID string, syncMsg *types.SyncMess
 			agentName := d.round.agentName
 			if len(d.round.threadIDs) == 0 {
 				d.mu.Unlock()
-				log.Printf("[%s] Phase 12: ERROR no thread IDs available", agentName)
+				d.abort("no thread IDs available to reopen after reconnect")
 				return
 			}
 			threadID := d.round.threadIDs[0]
@@ -383,11 +396,11 @@ func (d *testDriver) syncEventCallback(sessionID string, syncMsg *types.SyncMess
 			// only by the test driver, never by Zed (which uses ACP UUIDs),
 			// so this exclusion cannot mask a real Zed regression.
 			if acpThreadID == d.round.phase10NewThreadID {
-				log.Printf("[%s] Phase 10 injected user_created_thread: %s (excluded from Phase 16 counter)", d.round.agentName, truncate(acpThreadID, 16))
+				log.Printf("[%s] Phase 10 injected user_created_thread: %s (excluded from the draft-emit counter)", d.round.agentName, truncate(acpThreadID, 16))
 				break
 			}
 			log.Printf("[%s] Spontaneous user_created_thread: %s (not tracked for phases)", d.round.agentName, truncate(acpThreadID, 16))
-			// Phase 16: count these for the deferred-emit regression
+			// Count these for the draft-emit check
 			// assertion. Post-Fix-1a there should be zero of these per
 			// round — emission is deferred until the user actually
 			// sends in the draft thread, which never happens in our
@@ -407,20 +420,15 @@ func (d *testDriver) syncEventCallback(sessionID string, syncMsg *types.SyncMess
 		// Ignore message_added events for threads from previous rounds.
 		// Check if the thread ID belongs to the current round's tracked threads.
 		addedThreadID, _ := syncMsg.Data["acp_thread_id"].(string)
-		isCurrentRoundThread := false
-		for _, tid := range d.round.threadIDs {
-			if tid == addedThreadID {
-				isCurrentRoundThread = true
-				break
-			}
-		}
-		// Also check phase 8/9/13/15 thread IDs (they may not be in threadIDs yet)
-		if addedThreadID == d.round.phase8ThreadID || addedThreadID == d.round.phase9ThreadID || addedThreadID == d.round.phase13ThreadID || addedThreadID == d.round.phase15ThreadID {
-			isCurrentRoundThread = true
-		}
-		if !isCurrentRoundThread && addedThreadID != "" {
+		if !d.round.ownsThread(addedThreadID) && addedThreadID != "" {
 			d.mu.Unlock()
 			return // silently ignore stale events
+		}
+
+		if isAgentOutput(syncMsg.Data) {
+			if requestID, _ := syncMsg.Data["request_id"].(string); requestID != "" {
+				d.round.streamingRequests[requestID] = true
+			}
 		}
 
 		// Phase 15: record (timestamp, content_length) for every assistant
@@ -443,9 +451,8 @@ func (d *testDriver) syncEventCallback(sessionID string, syncMsg *types.SyncMess
 		// Phase 8: send an interrupt on the first assistant event for the phase 8
 		// thread, while the initial turn is still active.
 		if d.phase == 8 && !d.round.phase8InterruptSent {
-			role, _ := syncMsg.Data["role"].(string)
 			threadID, _ := syncMsg.Data["acp_thread_id"].(string)
-			if role == "assistant" && threadID == d.round.phase8ThreadID {
+			if isAgentOutput(syncMsg.Data) && threadID == d.round.phase8ThreadID {
 				d.round.phase8InterruptSent = true
 				agentName := d.round.agentName
 				requestID := d.round.reqID("phase8-interrupt")
@@ -453,11 +460,10 @@ func (d *testDriver) syncEventCallback(sessionID string, syncMsg *types.SyncMess
 				log.Printf("[%s] Phase 8: First assistant event arrived, sending interrupt to %s", agentName, truncate(threadID, 16))
 				routedSessionID, ok := d.srv.ContextMappings()[threadID]
 				if !ok {
-					log.Printf("[test-server] WARNING: Phase 8 interrupt %s has no session mapping for thread %s", requestID, threadID)
-					return
+					d.abort("interrupt %s: no session mapping for thread %s", requestID, threadID)
 				}
 				if err := d.srv.SendChatMessageWithInterrupt(routedSessionID, "Actually just say 'hello'.", requestID, true); err != nil {
-					log.Printf("[test-server] WARNING: Phase 8 interrupt %s failed for session %s: %v", requestID, routedSessionID, err)
+					d.abort("interrupt %s failed for session %s: %v", requestID, routedSessionID, err)
 				}
 				return
 			}
@@ -466,9 +472,8 @@ func (d *testDriver) syncEventCallback(sessionID string, syncMsg *types.SyncMess
 		// Phase 13: send cancel_current_turn as soon as the first assistant token arrives.
 		// This tests the Helix-initiated cancel flow via the cancel_current_turn command.
 		if d.phase == 13 && !d.round.phase13CancelSent {
-			role, _ := syncMsg.Data["role"].(string)
 			threadID, _ := syncMsg.Data["acp_thread_id"].(string)
-			if role == "assistant" && threadID == d.round.phase13ThreadID {
+			if isAgentOutput(syncMsg.Data) && threadID == d.round.phase13ThreadID {
 				d.round.phase13CancelSent = true
 				agentName := d.round.agentName
 				reqID := d.round.reqID("phase13")
@@ -485,9 +490,8 @@ func (d *testDriver) syncEventCallback(sessionID string, syncMsg *types.SyncMess
 		// creates a 3-turn rapid cancel chain that previously caused a Task to
 		// be dropped, breaking the oneshot channel and hanging the thread.
 		if d.phase == 9 && !d.round.phase9RapidSent {
-			role, _ := syncMsg.Data["role"].(string)
 			threadID, _ := syncMsg.Data["acp_thread_id"].(string)
-			if role == "assistant" && threadID == d.round.phase9ThreadID {
+			if isAgentOutput(syncMsg.Data) && threadID == d.round.phase9ThreadID {
 				d.round.phase9RapidSent = true
 				agentName := d.round.agentName
 				d.mu.Unlock()
@@ -534,17 +538,7 @@ func (d *testDriver) syncEventCallback(sessionID string, syncMsg *types.SyncMess
 				agentName, requestID, truncate(acpThreadID, 12))
 			return
 		}
-		isCurrentRoundThread := false
-		for _, tid := range d.round.threadIDs {
-			if tid == acpThreadID {
-				isCurrentRoundThread = true
-				break
-			}
-		}
-		if acpThreadID == d.round.phase8ThreadID || acpThreadID == d.round.phase9ThreadID || acpThreadID == d.round.phase13ThreadID || acpThreadID == d.round.phase15ThreadID {
-			isCurrentRoundThread = true
-		}
-		if !isCurrentRoundThread && acpThreadID != "" {
+		if !d.round.ownsThread(acpThreadID) && acpThreadID != "" {
 			d.mu.Unlock()
 			log.Printf("[%s] FILTERED completion (wrong thread): req=%s thread=%s known=%v",
 				agentName, requestID, truncate(acpThreadID, 12), d.round.threadIDs)
@@ -579,46 +573,27 @@ func (d *testDriver) syncEventCallback(sessionID string, syncMsg *types.SyncMess
 				agentName, completions, truncate(acpThreadID, 12), requestID)
 			if completions >= 2 {
 				log.Printf("[%s] Phase 8: Both turns completed (cancelled + interrupt)", agentName)
-				d.markPhaseSucceeded(8)
-				time.Sleep(500 * time.Millisecond)
 				go d.advanceAfterCompletion(8)
 			}
 			return
 		}
 
-		// Phase 9: rapid 3-turn cancel -- we expect at least 2 completions
-		// (some turns may be cancelled/dropped, but the thread must not hang).
+		// Phase 9: rapid 3-turn cancel. An earlier turn may be cancelled or
+		// absorbed, but the thread must not hang: the last turn sent (the queue
+		// delivery) has to complete, and the phase advances only then.
 		if currentPhase == 9 && acpThreadID == d.round.phase9ThreadID {
 			d.round.phase9Completions++
 			completions := d.round.phase9Completions
+			advance := requestID == d.round.reqID("phase9-queue") && d.claimAdvanceLocked(9)
+			if advance {
+				d.phase = 10
+			}
 			d.mu.Unlock()
 			log.Printf("[%s] Phase 9: Completion %d for thread=%s req=%s",
 				agentName, completions, truncate(acpThreadID, 12), requestID)
-			if completions >= 2 {
-				log.Printf("[%s] Phase 9: Received enough completions -- thread did not hang", agentName)
-				// Record the advance IMMEDIATELY. The phase has succeeded at this
-				// point; the pause below is only pacing before phase 10 sends its
-				// first message.
-				//
-				// Previously d.phase stayed at 9 across a 500ms sleep plus
-				// goroutine scheduling, and the phase-timeout watcher aborts
-				// solely on `d.phase != phase`. When completions land near the end
-				// of the 90s window — routine for claude, which is slower than
-				// zed-agent — the watcher fired on an ALREADY-SUCCESSFUL phase:
-				//
-				//   11:43:57 Phase 9: Received enough completions -- thread did not hang
-				//   11:43:58 PHASE 9 TIMED OUT after 1m30s
-				//
-				// Advancing under the lock first closes that window entirely,
-				// rather than papering over it by enlarging the timeout.
-				d.markPhaseSucceeded(9)
-				d.mu.Lock()
-				d.phase = 10
-				d.mu.Unlock()
-				go func() {
-					time.Sleep(500 * time.Millisecond)
-					d.runPhase10()
-				}()
+			if advance {
+				log.Printf("[%s] Phase 9: Last queued turn completed -- thread did not hang", agentName)
+				go d.runPhase10()
 			}
 			return
 		}
@@ -651,12 +626,13 @@ func (d *testDriver) syncEventCallback(sessionID string, syncMsg *types.SyncMess
 		queryID, _ := syncMsg.Data["query_id"].(string)
 		activeView, _ := syncMsg.Data["active_view"].(string)
 		threadID, _ := syncMsg.Data["thread_id"].(string)
+		advance := currentPhase == 6 && d.claimAdvanceLocked(6)
 		d.mu.Unlock()
 
 		log.Printf("[%s] UI state: query_id=%s active_view=%s thread_id=%s (phase %d)",
 			agentName, queryID, activeView, truncate(threadID, 12), currentPhase)
 
-		if currentPhase == 6 {
+		if advance {
 			go d.advanceAfterUiState()
 		}
 		return
@@ -667,20 +643,26 @@ func (d *testDriver) syncEventCallback(sessionID string, syncMsg *types.SyncMess
 		currentPhase := d.phase
 		agentName := d.round.agentName
 
-		if currentPhase == 13 {
+		if currentPhase == 13 && requestID == d.round.reqID("phase13") {
 			d.round.phase13TurnCancelled = true
 			d.round.phase13CancelStatus = status
+			advance := d.claimAdvanceLocked(13)
 			d.mu.Unlock()
 			log.Printf("[%s] Phase 13: turn_cancelled received: request_id=%s status=%s", agentName, requestID, status)
-			go d.advanceAfterPhase13()
+			if advance {
+				go d.advanceAfterPhase13()
+			}
 			return
 		}
-		if currentPhase == 14 {
+		if currentPhase == 14 && requestID == noopCancelRequestID {
 			d.round.phase14TurnCancelled = true
 			d.round.phase14CancelStatus = status
+			advance := d.claimAdvanceLocked(14)
 			d.mu.Unlock()
 			log.Printf("[%s] Phase 14: turn_cancelled received: request_id=%s status=%s", agentName, requestID, status)
-			go d.advanceAfterPhase14()
+			if advance {
+				go d.advanceAfterPhase14()
+			}
 			return
 		}
 		d.mu.Unlock()
@@ -753,7 +735,9 @@ func (d *testDriver) sendSimulateUserInput(acpThreadID, message, requestID, agen
 			"agent_name":    agentName,
 		},
 	}
-	d.srv.QueueCommand(d.agentID, cmd)
+	if !d.srv.QueueCommand(d.agentID, cmd) {
+		d.abort("failed to send simulate_user_input to agent %s", d.agentID)
+	}
 }
 
 func (d *testDriver) sendOpenThread(acpThreadID, agentName string) {
@@ -798,6 +782,18 @@ func (d *testDriver) sendQueryUiState(queryID string) {
 
 const phaseTimeout = 90 * time.Second
 
+// lifecycleLongTurnCue asks the scripted lifecycle agent (plan-test-agent with
+// E2E_SCRIPTED_LIFECYCLE=1) for a long, slowly streamed turn; every other prompt
+// gets a short one. It goes on exactly the prompts whose turn must still be
+// streaming when the driver acts on it. Model-backed agents read it as part of
+// a request that already asks for a long answer. Must match longTurnCue in
+// plan-test-agent.
+const lifecycleLongTurnCue = "[e2e:long-turn]"
+
+func longTurn(prompt string) string {
+	return prompt + " " + lifecycleLongTurnCue
+}
+
 // Smoke mode: a single tool-call phase instead of the full suite. See the
 // package comment. smokePhase is deliberately outside the 1..17 range so no
 // phase-numbered branch elsewhere can mistake it for a real phase.
@@ -840,113 +836,84 @@ func (d *testDriver) startRound() {
 	d.runPhase1()
 }
 
-// startPhaseTimeout launches a watchdog that fires if the current phase
-// doesn't complete within phaseTimeout. On timeout it dumps diagnostic
-// state and advances to the next round (failing the current one).
+// startPhaseTimeout arms a watchdog that aborts the run if the phase has
+// neither advanced nor succeeded within phaseTimeout. It is for phases that
+// wait on an event with no deadline of their own.
 func (d *testDriver) startPhaseTimeout(phase int) {
 	d.mu.Lock()
-	d.phaseStarted = time.Now()
 	gen := d.roundGeneration
-	agent := d.round.agentName
 	d.mu.Unlock()
 
-	go func() {
-		time.Sleep(phaseTimeout)
+	time.AfterFunc(phaseTimeout, func() {
 		d.mu.Lock()
-		if d.roundGeneration != gen {
-			d.mu.Unlock()
-			return // round already advanced
-		}
-		if d.phase != phase {
-			d.mu.Unlock()
-			return // phase already advanced
-		}
-		if d.phaseSucceeded[phase] {
-			d.mu.Unlock()
-			return // succeeded already; still settling before it bumps d.phase
-		}
-		// Phase timed out — dump state
-		if d.phaseTimedOut == nil {
-			d.phaseTimedOut = make(map[int]bool)
-		}
-		d.phaseTimedOut[phase] = true
-		eventCount := len(d.round.events)
-		threadCount := len(d.round.threadIDs)
-		threads := make([]string, len(d.round.threadIDs))
-		copy(threads, d.round.threadIDs)
-		completions := make(map[string][]string)
-		for k, v := range d.round.completions {
-			completions[k] = v
-		}
+		stale := d.roundGeneration != gen || d.phase != phase || d.round.advancedPhases[phase]
 		d.mu.Unlock()
-
-		log.Printf("\n!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!")
-		log.Printf("  [%s] PHASE %d TIMED OUT after %s", agent, phase, phaseTimeout)
-		log.Printf("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!")
-		log.Printf("[%s] State at timeout:", agent)
-		log.Printf("[%s]   Events received: %d", agent, eventCount)
-		log.Printf("[%s]   Threads: %d %v", agent, threadCount, threads)
-		log.Printf("[%s]   Completions: %v", agent, completions)
-
-		// Dump recent events
-		d.mu.Lock()
-		events := d.round.events
-		d.mu.Unlock()
-		start := 0
-		if len(events) > 10 {
-			start = len(events) - 10
+		if !stale {
+			d.abort("PHASE %d TIMED OUT after %s", phase, phaseTimeout)
 		}
-		for i := start; i < len(events); i++ {
-			data, _ := json.Marshal(events[i].Data)
-			dataStr := string(data)
-			if len(dataStr) > 200 {
-				dataStr = dataStr[:200] + "..."
-			}
-			log.Printf("[%s]   event %d: type=%s data=%s", agent, i, events[i].EventType, dataStr)
-		}
+	})
+}
 
-		log.Printf("[%s] ABORTING: phase %d timed out — phases are sequential, cannot continue", agent, phase)
-		os.Exit(1)
-	}()
+// abort ends the run on a failure the sequential phase chain cannot recover
+// from, after dumping the round state that diagnoses it. Callers must not hold
+// d.mu.
+func (d *testDriver) abort(format string, args ...interface{}) {
+	d.mu.Lock()
+	agent := d.round.agentName
+	phase := d.phase
+	threads := append([]string(nil), d.round.threadIDs...)
+	completions := make(map[string][]string, len(d.round.completions))
+	for k, v := range d.round.completions {
+		completions[k] = v
+	}
+	events := d.round.events
+	d.mu.Unlock()
+
+	log.Printf("\n!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!")
+	log.Printf("  [%s] ABORT in phase %d: %s", agent, phase, fmt.Sprintf(format, args...))
+	log.Printf("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!")
+	log.Printf("[%s]   Events received: %d", agent, len(events))
+	log.Printf("[%s]   Threads: %d %v", agent, len(threads), threads)
+	log.Printf("[%s]   Completions: %v", agent, completions)
+	for i := max(0, len(events)-10); i < len(events); i++ {
+		data, _ := json.Marshal(events[i].Data)
+		dataStr := string(data)
+		if len(dataStr) > 200 {
+			dataStr = dataStr[:200] + "..."
+		}
+		log.Printf("[%s]   event %d: type=%s data=%s", agent, i, events[i].EventType, dataStr)
+	}
+	os.Exit(1)
 }
 
 // --- Phase execution ---
 
-// markPhaseSucceeded records that a phase has met its success condition, so the
-// phase-timeout watcher will not fire while the advance path settles. Safe to
-// call without holding d.mu.
-func (d *testDriver) markPhaseSucceeded(phase int) {
-	d.mu.Lock()
-	if d.phaseSucceeded == nil {
-		d.phaseSucceeded = make(map[int]bool)
+// claimAdvanceLocked records that phase succeeded and reports whether this
+// caller is the first to advance from it. Every advance path calls it before
+// moving on: an event can be delivered twice (Zed re-sends entries on replay
+// and reconnect), and advancing twice would run the next phase twice. The mark
+// also stops the phase watchdog, which aborts solely on `d.phase != phase`,
+// from failing a phase whose advance is still being scheduled. Callers hold
+// d.mu.
+func (d *testDriver) claimAdvanceLocked(phase int) bool {
+	if d.round.advancedPhases[phase] {
+		log.Printf("[%s] Phase %d: DUPLICATE success event ignored (already advanced)", d.round.agentName, phase)
+		return false
 	}
-	d.phaseSucceeded[phase] = true
-	d.mu.Unlock()
+	d.round.advancedPhases[phase] = true
+	return true
 }
 
 func (d *testDriver) advanceAfterCompletion(completedPhase int) {
-	// The caller has already decided this phase passed; record it before the
-	// settle sleeps below so the timeout watcher cannot race them.
-	d.markPhaseSucceeded(completedPhase)
 	d.mu.Lock()
 	agentName := d.round.agentName
 	actualPhase := d.phase
-	gen := d.roundGeneration
+	first := d.claimAdvanceLocked(completedPhase)
 	d.mu.Unlock()
-	log.Printf("[%s] advanceAfterCompletion(%d) called (current phase=%d gen=%d), sleeping 2s...",
-		agentName, completedPhase, actualPhase, gen)
-	time.Sleep(2 * time.Second) // let Zed settle
-
-	// If the round changed while we slept, this completion is stale — bail out.
-	d.mu.Lock()
-	if d.roundGeneration != gen {
-		curAgent := d.round.agentName
-		d.mu.Unlock()
-		log.Printf("[%s] advanceAfterCompletion(%d) STALE: gen changed %d→%d (now in %s round), ignoring",
-			agentName, completedPhase, gen, d.roundGeneration, curAgent)
+	if !first {
 		return
 	}
-	d.mu.Unlock()
+	log.Printf("[%s] advanceAfterCompletion(%d) called (current phase=%d)", agentName, completedPhase, actualPhase)
 
 	switch completedPhase {
 	case smokePhase:
@@ -995,35 +962,17 @@ func (d *testDriver) advanceAfterCompletion(completedPhase int) {
 		d.runPhase9()
 	case 11:
 		d.mu.Lock()
-		if d.round.phase11Completed {
-			agentName := d.round.agentName
-			d.mu.Unlock()
-			log.Printf("[%s] Phase 11: DUPLICATE completion ignored (already advanced)", agentName)
-			return
-		}
 		d.round.phase11Completed = true
-		agentName := d.round.agentName
-		d.mu.Unlock()
-		log.Printf("[%s] Phase 11: ✅ Routed message completed", agentName)
-		d.mu.Lock()
 		d.phase = 12
 		d.mu.Unlock()
+		log.Printf("[%s] Phase 11: ✅ Routed message completed", agentName)
 		d.runPhase12()
 	case 12:
 		d.mu.Lock()
-		if d.round.phase12Completed {
-			agentName := d.round.agentName
-			d.mu.Unlock()
-			log.Printf("[%s] Phase 12: DUPLICATE completion ignored (already advanced)", agentName)
-			return
-		}
 		d.round.phase12Completed = true
-		agentName := d.round.agentName
-		d.mu.Unlock()
-		log.Printf("[%s] Phase 12: ✅ Reconnect message completed", agentName)
-		d.mu.Lock()
 		d.phase = 13
 		d.mu.Unlock()
+		log.Printf("[%s] Phase 12: ✅ Reconnect message completed", agentName)
 		d.runPhase13()
 	case 15:
 		// Phase 15 done — advance to the production queue-path phases.
@@ -1040,7 +989,6 @@ func (d *testDriver) advanceAfterCompletion(completedPhase int) {
 }
 
 func (d *testDriver) advanceAfterUiState() {
-	time.Sleep(1 * time.Second)
 	d.mu.Lock()
 	d.phase = 7
 	d.mu.Unlock()
@@ -1073,10 +1021,10 @@ func (d *testDriver) advanceToNextRound() {
 		return
 	}
 
-	// Start next round
+	// Start next round. The generation bumps now so the finished round's
+	// watchdogs go stale; the new round state is installed only after the
+	// drain below, so trailing events land in the round they belong to.
 	nextAgent := d.agentRounds[d.currentRoundIdx]
-	d.round = newRoundState(nextAgent)
-	d.phase = 1
 	d.roundGeneration++
 	d.mu.Unlock()
 
@@ -1093,6 +1041,10 @@ func (d *testDriver) advanceToNextRound() {
 	log.Printf("[test-server] Waiting 10s for previous round events to drain...")
 	time.Sleep(10 * time.Second)
 
+	d.mu.Lock()
+	d.round = newRoundState(nextAgent)
+	d.phase = 1
+	d.mu.Unlock()
 	d.startRound()
 }
 
@@ -1133,8 +1085,7 @@ func (d *testDriver) runPlanSecondPhase() {
 	agent := d.round.agentName
 	if len(d.round.threadIDs) == 0 {
 		d.mu.Unlock()
-		log.Printf("[%s] PLAN TURN 2: no thread from turn 1", agent)
-		os.Exit(1)
+		d.abort("no thread from plan turn 1")
 	}
 	threadID := d.round.threadIDs[0]
 	d.mu.Unlock()
@@ -1310,7 +1261,7 @@ func (d *testDriver) runPhase2() {
 	d.mu.Lock()
 	if len(d.round.threadIDs) == 0 {
 		d.mu.Unlock()
-		log.Fatalf("[%s] ERROR: No thread IDs captured from phase 1!", agent)
+		d.abort("no thread IDs captured from phase 1")
 	}
 	tid := d.round.threadIDs[0]
 	d.mu.Unlock()
@@ -1337,7 +1288,7 @@ func (d *testDriver) runPhase4() {
 	d.mu.Lock()
 	if len(d.round.threadIDs) < 2 {
 		d.mu.Unlock()
-		log.Fatalf("[%s] ERROR: Need at least 2 threads for phase 4!", agent)
+		d.abort("need at least 2 threads")
 	}
 	tid := d.round.threadIDs[0]
 	d.mu.Unlock()
@@ -1355,7 +1306,7 @@ func (d *testDriver) runPhase5() {
 	d.mu.Lock()
 	if len(d.round.threadIDs) == 0 {
 		d.mu.Unlock()
-		log.Fatalf("[%s] ERROR: No thread IDs available for phase 5!", agent)
+		d.abort("no thread IDs captured from phase 1")
 	}
 	tid := d.round.threadIDs[0]
 	d.mu.Unlock()
@@ -1382,7 +1333,7 @@ func (d *testDriver) runPhase7() {
 	d.mu.Lock()
 	if len(d.round.threadIDs) < 2 {
 		d.mu.Unlock()
-		log.Fatalf("[%s] ERROR: Need at least 2 threads for phase 7!", agent)
+		d.abort("need at least 2 threads")
 	}
 	// Open Thread B (created in phase 3), then send a follow-up
 	tid := d.round.threadIDs[1]
@@ -1403,7 +1354,7 @@ func (d *testDriver) runPhase8() {
 	// to send an interrupt before it completes. The syncEventCallback will fire the
 	// interrupt the moment the first assistant token arrives.
 	d.sendChatMessage(
-		"Write me a detailed explanation of recursion with three worked examples.",
+		longTurn("Write me a detailed explanation of recursion with three worked examples."),
 		d.round.reqID("phase8-initial"),
 		agent,
 	)
@@ -1427,7 +1378,7 @@ func (d *testDriver) runPhase9() {
 	// Turn 1: start a bounded streaming response. The syncEventCallback will
 	// fire the rapid sequence as soon as the first assistant token arrives.
 	d.sendChatMessage(
-		"Output the numbers 1 through 100, one per line, and nothing else.",
+		longTurn("Output the numbers 1 through 100, one per line, and nothing else."),
 		d.round.reqID("phase9-initial"),
 		agent,
 		d.round.phase8ThreadID,
@@ -1468,8 +1419,7 @@ func (d *testDriver) runPhase10() {
 		existingSessionID = mappings[firstThreadID]
 	}
 	if existingSessionID == "" {
-		log.Printf("[%s] Phase 10: ERROR no existing session found to use as parent", agent)
-		go d.advanceToNextRound()
+		d.abort("no existing session found to use as parent")
 		return
 	}
 
@@ -1486,15 +1436,13 @@ func (d *testDriver) runPhase10() {
 	}
 
 	if err := d.srv.ProcessSyncEvent(existingSessionID, syncMsg); err != nil {
-		log.Printf("[%s] Phase 10: ERROR injecting user_created_thread: %v", agent, err)
-		go d.advanceToNextRound()
+		d.abort("injecting user_created_thread: %v", err)
 		return
 	}
 
 	log.Printf("[%s] Phase 10: Injected user_created_thread for thread=%s", agent, truncate(newThreadID, 12))
 
-	// Verify the session was created by checking context mappings
-	time.Sleep(500 * time.Millisecond)
+	// ProcessSyncEvent handles the event synchronously, so the mapping exists now.
 	mappings := d.srv.ContextMappings()
 	if sessionID, ok := mappings[newThreadID]; ok {
 		log.Printf("[%s] Phase 10: ✅ New session created: %s", agent, sessionID)
@@ -1515,7 +1463,6 @@ func (d *testDriver) runPhase10() {
 				agent, ses.ID, truncate(ses.Metadata.ZedThreadID, 12), ses.Metadata.SpecTaskID)
 			d.mu.Lock()
 			d.round.phase10WorkSessionFound = true
-			d.round.phase10ChatCompleted = true // skip chat test — synthetic thread doesn't exist in Zed
 			d.mu.Unlock()
 			break
 		}
@@ -1552,8 +1499,7 @@ func (d *testDriver) runPhase11() {
 	d.mu.Lock()
 	if len(d.round.threadIDs) < 2 {
 		d.mu.Unlock()
-		log.Printf("[%s] Phase 11: SKIP — need at least 2 threads, got %d", agent, len(d.round.threadIDs))
-		go d.advanceToNextRound()
+		d.abort("need at least 2 threads, got %d", len(d.round.threadIDs))
 		return
 	}
 	threadA := d.round.threadIDs[0]
@@ -1565,8 +1511,7 @@ func (d *testDriver) runPhase11() {
 	sessionB := mappings[threadB]
 
 	if sessionA == "" || sessionB == "" {
-		log.Printf("[%s] Phase 11: ERROR — missing session mappings (A=%s, B=%s)", agent, sessionA, sessionB)
-		go d.advanceToNextRound()
+		d.abort("missing session mappings (A=%s, B=%s)", sessionA, sessionB)
 		return
 	}
 
@@ -1574,14 +1519,12 @@ func (d *testDriver) runPhase11() {
 	for _, sid := range []string{sessionA, sessionB} {
 		ses, err := d.store.GetSession(ctx, sid)
 		if err != nil {
-			log.Printf("[%s] Phase 11: ERROR getting session %s: %v", agent, sid, err)
-			go d.advanceToNextRound()
+			d.abort("getting session %s: %v", sid, err)
 			return
 		}
 		ses.Metadata.SpecTaskID = specTaskID
 		if _, err := d.store.UpdateSession(ctx, *ses); err != nil {
-			log.Printf("[%s] Phase 11: ERROR updating session %s: %v", agent, sid, err)
-			go d.advanceToNextRound()
+			d.abort("updating session %s: %v", sid, err)
 			return
 		}
 	}
@@ -1592,8 +1535,7 @@ func (d *testDriver) runPhase11() {
 	d.store.SeedSpecTask(specTask)
 	routedSessionID, err := d.srv.FindConnectedSessionForSpecTask(ctx, specTask)
 	if err != nil {
-		log.Printf("[%s] Phase 11: ERROR FindConnectedSessionForSpecTask failed: %v", agent, err)
-		go d.advanceToNextRound()
+		d.abort("FindConnectedSessionForSpecTask failed: %v", err)
 		return
 	}
 
@@ -1613,8 +1555,7 @@ func (d *testDriver) runPhase11() {
 	// Send a message via the routed session and wait for completion
 	reqID := d.round.reqID("phase11")
 	if err := d.srv.SendChatMessage(routedSessionID, "What is 7 + 7? Reply with just the number.", reqID); err != nil {
-		log.Printf("[%s] Phase 11: ERROR SendChatMessage failed: %v", agent, err)
-		go d.advanceToNextRound()
+		d.abort("SendChatMessage failed: %v", err)
 		return
 	}
 
@@ -1635,12 +1576,11 @@ func (d *testDriver) runPhase12() {
 	// Create signal file to tell run_e2e.sh to restart Zed
 	signalFile := "/tmp/zed-restart-requested"
 	if err := os.WriteFile(signalFile, []byte("phase12"), 0644); err != nil {
-		log.Printf("[%s] Phase 12: ERROR creating signal file: %v", agent, err)
-		go d.advanceToNextRound()
+		d.abort("creating signal file: %v", err)
 		return
 	}
 	log.Printf("[%s] Phase 12: Created signal file %s, waiting for Zed to disconnect and reconnect...", agent, signalFile)
-	// The HTTP handler will detect the reconnection (phase == 12) and send
+	// The agent_ready handler will detect the reconnection (phase == 12) and send
 	// the chat message to Thread A. syncEventCallback will handle
 	// message_completed and call advanceAfterCompletion(12).
 }
@@ -1659,14 +1599,13 @@ func (d *testDriver) runPhase13() {
 	// The syncEventCallback will fire cancel_current_turn when the first
 	// assistant token arrives.
 	d.sendChatMessage(
-		"Write a detailed explanation of binary search trees with three worked examples.",
+		longTurn("Write a detailed explanation of binary search trees with three worked examples."),
 		d.round.reqID("phase13"),
 		agent,
 	)
 }
 
 func (d *testDriver) advanceAfterPhase13() {
-	time.Sleep(1 * time.Second)
 	d.mu.Lock()
 	agentName := d.round.agentName
 	d.mu.Unlock()
@@ -1688,11 +1627,13 @@ func (d *testDriver) runPhase14() {
 	log.Println("  correspond to any active turn. Verifies Zed responds with")
 	log.Println("  turn_cancelled (status=noop).")
 
-	d.sendCancelCurrentTurn("bogus-request-id-that-does-not-exist")
+	d.sendCancelCurrentTurn(noopCancelRequestID)
 }
 
+// noopCancelRequestID matches no turn, so Phase 14's cancel must be a no-op.
+const noopCancelRequestID = "bogus-request-id-that-does-not-exist"
+
 func (d *testDriver) advanceAfterPhase14() {
-	time.Sleep(1 * time.Second)
 	d.mu.Lock()
 	agentName := d.round.agentName
 	d.phase = 15
@@ -1714,17 +1655,14 @@ func (d *testDriver) runPhase15() {
 	log.Println("  acp_thread.rs re-emits EntryUpdated after each drain so")
 	log.Println("  external_websocket_sync sees fresh content as it grows).")
 
-	d.mu.Lock()
-	d.mu.Unlock()
-
 	// Long-form, plain-prose prompt with NO tool calls. ~400 words gives ~30+
 	// streaming chunks at typical model token rates, well above the >=5 sample
 	// threshold. The "no tools" instruction matters: tool calls would split the
 	// response into many short text entries and obscure the streaming-cadence
 	// signal we want to assert on.
 	d.sendChatMessage(
-		"Write a 400-word essay about the history of the printing press in plain prose. "+
-			"No headings, no bullet lists, no tool calls — just a single flowing essay.",
+		longTurn("Write a 400-word essay about the history of the printing press in plain prose. "+
+			"No headings, no bullet lists, no tool calls — just a single flowing essay."),
 		d.round.reqID("phase15"),
 		agent,
 	)
@@ -1755,35 +1693,50 @@ func (d *testDriver) findInteractionByPromptID(promptID string) (string, string)
 	return "", ""
 }
 
-// waitInteractionStreaming polls until the interaction for promptID is actively
-// streaming (waiting state with some assistant content) — the same precondition
-// Phase 8 uses before interrupting, so the second message lands mid-turn rather
-// than before the turn has started (cancelling a not-yet-started turn leaves the
-// follow-up wedged). Returns true once streaming, false on timeout.
-func (d *testDriver) waitInteractionStreaming(promptID string, timeout time.Duration) bool {
-	deadline := time.Now().Add(timeout)
-	for time.Now().Before(deadline) {
-		for _, in := range d.store.GetAllInteractions() {
-			if in.PromptID == promptID && in.ResponseMessage != "" {
-				return true
-			}
+// storeRecheckInterval backstops waitForStore for store writes that happen off
+// the sync-event path, such as the queue dispatching its next prompt from a
+// goroutine after a completion.
+const storeRecheckInterval = 250 * time.Millisecond
+
+// waitForStore returns true once cond holds, or false after timeout. It
+// re-checks after every processed sync event and every storeRecheckInterval.
+func (d *testDriver) waitForStore(cond func() bool, timeout time.Duration) bool {
+	deadline := time.NewTimer(timeout)
+	defer deadline.Stop()
+	recheck := time.NewTicker(storeRecheckInterval)
+	defer recheck.Stop()
+	for !cond() {
+		select {
+		case <-d.storeChanged:
+		case <-recheck.C:
+		case <-deadline.C:
+			return cond()
 		}
-		time.Sleep(300 * time.Millisecond)
 	}
-	return false
+	return true
 }
 
-// waitInteractionState polls until the interaction for promptID reaches one of
-// wantStates, returning true on success or false on timeout.
+// waitInteractionStreaming waits until the interaction for promptID has
+// streamed assistant content — the same precondition Phase 8 uses before
+// interrupting, so the second message lands mid-turn rather than before the turn
+// has started (cancelling a not-yet-started turn leaves the follow-up wedged).
+// Queue interactions use their interaction id as the request id.
+func (d *testDriver) waitInteractionStreaming(promptID string, timeout time.Duration) bool {
+	return d.waitForStore(func() bool {
+		interactionID, _ := d.findInteractionByPromptID(promptID)
+		d.mu.Lock()
+		defer d.mu.Unlock()
+		return interactionID != "" && d.round.streamingRequests[interactionID]
+	}, timeout)
+}
+
+// waitInteractionState waits until the interaction for promptID reaches one of
+// wantStates.
 func (d *testDriver) waitInteractionState(promptID string, wantStates map[string]bool, timeout time.Duration) bool {
-	deadline := time.Now().Add(timeout)
-	for time.Now().Before(deadline) {
-		if _, st := d.findInteractionByPromptID(promptID); st != "" && wantStates[st] {
-			return true
-		}
-		time.Sleep(500 * time.Millisecond)
-	}
-	return false
+	return d.waitForStore(func() bool {
+		_, st := d.findInteractionByPromptID(promptID)
+		return wantStates[st]
+	}, timeout)
 }
 
 // runQueuePhases drives the production send path against live Zed:
@@ -1794,8 +1747,11 @@ func (d *testDriver) waitInteractionState(promptID string, wantStates map[string
 //	Phase 17 (interrupt): enqueue interrupt=true while busy and assert it cancels
 //	  the running turn (interaction → interrupted) and its own message is delivered.
 //
-// Driven by polling the store because queue prompts get generated request_ids
-// that don't flow through the phase-completion switch.
+// Driven by store waits because queue prompts get generated request_ids that
+// don't flow through the phase-completion switch. Every wait is bounded and
+// either aborts or records a failure for validation, so these phases do not
+// arm the phase watchdog: its 90s would undercut their own (longer) budgets
+// on a slow model-backed round.
 func (d *testDriver) runQueuePhases() {
 	agent := d.round.agentName
 	d.mu.Lock()
@@ -1812,8 +1768,7 @@ func (d *testDriver) runQueuePhases() {
 		}
 	}
 	if sessID == "" {
-		log.Printf("[%s] Phase 16: ABORT — no session found for queue thread %s", agent, truncate(threadID, 12))
-		os.Exit(1)
+		d.abort("no session found for queue thread %s", truncate(threadID, 12))
 	}
 	waiting := map[string]bool{"waiting": true}
 	complete := map[string]bool{"complete": true}
@@ -1823,28 +1778,23 @@ func (d *testDriver) runQueuePhases() {
 	log.Printf("\n==================================================")
 	log.Printf("  [%s] PHASE 16: Queue busy-defer (interrupt=false)", agent)
 	log.Printf("==================================================")
-	d.startPhaseTimeout(16)
 
-	promptA, err := d.srv.EnqueueQueuedPrompt(sessID, "Count slowly from 1 to 40, writing one number per line with a short fact about each.", false)
+	promptA, err := d.srv.EnqueueQueuedPrompt(sessID, longTurn("Count slowly from 1 to 40, writing one number per line with a short fact about each."), false)
 	if err != nil {
-		log.Printf("[%s] Phase 16: ABORT — enqueue A failed: %v", agent, err)
-		os.Exit(1)
+		d.abort("enqueue A failed: %v", err)
 	}
 	if !d.waitInteractionState(promptA, waiting, 15*time.Second) {
-		log.Printf("[%s] Phase 16: ABORT — turn A never became waiting", agent)
-		os.Exit(1)
+		d.abort("turn A never became waiting")
 	}
 	// Wait until A is actively streaming so the session is genuinely busy when we
 	// enqueue B (avoids racing a fast turn that completes before B is queued).
 	if !d.waitInteractionStreaming(promptA, 30*time.Second) {
-		log.Printf("[%s] Phase 16: ABORT — turn A never started streaming", agent)
-		os.Exit(1)
+		d.abort("turn A never started streaming")
 	}
 	// Agent is now busy on A. Enqueue B (interrupt=false): must be HELD.
 	promptB, err := d.srv.EnqueueQueuedPrompt(sessID, "Reply with exactly this one sentence: Whales are mammals.", false)
 	if err != nil {
-		log.Printf("[%s] Phase 16: ABORT — enqueue B failed: %v", agent, err)
-		os.Exit(1)
+		d.abort("enqueue B failed: %v", err)
 	}
 	if inID, _ := d.findInteractionByPromptID(promptB); inID != "" {
 		log.Printf("[%s] Phase 16: FAIL — B was dispatched concurrently (interaction %s) instead of deferred", agent, truncate(inID, 12))
@@ -1872,28 +1822,23 @@ func (d *testDriver) runQueuePhases() {
 	log.Printf("\n==================================================")
 	log.Printf("  [%s] PHASE 17: Queue interrupt (interrupt=true)", agent)
 	log.Printf("==================================================")
-	d.startPhaseTimeout(17)
 
-	promptX, err := d.srv.EnqueueQueuedPrompt(sessID, "Count slowly from 1 to 60, one number per line, with a short sentence about each.", false)
+	promptX, err := d.srv.EnqueueQueuedPrompt(sessID, longTurn("Count slowly from 1 to 60, one number per line, with a short sentence about each."), false)
 	if err != nil {
-		log.Printf("[%s] Phase 17: ABORT — enqueue X failed: %v", agent, err)
-		os.Exit(1)
+		d.abort("enqueue X failed: %v", err)
 	}
 	if !d.waitInteractionState(promptX, waiting, 15*time.Second) {
-		log.Printf("[%s] Phase 17: ABORT — turn X never became waiting", agent)
-		os.Exit(1)
+		d.abort("turn X never became waiting")
 	}
 	// Interrupt only once X is actively streaming (cancelling a not-yet-started
 	// turn leaves the follow-up wedged — same precondition Phase 8 relies on).
 	if !d.waitInteractionStreaming(promptX, 30*time.Second) {
-		log.Printf("[%s] Phase 17: ABORT — turn X never started streaming", agent)
-		os.Exit(1)
+		d.abort("turn X never started streaming")
 	}
 	// Interrupt while X is streaming: cancel-then-send via processInterruptPrompt.
 	promptY, err := d.srv.EnqueueQueuedPrompt(sessID, "Stop counting — just say 'done'.", true)
 	if err != nil {
-		log.Printf("[%s] Phase 17: ABORT — enqueue Y (interrupt) failed: %v", agent, err)
-		os.Exit(1)
+		d.abort("enqueue Y (interrupt) failed: %v", err)
 	}
 	if d.waitInteractionState(promptX, interrupted, 30*time.Second) {
 		d.mu.Lock()
@@ -1916,6 +1861,52 @@ func (d *testDriver) runQueuePhases() {
 }
 
 // --- Per-round validation ---
+
+// threadInteractions returns the stored interactions of the session mapped to
+// a Zed thread. The store is shared across rounds and phases, so assertions
+// about one turn must be scoped to its thread's session.
+func (d *testDriver) threadInteractions(threadID string) []*types.Interaction {
+	sessionID := d.srv.ContextMappings()[threadID]
+	var out []*types.Interaction
+	for _, in := range d.store.GetAllInteractions() {
+		if sessionID != "" && in.SessionID == sessionID {
+			out = append(out, in)
+		}
+	}
+	return out
+}
+
+// isAgentOutput reports whether a message_added event carries something the
+// agent produced. Zed also emits the thread's plan snapshot (entry_type "plan",
+// content `{"steps":[]}` when empty) as a turn starts, before the prompt
+// reaches the agent, so a role check alone mistakes "turn dispatched" for
+// "turn streaming" and lets an interrupt land before the turn exists.
+func isAgentOutput(data map[string]interface{}) bool {
+	role, _ := data["role"].(string)
+	entryType, _ := data["entry_type"].(string)
+	content, _ := data["content"].(string)
+	return role == "assistant" && entryType != "plan" && content != ""
+}
+
+// streamedBeforeCompletion counts the agent-output message_added events for
+// requestID that arrived before its first message_completed.
+func streamedBeforeCompletion(events []types.SyncMessage, requestID string) int {
+	added := 0
+	for _, evt := range events {
+		if evt.Data["request_id"] != requestID {
+			continue
+		}
+		switch evt.EventType {
+		case "message_completed":
+			return added
+		case "message_added":
+			if isAgentOutput(evt.Data) {
+				added++
+			}
+		}
+	}
+	return added
+}
 
 func (d *testDriver) validateRound() roundResult {
 	d.mu.Lock()
@@ -2052,13 +2043,12 @@ func (d *testDriver) validateRound() roundResult {
 		if d.round.phase8ThreadID == "" {
 			errors = append(errors, "Phase 8: No thread ID captured (phase 8 may not have run)")
 		} else {
-			completionsForPhase8 := len(d.round.completions[d.round.phase8ThreadID])
-			if completionsForPhase8 < 2 {
-				errors = append(errors, fmt.Sprintf(
-					"Phase 8: Expected 2 message_completed events (cancelled turn + interrupt), got %d",
-					completionsForPhase8))
+			// Phase 9 reuses this thread, so assert the two turns by request id
+			// rather than counting the thread's completions.
+			if !d.hasRoundCompletion(d.round.reqID("phase8-initial")) {
+				errors = append(errors, "Phase 8: the interrupted turn never completed ("+d.round.reqID("phase8-initial")+")")
 			} else {
-				log.Printf("[%s] Phase 8: Received %d completions for phase 8 thread (correct)", agent, completionsForPhase8)
+				log.Printf("[%s] Phase 8: interrupted turn completed (correct)", agent)
 			}
 		}
 		if !d.hasRoundCompletion(d.round.reqID("phase8-interrupt")) {
@@ -2079,9 +2069,8 @@ func (d *testDriver) validateRound() roundResult {
 					seenFirstCompletion = true
 				}
 				if e.EventType == "message_added" && !seenFirstCompletion {
-					role, _ := e.Data["role"].(string)
 					reqID, _ := e.Data["request_id"].(string)
-					if role == "assistant" && reqID == d.round.reqID("phase8-interrupt") {
+					if isAgentOutput(e.Data) && reqID == d.round.reqID("phase8-interrupt") {
 						orderingViolation = true
 					}
 				}
@@ -2097,7 +2086,9 @@ func (d *testDriver) validateRound() roundResult {
 		if d.round.phase9ThreadID == "" {
 			errors = append(errors, "Phase 9: No thread ID (phase 9 may not have run)")
 		} else {
-			if d.round.phase9Completions < 2 {
+			if !d.hasRoundCompletion(d.round.reqID("phase9-queue")) {
+				errors = append(errors, "Phase 9: the last queued turn never completed -- thread hung")
+			} else if d.round.phase9Completions < 2 {
 				errors = append(errors, fmt.Sprintf(
 					"Phase 9: Expected at least 2 message_completed events (got %d) -- thread may have hung",
 					d.round.phase9Completions))
@@ -2153,10 +2144,9 @@ func (d *testDriver) validateRound() roundResult {
 	} else {
 		// Verify the interaction in the store has actual content (not response_length=0).
 		// After reconnect, request_id may differ from what we sent (pickupWaitingInteraction
-		// creates new mappings), so we match by prompt content instead.
+		// creates new mappings), so we match by prompt content within Thread A's session.
 		phase12HasContent := false
-		allInteractions := d.store.GetAllInteractions()
-		for _, i := range allInteractions {
+		for _, i := range d.threadInteractions(d.round.threadIDs[0]) {
 			if i.PromptMessage == "What is 12 + 12? Reply with just the number." && i.State == types.InteractionStateComplete {
 				if len(i.ResponseMessage) > 0 {
 					phase12HasContent = true
@@ -2181,10 +2171,9 @@ func (d *testDriver) validateRound() roundResult {
 		} else {
 			log.Printf("[%s] Phase 13: ✅ turn_cancelled received with status=cancelled", agent)
 		}
-		// Verify the interaction is marked as interrupted in the store
+		// Verify the cancelled turn's own interaction is marked interrupted.
 		phase13Interrupted := false
-		allInteractions := d.store.GetAllInteractions()
-		for _, i := range allInteractions {
+		for _, i := range d.threadInteractions(d.round.phase13ThreadID) {
 			if i.State == types.InteractionStateInterrupted {
 				phase13Interrupted = true
 				log.Printf("[%s] Phase 13: ✅ Interaction %s marked as interrupted", agent, truncate(i.ID, 12))
@@ -2192,7 +2181,7 @@ func (d *testDriver) validateRound() roundResult {
 			}
 		}
 		if !phase13Interrupted {
-			errors = append(errors, "Phase 13: No interaction in store with state=interrupted")
+			errors = append(errors, "Phase 13: the cancelled turn's interaction is not marked interrupted")
 		}
 	}
 
@@ -2317,7 +2306,7 @@ func (d *testDriver) validateRound() roundResult {
 			agent, len(threadCreatedEvents))
 	}
 
-	// Phase 16 — DEFERRED-EMIT REGRESSION ASSERTION (Fix 1a).
+	// Draft-emit check — DEFERRED-EMIT REGRESSION ASSERTION (Fix 1a).
 	//
 	// Zed's agent panel `activate_draft` creates a non-resume
 	// `ConversationView` for the empty input editor every time the panel
@@ -2349,15 +2338,15 @@ func (d *testDriver) validateRound() roundResult {
 	// Full diagnosis: helix/design/2026-05-13-mcp-cache-contention-and-duplicate-claude-spawn.md
 	if d.round.spontaneousUserCreatedThreadCount > 0 {
 		errors = append(errors, fmt.Sprintf(
-			"Phase 16 (deferred-emit regression): received %d spontaneous user_created_thread event(s) — Zed agent panel's draft ConversationView is emitting UserCreatedThread eagerly instead of deferring until first user message. Phantom acp_thread_id(s): %v. See helixml/zed PR #56 / helix/design/2026-05-13-mcp-cache-contention-and-duplicate-claude-spawn.md",
+			"Draft-emit check: received %d spontaneous user_created_thread event(s) — Zed agent panel's draft ConversationView is emitting UserCreatedThread eagerly instead of deferring until first user message. Phantom acp_thread_id(s): %v. See helixml/zed PR #56 / helix/design/2026-05-13-mcp-cache-contention-and-duplicate-claude-spawn.md",
 			d.round.spontaneousUserCreatedThreadCount,
 			d.round.spontaneousUserCreatedThreadIDs,
 		))
 	} else {
-		log.Printf("[%s] Phase 16: 0 spontaneous user_created_thread events — Fix 1a deferred-emit working as expected", agent)
+		log.Printf("[%s] Draft-emit check: 0 spontaneous user_created_thread events — Fix 1a deferred-emit working as expected", agent)
 	}
 
-	// Phase 17 — LIVE CLAUDE PROCESS COUNT (Fix 1b regression).
+	// Claude process count — LIVE CLAUDE PROCESS COUNT (Fix 1b regression).
 	//
 	// Counts how many `claude --output-format` processes are alive in
 	// the test container right now. Each ACP `new_session()` call against
@@ -2377,31 +2366,23 @@ func (d *testDriver) validateRound() roundResult {
 	// `chrome-devtools/github context server failed to start` timeouts
 	// in long-running spec_tasks.
 	//
-	// IMPORTANT: this assertion currently DOES catch the ambient draft
-	// Claude that spawns on Zed startup — Fix 1b (defer
-	// connection.new_session() until first user input in the draft) is
-	// not yet implemented. Until that lands, this assertion will report
-	// `expected N, got N+1` per agent round and fail. That failure is
-	// the deliberate tracked-failure regression-test for Fix 1b. Once
-	// Fix 1b lands the assertion passes and continues to guard against
-	// future regression. See:
+	// The expected count tolerates ONE Claude beyond the round's real threads:
+	// it has always included Phase 10's synthetic thread, which Zed never sees
+	// and so never spawns a Claude for. One ambient draft Claude therefore
+	// passes; the live claude lane on Helix main is green with this slack.
+	// Tightening it to len(threadIDs) needs a live claude run first. Background:
 	// helix/design/2026-05-13-mcp-cache-contention-and-duplicate-claude-spawn.md
-	// section "Why Fix 1b was deferred" for the implementation plan.
 	if agent == "claude" {
 		liveClaudes, err := countLiveClaudeProcesses()
 		if err != nil {
-			log.Printf("[%s] Phase 17: WARNING failed to count Claude processes: %v", agent, err)
+			errors = append(errors, fmt.Sprintf("Claude process count: failed to count Claude processes: %v", err))
 		} else {
-			expectedClaudes := len(d.round.threadIDs) +
-				boolToInt(d.round.phase8ThreadID != "" && !contains(d.round.threadIDs, d.round.phase8ThreadID)) +
-				boolToInt(d.round.phase13ThreadID != "" && !contains(d.round.threadIDs, d.round.phase13ThreadID)) +
-				boolToInt(d.round.phase15ThreadID != "" && !contains(d.round.threadIDs, d.round.phase15ThreadID)) +
-				boolToInt(d.round.phase10NewThreadID != "" && !contains(d.round.threadIDs, d.round.phase10NewThreadID))
-			log.Printf("[%s] Phase 17: %d live Claude processes (expected %d)", agent, liveClaudes, expectedClaudes)
+			expectedClaudes := len(d.round.threadIDs) + 1 // see the slack note above
+			log.Printf("[%s] Claude process count: %d live Claude processes (expected %d)", agent, liveClaudes, expectedClaudes)
 			if liveClaudes > expectedClaudes {
 				extra := liveClaudes - expectedClaudes
 				errors = append(errors, fmt.Sprintf(
-					"Phase 17 (Fix 1b regression): %d Claude processes alive but only %d real conversation threads exist (%d extras). Likely the agent panel's `activate_draft` is spawning a Claude for the empty input editor before the user types. Each extra Claude child brings its own MCP server tree and contends for the `_npx/<hash>` cache → 180s context_server timeouts in long-running spec_tasks. Fix 1b (defer connection.new_session() until first user input in draft) is not yet implemented; once it lands this assertion will pass without the +1 ambient draft. See helix/design/2026-05-13-mcp-cache-contention-and-duplicate-claude-spawn.md.",
+					"Claude process count (Fix 1b regression): %d Claude processes alive but only %d real conversation threads exist (%d extras). Likely the agent panel's `activate_draft` is spawning a Claude for the empty input editor before the user types. Each extra Claude child brings its own MCP server tree and contends for the `_npx/<hash>` cache → 180s context_server timeouts in long-running spec_tasks. Fix 1b (defer connection.new_session() until first user input in draft) is not yet implemented; once it lands this assertion will pass without the +1 ambient draft. See helix/design/2026-05-13-mcp-cache-contention-and-duplicate-claude-spawn.md.",
 					liveClaudes, expectedClaudes, extra,
 				))
 			}
@@ -2434,28 +2415,13 @@ func (d *testDriver) validateRound() roundResult {
 		d.round.reqID("phase15"),
 	}
 	for _, reqID := range completionPhases {
-		firstAddedIdx := -1
-		completedIdx := -1
-		addedCount := 0
-
-		for i, evt := range d.round.events {
-			if evt.EventType == "message_added" && evt.Data["role"] == "assistant" {
-				if firstAddedIdx == -1 {
-					firstAddedIdx = i
-				}
-				addedCount++
-			}
-			if evt.EventType == "message_completed" && evt.Data["request_id"] == reqID {
-				completedIdx = i
-			}
+		if !d.hasRoundCompletion(reqID) {
+			continue // a missing completion is reported by the phase's own check
 		}
-
-		if firstAddedIdx >= 0 && completedIdx >= 0 {
-			if firstAddedIdx < completedIdx {
-				log.Printf("[%s] Streaming %s: %d message_added before message_completed", agent, reqID, addedCount)
-			} else {
-				errors = append(errors, fmt.Sprintf("Streaming %s: message_added did NOT arrive before message_completed", reqID))
-			}
+		if added := streamedBeforeCompletion(d.round.events, reqID); added > 0 {
+			log.Printf("[%s] Streaming %s: %d message_added before message_completed", agent, reqID, added)
+		} else {
+			errors = append(errors, fmt.Sprintf("Streaming %s: no assistant message_added arrived before message_completed", reqID))
 		}
 	}
 
@@ -2552,8 +2518,8 @@ func (d *testDriver) validateStore() bool {
 	}
 	expectedSessions := perRoundSessions * len(d.agentRounds)
 	if len(sessions) < expectedSessions {
-		errors = append(errors, fmt.Sprintf("Expected at least %d sessions (%d rounds * 4 threads), got %d",
-			expectedSessions, len(d.agentRounds), len(sessions)))
+		errors = append(errors, fmt.Sprintf("Expected at least %d sessions (%d rounds * %d per round), got %d",
+			expectedSessions, len(d.agentRounds), perRoundSessions, len(sessions)))
 	}
 
 	// Check that sessions have ZedThreadID metadata
@@ -2662,7 +2628,8 @@ func (d *testDriver) validateStore() bool {
 		}
 	}
 
-	// Expect at least 8 completed interactions per round:
+	// Expect at least 8 completed interactions per round — a floor below the
+	// 10 sources listed, because a cancelled or absorbed turn may not complete:
 	//   - Phase 1:  thread_created → new session + interaction
 	//   - Phase 2:  sendChatMessageToExternalAgent creates interaction for follow-up
 	//   - Phase 3:  thread_created → new session + interaction
@@ -2944,8 +2911,13 @@ func main() {
 	log.Printf("[test-server] Listening on ws://127.0.0.1:%d", port)
 	log.Println("[test-server] Using REAL HelixAPIServer handlers with in-memory store")
 
-	if err := os.WriteFile(portFile, []byte(fmt.Sprintf("%d", port)), 0644); err != nil {
+	// Write then rename, so run_e2e.sh (which starts Zed the moment the file
+	// exists) never reads a half-written port.
+	if err := os.WriteFile(portFile+".tmp", []byte(fmt.Sprintf("%d", port)), 0644); err != nil {
 		log.Fatalf("[test-server] Failed to write port file: %v", err)
+	}
+	if err := os.Rename(portFile+".tmp", portFile); err != nil {
+		log.Fatalf("[test-server] Failed to publish port file: %v", err)
 	}
 
 	go func() {
@@ -2954,27 +2926,19 @@ func main() {
 		}
 	}()
 
-	// Increase timeout for multi-agent runs. Phase 15 adds ~30–60s of
-	// streaming time per agent, so the per-agent budget is bumped to 360s.
-	timeout := 360 * time.Second
-	if len(agents) > 1 {
-		timeout = time.Duration(360*len(agents)) * time.Second
+	// run_e2e.sh owns the run's time budget and hands the server a slightly
+	// shorter one, so the server's own timeout (which dumps round state) fires
+	// before the script kills it.
+	timeoutSecs, err := strconv.Atoi(os.Getenv("E2E_SERVER_TIMEOUT_SECS"))
+	if err != nil || timeoutSecs <= 0 {
+		log.Fatalf("[test-server] E2E_SERVER_TIMEOUT_SECS must be a positive integer, got %q", os.Getenv("E2E_SERVER_TIMEOUT_SECS"))
 	}
+	timeout := time.Duration(timeoutSecs) * time.Second
 
 	select {
 	case <-driver.done:
 	case <-time.After(timeout):
-		driver.mu.Lock()
-		var eventTypes []string
-		if driver.round != nil {
-			for _, e := range driver.round.events {
-				eventTypes = append(eventTypes, e.EventType)
-			}
-		}
-		driver.mu.Unlock()
-		log.Printf("[test-server] TIMEOUT at round %d/%d, phase %d. Events: %v",
-			driver.currentRoundIdx+1, len(agents), driver.phase, eventTypes)
-		os.Exit(1)
+		driver.abort("overall timeout after %s", timeout)
 	}
 
 	// Validate store state (cross-round)
@@ -3015,7 +2979,7 @@ func main() {
 // processes currently alive in the test container. Each ACP `new_session()`
 // against the Claude wrapper spawns one such process; the wrapper itself
 // (npm exec @agentclientprotocol/claude-agent-acp) is shared across
-// sessions. Used by Phase 17 to assert there are no extra "draft" Claude
+// sessions. Used by round validation to assert there are no extra "draft" Claude
 // processes spawned by the agent panel beyond the real conversation
 // threads the test created.
 func countLiveClaudeProcesses() (int, error) {
@@ -3030,20 +2994,4 @@ func countLiveClaudeProcesses() (int, error) {
 		}
 	}
 	return count, nil
-}
-
-func boolToInt(b bool) int {
-	if b {
-		return 1
-	}
-	return 0
-}
-
-func contains(haystack []string, needle string) bool {
-	for _, s := range haystack {
-		if s == needle {
-			return true
-		}
-	}
-	return false
 }

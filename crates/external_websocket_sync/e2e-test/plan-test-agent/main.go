@@ -1,7 +1,12 @@
-// plan-test-agent is a deterministic ACP agent used by the headless Zed E2E
-// suite. Its first turn publishes two plan snapshots; its second turn publishes
-// no plan. This makes plan replacement and turn isolation testable without an
-// external model or nondeterministic prompting.
+// plan-test-agent is a deterministic ACP agent for the Zed E2E suite, so the
+// suite can test protocol behaviour without an external model.
+//
+// Plan mode (default): the first turn publishes two plan snapshots and the
+// second publishes none, testing plan replacement and turn isolation.
+//
+// Lifecycle mode (E2E_SCRIPTED_LIFECYCLE=1): every turn streams scripted text,
+// short by default and long only for prompts carrying longTurnCue, and honours
+// session/cancel at every chunk. It drives the full lifecycle phase chain.
 package main
 
 import (
@@ -192,36 +197,98 @@ func handle(req request) {
 	}
 }
 
+// longTurnCue marks a prompt whose turn must still be streaming when the
+// lifecycle driver acts on it: an interrupt or cancel aimed mid-turn, a message
+// queued behind a busy session, or the streaming-cadence measurement. Every
+// other prompt gets a short turn, so the suite spends no time on turns it only
+// needs to complete. Must match lifecycleLongTurnCue in helix-ws-test-server.
+const longTurnCue = "[e2e:long-turn]"
+
+// Turn shapes. A long turn is cancellable at every chunk, so turns the driver
+// interrupts end as soon as the cancel lands; only uninterrupted long turns
+// pay the full longTurnChunks*longTurnChunkGap (2.5s), which is ample margin
+// for a driver that reacts to the first streamed chunk within milliseconds.
+const (
+	shortTurnChunks  = 3
+	longTurnChunks   = 25
+	longTurnChunkGap = 100 * time.Millisecond
+)
+
+// promptText concatenates the text blocks of a session/prompt request.
+func promptText(params map[string]interface{}) string {
+	blocks, _ := params["prompt"].([]interface{})
+	var text strings.Builder
+	for _, entry := range blocks {
+		block, _ := entry.(map[string]interface{})
+		if value, _ := block["text"].(string); value != "" {
+			text.WriteString(value)
+		}
+	}
+	return text.String()
+}
+
 func runLifecyclePrompt(req request) {
 	sessionID := stringParam(req.Params, "sessionId", "")
 	turn := lifecycleCount.Add(1)
 	cancel := make(chan struct{})
 	cancelMu.Lock()
-	if previous := cancels[sessionID]; previous != nil {
-		close(previous)
+	if cancels[sessionID] != nil {
+		cancelMu.Unlock()
+		// ACP clients must cancel (or await) a running turn before prompting
+		// again. Cancelling it here on Zed's behalf would hide exactly the
+		// missing-cancel regressions the interrupt phases exist to catch.
+		fmt.Fprintf(os.Stderr, "[plan-test-agent] session/prompt for %s while a turn is still running\n", sessionID)
+		write(map[string]interface{}{
+			"jsonrpc": "2.0",
+			"id":      req.ID,
+			"error": map[string]interface{}{
+				"code":    -32600,
+				"message": "session/prompt while a turn is still running; send session/cancel first",
+			},
+		})
+		return
 	}
 	cancels[sessionID] = cancel
 	cancelMu.Unlock()
 
+	chunks, gap := shortTurnChunks, time.Duration(0)
+	if strings.Contains(promptText(req.Params), longTurnCue) {
+		chunks, gap = longTurnChunks, longTurnChunkGap
+	}
+
 	go func() {
-		stopReason := "end_turn"
-		for i := 1; i <= 60; i++ {
-			select {
-			case <-cancel:
-				stopReason = "cancelled"
-				i = 60
-			default:
-				publishText(sessionID, fmt.Sprintf("scripted turn %02d chunk %02d. ", turn, i))
-				time.Sleep(120 * time.Millisecond)
-			}
-		}
-		respond(req.ID, map[string]interface{}{"stopReason": stopReason})
+		stopReason := streamTurn(sessionID, turn, chunks, gap, cancel)
+		// Unregister before responding: Zed may send its next prompt the moment
+		// it reads the response.
 		cancelMu.Lock()
 		if cancels[sessionID] == cancel {
 			delete(cancels, sessionID)
 		}
 		cancelMu.Unlock()
+		respond(req.ID, map[string]interface{}{"stopReason": stopReason})
 	}()
+}
+
+// streamTurn publishes chunks text chunks gap apart and returns the ACP stop
+// reason: "cancelled" as soon as cancel closes, "end_turn" otherwise.
+func streamTurn(sessionID string, turn int64, chunks int, gap time.Duration, cancel <-chan struct{}) string {
+	for i := 1; i <= chunks; i++ {
+		select {
+		case <-cancel:
+			return "cancelled"
+		default:
+		}
+		publishText(sessionID, fmt.Sprintf("scripted turn %02d chunk %02d. ", turn, i))
+		if i == chunks || gap == 0 {
+			continue
+		}
+		select {
+		case <-cancel:
+			return "cancelled"
+		case <-time.After(gap):
+		}
+	}
+	return "end_turn"
 }
 
 func main() {
