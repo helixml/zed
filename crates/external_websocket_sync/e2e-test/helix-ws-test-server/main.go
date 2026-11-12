@@ -157,7 +157,9 @@ type roundState struct {
 	// the completion lands right at the deadline (observed on the slower claude
 	// round: "Phase 9: Received enough completions" then "PHASE 9 TIMED OUT").
 	// Per round, because phase numbers repeat in every round.
-	succeededPhases    map[int]bool
+	succeededPhases map[int]bool
+	// advancedPhases holds phases advanceAfterCompletion has already advanced.
+	advancedPhases     map[int]bool
 	phase16Deferred    bool // interrupt=false was HELD while busy (no concurrent interaction)
 	phase16Delivered   bool // the deferred message was delivered as the next turn once idle
 	phase17Interrupted bool // interrupt=true cancelled the running turn (interaction went interrupted)
@@ -197,6 +199,7 @@ func newRoundState(agentName string) *roundState {
 		completions:       make(map[string][]string),
 		streamingRequests: make(map[string]bool),
 		succeededPhases:   make(map[int]bool),
+		advancedPhases:    make(map[int]bool),
 	}
 }
 
@@ -923,7 +926,15 @@ func (d *testDriver) advanceAfterCompletion(completedPhase int) {
 	d.mu.Lock()
 	agentName := d.round.agentName
 	actualPhase := d.phase
+	// A completion can be delivered twice (Zed re-sends entries on replay and
+	// reconnect); advancing twice would run the next phase twice.
+	duplicate := d.round.advancedPhases[completedPhase]
+	d.round.advancedPhases[completedPhase] = true
 	d.mu.Unlock()
+	if duplicate {
+		log.Printf("[%s] Phase %d: DUPLICATE completion ignored (already advanced)", agentName, completedPhase)
+		return
+	}
 	log.Printf("[%s] advanceAfterCompletion(%d) called (current phase=%d)", agentName, completedPhase, actualPhase)
 
 	switch completedPhase {
@@ -973,35 +984,17 @@ func (d *testDriver) advanceAfterCompletion(completedPhase int) {
 		d.runPhase9()
 	case 11:
 		d.mu.Lock()
-		if d.round.phase11Completed {
-			agentName := d.round.agentName
-			d.mu.Unlock()
-			log.Printf("[%s] Phase 11: DUPLICATE completion ignored (already advanced)", agentName)
-			return
-		}
 		d.round.phase11Completed = true
-		agentName := d.round.agentName
-		d.mu.Unlock()
-		log.Printf("[%s] Phase 11: ✅ Routed message completed", agentName)
-		d.mu.Lock()
 		d.phase = 12
 		d.mu.Unlock()
+		log.Printf("[%s] Phase 11: ✅ Routed message completed", agentName)
 		d.runPhase12()
 	case 12:
 		d.mu.Lock()
-		if d.round.phase12Completed {
-			agentName := d.round.agentName
-			d.mu.Unlock()
-			log.Printf("[%s] Phase 12: DUPLICATE completion ignored (already advanced)", agentName)
-			return
-		}
 		d.round.phase12Completed = true
-		agentName := d.round.agentName
-		d.mu.Unlock()
-		log.Printf("[%s] Phase 12: ✅ Reconnect message completed", agentName)
-		d.mu.Lock()
 		d.phase = 13
 		d.mu.Unlock()
+		log.Printf("[%s] Phase 12: ✅ Reconnect message completed", agentName)
 		d.runPhase13()
 	case 15:
 		// Phase 15 done — advance to the production queue-path phases.
@@ -2388,16 +2381,10 @@ func (d *testDriver) validateRound() roundResult {
 	// `chrome-devtools/github context server failed to start` timeouts
 	// in long-running spec_tasks.
 	//
-	// IMPORTANT: this assertion currently DOES catch the ambient draft
-	// Claude that spawns on Zed startup — Fix 1b (defer
-	// connection.new_session() until first user input in the draft) is
-	// not yet implemented. Until that lands, this assertion will report
-	// `expected N, got N+1` per agent round and fail. That failure is
-	// the deliberate tracked-failure regression-test for Fix 1b. Once
-	// Fix 1b lands the assertion passes and continues to guard against
-	// future regression. See:
+	// The live claude lane on Helix main passes this check (every run from
+	// build 5381 to 5543, Nov 2026), so no ambient draft Claude is counted
+	// today; it guards against one coming back. Background:
 	// helix/design/2026-05-13-mcp-cache-contention-and-duplicate-claude-spawn.md
-	// section "Why Fix 1b was deferred" for the implementation plan.
 	if agent == "claude" {
 		liveClaudes, err := countLiveClaudeProcesses()
 		if err != nil {
