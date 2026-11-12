@@ -227,8 +227,21 @@ func runLifecyclePrompt(req request) {
 	turn := lifecycleCount.Add(1)
 	cancel := make(chan struct{})
 	cancelMu.Lock()
-	if previous := cancels[sessionID]; previous != nil {
-		close(previous)
+	if cancels[sessionID] != nil {
+		cancelMu.Unlock()
+		// ACP clients must cancel (or await) a running turn before prompting
+		// again. Cancelling it here on Zed's behalf would hide exactly the
+		// missing-cancel regressions the interrupt phases exist to catch.
+		fmt.Fprintf(os.Stderr, "[plan-test-agent] session/prompt for %s while a turn is still running\n", sessionID)
+		write(map[string]interface{}{
+			"jsonrpc": "2.0",
+			"id":      req.ID,
+			"error": map[string]interface{}{
+				"code":    -32600,
+				"message": "session/prompt while a turn is still running; send session/cancel first",
+			},
+		})
+		return
 	}
 	cancels[sessionID] = cancel
 	cancelMu.Unlock()
@@ -239,12 +252,15 @@ func runLifecyclePrompt(req request) {
 	}
 
 	go func() {
-		respond(req.ID, map[string]interface{}{"stopReason": streamTurn(sessionID, turn, chunks, gap, cancel)})
+		stopReason := streamTurn(sessionID, turn, chunks, gap, cancel)
+		// Unregister before responding: Zed may send its next prompt the moment
+		// it reads the response.
 		cancelMu.Lock()
 		if cancels[sessionID] == cancel {
 			delete(cancels, sessionID)
 		}
 		cancelMu.Unlock()
+		respond(req.ID, map[string]interface{}{"stopReason": stopReason})
 	}()
 }
 

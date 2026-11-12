@@ -25,6 +25,9 @@ ZED_BINARY="${ZED_BINARY:-/usr/local/bin/zed}"
 AGENT_COUNT=$(echo "${E2E_AGENTS:-zed-agent}" | tr ',' '\n' | wc -l)
 DEFAULT_TIMEOUT=$((300 * AGENT_COUNT))
 TEST_TIMEOUT="${TEST_TIMEOUT:-$DEFAULT_TIMEOUT}"
+# The server gets a slightly shorter budget so its own timeout, which dumps the
+# round state, fires before this script gives up on it.
+export E2E_SERVER_TIMEOUT_SECS=$((TEST_TIMEOUT - 20))
 MOCK_SERVER="${HELIX_WS_TEST_SERVER:-/usr/local/bin/helix-ws-test-server}"
 PROJECT_DIR="/test/project"
 MOCK_PORT_FILE="/tmp/mock_helix_port"
@@ -477,8 +480,8 @@ while [ "$SECONDS" -lt "$DEADLINE" ]; do
         echo "[error] Zed exited early with code ${ZED_EXIT:-0}"
         # Still check if mock server got enough events
         if ! kill -0 "$MOCK_PID" 2>/dev/null; then
-            wait "$MOCK_PID"
-            MOCK_EXIT=$?
+            MOCK_EXIT=0
+            wait "$MOCK_PID" || MOCK_EXIT=$?
             if [ "$MOCK_EXIT" -eq 0 ]; then
                 echo ""
                 echo "============================================"
@@ -496,8 +499,8 @@ while [ "$SECONDS" -lt "$DEADLINE" ]; do
 
     # Check if mock server completed successfully
     if ! kill -0 "$MOCK_PID" 2>/dev/null; then
-        wait "$MOCK_PID"
-        MOCK_EXIT=$?
+        MOCK_EXIT=0
+        wait "$MOCK_PID" || MOCK_EXIT=$?
         if [ "$MOCK_EXIT" -eq 0 ]; then
             echo ""
             echo "============================================"

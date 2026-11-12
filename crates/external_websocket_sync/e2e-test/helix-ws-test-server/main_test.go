@@ -1,6 +1,10 @@
 package main
 
-import "testing"
+import (
+	"testing"
+
+	"github.com/helixml/helix/api/pkg/types"
+)
 
 func TestResponseEntryIsolationKey(t *testing.T) {
 	previous := map[responseEntryKey]string{{messageID: "3", content: "first"}: "interaction-1"}
@@ -53,5 +57,65 @@ func TestIsCompletedSlowMCPToolCall(t *testing.T) {
 	data["request_id"] = "req-phase2-claude"
 	if isCompletedSlowMCPToolCall(data, "req-phase1-claude") {
 		t.Fatal("tool call from another turn was accepted")
+	}
+}
+
+func TestStreamedBeforeCompletion(t *testing.T) {
+	event := func(eventType, requestID, role string) types.SyncMessage {
+		return types.SyncMessage{EventType: eventType, Data: map[string]interface{}{
+			"request_id": requestID, "role": role, "entry_type": "text", "content": "chunk",
+		}}
+	}
+	planSnapshot := types.SyncMessage{EventType: "message_added", Data: map[string]interface{}{
+		"request_id": "req-2", "role": "assistant", "entry_type": "plan", "content": `{"steps":[]}`,
+	}}
+	tests := []struct {
+		name   string
+		events []types.SyncMessage
+		want   int
+	}{
+		{
+			name: "streamed before its completion",
+			events: []types.SyncMessage{
+				event("message_added", "req-2", "assistant"),
+				event("message_added", "req-2", "assistant"),
+				event("message_completed", "req-2", ""),
+			},
+			want: 2,
+		},
+		{
+			// The bug this guards: another turn's earlier streaming must not
+			// count for a turn whose content only arrived with its completion.
+			name: "only another request streamed first",
+			events: []types.SyncMessage{
+				event("message_added", "req-1", "assistant"),
+				event("message_completed", "req-1", ""),
+				event("message_completed", "req-2", ""),
+				event("message_added", "req-2", "assistant"),
+			},
+			want: 0,
+		},
+		{
+			// Zed emits the plan snapshot as the turn starts, before the agent
+			// has the prompt; it must not count as the turn streaming.
+			name:   "plan snapshot is not agent output",
+			events: []types.SyncMessage{planSnapshot, event("message_completed", "req-2", "")},
+			want:   0,
+		},
+		{
+			name: "user echo is not assistant streaming",
+			events: []types.SyncMessage{
+				event("message_added", "req-2", "user"),
+				event("message_completed", "req-2", ""),
+			},
+			want: 0,
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if got := streamedBeforeCompletion(test.events, "req-2"); got != test.want {
+				t.Fatalf("streamedBeforeCompletion() = %d, want %d", got, test.want)
+			}
+		})
 	}
 }
