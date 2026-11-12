@@ -26,8 +26,8 @@ COPY helix-api /helix/api
 COPY helix-org /helix/helix-org
 COPY helix-ws-test-server /app
 WORKDIR /app
-RUN --mount=type=cache,target=/go/pkg/mod \
-    --mount=type=cache,target=/root/.cache/go-build \
+RUN --mount=type=cache,id=zed-e2e-gomod,target=/go/pkg/mod \
+    --mount=type=cache,id=zed-e2e-gobuild,target=/root/.cache/go-build \
     sed -i 's|../../../../../helix|/helix|g' go.mod && \
     go mod tidy && \
     CGO_ENABLED=1 go build -ldflags '-extldflags "-static"' -o /helix-ws-test-server .
@@ -36,14 +36,14 @@ RUN --mount=type=cache,target=/go/pkg/mod \
 FROM golang:1.25-alpine AS mcp-builder
 COPY slow-mcp-server /app
 WORKDIR /app
-RUN --mount=type=cache,target=/root/.cache/go-build \
+RUN --mount=type=cache,id=zed-e2e-gobuild,target=/root/.cache/go-build \
     CGO_ENABLED=0 go build -o /slow-mcp-server .
 
 # Stage 3: Build the deterministic ACP plan agent.
 FROM golang:1.25-alpine AS plan-agent-builder
 COPY plan-test-agent /app
 WORKDIR /app
-RUN --mount=type=cache,target=/root/.cache/go-build \
+RUN --mount=type=cache,id=zed-e2e-gobuild,target=/root/.cache/go-build \
     CGO_ENABLED=0 go build -o /plan-test-agent .
 
 # Stage 4: Runtime
