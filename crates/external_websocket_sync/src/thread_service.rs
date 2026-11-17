@@ -32,6 +32,76 @@ fn zed_agent_server_id(agent_name: &str) -> &str {
     }
 }
 
+/// How many times [`connect_when_registered`] retries a connect that failed
+/// because the agent is not registered yet, and how long it waits between tries.
+const AGENT_REGISTRATION_RETRIES: u32 = 10;
+const AGENT_REGISTRATION_RETRY_DELAY: Duration = Duration::from_secs(1);
+
+fn is_agent_not_registered(error: &acp_thread::LoadError) -> bool {
+    error.to_string().contains("is not registered")
+}
+
+/// Connect to `server` through the shared connection cache, retrying while the
+/// agent is not registered yet.
+///
+/// Registry agents (`claude-acp`, `codex-acp`) are only registered after
+/// `AgentRegistryStore` has loaded the ACP registry, which happens
+/// asynchronously after every Zed start. A Helix message that arrives in that
+/// window, such as a follow-up to an existing thread right after a Zed restart,
+/// would otherwise fail with "Custom agent server `codex-acp` is not
+/// registered", although the same message succeeds a few seconds later. Every
+/// path that connects on Helix's behalf must go through this helper, not only
+/// thread creation.
+async fn connect_when_registered(
+    project: Entity<Project>,
+    server: std::rc::Rc<dyn agent_servers::AgentServer>,
+    cx: &gpui::AsyncApp,
+) -> std::result::Result<std::rc::Rc<dyn acp_thread::AgentConnection>, acp_thread::LoadError> {
+    let agent_id = server.agent_id();
+    let mut attempt = 0u32;
+    loop {
+        let shared = cx.update(|cx| {
+            let agent_server_store = project.read(cx).agent_server_store().clone();
+            let delegate = agent_servers::AgentServerDelegate::new(agent_server_store, None, None);
+            agent_servers::AgentConnectionCache::request_connection(
+                cx,
+                project.clone(),
+                agent_id.clone(),
+                server.clone(),
+                delegate,
+            )
+        });
+        match shared.await {
+            Ok(connection) => return Ok(connection),
+            Err(error)
+                if attempt < AGENT_REGISTRATION_RETRIES && is_agent_not_registered(&error) =>
+            {
+                attempt += 1;
+                log::warn!(
+                    "[THREAD_SERVICE] Agent {:?} not registered yet (attempt {}/{}), retrying in {:?}: {}",
+                    agent_id,
+                    attempt,
+                    AGENT_REGISTRATION_RETRIES,
+                    AGENT_REGISTRATION_RETRY_DELAY,
+                    error
+                );
+                // Drop the cached failure so the next attempt calls connect() again.
+                cx.update(|cx| {
+                    agent_servers::AgentConnectionCache::evict(
+                        cx,
+                        project.entity_id(),
+                        agent_id.clone(),
+                    )
+                });
+                cx.background_executor()
+                    .timer(AGENT_REGISTRATION_RETRY_DELAY)
+                    .await;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
 fn report_thread_creation_failure(request_id: &str, error: &str) {
     if let Err(send_err) = crate::send_websocket_event(SyncEvent::ChatResponseError {
         request_id: request_id.to_string(),
@@ -123,6 +193,117 @@ mod agent_server_id_tests {
         assert_eq!(zed_agent_server_id("claude"), "claude-acp");
         assert_eq!(zed_agent_server_id("codex"), "codex-acp");
         assert_eq!(zed_agent_server_id("qwen"), "qwen");
+    }
+}
+
+#[cfg(test)]
+mod connect_when_registered_tests {
+    use super::{
+        AGENT_REGISTRATION_RETRIES, AGENT_REGISTRATION_RETRY_DELAY, connect_when_registered,
+    };
+    use acp_thread::{AgentConnection, StubAgentConnection};
+    use agent_servers::{AgentServer, AgentServerDelegate};
+    use anyhow::anyhow;
+    use fs::FakeFs;
+    use gpui::{App, Entity, Task, TestAppContext};
+    use project::{AgentId, Project};
+    use settings::SettingsStore;
+    use std::rc::Rc;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// Fails its first `failures` connects with `error`, then connects.
+    struct LateRegisteringAgentServer {
+        agent_id: AgentId,
+        failures: usize,
+        error: &'static str,
+        connect_count: Arc<AtomicUsize>,
+    }
+
+    impl AgentServer for LateRegisteringAgentServer {
+        fn logo(&self) -> ui::IconName {
+            ui::IconName::ZedAgent
+        }
+
+        fn agent_id(&self) -> AgentId {
+            self.agent_id.clone()
+        }
+
+        fn connect(
+            &self,
+            _delegate: AgentServerDelegate,
+            _project: Entity<Project>,
+            _cx: &mut App,
+        ) -> Task<anyhow::Result<Rc<dyn AgentConnection>>> {
+            let attempt = self.connect_count.fetch_add(1, Ordering::SeqCst);
+            if attempt < self.failures {
+                Task::ready(Err(anyhow!(self.error)))
+            } else {
+                Task::ready(Ok(Rc::new(StubAgentConnection::new())))
+            }
+        }
+
+        fn into_any(self: Rc<Self>) -> Rc<dyn std::any::Any> {
+            self
+        }
+    }
+
+    async fn connect(
+        failures: usize,
+        error: &'static str,
+        cx: &mut TestAppContext,
+    ) -> (bool, usize) {
+        cx.update(|cx| {
+            let settings_store = SettingsStore::test(cx);
+            cx.set_global(settings_store);
+        });
+        let fs = FakeFs::new(cx.executor());
+        let project = Project::test(fs, [], cx).await;
+        let connect_count = Arc::new(AtomicUsize::new(0));
+        let server = Rc::new(LateRegisteringAgentServer {
+            // Unique per test: the connection cache is process-global.
+            agent_id: AgentId::new(format!("codex-acp-{}", uuid::Uuid::new_v4())),
+            failures,
+            error,
+            connect_count: connect_count.clone(),
+        });
+
+        let task = cx.update(|cx| {
+            cx.spawn(async move |cx| connect_when_registered(project, server, cx).await)
+        });
+        for _ in 0..=AGENT_REGISTRATION_RETRIES {
+            cx.run_until_parked();
+            cx.executor().advance_clock(AGENT_REGISTRATION_RETRY_DELAY);
+        }
+        let connected = task.await.is_ok();
+        (connected, connect_count.load(Ordering::SeqCst))
+    }
+
+    #[gpui::test]
+    async fn waits_for_a_late_registering_agent(cx: &mut TestAppContext) {
+        let (connected, attempts) =
+            connect(3, "Custom agent server `codex-acp` is not registered", cx).await;
+        assert!(connected, "connect should succeed once the agent registers");
+        assert_eq!(attempts, 4);
+    }
+
+    #[gpui::test]
+    async fn gives_up_when_the_agent_never_registers(cx: &mut TestAppContext) {
+        let (connected, attempts) = connect(
+            usize::MAX,
+            "Custom agent server `codex-acp` is not registered",
+            cx,
+        )
+        .await;
+        assert!(!connected);
+        assert_eq!(attempts, AGENT_REGISTRATION_RETRIES as usize + 1);
+    }
+
+    #[gpui::test]
+    async fn does_not_retry_other_connect_errors(cx: &mut TestAppContext) {
+        let (connected, attempts) = connect(1, "Claude Agent process exited", cx).await;
+        assert!(!connected);
+        assert_eq!(attempts, 1);
     }
 }
 
@@ -3227,55 +3408,17 @@ fn create_new_thread_sync(
     cx.spawn(async move |cx| {
         eprintln!("🚀 [THREAD_SERVICE] Spawn task started for request: {}", request_clone.request_id);
 
-        // Retry connecting up to 10 times with 1s delay when the agent is not yet registered.
-        // This handles the race where the AgentRegistryStore's async network fetch (for registry
-        // agents like claude-acp) hasn't completed by the time the first message arrives.
-        let max_retries = 10u32;
-        let connection: std::rc::Rc<dyn acp_thread::AgentConnection> = {
-            let mut attempt = 0u32;
-            loop {
-                let shared = cx.update(|cx| {
-                    let server = agent.server(fs.clone(), acp_history_store.clone());
-                    let agent_id = server.agent_id();
-                    let agent_server_store = project.read(cx).agent_server_store().clone();
-                    let delegate = agent_servers::AgentServerDelegate::new(
-                        agent_server_store,
-                        None,
-                        None,
-                    );
-                    eprintln!("🔌 [THREAD_SERVICE] Requesting cached connection (attempt {}/{})...", attempt + 1, max_retries + 1);
-                    agent_servers::AgentConnectionCache::request_connection(
-                        cx,
-                        project.clone(),
-                        agent_id,
-                        server,
-                        delegate,
-                    )
-                });
-
-                eprintln!("⏳ [THREAD_SERVICE] Awaiting connection task...");
-                match shared.await {
-                    Ok(conn) => {
-                        eprintln!("✅ [THREAD_SERVICE] Connected to agent successfully");
-                        break conn;
-                    }
-                    Err(e) if attempt < max_retries && e.to_string().contains("not registered") => {
-                        eprintln!("⚠️ [THREAD_SERVICE] Agent not registered yet (attempt {}/{}), retrying in 1s: {:?}", attempt + 1, max_retries, e);
-                        // Evict the cached failure so the next iteration triggers a fresh connect.
-                        cx.update(|cx| {
-                            let server = agent.server(fs.clone(), acp_history_store.clone());
-                            agent_servers::AgentConnectionCache::evict(cx, project.entity_id(), server.agent_id());
-                        });
-                        attempt += 1;
-                        cx.background_executor().timer(Duration::from_secs(1)).await;
-                    }
-                    Err(e) => {
-                        eprintln!("❌ [THREAD_SERVICE] Failed to connect to agent: {:?}", e);
-                        let error = format!("agent connect failed: {:#}", e);
-                        report_thread_creation_failure(&request_clone.request_id, &error);
-                        return Err(anyhow::anyhow!(error));
-                    }
-                }
+        let server = agent.server(fs.clone(), acp_history_store.clone());
+        let connection = match connect_when_registered(project.clone(), server, cx).await {
+            Ok(connection) => {
+                eprintln!("✅ [THREAD_SERVICE] Connected to agent successfully");
+                connection
+            }
+            Err(e) => {
+                eprintln!("❌ [THREAD_SERVICE] Failed to connect to agent: {:?}", e);
+                let error = format!("agent connect failed: {:#}", e);
+                report_thread_creation_failure(&request_clone.request_id, &error);
+                return Err(anyhow::anyhow!(error));
             }
         };
 
@@ -3866,20 +4009,7 @@ async fn force_close_agent_session(
 
     let server = agent.server(fs, acp_history_store.clone());
 
-    let shared = cx.update(|cx| {
-        let agent_id = server.agent_id();
-        let agent_server_store = project.read(cx).agent_server_store().clone();
-        let delegate = agent_servers::AgentServerDelegate::new(agent_server_store, None, None);
-        agent_servers::AgentConnectionCache::request_connection(
-            cx,
-            project.clone(),
-            agent_id,
-            server.clone(),
-            delegate,
-        )
-    });
-
-    let connection: std::rc::Rc<dyn acp_thread::AgentConnection> = shared
+    let connection = connect_when_registered(project.clone(), server, &cx)
         .await
         .map_err(|e| anyhow::anyhow!("agent connect for force-close failed: {:?}", e))?;
 
@@ -3996,20 +4126,9 @@ async fn load_thread_from_agent(
 
     let server = agent.server(fs, acp_history_store.clone());
 
-    // Get agent server store and create (or reuse cached) connection
-    let (shared, cwd) = cx.update(|cx| {
-        let agent_id = server.agent_id();
-        let agent_server_store = project.read(cx).agent_server_store().clone();
-        let delegate = agent_servers::AgentServerDelegate::new(agent_server_store, None, None);
-        let shared = agent_servers::AgentConnectionCache::request_connection(
-            cx,
-            project.clone(),
-            agent_id,
-            server.clone(),
-            delegate,
-        );
+    let cwd = cx.update(|cx| {
         // Use ZED_WORK_DIR for consistency with session storage
-        let cwd = std::env::var("ZED_WORK_DIR")
+        std::env::var("ZED_WORK_DIR")
             .ok()
             .map(|dir| std::path::PathBuf::from(dir))
             .unwrap_or_else(|| {
@@ -4019,11 +4138,10 @@ async fn load_thread_from_agent(
                     .next()
                     .map(|wt| wt.read(cx).abs_path().to_path_buf())
                     .unwrap_or_else(|| std::env::current_dir().unwrap_or_default())
-            });
-        (shared, cwd)
+            })
     });
 
-    let connection: std::rc::Rc<dyn acp_thread::AgentConnection> = shared
+    let connection = connect_when_registered(project.clone(), server, &cx)
         .await
         .map_err(|e| anyhow::anyhow!("agent connect failed: {:?}", e))?;
 
@@ -4262,23 +4380,6 @@ fn open_existing_thread_sync(
     log::info!("🔧 [THREAD_SERVICE] Selected agent: {:?}", agent);
 
     let server = agent.server(fs, acp_history_store.clone());
-    let agent_id = server.agent_id();
-
-    // Get agent server store from project
-    let agent_server_store = project.read(cx).agent_server_store().clone();
-
-    // Create delegate for connection
-    let delegate = agent_servers::AgentServerDelegate::new(agent_server_store, None, None);
-
-    // Get cached connection or create a new one (deduped against concurrent
-    // callers in workspace restore / load_thread_from_agent / agent_connection_store).
-    let shared = agent_servers::AgentConnectionCache::request_connection(
-        cx,
-        project.clone(),
-        agent_id,
-        server.clone(),
-        delegate,
-    );
 
     // Use ZED_WORK_DIR for consistency with session storage
     let cwd = std::env::var("ZED_WORK_DIR")
@@ -4309,7 +4410,7 @@ fn open_existing_thread_sync(
         }
         let _loading_guard = ClearLoadingGuard;
 
-        let connection = match shared.await {
+        let connection = match connect_when_registered(project_clone.clone(), server, cx).await {
             Ok(result) => result,
             Err(e) => {
                 eprintln!("❌ [THREAD_SERVICE] Failed to connect to agent: {:?}", e);
