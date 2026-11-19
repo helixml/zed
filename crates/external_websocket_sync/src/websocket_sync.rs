@@ -477,10 +477,10 @@ impl WebSocketSync {
             return Ok(());
         }
 
-        eprintln!("💬 [WEBSOCKET-IN] Processing chat_message: acp_thread_id={:?}, request_id={}, message_len={}, interrupt={}",
-                   chat_msg.acp_thread_id, chat_msg.request_id, chat_msg.message.len(), chat_msg.interrupt);
-        log::info!("💬 [WEBSOCKET-IN] Processing chat_message: acp_thread_id={:?}, request_id={}, message_len={}, interrupt={}",
-                   chat_msg.acp_thread_id, chat_msg.request_id, chat_msg.message.len(), chat_msg.interrupt);
+        eprintln!("💬 [WEBSOCKET-IN] Processing chat_message: acp_thread_id={:?}, request_id={}, message_len={}, interrupt={}, steer={}",
+                   chat_msg.acp_thread_id, chat_msg.request_id, chat_msg.message.len(), chat_msg.interrupt, chat_msg.steer);
+        log::info!("💬 [WEBSOCKET-IN] Processing chat_message: acp_thread_id={:?}, request_id={}, message_len={}, interrupt={}, steer={}",
+                   chat_msg.acp_thread_id, chat_msg.request_id, chat_msg.message.len(), chat_msg.interrupt, chat_msg.steer);
 
         // If this is an interrupt message and we have an existing thread, cancel its
         // running turn immediately via the dedicated cancel task (which runs independently
@@ -503,6 +503,17 @@ impl WebSocketSync {
                         log::warn!("⚠️ [WEBSOCKET-IN] Failed to request cancel for thread {}: {}", thread_id, e);
                     }
                 }
+            }
+        }
+
+        if chat_msg.steer && !chat_msg.interrupt {
+            if let Some(thread_id) = chat_msg.acp_thread_id.clone().filter(|id| !id.is_empty()) {
+                return crate::request_steer_thread(crate::SteerThreadRequest {
+                    acp_thread_id: thread_id,
+                    message: chat_msg.message,
+                    request_id: chat_msg.request_id,
+                    agent_name: chat_msg.agent_name,
+                });
             }
         }
 

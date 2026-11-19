@@ -309,6 +309,14 @@ pub enum SyncEvent {
         /// an empty array, so it is always serialized.
         active_turns: Vec<crate::ActiveTurn>,
     },
+    /// What the agent behind a thread can do, sent once its connection is
+    /// known. `steering_supported` tells Helix whether a steer can be delivered
+    /// mid-turn or must wait for the turn to end.
+    #[serde(rename = "agent_capabilities")]
+    AgentCapabilities {
+        acp_thread_id: String,
+        steering_supported: bool,
+    },
     /// Sent in response to cancel_current_turn command from Helix
     #[serde(rename = "turn_cancelled")]
     TurnCancelled {
@@ -459,6 +467,16 @@ impl SyncEvent {
                     "active_turns": active_turns,
                 }),
             ),
+            SyncEvent::AgentCapabilities {
+                acp_thread_id,
+                steering_supported,
+            } => (
+                "agent_capabilities".to_string(),
+                serde_json::json!({
+                    "acp_thread_id": acp_thread_id,
+                    "steering_supported": steering_supported,
+                }),
+            ),
             SyncEvent::TurnCancelled { request_id, status } => (
                 "turn_cancelled".to_string(),
                 serde_json::json!({
@@ -525,6 +543,10 @@ pub struct IncomingChatMessage {
     pub agent_name: Option<String>,  // Which agent to use (zed-agent or qwen) - defaults to zed-agent
     #[serde(default)]
     pub interrupt: bool,  // If true, cancel the current running turn before sending this message
+    /// If true, deliver the message into the running turn instead of waiting
+    /// for it to finish. Ignored when no turn is running.
+    #[serde(default)]
+    pub steer: bool,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
