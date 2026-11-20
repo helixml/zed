@@ -156,10 +156,10 @@ type roundState struct {
 	// advancedPhases holds the phases whose success has been claimed
 	// (claimAdvanceLocked). Per round, because phase numbers repeat each round.
 	advancedPhases     map[int]bool
-	phase16Deferred    bool // interrupt=false was HELD while busy (no concurrent interaction)
-	phase16Delivered   bool // the deferred message was delivered as the next turn once idle
-	phase17Interrupted bool // interrupt=true cancelled the running turn (interaction went interrupted)
-	phase17Delivered   bool // the interrupt message was delivered
+	phase16Deferred    bool     // interrupt=false was HELD while busy (no concurrent interaction)
+	phase16Delivered   bool     // the deferred message was delivered as the next turn once idle
+	phase17Interrupted bool     // interrupt=true cancelled the running turn (interaction went interrupted)
+	phase17Delivered   bool     // the interrupt message was delivered
 	phase18Checked     bool     // phase 18 ran to its assertions
 	phase18Failures    []string // phase 18 assertion failures
 }

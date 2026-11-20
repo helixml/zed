@@ -486,11 +486,12 @@ static EXTERNAL_ORIGINATED_ENTRIES: parking_lot::Mutex<
 static SIMULATED_INPUT_ENTRIES: LazyLock<parking_lot::Mutex<HashMap<String, HashSet<usize>>>> =
     LazyLock::new(|| parking_lot::Mutex::new(HashMap::new()));
 
-/// thread_id -> (entry index, request_id) of a steered user entry about to be
-/// pushed. The subscription's NewEntry handler consumes it to split the
+/// thread_id -> entry index -> request_id of steered user entries about to be
+/// pushed. The subscription's NewEntry handler consumes each one to split the
 /// running turn: everything before the entry completes under the old
-/// request_id, everything after streams under the steered one.
-static STEER_SPLITS: LazyLock<parking_lot::Mutex<HashMap<String, (usize, String)>>> =
+/// request_id, everything after streams under the steered one. Keyed by entry
+/// so two steers into one turn cannot overwrite each other's split.
+static STEER_SPLITS: LazyLock<parking_lot::Mutex<HashMap<String, HashMap<usize, String>>>> =
     LazyLock::new(|| parking_lot::Mutex::new(HashMap::new()));
 
 /// Lifecycle guards for steered requests, released when the agent's turn on
@@ -2100,6 +2101,8 @@ fn native_steer_started(
     }
 }
 
+const STEER_RESPONSE_TIMEOUT: Duration = Duration::from_secs(10);
+
 async fn steer_thread(request: crate::SteerThreadRequest, cx: &mut gpui::AsyncApp) {
     let Some(thread) = crate::get_thread(&request.acp_thread_id).and_then(|weak| weak.upgrade())
     else {
@@ -2149,7 +2152,20 @@ async fn steer_thread(request: crate::SteerThreadRequest, cx: &mut gpui::AsyncAp
             let prompt = vec![ContentBlock::Text(TextContent::new(
                 request.message.clone(),
             ))];
-            let outcome = cx.update(|cx| steer.run(prompt, cx)).await;
+            // This task serialises every steer in the process, so a live but
+            // unresponsive agent must not hold it. A steer only enqueues the
+            // message on the agent side and answers at once; past the bound we
+            // deliver the message as a follow-up instead, which has its own
+            // silence watchdog. If the agent does inject it after giving up
+            // here, the message reaches it twice rather than not at all.
+            let steer_response = Box::pin(cx.update(|cx| steer.run(prompt, cx)));
+            let timeout = Box::pin(cx.background_executor().timer(STEER_RESPONSE_TIMEOUT));
+            let outcome = match futures::future::select(steer_response, timeout).await {
+                futures::future::Either::Left((outcome, _)) => outcome,
+                futures::future::Either::Right(_) => Err(anyhow::anyhow!(
+                    "agent did not answer the steering request within {STEER_RESPONSE_TIMEOUT:?}"
+                )),
+            };
             match outcome {
                 Ok(acp_thread::SteerOutcome::Injected) => {
                     log::info!(
@@ -2198,10 +2214,7 @@ fn record_steered_entry(
 ) {
     let entry_idx = thread.read(cx).entries().len();
     mark_external_originated_entry(request.acp_thread_id.clone(), entry_idx);
-    STEER_SPLITS.lock().insert(
-        request.acp_thread_id.clone(),
-        (entry_idx, request.request_id.clone()),
-    );
+    record_steer_split(&request.acp_thread_id, entry_idx, &request.request_id);
     thread.update(cx, |thread, cx| {
         thread.push_user_content_block(
             None,
@@ -2211,12 +2224,31 @@ fn record_steered_entry(
     });
 }
 
+fn record_steer_split(thread_id: &str, entry_idx: usize, request_id: &str) {
+    STEER_SPLITS
+        .lock()
+        .entry(thread_id.to_string())
+        .or_default()
+        .insert(entry_idx, request_id.to_string());
+}
+
 fn take_steer_split(thread_id: &str, entry_idx: usize) -> Option<String> {
     let mut splits = STEER_SPLITS.lock();
-    match splits.get(thread_id) {
-        Some((idx, _)) if *idx == entry_idx => splits.remove(thread_id).map(|(_, rid)| rid),
-        _ => None,
+    let thread_splits = splits.get_mut(thread_id)?;
+    let request_id = thread_splits.remove(&entry_idx);
+    if thread_splits.is_empty() {
+        splits.remove(thread_id);
     }
+    request_id
+}
+
+/// Drop a closed thread's steering state. Releasing its steered-turn guards
+/// keeps `active_turns` from reporting a turn that can no longer finish.
+fn forget_thread_steering(thread_id: &str) {
+    STEER_SPLITS.lock().remove(thread_id);
+    NATIVE_STEERS_PENDING.lock().remove(thread_id);
+    let guards = STEERED_TURN_GUARDS.lock().remove(thread_id);
+    drop(guards);
 }
 
 /// Ensure a thread has an event subscription for syncing to Helix.
@@ -4390,6 +4422,7 @@ async fn close_discarded_thread(
         ),
     }
     forget_thread_agent_session(&acp_thread_id);
+    forget_thread_steering(&acp_thread_id);
 }
 
 /// Drop a thread's agent session id and agent name.
@@ -6185,5 +6218,51 @@ mod agent_process_crash_tests {
              activation lane. Without an Error arm the crash is swallowed and the \
              interaction stays waiting forever — the permanent worker wedge."
         );
+    }
+}
+
+#[cfg(test)]
+mod steer_bookkeeping_tests {
+    use super::*;
+
+    #[test]
+    fn two_steers_into_one_turn_keep_their_own_splits() {
+        let thread_id = "steer-bookkeeping-two-splits";
+        record_steer_split(thread_id, 4, "steer-a");
+        record_steer_split(thread_id, 7, "steer-b");
+
+        assert_eq!(take_steer_split(thread_id, 5), None);
+        assert_eq!(take_steer_split(thread_id, 4).as_deref(), Some("steer-a"));
+        assert_eq!(take_steer_split(thread_id, 4), None);
+        assert_eq!(take_steer_split(thread_id, 7).as_deref(), Some("steer-b"));
+        assert!(!STEER_SPLITS.lock().contains_key(thread_id));
+    }
+
+    #[test]
+    fn closing_a_thread_releases_its_steered_turns() {
+        let thread_id = "steer-bookkeeping-close";
+        let request_id = "steer-bookkeeping-close-request";
+        let guard = crate::start_steered_request(request_id, thread_id)
+            .expect("a new steer is admitted");
+        STEERED_TURN_GUARDS
+            .lock()
+            .entry(thread_id.to_string())
+            .or_default()
+            .push(guard);
+        record_steer_split(thread_id, 3, request_id);
+        NATIVE_STEERS_PENDING
+            .lock()
+            .entry(thread_id.to_string())
+            .or_default()
+            .insert(request_id.to_string());
+
+        forget_thread_steering(thread_id);
+
+        assert!(!STEER_SPLITS.lock().contains_key(thread_id));
+        assert!(!NATIVE_STEERS_PENDING.lock().contains_key(thread_id));
+        assert!(!STEERED_TURN_GUARDS.lock().contains_key(thread_id));
+        // The released request no longer counts as active, so a redelivery
+        // after reconnect is admitted again.
+        assert!(crate::start_steered_request(request_id, thread_id).is_some());
     }
 }

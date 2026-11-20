@@ -382,6 +382,26 @@ mod request_lifecycle_tests {
     }
 
     #[test]
+    fn steered_request_is_admitted_once() {
+        let request_id = "request-lifecycle-steer-duplicate";
+        let guard = start_steered_request(request_id, "thread-steer").unwrap();
+        assert!(guard.can_continue());
+        assert!(start_steered_request(request_id, "thread-steer").is_none());
+
+        drop(guard);
+        assert!(start_steered_request(request_id, "thread-steer").is_some());
+    }
+
+    #[test]
+    fn steered_request_honours_a_cancellation_tombstone() {
+        let request_id = "request-lifecycle-steer-cancelled";
+        register_queued_request(request_id, Some("thread-steer"));
+        assert_eq!(cancel_registered_request(request_id), CancellationTarget::Queued);
+
+        assert!(start_steered_request(request_id, "thread-steer").is_none());
+    }
+
+    #[test]
     fn duplicate_ingress_is_rejected_while_active() {
         let request_id = "request-lifecycle-duplicate";
         assert_eq!(

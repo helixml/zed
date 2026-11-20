@@ -37,7 +37,7 @@ var (
 	// steers carries `_session/steering` messages into the session's running
 	// turn. Present exactly while a lifecycle turn runs.
 	steers = make(map[string]chan string)
-	mcpMu          sync.Mutex
+	mcpMu  sync.Mutex
 	// mcpServerNames is what session/new handed us. An ACP agent is given its
 	// MCP servers once, at session creation, so this is the only chance to see
 	// them — and reporting them is how the suite catches a Zed that creates the
