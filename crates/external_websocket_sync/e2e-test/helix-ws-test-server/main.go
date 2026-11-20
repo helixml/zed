@@ -4,7 +4,7 @@
 // tests and production.
 //
 // The server runs multiple "rounds", one per agent type (zed-agent, claude, etc.).
-// Each round executes the same 17 test phases:
+// Each round executes the same 18 test phases:
 //
 //	Phase 1: Basic thread creation (new chat_message, no thread ID)
 //	Phase 2: Follow-up on existing thread (same thread ID)
@@ -26,6 +26,8 @@
 //	          so external_websocket_sync only sees stale snapshots until message_completed.)
 //	Phase 16: Production queue busy-defer (enqueue interrupt=false while busy; held, then delivered when idle)
 //	Phase 17: Production queue interrupt (enqueue interrupt=true while busy; cancels the turn, then delivered)
+//	Phase 18: Production queue steer (enqueue steer=true while busy; delivered mid-turn without cancelling
+//	          when the agent reports steering support, else held like a queued prompt)
 //
 // Smoke mode (E2E_SMOKE=1) replaces the phase chain above with a single phase:
 // the agent is asked to read a file holding a magic number and echo it back. It
@@ -154,10 +156,12 @@ type roundState struct {
 	// advancedPhases holds the phases whose success has been claimed
 	// (claimAdvanceLocked). Per round, because phase numbers repeat each round.
 	advancedPhases     map[int]bool
-	phase16Deferred    bool // interrupt=false was HELD while busy (no concurrent interaction)
-	phase16Delivered   bool // the deferred message was delivered as the next turn once idle
-	phase17Interrupted bool // interrupt=true cancelled the running turn (interaction went interrupted)
-	phase17Delivered   bool // the interrupt message was delivered
+	phase16Deferred    bool     // interrupt=false was HELD while busy (no concurrent interaction)
+	phase16Delivered   bool     // the deferred message was delivered as the next turn once idle
+	phase17Interrupted bool     // interrupt=true cancelled the running turn (interaction went interrupted)
+	phase17Delivered   bool     // the interrupt message was delivered
+	phase18Checked     bool     // phase 18 ran to its assertions
+	phase18Failures    []string // phase 18 assertion failures
 }
 
 // phase15AddSample records a single message_added event tied to phase 15's
@@ -1857,7 +1861,120 @@ func (d *testDriver) runQueuePhases() {
 		log.Printf("[%s] Phase 17: FAIL — interrupt message never delivered", agent)
 	}
 
+	d.runSteerPhase(sessID)
+
 	d.advanceToNextRound()
+}
+
+// interactionByPromptID returns the stored interaction created for promptID.
+func (d *testDriver) interactionByPromptID(promptID string) *types.Interaction {
+	for _, in := range d.store.GetAllInteractions() {
+		if in.PromptID == promptID {
+			return in
+		}
+	}
+	return nil
+}
+
+// runSteerPhase is Phase 18: a steer prompt enqueued while the agent is busy.
+// When Zed reported the agent can steer, it is dispatched immediately and the
+// running turn is NOT cancelled: the steered-from interaction completes at the
+// split and the steer's own interaction gets the rest of the turn. Without
+// steering support it is held until the turn ends, like a queued prompt.
+func (d *testDriver) runSteerPhase(sessID string) {
+	agent := d.round.agentName
+	d.mu.Lock()
+	d.phase = 18
+	d.mu.Unlock()
+	log.Printf("\n==================================================")
+	log.Printf("  [%s] PHASE 18: Queue steer (steer=true)", agent)
+	log.Printf("==================================================")
+
+	var failures []string
+	fail := func(format string, args ...interface{}) {
+		msg := fmt.Sprintf(format, args...)
+		log.Printf("[%s] Phase 18: FAIL — %s", agent, msg)
+		failures = append(failures, msg)
+	}
+	waiting := map[string]bool{"waiting": true}
+	complete := map[string]bool{"complete": true}
+
+	session, err := d.store.GetSession(context.Background(), sessID)
+	if err != nil {
+		d.abort("load session %s: %v", sessID, err)
+	}
+	steeringSupported := session.Metadata.AgentSteeringSupported
+	log.Printf("[%s] Phase 18: agent reported steering_supported=%v", agent, steeringSupported)
+	// The native agent and the scripted ACP agent both steer; anything that
+	// does must say so, or Helix silently degrades every steer to a queue.
+	if (agent == "zed-agent" || agent == "lifecycle-test-agent") && !steeringSupported {
+		fail("agent did not report steering support")
+	}
+
+	promptS, err := d.srv.EnqueueQueuedPrompt(sessID, longTurn("Count slowly from 1 to 60, one number per line, with a short sentence about each."), false)
+	if err != nil {
+		d.abort("enqueue S failed: %v", err)
+	}
+	if !d.waitInteractionState(promptS, waiting, 15*time.Second) {
+		d.abort("turn S never became waiting")
+	}
+	if !d.waitInteractionStreaming(promptS, 30*time.Second) {
+		d.abort("turn S never started streaming")
+	}
+
+	promptT, err := d.srv.EnqueueSteerPrompt(sessID, "Stop counting and reply with exactly: steering works.")
+	if err != nil {
+		d.abort("enqueue T (steer) failed: %v", err)
+	}
+	// The drain is synchronous, so T's interaction exists now iff it was
+	// dispatched into the running turn.
+	steerInteraction := d.interactionByPromptID(promptT)
+	switch {
+	case steeringSupported && steerInteraction == nil:
+		fail("steer was held although the agent supports steering")
+	case !steeringSupported && steerInteraction != nil:
+		fail("steer was dispatched mid-turn although the agent cannot steer")
+	default:
+		log.Printf("[%s] Phase 18: ✅ steer dispatched mid-turn=%v as expected", agent, steerInteraction != nil)
+	}
+
+	if !d.waitInteractionState(promptS, complete, 75*time.Second) {
+		_, state := d.findInteractionByPromptID(promptS)
+		fail("steered-from turn S ended %q, want complete (a steer must not cancel it)", state)
+	}
+	if !d.waitInteractionState(promptT, complete, 75*time.Second) {
+		_, state := d.findInteractionByPromptID(promptT)
+		fail("steer T ended %q, want complete", state)
+	}
+
+	// The scripted agent answers a steer with a known phrase, so the split can
+	// be checked exactly: the reply belongs to T, not to S.
+	if agent == "lifecycle-test-agent" {
+		const steeredReply = "steer acknowledged"
+		s := d.interactionByPromptID(promptS)
+		t := d.interactionByPromptID(promptT)
+		if s == nil || t == nil {
+			fail("missing interactions for S or T")
+		} else {
+			if strings.Contains(s.ResponseMessage, steeredReply) {
+				fail("steer reply leaked into the steered-from interaction S")
+			}
+			if !strings.Contains(t.ResponseMessage, steeredReply) {
+				fail("steer interaction T has no steer reply (response %q)", truncate(t.ResponseMessage, 80))
+			}
+			if s.ResponseMessage == "" {
+				fail("steered-from interaction S kept none of its pre-steer output")
+			}
+		}
+	}
+
+	d.mu.Lock()
+	d.round.phase18Checked = true
+	d.round.phase18Failures = failures
+	d.mu.Unlock()
+	if len(failures) == 0 {
+		log.Printf("[%s] Phase 18: ✅ steer delivered without cancelling the running turn", agent)
+	}
 }
 
 // --- Per-round validation ---
@@ -2438,6 +2555,13 @@ func (d *testDriver) validateRound() roundResult {
 	}
 	if !d.round.phase17Delivered {
 		errors = append(errors, "Phase 17: interrupt queue message was never delivered")
+	}
+	// Phase 18: production queue path — steer.
+	if !d.round.phase18Checked {
+		errors = append(errors, "Phase 18: steer phase never ran")
+	}
+	for _, failure := range d.round.phase18Failures {
+		errors = append(errors, "Phase 18: "+failure)
 	}
 
 	// --- SUMMARY ---

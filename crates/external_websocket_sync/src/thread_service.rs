@@ -486,6 +486,26 @@ static EXTERNAL_ORIGINATED_ENTRIES: parking_lot::Mutex<
 static SIMULATED_INPUT_ENTRIES: LazyLock<parking_lot::Mutex<HashMap<String, HashSet<usize>>>> =
     LazyLock::new(|| parking_lot::Mutex::new(HashMap::new()));
 
+/// thread_id -> entry index -> request_id of steered user entries about to be
+/// pushed. The subscription's NewEntry handler consumes each one to split the
+/// running turn: everything before the entry completes under the old
+/// request_id, everything after streams under the steered one. Keyed by entry
+/// so two steers into one turn cannot overwrite each other's split.
+static STEER_SPLITS: LazyLock<parking_lot::Mutex<HashMap<String, HashMap<usize, String>>>> =
+    LazyLock::new(|| parking_lot::Mutex::new(HashMap::new()));
+
+/// Lifecycle guards for steered requests, released when the agent's turn on
+/// that thread stops. The turn that was steered owns no ingress request of its
+/// own past the split, so these keep `active_turns` truthful meanwhile.
+static STEERED_TURN_GUARDS: LazyLock<
+    parking_lot::Mutex<HashMap<String, Vec<crate::RequestLifecycleGuard>>>,
+> = LazyLock::new(|| parking_lot::Mutex::new(HashMap::new()));
+
+/// Native-agent steers waiting for their follow-up to start, per thread. While
+/// non-empty, the native thread ends its turn at the next message boundary.
+static NATIVE_STEERS_PENDING: LazyLock<parking_lot::Mutex<HashMap<String, HashSet<String>>>> =
+    LazyLock::new(|| parking_lot::Mutex::new(HashMap::new()));
+
 /// Set of thread_ids that already have a persistent event subscription
 /// Prevents creating duplicate subscriptions when follow-up messages arrive
 static PERSISTENT_SUBSCRIPTIONS: parking_lot::Mutex<Option<Arc<RwLock<HashSet<String>>>>> =
@@ -1928,6 +1948,332 @@ pub fn get_thread(acp_thread_id: &str) -> Option<WeakEntity<AcpThread>> {
         .and_then(|ka| ka.read().get(acp_thread_id).map(|e| e.downgrade()))
 }
 
+/// Re-send a turn's assistant entries with their now-complete content. The
+/// Go accumulator overwrites known message_ids, so this corrects truncated
+/// text from throttled `EntryUpdated` sends.
+fn flush_turn_entries(
+    thread: &AcpThread,
+    thread_id: &str,
+    turn: std::ops::Range<usize>,
+    request_id: &str,
+    cx: &App,
+) {
+    for (idx, entry) in thread.entries().iter().enumerate().take(turn.end).skip(turn.start) {
+        match entry {
+            acp_thread::AgentThreadEntry::AssistantMessage(msg) => {
+                let content = msg.content_only(cx);
+                if !content.is_empty() {
+                    crate::send_websocket_event(SyncEvent::MessageAdded {
+                        acp_thread_id: thread_id.to_string(),
+                        message_id: idx.to_string(),
+                        role: "assistant".to_string(),
+                        content,
+                        request_id: request_id.to_string(),
+                        entry_type: "text".to_string(),
+                        tool_name: String::new(),
+                        tool_status: String::new(),
+                        tool_call_id: String::new(),
+                        tool_call_name: String::new(),
+                        subagent_id: String::new(),
+                        timestamp: chrono::Utc::now().timestamp(),
+                    }).log_err();
+                }
+            }
+            acp_thread::AgentThreadEntry::ToolCall(tool_call) => {
+                let content = tool_call.to_markdown(cx);
+                if !content.is_empty() {
+                    let name = tool_call.label.read(cx).source().to_string();
+                    let status = tool_call.status.to_string();
+                    let (tool_call_id, tool_call_name, subagent_id) =
+                        tool_message_metadata(tool_call);
+                    crate::send_websocket_event(SyncEvent::MessageAdded {
+                        acp_thread_id: thread_id.to_string(),
+                        message_id: idx.to_string(),
+                        role: "assistant".to_string(),
+                        content,
+                        request_id: request_id.to_string(),
+                        entry_type: "tool_call".to_string(),
+                        tool_name: name,
+                        tool_status: status,
+                        tool_call_id,
+                        tool_call_name,
+                        subagent_id,
+                        timestamp: chrono::Utc::now().timestamp(),
+                    }).log_err();
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+enum SteerRoute {
+    /// ACP agent with the steering extension, mid-turn.
+    Inject(std::rc::Rc<dyn acp_thread::AgentSessionSteer>),
+    /// Native agent, mid-turn: end the turn at the next boundary.
+    NativeBoundary(Entity<agent::Thread>),
+    /// Nothing to steer into: run as an ordinary follow-up.
+    FollowUp,
+}
+
+fn steer_route(thread: &AcpThread, cx: &App) -> SteerRoute {
+    if thread.status() != acp_thread::ThreadStatus::Generating {
+        return SteerRoute::FollowUp;
+    }
+    // A turn that has produced no output yet still ends in the user entry
+    // that started it; a steered entry pushed now would merge into it.
+    if matches!(
+        thread.entries().last(),
+        Some(acp_thread::AgentThreadEntry::UserMessage(_))
+    ) {
+        return SteerRoute::FollowUp;
+    }
+    if let Some(steer) = thread.connection().steer(thread.session_id(), cx) {
+        return SteerRoute::Inject(steer);
+    }
+    if let Some(native) = thread
+        .connection()
+        .clone()
+        .downcast::<agent::NativeAgentConnection>()
+        .and_then(|connection| connection.thread(thread.session_id(), cx))
+    {
+        return SteerRoute::NativeBoundary(native);
+    }
+    SteerRoute::FollowUp
+}
+
+/// Whether the agent behind this thread can take a message mid-turn, as
+/// reported to Helix so it knows whether to hold a steer until the turn ends.
+pub(crate) fn thread_supports_steering(thread: &AcpThread, cx: &App) -> bool {
+    thread.connection().steer(thread.session_id(), cx).is_some()
+        || thread
+            .connection()
+            .clone()
+            .downcast::<agent::NativeAgentConnection>()
+            .is_some()
+}
+
+fn send_follow_up(request: crate::SteerThreadRequest) {
+    if let Err(error) = crate::request_thread_creation(request.into_follow_up()) {
+        log::error!("🧭 [STEER] Failed to queue follow-up: {error:#}");
+    }
+}
+
+fn set_native_end_at_boundary(thread_id: &str, native: &Entity<agent::Thread>, cx: &mut App) {
+    let end_at_boundary = NATIVE_STEERS_PENDING
+        .lock()
+        .get(thread_id)
+        .is_some_and(|pending| !pending.is_empty());
+    native.update(cx, |thread, _| thread.set_end_turn_at_next_boundary(end_at_boundary));
+}
+
+/// Called when a follow-up turn starts: if it was a native steer, it no longer
+/// needs the running turn to end early.
+fn native_steer_started(
+    thread_id: &str,
+    request_id: &str,
+    thread: &Entity<AcpThread>,
+    cx: &mut App,
+) {
+    let was_pending = {
+        let mut pending = NATIVE_STEERS_PENDING.lock();
+        let removed = pending
+            .get_mut(thread_id)
+            .is_some_and(|requests| requests.remove(request_id));
+        if pending.get(thread_id).is_some_and(HashSet::is_empty) {
+            pending.remove(thread_id);
+        }
+        removed
+    };
+    if !was_pending {
+        return;
+    }
+    let native = {
+        let thread = thread.read(cx);
+        thread
+            .connection()
+            .clone()
+            .downcast::<agent::NativeAgentConnection>()
+            .and_then(|connection| connection.thread(thread.session_id(), cx))
+    };
+    if let Some(native) = native {
+        set_native_end_at_boundary(thread_id, &native, cx);
+    }
+}
+
+const STEER_RESPONSE_TIMEOUT: Duration = Duration::from_secs(10);
+
+async fn steer_thread(request: crate::SteerThreadRequest, cx: &mut gpui::AsyncApp) {
+    let Some(thread) = crate::get_thread(&request.acp_thread_id).and_then(|weak| weak.upgrade())
+    else {
+        log::info!(
+            "🧭 [STEER] Thread {} not loaded; delivering {} as a follow-up",
+            request.acp_thread_id,
+            request.request_id
+        );
+        send_follow_up(request);
+        return;
+    };
+
+    let route = cx.update(|cx| steer_route(thread.read(cx), cx));
+    match route {
+        SteerRoute::FollowUp => {
+            log::info!(
+                "🧭 [STEER] Thread {} cannot be steered now; delivering {} as a follow-up",
+                request.acp_thread_id,
+                request.request_id
+            );
+            send_follow_up(request);
+        }
+        SteerRoute::NativeBoundary(native) => {
+            log::info!(
+                "🧭 [STEER] Native thread {}: ending turn at next boundary for {}",
+                request.acp_thread_id,
+                request.request_id
+            );
+            NATIVE_STEERS_PENDING
+                .lock()
+                .entry(request.acp_thread_id.clone())
+                .or_default()
+                .insert(request.request_id.clone());
+            cx.update(|cx| set_native_end_at_boundary(&request.acp_thread_id, &native, cx));
+            send_follow_up(request);
+        }
+        SteerRoute::Inject(steer) => {
+            let Some(guard) =
+                crate::start_steered_request(&request.request_id, &request.acp_thread_id)
+            else {
+                log::info!(
+                    "🔁 [STEER] Ignoring duplicate steer request_id={}",
+                    request.request_id
+                );
+                return;
+            };
+            let prompt = vec![ContentBlock::Text(TextContent::new(
+                request.message.clone(),
+            ))];
+            // This task serialises every steer in the process, so a live but
+            // unresponsive agent must not hold it. A steer only enqueues the
+            // message on the agent side and answers at once; past the bound we
+            // deliver the message as a follow-up instead, which has its own
+            // silence watchdog. If the agent does inject it after giving up
+            // here, the message reaches it twice rather than not at all.
+            let steer_response = Box::pin(cx.update(|cx| steer.run(prompt, cx)));
+            let timeout = Box::pin(cx.background_executor().timer(STEER_RESPONSE_TIMEOUT));
+            let outcome = match futures::future::select(steer_response, timeout).await {
+                futures::future::Either::Left((outcome, _)) => outcome,
+                futures::future::Either::Right(_) => Err(anyhow::anyhow!(
+                    "agent did not answer the steering request within {STEER_RESPONSE_TIMEOUT:?}"
+                )),
+            };
+            match outcome {
+                Ok(acp_thread::SteerOutcome::Injected)
+                    if !cx.update(|cx| {
+                        thread.read(cx).status() == acp_thread::ThreadStatus::Generating
+                    }) =>
+                {
+                    // The agent claims an injection into a turn that has
+                    // already stopped (it should have answered
+                    // promptRequired). Splitting now would complete the
+                    // finished turn twice and park the steer as running
+                    // forever, so deliver it as the next turn instead.
+                    log::warn!(
+                        "🧭 [STEER] Agent injected {} but the turn on {} has ended; delivering as a follow-up",
+                        request.request_id,
+                        request.acp_thread_id
+                    );
+                    drop(guard);
+                    send_follow_up(request);
+                }
+                Ok(acp_thread::SteerOutcome::Injected) => {
+                    // Output the agent streams between acknowledging and
+                    // record_steered_entry below still lands in the
+                    // steered-from turn. Agents acknowledge before producing
+                    // output, so at most a few tokens are misattributed.
+                    log::info!(
+                        "🧭 [STEER] Injected {} into running turn on thread {}",
+                        request.request_id,
+                        request.acp_thread_id
+                    );
+                    STEERED_TURN_GUARDS
+                        .lock()
+                        .entry(request.acp_thread_id.clone())
+                        .or_default()
+                        .push(guard);
+                    cx.update(|cx| {
+                        record_steered_entry(&thread, &request, cx);
+                    });
+                }
+                Ok(acp_thread::SteerOutcome::NoRunningTurn) => {
+                    log::info!(
+                        "🧭 [STEER] Turn on {} ended before steer; delivering {} as a follow-up",
+                        request.acp_thread_id,
+                        request.request_id
+                    );
+                    drop(guard);
+                    send_follow_up(request);
+                }
+                Err(error) => {
+                    log::warn!(
+                        "🧭 [STEER] Steering {} failed ({error:#}); delivering as a follow-up",
+                        request.request_id
+                    );
+                    drop(guard);
+                    send_follow_up(request);
+                }
+            }
+        }
+    }
+}
+
+/// Show the steered message in the thread and split the running turn at it.
+/// The entry is external-originated (Helix already has it), so it is not
+/// echoed; the subscription performs the split when the entry lands.
+fn record_steered_entry(
+    thread: &Entity<AcpThread>,
+    request: &crate::SteerThreadRequest,
+    cx: &mut App,
+) {
+    let entry_idx = thread.read(cx).entries().len();
+    mark_external_originated_entry(request.acp_thread_id.clone(), entry_idx);
+    record_steer_split(&request.acp_thread_id, entry_idx, &request.request_id);
+    thread.update(cx, |thread, cx| {
+        thread.push_user_content_block(
+            None,
+            ContentBlock::Text(TextContent::new(request.message.clone())),
+            cx,
+        );
+    });
+}
+
+fn record_steer_split(thread_id: &str, entry_idx: usize, request_id: &str) {
+    STEER_SPLITS
+        .lock()
+        .entry(thread_id.to_string())
+        .or_default()
+        .insert(entry_idx, request_id.to_string());
+}
+
+fn take_steer_split(thread_id: &str, entry_idx: usize) -> Option<String> {
+    let mut splits = STEER_SPLITS.lock();
+    let thread_splits = splits.get_mut(thread_id)?;
+    let request_id = thread_splits.remove(&entry_idx);
+    if thread_splits.is_empty() {
+        splits.remove(thread_id);
+    }
+    request_id
+}
+
+/// Drop a closed thread's steering state. Releasing its steered-turn guards
+/// keeps `active_turns` from reporting a turn that can no longer finish.
+fn forget_thread_steering(thread_id: &str) {
+    STEER_SPLITS.lock().remove(thread_id);
+    NATIVE_STEERS_PENDING.lock().remove(thread_id);
+    crate::forget_thread_steering_support(thread_id);
+    let guards = STEERED_TURN_GUARDS.lock().remove(thread_id);
+    drop(guards);
+}
+
 /// Ensure a thread has an event subscription for syncing to Helix.
 ///
 /// This is the SINGLE source of truth for thread event subscriptions. All code paths
@@ -1967,6 +2313,11 @@ pub fn ensure_thread_subscription(
 
     let thread_id_for_sub = thread_id.to_string();
     mark_persistent_subscription(thread_id.to_string());
+
+    crate::announce_thread_steering(
+        thread_id,
+        thread_supports_steering(thread_entity.read(cx), cx),
+    );
 
     // Track the request_id that was active when the current turn started.
     // Used by the Stopped handler to flush with the correct request_id,
@@ -2026,6 +2377,57 @@ pub fn ensure_thread_subscription(
                 let thread = thread_entity.read(cx);
                 let latest_idx = thread.entries().len().saturating_sub(1);
                 if is_external_originated_entry(&thread_id_for_sub, latest_idx) {
+                    if let Some(steered_request_id) =
+                        take_steer_split(&thread_id_for_sub, latest_idx)
+                    {
+                        flush_streaming_throttle(&thread_id_for_sub);
+                        discard_pending_for_thread(&thread_id_for_sub);
+                        let fallback = crate::get_thread_request_id(&thread_id_for_sub)
+                            .unwrap_or_else(|| turn_request_id.borrow().clone());
+                        let steered_from = capture_current_turn_request_id(
+                            &mut turn_request_id.borrow_mut(),
+                            &mut prev_turn_request_id.borrow_mut(),
+                            &last_completed_request_id.borrow(),
+                            fallback,
+                        );
+                        let entries = thread.entries();
+                        let turn_start = entries
+                            .iter()
+                            .enumerate()
+                            .take(latest_idx)
+                            .rev()
+                            .find_map(|(i, e)| {
+                                matches!(e, acp_thread::AgentThreadEntry::UserMessage(_))
+                                    .then_some(i + 1)
+                            })
+                            .unwrap_or(0);
+                        flush_turn_entries(
+                            thread,
+                            &thread_id_for_sub,
+                            turn_start..latest_idx,
+                            &steered_from,
+                            cx,
+                        );
+                        log::info!(
+                            "🧭 [THREAD_SERVICE] Steer split on {}: completing {} and continuing as {}",
+                            thread_id_for_sub, steered_from, steered_request_id
+                        );
+                        // The steered-from turn ends here as far as Helix is
+                        // concerned; the agent's turn carries on as the steer.
+                        crate::send_websocket_event(SyncEvent::MessageCompleted {
+                            acp_thread_id: thread_id_for_sub.clone(),
+                            message_id: "0".to_string(),
+                            request_id: steered_from.clone(),
+                            agent_name: thread.agent_telemetry_id().to_string(),
+                            usage: None,
+                            context_usage: None,
+                        })
+                        .log_err();
+                        *prev_turn_request_id.borrow_mut() = steered_from.clone();
+                        *last_completed_request_id.borrow_mut() = steered_from;
+                        *turn_request_id.borrow_mut() = steered_request_id.clone();
+                        set_thread_request_id(thread_id_for_sub.clone(), steered_request_id);
+                    }
                     return;
                 }
                 if let Some(entry) = thread.entries().get(latest_idx) {
@@ -2387,6 +2789,7 @@ pub fn ensure_thread_subscription(
             // that streamed partial output wedges the worker forever.
             AcpThreadEvent::Stopped(_) | AcpThreadEvent::Error(_) => {
                 settle_pending_questions_for_thread(&thread_id_for_sub);
+                STEERED_TURN_GUARDS.lock().remove(&thread_id_for_sub);
                 let abort_cause = match event {
                     AcpThreadEvent::Error(cause) => Some(cause.clone()),
                     _ => None,
@@ -2419,53 +2822,7 @@ pub fn ensure_thread_subscription(
                     .find_map(|(i, e)| matches!(e, acp_thread::AgentThreadEntry::UserMessage(_)).then_some(i + 1))
                     .unwrap_or(0);
 
-                for (idx, entry) in entries.iter().enumerate().skip(turn_start) {
-                    match entry {
-                        acp_thread::AgentThreadEntry::AssistantMessage(msg) => {
-                            let content = msg.content_only(cx);
-                            if !content.is_empty() {
-                                crate::send_websocket_event(SyncEvent::MessageAdded {
-                                    acp_thread_id: thread_id_for_sub.clone(),
-                                    message_id: idx.to_string(),
-                                    role: "assistant".to_string(),
-                                    content,
-                                    request_id: rid.clone(),
-                                    entry_type: "text".to_string(),
-                                    tool_name: String::new(),
-                                    tool_status: String::new(),
-                                    tool_call_id: String::new(),
-                                    tool_call_name: String::new(),
-                                    subagent_id: String::new(),
-                                    timestamp: chrono::Utc::now().timestamp(),
-                                }).log_err();
-                            }
-                        }
-                        acp_thread::AgentThreadEntry::ToolCall(tool_call) => {
-                            let content = tool_call.to_markdown(cx);
-                            if !content.is_empty() {
-                                let name = tool_call.label.read(cx).source().to_string();
-                                let status = tool_call.status.to_string();
-                                let (tool_call_id, tool_call_name, subagent_id) =
-                                    tool_message_metadata(tool_call);
-                                crate::send_websocket_event(SyncEvent::MessageAdded {
-                                    acp_thread_id: thread_id_for_sub.clone(),
-                                    message_id: idx.to_string(),
-                                    role: "assistant".to_string(),
-                                    content,
-                                    request_id: rid.clone(),
-                                    entry_type: "tool_call".to_string(),
-                                    tool_name: name,
-                                    tool_status: status,
-                                    tool_call_id,
-                                    tool_call_name,
-                                    subagent_id,
-                                    timestamp: chrono::Utc::now().timestamp(),
-                                }).log_err();
-                            }
-                        }
-                        _ => {}
-                    }
-                }
+                flush_turn_entries(thread, &thread_id_for_sub, turn_start..entries.len(), &rid, cx);
 
                 // Use the turn's captured request_id for message_completed.
                 // FALLBACK: if turn_request_id still holds the previous turn's id
@@ -2801,6 +3158,15 @@ pub fn setup_thread_handler(
             }
         }
     }).detach();
+
+    let (steer_tx, mut steer_rx) = mpsc::unbounded_channel::<crate::SteerThreadRequest>();
+    crate::init_steer_thread_callback(steer_tx);
+    cx.spawn(async move |cx| {
+        while let Some(request) = steer_rx.recv().await {
+            steer_thread(request, cx).await;
+        }
+    })
+    .detach();
 
     let (question_tx, mut question_rx) =
         mpsc::unbounded_channel::<crate::QuestionCommandRequest>();
@@ -3726,6 +4092,7 @@ async fn handle_follow_up_message(
     cx.update(|cx| {
         if let Some(thread_entity) = thread.upgrade() {
             ensure_thread_subscription(&thread_entity, &thread_id, cx);
+            native_steer_started(&thread_id, &request_id, &thread_entity, cx);
         }
     });
 
@@ -4077,6 +4444,7 @@ async fn close_discarded_thread(
         ),
     }
     forget_thread_agent_session(&acp_thread_id);
+    forget_thread_steering(&acp_thread_id);
 }
 
 /// Drop a thread's agent session id and agent name.
@@ -5871,6 +6239,198 @@ mod agent_process_crash_tests {
              handleChatResponseError marks the interaction errored and frees the \
              activation lane. Without an Error arm the crash is swallowed and the \
              interaction stays waiting forever — the permanent worker wedge."
+        );
+    }
+}
+
+#[cfg(test)]
+mod steer_bookkeeping_tests {
+    use super::*;
+
+    #[test]
+    fn two_steers_into_one_turn_keep_their_own_splits() {
+        let thread_id = "steer-bookkeeping-two-splits";
+        record_steer_split(thread_id, 4, "steer-a");
+        record_steer_split(thread_id, 7, "steer-b");
+
+        assert_eq!(take_steer_split(thread_id, 5), None);
+        assert_eq!(take_steer_split(thread_id, 4).as_deref(), Some("steer-a"));
+        assert_eq!(take_steer_split(thread_id, 4), None);
+        assert_eq!(take_steer_split(thread_id, 7).as_deref(), Some("steer-b"));
+        assert!(!STEER_SPLITS.lock().contains_key(thread_id));
+    }
+
+    #[test]
+    fn closing_a_thread_releases_its_steered_turns() {
+        let thread_id = "steer-bookkeeping-close";
+        let request_id = "steer-bookkeeping-close-request";
+        let guard = crate::start_steered_request(request_id, thread_id)
+            .expect("a new steer is admitted");
+        STEERED_TURN_GUARDS
+            .lock()
+            .entry(thread_id.to_string())
+            .or_default()
+            .push(guard);
+        record_steer_split(thread_id, 3, request_id);
+        NATIVE_STEERS_PENDING
+            .lock()
+            .entry(thread_id.to_string())
+            .or_default()
+            .insert(request_id.to_string());
+
+        forget_thread_steering(thread_id);
+
+        assert!(!STEER_SPLITS.lock().contains_key(thread_id));
+        assert!(!NATIVE_STEERS_PENDING.lock().contains_key(thread_id));
+        assert!(!STEERED_TURN_GUARDS.lock().contains_key(thread_id));
+        // The released request no longer counts as active, so a redelivery
+        // after reconnect is admitted again.
+        assert!(crate::start_steered_request(request_id, thread_id).is_some());
+    }
+}
+
+#[cfg(test)]
+mod steer_split_subscription_tests {
+    //! Drives a steered entry through the real thread subscription and checks
+    //! what Helix sees on the wire: the steered-from turn completes at the
+    //! steer, and the rest of the agent's turn streams under the steer.
+
+    use super::*;
+    use crate::types::SyncEvent;
+    use crate::websocket_sync::{WEBSOCKET_SERVICE, WebSocketSync};
+    use acp_thread::{AcpThread, AgentConnection, StubAgentConnection};
+    use fs::FakeFs;
+    use gpui::{AppContext as _, TestAppContext};
+    use project::Project;
+    use settings::SettingsStore;
+    use std::rc::Rc;
+    use util::path_list::PathList;
+
+    #[gpui::test]
+    async fn steer_splits_the_running_turn_on_the_wire(cx: &mut TestAppContext) {
+        let _ws_guard = TEST_WEBSOCKET_SERVICE_GUARD.lock();
+        env_logger::try_init().ok();
+        cx.update(|cx| {
+            let settings_store = SettingsStore::test(cx);
+            cx.set_global(settings_store);
+        });
+
+        let fs = FakeFs::new(cx.executor());
+        let project = Project::test(fs, [], cx).await;
+        let connection = Rc::new(StubAgentConnection::new());
+        let thread: Entity<AcpThread> = cx
+            .update(|cx| {
+                connection
+                    .clone()
+                    .new_session(project.clone(), PathList::default(), cx)
+            })
+            .await
+            .expect("stub new_session should succeed");
+        let session_id = cx.read(|cx| thread.read(cx).session_id().clone());
+
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let acp_thread_id = format!("test-steer-split-{nonce}");
+        let original_request = format!("req-original-{nonce}");
+        let steer_request = format!("req-steer-{nonce}");
+
+        set_thread_request_id(acp_thread_id.clone(), original_request.clone());
+        register_thread(acp_thread_id.clone(), thread.clone());
+        cx.update(|cx| ensure_thread_subscription(&thread, &acp_thread_id, cx));
+
+        let (service, mut events_rx) = WebSocketSync::new_test();
+        *WEBSOCKET_SERVICE.lock() = Some(service);
+
+        let send = cx.update(|cx| {
+            thread.update(cx, |thread, cx| thread.send(vec!["long task".into()], cx))
+        });
+        cx.foreground_executor()
+            .spawn(async move {
+                send.await.log_err();
+            })
+            .detach();
+        cx.run_until_parked();
+
+        cx.update(|cx| {
+            connection.send_update(
+                session_id.clone(),
+                acp::SessionUpdate::AgentMessageChunk(acp::ContentChunk::new(
+                    "before the steer".into(),
+                )),
+                cx,
+            )
+        });
+        cx.run_until_parked();
+
+        cx.update(|cx| {
+            record_steered_entry(
+                &thread,
+                &crate::SteerThreadRequest {
+                    acp_thread_id: acp_thread_id.clone(),
+                    message: "change of plan".to_string(),
+                    request_id: steer_request.clone(),
+                    agent_name: None,
+                },
+                cx,
+            )
+        });
+        cx.run_until_parked();
+
+        cx.update(|cx| {
+            connection.send_update(
+                session_id.clone(),
+                acp::SessionUpdate::AgentMessageChunk(acp::ContentChunk::new(
+                    "after the steer".into(),
+                )),
+                cx,
+            )
+        });
+        cx.run_until_parked();
+        connection.end_turn(session_id, acp::StopReason::EndTurn);
+        cx.run_until_parked();
+
+        let mut events = Vec::new();
+        while let Ok(event) = events_rx.try_recv() {
+            events.push(event);
+        }
+
+        *WEBSOCKET_SERVICE.lock() = None;
+        unregister_thread(&acp_thread_id);
+        if let Some(keep_alive) = THREAD_KEEP_ALIVE.lock().as_ref() {
+            keep_alive.write().remove(&acp_thread_id);
+        }
+        cx.run_until_parked();
+
+        let completed: Vec<&str> = events
+            .iter()
+            .filter_map(|event| match event {
+                SyncEvent::MessageCompleted { request_id, .. } => Some(request_id.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            completed,
+            vec![original_request.as_str(), steer_request.as_str()],
+            "the steered-from turn completes once, at the steer; the steer completes when the agent stops"
+        );
+
+        let added = |request: &str, text: &str| {
+            events.iter().any(|event| {
+                matches!(event, SyncEvent::MessageAdded { request_id, role, content, .. }
+                    if request_id == request && role == "assistant" && content.contains(text))
+            })
+        };
+        assert!(added(&original_request, "before the steer"));
+        assert!(added(&steer_request, "after the steer"));
+        assert!(!added(&original_request, "after the steer"));
+        assert!(!added(&steer_request, "before the steer"));
+        assert!(
+            !events.iter().any(|event| matches!(event,
+                SyncEvent::MessageAdded { role, content, .. }
+                    if role == "user" && content.contains("change of plan"))),
+            "the steered message came from Helix and must not be echoed back"
         );
     }
 }

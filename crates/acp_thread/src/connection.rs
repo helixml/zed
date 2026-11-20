@@ -228,6 +228,13 @@ pub trait AgentConnection {
 
     fn cancel(&self, session_id: &acp::SessionId, cx: &mut App);
 
+    /// Returns a capability for agents that accept a user message into the
+    /// turn that is currently running, instead of queueing it behind the turn
+    /// or cancelling it (ACP `_session/steering` extension).
+    fn steer(&self, _session_id: &acp::SessionId, _cx: &App) -> Option<Rc<dyn AgentSessionSteer>> {
+        None
+    }
+
     /// Request-scoped elicitations are connection-level because they can arrive before a session
     /// thread exists. Session-scoped elicitations stay in the thread timeline, but use
     /// `ElicitationStore` for shared processing.
@@ -316,6 +323,19 @@ pub trait AgentSessionClientUserMessageIds {
         params: acp::PromptRequest,
         cx: &mut App,
     ) -> Task<Result<acp::PromptResponse>>;
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SteerOutcome {
+    /// The message was delivered into the running turn.
+    Injected,
+    /// No turn was running; the message was not delivered and must be sent as
+    /// a normal prompt.
+    NoRunningTurn,
+}
+
+pub trait AgentSessionSteer {
+    fn run(&self, prompt: Vec<acp::ContentBlock>, cx: &mut App) -> Task<Result<SteerOutcome>>;
 }
 
 pub trait AgentSessionRetry {

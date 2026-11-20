@@ -477,10 +477,10 @@ impl WebSocketSync {
             return Ok(());
         }
 
-        eprintln!("💬 [WEBSOCKET-IN] Processing chat_message: acp_thread_id={:?}, request_id={}, message_len={}, interrupt={}",
-                   chat_msg.acp_thread_id, chat_msg.request_id, chat_msg.message.len(), chat_msg.interrupt);
-        log::info!("💬 [WEBSOCKET-IN] Processing chat_message: acp_thread_id={:?}, request_id={}, message_len={}, interrupt={}",
-                   chat_msg.acp_thread_id, chat_msg.request_id, chat_msg.message.len(), chat_msg.interrupt);
+        eprintln!("💬 [WEBSOCKET-IN] Processing chat_message: acp_thread_id={:?}, request_id={}, message_len={}, interrupt={}, steer={}",
+                   chat_msg.acp_thread_id, chat_msg.request_id, chat_msg.message.len(), chat_msg.interrupt, chat_msg.steer);
+        log::info!("💬 [WEBSOCKET-IN] Processing chat_message: acp_thread_id={:?}, request_id={}, message_len={}, interrupt={}, steer={}",
+                   chat_msg.acp_thread_id, chat_msg.request_id, chat_msg.message.len(), chat_msg.interrupt, chat_msg.steer);
 
         // If this is an interrupt message and we have an existing thread, cancel its
         // running turn immediately via the dedicated cancel task (which runs independently
@@ -503,6 +503,17 @@ impl WebSocketSync {
                         log::warn!("⚠️ [WEBSOCKET-IN] Failed to request cancel for thread {}: {}", thread_id, e);
                     }
                 }
+            }
+        }
+
+        if chat_msg.steer && !chat_msg.interrupt {
+            if let Some(thread_id) = chat_msg.acp_thread_id.clone().filter(|id| !id.is_empty()) {
+                return crate::request_steer_thread(crate::SteerThreadRequest {
+                    acp_thread_id: thread_id,
+                    message: chat_msg.message,
+                    request_id: chat_msg.request_id,
+                    agent_name: chat_msg.agent_name,
+                });
             }
         }
 
@@ -774,6 +785,7 @@ pub fn send_agent_ready(agent_name: String, thread_id: Option<String>) {
     eprintln!("🚀 [WEBSOCKET] Sending agent_ready event: agent_name={}, thread_id={:?}, active_turns={:?}",
               agent_name, thread_id, active_turns);
 
+    let steering_supported = thread_id.as_deref().and_then(crate::thread_steering_support);
     match send_websocket_event(SyncEvent::AgentReady {
         agent_name: agent_name.clone(),
         thread_id: thread_id.clone(),
@@ -782,6 +794,16 @@ pub fn send_agent_ready(agent_name: String, thread_id: Option<String>) {
         Ok(_) => {
             log::info!("✅ [WEBSOCKET] agent_ready event sent successfully");
             eprintln!("✅ [WEBSOCKET] agent_ready event sent successfully");
+            // A reconnected Helix (or one that lost its in-memory state) only
+            // hears the capability at subscription time otherwise.
+            if let (Some(acp_thread_id), Some(steering_supported)) = (thread_id, steering_supported) {
+                if let Err(error) = send_websocket_event(SyncEvent::AgentCapabilities {
+                    acp_thread_id,
+                    steering_supported,
+                }) {
+                    log::warn!("⚠️ [WEBSOCKET] Failed to send agent_capabilities: {error:#}");
+                }
+            }
         }
         Err(e) => {
             log::warn!("⚠️ [WEBSOCKET] Failed to send agent_ready event (may not be connected): {}", e);

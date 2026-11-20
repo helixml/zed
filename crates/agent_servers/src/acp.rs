@@ -81,6 +81,33 @@ struct RawRequestPermissionResponse {
     meta: Option<acp::Meta>,
 }
 
+/// ACP steering extension: injects a user message into the running turn.
+/// Advertised by the agent via `InitializeResponse._meta.steering.supported`.
+const STEERING_META_KEY: &str = "steering";
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonRpcRequest)]
+#[request(method = "_session/steering", response = RawSteeringResponse)]
+#[serde(rename_all = "camelCase")]
+struct RawSteeringRequest {
+    session_id: acp::SessionId,
+    prompt: Vec<acp::ContentBlock>,
+    #[serde(default, rename = "_meta", skip_serializing_if = "Option::is_none")]
+    meta: Option<acp::Meta>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonRpcResponse)]
+#[serde(rename_all = "camelCase")]
+struct RawSteeringResponse {
+    outcome: String,
+}
+
+fn agent_supports_steering(meta: Option<&acp::Meta>) -> bool {
+    meta.and_then(|meta| meta.get(STEERING_META_KEY))
+        .and_then(|steering| steering.get("supported"))
+        .and_then(|supported| supported.as_bool())
+        .unwrap_or(false)
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AcpDebugMessageDirection {
     Incoming,
@@ -427,6 +454,40 @@ fn enqueue_notification<Notif>(
     }
 }
 
+struct AcpSessionSteer {
+    session_id: acp::SessionId,
+    connection: ConnectionTo<Agent>,
+}
+
+impl acp_thread::AgentSessionSteer for AcpSessionSteer {
+    fn run(
+        &self,
+        prompt: Vec<acp::ContentBlock>,
+        cx: &mut App,
+    ) -> Task<Result<acp_thread::SteerOutcome>> {
+        // `promptRequired`: an idle session must not start a detached turn
+        // behind the host's back — the host owns that prompt's lifecycle.
+        let meta = acp::Meta::from_iter([(
+            STEERING_META_KEY.to_string(),
+            serde_json::json!({ "idleBehavior": "promptRequired" }),
+        )]);
+        let request = RawSteeringRequest {
+            session_id: self.session_id.clone(),
+            prompt,
+            meta: Some(meta),
+        };
+        let connection = self.connection.clone();
+        cx.foreground_executor().spawn(async move {
+            let response = connection.send_request(request).block_task().await?;
+            match response.outcome.as_str() {
+                "injected" => Ok(acp_thread::SteerOutcome::Injected),
+                "promptRequired" => Ok(acp_thread::SteerOutcome::NoRunningTurn),
+                other => Err(anyhow!("unexpected steering outcome: {other}")),
+            }
+        })
+    }
+}
+
 pub struct AcpConnection {
     id: AgentId,
     telemetry_id: SharedString,
@@ -437,6 +498,7 @@ pub struct AcpConnection {
     auth_methods: Vec<acp::AuthMethod>,
     agent_server_store: WeakEntity<AgentServerStore>,
     agent_capabilities: acp::AgentCapabilities,
+    supports_steering: bool,
     request_elicitations: Entity<ElicitationStore>,
     defaults: AcpConnectionDefaults,
     child: Option<Child>,
@@ -1215,6 +1277,7 @@ impl AcpConnection {
             sessions,
             pending_sessions: Rc::new(RefCell::new(HashMap::default())),
             agent_capabilities: response.agent_capabilities,
+            supports_steering: agent_supports_steering(response.meta.as_ref()),
             request_elicitations,
             defaults,
             session_list,
@@ -1258,6 +1321,7 @@ impl AcpConnection {
             auth_methods: vec![],
             agent_server_store,
             agent_capabilities,
+            supports_steering: false,
             request_elicitations,
             defaults,
             child: None,
@@ -2186,6 +2250,20 @@ impl AgentConnection for AcpConnection {
         }
         let params = acp::CancelNotification::new(session_id.clone());
         self.connection.send_notification(params).log_err();
+    }
+
+    fn steer(
+        &self,
+        session_id: &acp::SessionId,
+        _cx: &App,
+    ) -> Option<Rc<dyn acp_thread::AgentSessionSteer>> {
+        if !self.supports_steering {
+            return None;
+        }
+        Some(Rc::new(AcpSessionSteer {
+            session_id: session_id.clone(),
+            connection: self.connection.clone(),
+        }))
     }
 
     fn request_elicitations(&self) -> Option<Entity<ElicitationStore>> {

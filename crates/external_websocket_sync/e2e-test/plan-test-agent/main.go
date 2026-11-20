@@ -34,7 +34,10 @@ var (
 	writeMu        sync.Mutex
 	cancelMu       sync.Mutex
 	cancels        = make(map[string]chan struct{})
-	mcpMu          sync.Mutex
+	// steers carries `_session/steering` messages into the session's running
+	// turn. Present exactly while a lifecycle turn runs.
+	steers = make(map[string]chan string)
+	mcpMu  sync.Mutex
 	// mcpServerNames is what session/new handed us. An ACP agent is given its
 	// MCP servers once, at session creation, so this is the only chance to see
 	// them — and reporting them is how the suite catches a Zed that creates the
@@ -137,14 +140,21 @@ func handle(req request) {
 		if protocolVersion == nil {
 			protocolVersion = 1
 		}
-		respond(req.ID, map[string]interface{}{
+		response := map[string]interface{}{
 			"protocolVersion":   protocolVersion,
 			"agentCapabilities": map[string]interface{}{"loadSession": true},
 			"agentInfo": map[string]interface{}{
 				"name":    "helix-plan-test-agent",
 				"version": "1.0.0",
 			},
-		})
+		}
+		if os.Getenv("E2E_SCRIPTED_LIFECYCLE") == "1" {
+			// The ACP steering extension, as claude-agent-acp advertises it.
+			response["_meta"] = map[string]interface{}{
+				"steering": map[string]interface{}{"supported": true},
+			}
+		}
+		respond(req.ID, response)
 	case "session/new":
 		recordMcpServers(req.Params)
 		sessionID := fmt.Sprintf("plan-test-session-%d-%d", os.Getpid(), sessionCount.Add(1))
@@ -174,6 +184,23 @@ func handle(req request) {
 			publishText(sessionID, "Second turn has no plan.")
 		}
 		respond(req.ID, map[string]interface{}{"stopReason": "end_turn"})
+	case "_session/steering":
+		sessionID := stringParam(req.Params, "sessionId", "")
+		text := promptText(req.Params)
+		cancelMu.Lock()
+		steer := steers[sessionID]
+		cancelMu.Unlock()
+		if steer == nil {
+			respond(req.ID, map[string]interface{}{"outcome": "promptRequired", "reason": "noRunningTurn"})
+			return
+		}
+		// Answer first: a real agent's reply to the steer takes at least one
+		// model round-trip, so the host always sees `injected` before output.
+		respond(req.ID, map[string]interface{}{"outcome": "injected"})
+		go func() {
+			time.Sleep(50 * time.Millisecond)
+			steer <- text
+		}()
 	case "session/cancel":
 		sessionID := stringParam(req.Params, "sessionId", "")
 		cancelMu.Lock()
@@ -249,6 +276,8 @@ func runLifecyclePrompt(req request) {
 		return
 	}
 	cancels[sessionID] = cancel
+	steer := make(chan string, 4)
+	steers[sessionID] = steer
 	cancelMu.Unlock()
 
 	chunks, gap := shortTurnChunks, time.Duration(0)
@@ -257,25 +286,37 @@ func runLifecyclePrompt(req request) {
 	}
 
 	go func() {
-		stopReason := streamTurn(sessionID, turn, chunks, gap, cancel)
+		stopReason := streamTurn(sessionID, turn, chunks, gap, cancel, steer)
 		// Unregister before responding: Zed may send its next prompt the moment
 		// it reads the response.
 		cancelMu.Lock()
 		if cancels[sessionID] == cancel {
 			delete(cancels, sessionID)
 		}
+		if steers[sessionID] == steer {
+			delete(steers, sessionID)
+		}
 		cancelMu.Unlock()
 		respond(req.ID, map[string]interface{}{"stopReason": stopReason})
 	}()
 }
 
+// steeredReply is what the scripted agent answers a steered message with, so
+// the suite can tell the steer's output landed in the steer's interaction.
+const steeredReply = "steer acknowledged"
+
 // streamTurn publishes chunks text chunks gap apart and returns the ACP stop
-// reason: "cancelled" as soon as cancel closes, "end_turn" otherwise.
-func streamTurn(sessionID string, turn int64, chunks int, gap time.Duration, cancel <-chan struct{}) string {
+// reason: "cancelled" as soon as cancel closes, "end_turn" otherwise. A steered
+// message ends the scripted work and is answered in the same turn, like a
+// steering agent that pre-empts its current generation.
+func streamTurn(sessionID string, turn int64, chunks int, gap time.Duration, cancel <-chan struct{}, steer <-chan string) string {
 	for i := 1; i <= chunks; i++ {
 		select {
 		case <-cancel:
 			return "cancelled"
+		case text := <-steer:
+			publishText(sessionID, fmt.Sprintf("%s: %s", steeredReply, text))
+			return "end_turn"
 		default:
 		}
 		publishText(sessionID, fmt.Sprintf("scripted turn %02d chunk %02d. ", turn, i))
@@ -285,6 +326,9 @@ func streamTurn(sessionID string, turn int64, chunks int, gap time.Duration, can
 		select {
 		case <-cancel:
 			return "cancelled"
+		case text := <-steer:
+			publishText(sessionID, fmt.Sprintf("%s: %s", steeredReply, text))
+			return "end_turn"
 		case <-time.After(gap):
 		}
 	}

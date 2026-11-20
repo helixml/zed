@@ -149,6 +149,32 @@ static REQUEST_LIFECYCLES: LazyLock<parking_lot::Mutex<HashMap<String, TrackedRe
     LazyLock::new(|| parking_lot::Mutex::new(HashMap::new()));
 
 /// Snapshot the turns this agent currently owns, for `agent_ready.active_turns`.
+/// Steering capability per thread, as last reported to Helix. Re-sent with
+/// every agent_ready so a reconnected Helix learns it for threads whose
+/// subscription (where it is first reported) predates the connection.
+static THREAD_STEERING_SUPPORT: LazyLock<parking_lot::Mutex<HashMap<String, bool>>> =
+    LazyLock::new(|| parking_lot::Mutex::new(HashMap::new()));
+
+pub(crate) fn announce_thread_steering(acp_thread_id: &str, steering_supported: bool) {
+    THREAD_STEERING_SUPPORT
+        .lock()
+        .insert(acp_thread_id.to_string(), steering_supported);
+    if let Err(error) = send_websocket_event(SyncEvent::AgentCapabilities {
+        acp_thread_id: acp_thread_id.to_string(),
+        steering_supported,
+    }) {
+        log::warn!("⚠️ [STEER] Failed to send agent_capabilities: {error:#}");
+    }
+}
+
+pub(crate) fn thread_steering_support(acp_thread_id: &str) -> Option<bool> {
+    THREAD_STEERING_SUPPORT.lock().get(acp_thread_id).copied()
+}
+
+pub(crate) fn forget_thread_steering_support(acp_thread_id: &str) {
+    THREAD_STEERING_SUPPORT.lock().remove(acp_thread_id);
+}
+
 pub(crate) fn active_turns_snapshot() -> Vec<ActiveTurn> {
     REQUEST_LIFECYCLES
         .lock()
@@ -382,6 +408,26 @@ mod request_lifecycle_tests {
     }
 
     #[test]
+    fn steered_request_is_admitted_once() {
+        let request_id = "request-lifecycle-steer-duplicate";
+        let guard = start_steered_request(request_id, "thread-steer").unwrap();
+        assert!(guard.can_continue());
+        assert!(start_steered_request(request_id, "thread-steer").is_none());
+
+        drop(guard);
+        assert!(start_steered_request(request_id, "thread-steer").is_some());
+    }
+
+    #[test]
+    fn steered_request_honours_a_cancellation_tombstone() {
+        let request_id = "request-lifecycle-steer-cancelled";
+        register_queued_request(request_id, Some("thread-steer"));
+        assert_eq!(cancel_registered_request(request_id), CancellationTarget::Queued);
+
+        assert!(start_steered_request(request_id, "thread-steer").is_none());
+    }
+
+    #[test]
     fn duplicate_ingress_is_rejected_while_active() {
         let request_id = "request-lifecycle-duplicate";
         assert_eq!(
@@ -488,6 +534,36 @@ pub struct CancelThreadRequest {
 /// bypassing the sequential callback_rx loop (which would be blocked awaiting the turn).
 static GLOBAL_CANCEL_THREAD_CALLBACK: parking_lot::Mutex<Option<mpsc::UnboundedSender<CancelThreadRequest>>> =
     parking_lot::Mutex::new(None);
+
+/// Request to deliver a message into a thread's running turn ("steering")
+/// instead of queueing it behind the turn or cancelling it.
+#[derive(Clone, Debug)]
+pub struct SteerThreadRequest {
+    pub acp_thread_id: String,
+    pub message: String,
+    pub request_id: String,
+    pub agent_name: Option<String>,
+}
+
+impl SteerThreadRequest {
+    /// The same message as an ordinary follow-up, which the sequential loop
+    /// runs once the current turn ends — queue semantics.
+    pub fn into_follow_up(self) -> ThreadCreationRequest {
+        ThreadCreationRequest {
+            acp_thread_id: Some(self.acp_thread_id),
+            message: self.message,
+            request_id: self.request_id,
+            agent_name: self.agent_name,
+            simulate_input: false,
+        }
+    }
+}
+
+/// Steering bypasses the sequential callback_rx loop for the same reason
+/// cancellation does: that loop is blocked awaiting the very turn being steered.
+static GLOBAL_STEER_THREAD_CALLBACK: parking_lot::Mutex<
+    Option<mpsc::UnboundedSender<SteerThreadRequest>>,
+> = parking_lot::Mutex::new(None);
 
 /// Request to close a thread Helix has discarded (a cleared session). Frees
 /// the agent-side session — and with it the MCP servers the harness started
@@ -1020,6 +1096,40 @@ pub fn init_cancel_thread_callback(sender: mpsc::UnboundedSender<CancelThreadReq
     eprintln!("🔧 [CANCEL] init_cancel_thread_callback() called - registering global callback");
     log::info!("🔧 [CANCEL] init_cancel_thread_callback() called - registering global callback");
     *GLOBAL_CANCEL_THREAD_CALLBACK.lock() = Some(sender);
+}
+
+/// Deliver a message into a thread's running turn. Falls back to an ordinary
+/// follow-up when the steer task is not up yet.
+pub fn request_steer_thread(request: SteerThreadRequest) -> Result<()> {
+    log::info!(
+        "🧭 [STEER] request_steer_thread() called for thread: {} request_id={}",
+        request.acp_thread_id,
+        request.request_id
+    );
+    let sender = GLOBAL_STEER_THREAD_CALLBACK.lock().clone();
+    match sender {
+        Some(sender) => sender
+            .send(request)
+            .map_err(|_| anyhow::anyhow!("Failed to send steer request")),
+        None => request_thread_creation(request.into_follow_up()),
+    }
+}
+
+pub fn init_steer_thread_callback(sender: mpsc::UnboundedSender<SteerThreadRequest>) {
+    *GLOBAL_STEER_THREAD_CALLBACK.lock() = Some(sender);
+}
+
+/// Admit a steered turn and mark it running. The returned guard keeps the turn
+/// in `active_turns` until it is dropped at the end of the agent's turn.
+/// `None` means the request is a duplicate of a turn already queued or running.
+pub(crate) fn start_steered_request(
+    request_id: &str,
+    acp_thread_id: &str,
+) -> Option<RequestLifecycleGuard> {
+    if register_queued_request(request_id, Some(acp_thread_id)) == RequestAdmission::AlreadyActive {
+        return None;
+    }
+    start_registered_request(request_id, || ()).map(|((), guard)| guard)
 }
 
 /// Request that a discarded thread be closed. Before the thread service is
