@@ -785,6 +785,7 @@ pub fn send_agent_ready(agent_name: String, thread_id: Option<String>) {
     eprintln!("🚀 [WEBSOCKET] Sending agent_ready event: agent_name={}, thread_id={:?}, active_turns={:?}",
               agent_name, thread_id, active_turns);
 
+    let steering_supported = thread_id.as_deref().and_then(crate::thread_steering_support);
     match send_websocket_event(SyncEvent::AgentReady {
         agent_name: agent_name.clone(),
         thread_id: thread_id.clone(),
@@ -793,6 +794,16 @@ pub fn send_agent_ready(agent_name: String, thread_id: Option<String>) {
         Ok(_) => {
             log::info!("✅ [WEBSOCKET] agent_ready event sent successfully");
             eprintln!("✅ [WEBSOCKET] agent_ready event sent successfully");
+            // A reconnected Helix (or one that lost its in-memory state) only
+            // hears the capability at subscription time otherwise.
+            if let (Some(acp_thread_id), Some(steering_supported)) = (thread_id, steering_supported) {
+                if let Err(error) = send_websocket_event(SyncEvent::AgentCapabilities {
+                    acp_thread_id,
+                    steering_supported,
+                }) {
+                    log::warn!("⚠️ [WEBSOCKET] Failed to send agent_capabilities: {error:#}");
+                }
+            }
         }
         Err(e) => {
             log::warn!("⚠️ [WEBSOCKET] Failed to send agent_ready event (may not be connected): {}", e);

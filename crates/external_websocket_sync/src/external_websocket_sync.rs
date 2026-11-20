@@ -149,6 +149,32 @@ static REQUEST_LIFECYCLES: LazyLock<parking_lot::Mutex<HashMap<String, TrackedRe
     LazyLock::new(|| parking_lot::Mutex::new(HashMap::new()));
 
 /// Snapshot the turns this agent currently owns, for `agent_ready.active_turns`.
+/// Steering capability per thread, as last reported to Helix. Re-sent with
+/// every agent_ready so a reconnected Helix learns it for threads whose
+/// subscription (where it is first reported) predates the connection.
+static THREAD_STEERING_SUPPORT: LazyLock<parking_lot::Mutex<HashMap<String, bool>>> =
+    LazyLock::new(|| parking_lot::Mutex::new(HashMap::new()));
+
+pub(crate) fn announce_thread_steering(acp_thread_id: &str, steering_supported: bool) {
+    THREAD_STEERING_SUPPORT
+        .lock()
+        .insert(acp_thread_id.to_string(), steering_supported);
+    if let Err(error) = send_websocket_event(SyncEvent::AgentCapabilities {
+        acp_thread_id: acp_thread_id.to_string(),
+        steering_supported,
+    }) {
+        log::warn!("⚠️ [STEER] Failed to send agent_capabilities: {error:#}");
+    }
+}
+
+pub(crate) fn thread_steering_support(acp_thread_id: &str) -> Option<bool> {
+    THREAD_STEERING_SUPPORT.lock().get(acp_thread_id).copied()
+}
+
+pub(crate) fn forget_thread_steering_support(acp_thread_id: &str) {
+    THREAD_STEERING_SUPPORT.lock().remove(acp_thread_id);
+}
+
 pub(crate) fn active_turns_snapshot() -> Vec<ActiveTurn> {
     REQUEST_LIFECYCLES
         .lock()
